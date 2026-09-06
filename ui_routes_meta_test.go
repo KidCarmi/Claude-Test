@@ -97,8 +97,11 @@ import (
 //     egress — no sender exists yet).
 //   - 189 — Added /api/urlcat/feed-status (GET viewer: UT1 + SaaS category
 //     feed freshness/failure counts, previously Prometheus-only).
+//   - 190 — Added /api/maintenance-agent (GET viewer: read-only maintenance
+//     agent version/privilege-posture/compose-stack health, previously only
+//     visible via SSH + `systemctl status culvert-maint`).
 func TestC1_RouteMetadata_Locked141(t *testing.T) {
-	const want = 236 // 235 + 1 authoritative rollback rehearsal route (/api/mcp/rollout/rehearse-rollback-authoritative)
+	const want = 237 // 236 + 1 maintenance-agent health visibility route (/api/maintenance-agent)
 	if got := len(uiRoutes); got != want {
 		t.Fatalf("uiRoutes has %d entries; want %d (route added or removed?)", got, want)
 	}
@@ -206,6 +209,7 @@ var helperSourceFiles = []string{
 	"release_api.go",
 	"ui_support.go",
 	"backups_api.go",
+	"maint_agent_status_api.go",
 	"diagnose.go",
 	"ui_mcp.go",
 	"ui_policy_learning.go",

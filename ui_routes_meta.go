@@ -779,6 +779,12 @@ var uiRoutes = []uiRouteMetadata{
 		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleViewer,
 			Note: "read-only backup archive listing via the CP-local maintenance agent"}}},
 
+	// Maintenance-agent health visibility (read-only pass-through of the
+	// CP-local maintenance agent's GET /v1/status; no new agent capability).
+	{Path: "/api/maintenance-agent", Handler: "apiMaintAgentStatus", Domain: "support", Public: false,
+		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleViewer,
+			Note: "read-only agent version/privilege-posture/compose-stack health via the CP-local maintenance agent"}}},
+
 	// Supportability framework (M1) — redacted csb/1 diagnostic bundles.
 	{Path: "/api/support/status", Handler: "apiSupportStatus", Domain: "support", Public: false,
 		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleViewer,
