@@ -498,9 +498,9 @@ run_mutation M38 \
 # effect makes MaxTotalExecutions stop measuring physical invocations.
 run_mutation M39 \
   'lifecycle/discovery traffic consumes a Canary execution reservation' \
-  'TestAuxiliaryTraffic_IsAdmittedButNeverMetered' \
-  ./internal/mcp/execution/ internal/mcp/execution/livegate.go \
-  's/\t\tMetered: upstreamclient\.ClassifyMethod\(in\.Method\)\.SideEffectBearing\(\),/\t\tMetered: true,/'
+  'TestLiveGate_AuxiliaryIsAdmittedWithoutTrustOrBudget' \
+  . mcp_live_gate.go \
+  's/\tif !in\.Metered \{\n\t\treturn execution\.LiveGateDecision\{Admit: true, Release: releaseAdmit\}\n\t\}\n\n//'
 
 # ── (39b) auxiliary traffic skips the gate ENTIRELY ────────────────────────
 #
