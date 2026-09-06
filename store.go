@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -258,11 +259,34 @@ const authCacheTTL = 5 * time.Minute
 type authCacheEntry struct {
 	ok     bool
 	expiry time.Time
+
+	// client is the fairness key of whoever caused this entry to be written,
+	// and added is when. Neither participates in lookup — the map key is still
+	// the HMAC of (user, pass) alone — they exist only to decide WHO gets
+	// evicted when the cache is full. See evictOneLocked.
+	client string
+	added  time.Time
+}
+
+// authCacheBucket tracks one client's entries in insertion order, so eviction
+// can take that client's OLDEST without scanning the whole cache. head is the
+// index of the first key not yet consumed; live is how many of this client's
+// keys are still present in the map.
+type authCacheBucket struct {
+	keys []string
+	head int
+	live int
 }
 
 type authCacheStore struct {
 	mu      sync.Mutex
 	entries map[string]*authCacheEntry
+	buckets map[string]*authCacheBucket
+
+	// evictions counts entries dropped to stay under the cap. It is the
+	// operator's only signal that cached credentials are being displaced —
+	// every eviction costs somebody a full ~80 ms bcrypt on their next request.
+	evictions uint64
 }
 
 func (a *authCacheStore) get(user, pass string) (ok, hit bool) {
@@ -279,33 +303,194 @@ func (a *authCacheStore) get(user, pass string) (ok, hit bool) {
 // memory growth from credential-stuffing attacks with unique user/pass pairs.
 const maxAuthCacheSize = 5_000
 
-func (a *authCacheStore) set(user, pass string, ok bool) {
+// set records a verification outcome, evicting fairly if the cache is full.
+//
+// CHAOS-57. This cache is populated by UNAUTHENTICATED requests: any client
+// that presents the configured username with any password writes an entry,
+// because negative results are cached too (deliberately — not caching them
+// would make every wrong password a fresh bcrypt). So its EVICTION POLICY is a
+// security control, not housekeeping, exactly as internal/authstate's is.
+//
+// The pre-fix policy was "scan for an expired entry; if none, drop an
+// arbitrary one" — a Go map range that stops at the first key, i.e. a
+// uniformly random LIVE entry. Two defects followed:
+//
+//   - A flood of distinct passwords under a known username displaced OTHER
+//     clients' cached positives at random. Measured: a legitimate user's
+//     cached credential survived a flood of one times the cache capacity and
+//     was reliably gone by two times it. The victim then paid a full ~80 ms
+//     bcrypt on EVERY subsequent request, which turns the attacker's CPU
+//     amplification onto legitimate traffic — the flood makes the gateway slow
+//     for exactly the users it is supposed to serve.
+//
+//   - The expired-entry scan is O(cache) whenever nothing has expired, which
+//     is precisely the state a flood keeps it in, and it runs holding the
+//     process-wide auth mutex. Measured at 64 µs per insertion at capacity.
+//
+// The replacement is internal/authstate's policy, which was written for the
+// same shape of problem: entries are attributed to a client key, and eviction
+// always takes the OLDEST entry of the client holding the MOST (ties broken by
+// oldest entry, then by client key, so the victim never depends on Go's map
+// iteration order). A flooding source therefore evicts ITSELF until it is no
+// longer the largest holder, and a client holding a single entry cannot be
+// displaced until every other client is down to one entry too.
+func (a *authCacheStore) set(client, user, pass string, ok bool) {
+	now := time.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.entries == nil {
+		a.entries = map[string]*authCacheEntry{}
+	}
+	if a.buckets == nil {
+		a.buckets = map[string]*authCacheBucket{}
+	}
+
+	k := cacheKey(user, pass)
+	// Overwriting a live entry (same credential re-verified after its TTL) must
+	// not double-count it in its bucket.
+	if _, exists := a.entries[k]; exists {
+		a.removeLocked(k)
+	}
 	if len(a.entries) >= maxAuthCacheSize {
-		// Evict one expired entry first; if none found, drop an arbitrary one.
-		now := time.Now()
-		evicted := false
-		for k, e := range a.entries {
-			if now.After(e.expiry) {
-				delete(a.entries, k)
-				evicted = true
-				break
-			}
+		a.evictOneLocked(now)
+	}
+
+	a.entries[k] = &authCacheEntry{ok: ok, expiry: now.Add(authCacheTTL), client: client, added: now}
+	b := a.buckets[client]
+	if b == nil {
+		b = &authCacheBucket{}
+		a.buckets[client] = b
+	}
+	b.keys = append(b.keys, k)
+	b.live++
+	a.compactLocked(client, b)
+}
+
+// evictOneLocked drops exactly one entry: an already-expired one if any is
+// found, otherwise the oldest live entry of the client holding the most.
+//
+// Only bucket FRONTS are examined, which is both cheap (O(active clients), not
+// O(cache)) and sufficient: entries within a bucket are in insertion order and
+// every entry carries the same TTL, so a bucket's front is its oldest and
+// therefore the first to expire. An expired entry is preferred wherever it is
+// found because dropping it costs nobody anything — it would have been a cache
+// miss anyway — so the fairness ordering only has to arbitrate between LIVE
+// entries, which is the case it exists for.
+func (a *authCacheStore) evictOneLocked(now time.Time) {
+	var (
+		victimKey    string
+		victimClient string
+		victimLive   int
+		victimAdded  time.Time
+		found        bool
+	)
+	for client, b := range a.buckets {
+		k, e, okFront := a.frontLocked(client, b)
+		if !okFront {
+			continue
 		}
-		if !evicted {
-			for k := range a.entries {
-				delete(a.entries, k)
-				break
-			}
+		// An expired entry is free to drop and is always the better victim.
+		if now.After(e.expiry) {
+			a.removeLocked(k)
+			a.evictions++
+			return
+		}
+		if !found || betterAuthCacheVictim(b.live, e.added, client, victimLive, victimAdded, victimClient) {
+			victimKey, victimClient, victimLive, victimAdded, found = k, client, b.live, e.added, true
 		}
 	}
-	a.entries[cacheKey(user, pass)] = &authCacheEntry{ok: ok, expiry: time.Now().Add(authCacheTTL)}
+	if !found {
+		return
+	}
+	a.removeLocked(victimKey)
+	a.evictions++
+}
+
+// betterAuthCacheVictim reports whether candidate (live, added, client) is a
+// better eviction victim than the incumbent. Ordering: most live entries
+// first, then the oldest entry, then the lexicographically smaller client key
+// — total and deterministic, so the victim never depends on map order.
+func betterAuthCacheVictim(live int, added time.Time, client string, bestLive int, bestAdded time.Time, bestClient string) bool {
+	switch {
+	case live != bestLive:
+		return live > bestLive
+	case !added.Equal(bestAdded):
+		return added.Before(bestAdded)
+	default:
+		return client < bestClient
+	}
+}
+
+// frontLocked returns the client's oldest still-present entry, advancing head
+// past keys that have already been removed.
+func (a *authCacheStore) frontLocked(client string, b *authCacheBucket) (string, *authCacheEntry, bool) {
+	for b.head < len(b.keys) {
+		k := b.keys[b.head]
+		if e, present := a.entries[k]; present && e.client == client {
+			return k, e, true
+		}
+		b.head++
+	}
+	return "", nil, false
+}
+
+// removeLocked deletes one entry and decrements its bucket, dropping the
+// bucket entirely at zero so the map's cardinality tracks ACTIVE clients
+// rather than every client ever seen.
+func (a *authCacheStore) removeLocked(k string) {
+	e, present := a.entries[k]
+	if !present {
+		return
+	}
+	delete(a.entries, k)
+	b := a.buckets[e.client]
+	if b == nil {
+		return
+	}
+	b.live--
+	if b.live <= 0 {
+		delete(a.buckets, e.client)
+	}
+}
+
+// compactLocked drops consumed positions once a bucket's backing slice has
+// grown past a small multiple of what the client actually holds.
+//
+// The condition is on len(b.keys), NOT on the un-consumed window
+// len(b.keys)-b.head: under a sustained flood the window stays pinned at the
+// cap while head and len advance together forever, so a window-based test
+// never fires and the backing array grows with total request count — a memory
+// leak reachable by the same flood the eviction policy exists to survive.
+// (The identical trap is documented in internal/authstate.)
+func (a *authCacheStore) compactLocked(client string, b *authCacheBucket) {
+	if len(b.keys) <= 8 || len(b.keys) < 4*b.live {
+		return
+	}
+	kept := b.keys[:0]
+	for _, k := range b.keys[b.head:] {
+		if e, present := a.entries[k]; present && e.client == client {
+			kept = append(kept, k)
+		}
+	}
+	b.keys = kept
+	b.head = 0
+	if len(b.keys) == 0 {
+		delete(a.buckets, client)
+	}
+}
+
+// Evictions reports how many cached verification results have been displaced
+// to stay under the cap.
+func (a *authCacheStore) Evictions() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.evictions
 }
 
 func (a *authCacheStore) clear() {
 	a.mu.Lock()
 	a.entries = map[string]*authCacheEntry{}
+	a.buckets = map[string]*authCacheBucket{}
 	a.mu.Unlock()
 }
 
@@ -320,11 +505,42 @@ var cacheKeySecret = func() []byte {
 	return b
 }()
 
-// cacheKey derives an HMAC-SHA256 tag from (user+pass) so we never store
+// cacheKey derives an HMAC-SHA256 tag from (user, pass) so we never store
 // plaintext credentials as map keys in heap-visible memory.
+//
+// The inputs are LENGTH-FRAMED, and that is a correctness requirement, not a
+// stylistic one. The previous derivation hashed `user + ":" + pass`, which is
+// NOT injective as soon as either field can contain the separator:
+//
+//	("admin",   "a:b")  ->  "admin:a:b"
+//	("admin:a", "b")    ->  "admin:a:b"     <- same key, different credential
+//
+// That was latent while the cache was consulted only AFTER the presented
+// username had been confirmed equal to the configured one — every reachable
+// key then shared the same `user + ":"` prefix, so distinct passwords gave
+// distinct keys. CHAOS-57 moves the lookup ahead of that comparison (so a
+// client riding a warm cache never consumes a verification slot), which makes
+// the ambiguity reachable with a caller-chosen username and turns it into an
+// AUTHENTICATION BYPASS: with a colon anywhere in the configured password, a
+// caller could present a re-split of it and hit the cached positive.
+//
+// Framing each field with its length makes the encoding injective, so no two
+// distinct (user, pass) pairs can ever share a key. Pinned by
+// TestChaos57_CacheKeyIsInjective and by the end-to-end bypass gate
+// TestChaos57_ReSplitCredentialCannotAuthenticate.
+//
+// The key derivation is process-local (cacheKeySecret is random per start) and
+// the cache is memory-only, so changing the encoding invalidates nothing that
+// outlives a restart.
 func cacheKey(user, pass string) string {
 	mac := hmac.New(sha256.New, cacheKeySecret)
-	mac.Write([]byte(user + ":" + pass))
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(user)))
+	mac.Write(lenBuf[:])
+	mac.Write([]byte(user))
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(pass)))
+	mac.Write(lenBuf[:])
+	mac.Write([]byte(pass))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -508,12 +724,72 @@ func (c *Config) snapshotAuthBackend() authBackendSnapshot {
 }
 
 func (c *Config) verifyAuthWithSnapshot(snapshot authBackendSnapshot, user, pass string) bool {
+	return c.verifyAuthFrom(snapshot, "", user, pass)
+}
+
+// verifyAuthFrom is verifyAuthWithSnapshot with the caller's client-fairness
+// key threaded in, so the credential-verification cost governor
+// (internal/authcost, CHAOS-57) can attribute the bcrypt work it admits.
+//
+// The ORDER of the four steps below is a security contract, not a style
+// choice. Read it as: answer for free if you can, then buy permission to spend
+// 80 ms of CPU, and only then look at the credential.
+//
+//  1. CACHE FIRST, and unconditionally — before the username is compared.
+//     Moving the lookup ahead of the comparison changes no verdict (entries are
+//     only ever stored for the configured username, so a wrong username was
+//     always a miss and still is) and costs the same one HMAC + one map probe
+//     either way, but it means a client riding a warm cache never consumes a
+//     verification slot. Without that, a legitimate high-rate deployment would
+//     be throttled by a governor that exists to bound work it is not doing.
+//
+//  2. ADMISSION SECOND, and INDEPENDENTLY OF THE USERNAME. This is the part
+//     that must not be "simplified". RISK-008 equalises the wrong-username and
+//     wrong-password paths — the dummy comparison below exists for no other
+//     reason — so that neither is distinguishable by timing. A gate consulted
+//     only on the branch that reaches the real hash, or given a budget that
+//     differed between the branches, would make "over budget" fast for one and
+//     slow for the other and hand back the username-enumeration oracle the
+//     equalisation removed. The decision is therefore taken here, where the
+//     code has not yet looked at `user`. Pinned by
+//     TestChaos57_AdmissionDecisionIsUsernameIndependent.
+//
+//  3. REFUSAL IS A DENY. Fail closed: the cost of a spurious refusal is a 407
+//     the client retries, and the cost of admitting without a bound is a
+//     remotely triggerable CPU exhaustion of the whole data plane (~13 KB/s of
+//     unauthenticated traffic saturated all four cores of the reference box).
+//     It is never silent — see auth_cost_health.go.
+//
+//  4. THE SLOT IS HELD ACROSS BOTH comparison branches, and released by defer
+//     so a panic inside bcrypt cannot leak it.
+func (c *Config) verifyAuthFrom(snapshot authBackendSnapshot, client, user, pass string) bool {
 	if snapshot.provider != nil {
+		// External providers (LDAP bind, OIDC introspection) do not run bcrypt;
+		// their cost and their failure modes are governed by CHAOS-47's
+		// authProbeGate instead. Charging them a verification slot here would
+		// bound the wrong resource.
 		return snapshot.provider.Verify(user, pass)
 	}
 	if snapshot.user == "" {
 		return true // auth disabled
 	}
+
+	c.mu.RLock()
+	revisionCurrent := c.authRevision == snapshot.revision
+	var ok, hit bool
+	if revisionCurrent {
+		ok, hit = c.cache.get(user, pass)
+	}
+	c.mu.RUnlock()
+	if hit {
+		return ok
+	}
+
+	if !authCostAdmit(client) {
+		return false
+	}
+	defer authCostRelease(client)
+
 	if user != snapshot.user {
 		// RISK-008: equalise timing with the correct-username path so a wrong
 		// username is indistinguishable from a wrong password — defeats
@@ -521,18 +797,10 @@ func (c *Config) verifyAuthWithSnapshot(snapshot authBackendSnapshot, user, pass
 		_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(pass))
 		return false
 	}
+	ok = bcrypt.CompareHashAndPassword(snapshot.passHash, []byte(pass)) == nil
 	c.mu.RLock()
 	if c.authRevision == snapshot.revision {
-		if ok, hit := c.cache.get(user, pass); hit {
-			c.mu.RUnlock()
-			return ok
-		}
-	}
-	c.mu.RUnlock()
-	ok := bcrypt.CompareHashAndPassword(snapshot.passHash, []byte(pass)) == nil
-	c.mu.RLock()
-	if c.authRevision == snapshot.revision {
-		c.cache.set(user, pass, ok)
+		c.cache.set(client, user, pass, ok)
 	}
 	c.mu.RUnlock()
 	return ok
@@ -545,6 +813,22 @@ func (c *Config) VerifyAuth(user, pass string) bool {
 	return c.verifyAuthWithSnapshot(c.snapshotAuthBackend(), user, pass)
 }
 
+// AuthCacheEvictions reports how many cached verification results have been
+// displaced to stay under the cache cap. A climbing counter is the operator's
+// signal that either the cap is undersized for real login volume or somebody
+// is flooding the credential path — each eviction costs the displaced client a
+// full bcrypt on its next request (CHAOS-57).
+func (c *Config) AuthCacheEvictions() uint64 { return c.cache.Evictions() }
+
+// VerifyAuthFrom is VerifyAuth with the caller's client-fairness key, so the
+// CHAOS-57 verification governor can attribute the bcrypt work. Data-plane
+// callers that know their peer MUST use this: the plain VerifyAuth passes the
+// empty key, which is valid but puts every such caller in one shared fairness
+// bucket where they can only throttle each other.
+func (c *Config) VerifyAuthFrom(client, user, pass string) bool {
+	return c.verifyAuthFrom(c.snapshotAuthBackend(), client, user, pass)
+}
+
 // resolveAuthIdentity preserves the legacy Config authentication selection but
 // returns a provider-derived identity when the configured backend supports it.
 // Non-identity providers and local bcrypt retain the historical caller username
@@ -553,7 +837,17 @@ func (c *Config) resolveAuthIdentity(user, pass string) (*Identity, bool) {
 	return c.resolveAuthIdentityWithSnapshot(c.snapshotAuthBackend(), user, pass)
 }
 
+// resolveAuthIdentityFrom is resolveAuthIdentity carrying the caller's
+// client-fairness key through to the CHAOS-57 verification governor.
+func (c *Config) resolveAuthIdentityFrom(client, user, pass string) (*Identity, bool) {
+	return c.resolveAuthIdentityFromSnapshot(c.snapshotAuthBackend(), client, user, pass)
+}
+
 func (c *Config) resolveAuthIdentityWithSnapshot(snapshot authBackendSnapshot, user, pass string) (*Identity, bool) {
+	return c.resolveAuthIdentityFromSnapshot(snapshot, "", user, pass)
+}
+
+func (c *Config) resolveAuthIdentityFromSnapshot(snapshot authBackendSnapshot, client, user, pass string) (*Identity, bool) {
 	// VerifyAuth historically treats an empty backend as authentication disabled
 	// and succeeds for setup/UI compatibility. Presented proxy credentials must
 	// never turn that sentinel success into a caller-controlled identity.
@@ -565,7 +859,7 @@ func (c *Config) resolveAuthIdentityWithSnapshot(snapshot authBackendSnapshot, u
 	}); ok {
 		return resolver.ResolveIdentity(user, pass)
 	}
-	if !c.verifyAuthWithSnapshot(snapshot, user, pass) {
+	if !c.verifyAuthFrom(snapshot, client, user, pass) {
 		return nil, false
 	}
 	return &Identity{Sub: user, Provider: "local"}, true

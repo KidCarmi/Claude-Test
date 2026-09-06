@@ -1112,6 +1112,69 @@ culvert_auth_backend_gated_denials_total %d
 		abSnap.GatedDenials,
 	)
 
+	// CHAOS-57: the credential-verification cost governor. bcrypt is ~80 ms of
+	// exclusive CPU per comparison and it runs on the per-request proxy-auth
+	// path, so these series are how an operator sees a credential flood — and,
+	// more importantly, how they tell "users are being denied because the
+	// governor is saturated" from "users are typing the wrong password", which
+	// look identical on culvert_auth_* alone.
+	//
+	// _refused_total is labelled by a CLOSED three-value reason set, never by
+	// anything caller-derived. _saturated is a gauge and _inflight tracks the
+	// ceiling it saturates against, so a dashboard can show utilisation rather
+	// than just the overflow. _waited_total is the LEADING indicator: it climbs
+	// while the queue is still absorbing, i.e. before anybody is refused.
+	acSnap := authCostHealthStatus()
+	acSaturated := 0
+	if acSnap.Saturated {
+		acSaturated = 1
+	}
+	_, _ = fmt.Fprintf(w, `# HELP culvert_auth_verify_total Local-account credential verifications that ran a bcrypt comparison
+# TYPE culvert_auth_verify_total counter
+culvert_auth_verify_total %d
+
+# HELP culvert_auth_verify_refused_total Credential verifications refused by the cost governor — denied fail-closed WITHOUT checking the credential
+# TYPE culvert_auth_verify_refused_total counter
+culvert_auth_verify_refused_total{reason="per_client"} %d
+culvert_auth_verify_refused_total{reason="queue_full"} %d
+culvert_auth_verify_refused_total{reason="timeout"} %d
+
+# HELP culvert_auth_verify_waited_total Credential verifications that had to queue for a slot (leading indicator: the ceiling is being approached but still absorbing)
+# TYPE culvert_auth_verify_waited_total counter
+culvert_auth_verify_waited_total %d
+
+# HELP culvert_auth_verify_inflight Credential verifications running right now
+# TYPE culvert_auth_verify_inflight gauge
+culvert_auth_verify_inflight %d
+
+# HELP culvert_auth_verify_max_concurrent Ceiling on concurrent credential verifications (half of GOMAXPROCS)
+# TYPE culvert_auth_verify_max_concurrent gauge
+culvert_auth_verify_max_concurrent %d
+
+# HELP culvert_auth_verify_queued Callers currently waiting for a verification slot
+# TYPE culvert_auth_verify_queued gauge
+culvert_auth_verify_queued %d
+
+# HELP culvert_auth_verify_saturated 1 while every credential-verification slot is occupied
+# TYPE culvert_auth_verify_saturated gauge
+culvert_auth_verify_saturated %d
+
+# HELP culvert_auth_cache_evictions_total Cached verification results displaced to stay under the cache cap — each one costs somebody a full bcrypt on their next request
+# TYPE culvert_auth_cache_evictions_total counter
+culvert_auth_cache_evictions_total %d
+`,
+		acSnap.Admitted,
+		acSnap.RefusedPerClient,
+		acSnap.RefusedQueueFull,
+		acSnap.RefusedTimeout,
+		acSnap.Waited,
+		acSnap.InFlight,
+		acSnap.MaxConcurrent,
+		acSnap.Queued,
+		acSaturated,
+		cfg.AuthCacheEvictions(),
+	)
+
 	// Decryption-profile success delta: which protocol inspected tunnels negotiated
 	// on the upstream leg (h2 = Inspect-as-HTTP/2 working; http/1.1 = strip/downgrade).
 	_, _ = fmt.Fprintf(w, `# HELP culvert_inspect_upstream_alpn_total Inspected-tunnel upstream (origin) leg negotiated protocol

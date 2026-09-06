@@ -1023,6 +1023,10 @@ func resetDiagVerdictGlobals(t *testing.T) {
 	// (one rule to remember, per the CHAOS-45 precedent).
 	resetAuthBackendHealthForTest()
 	t.Cleanup(resetAuthBackendHealthForTest)
+	// CHAOS-57: the credential-verification governor's refusal record is the
+	// same class of process-global and also folds into the aggregate verdict.
+	resetAuthCostHealthForTest()
+	t.Cleanup(resetAuthCostHealthForTest)
 	policyStore.mu.Lock()
 	prevRules := policyStore.rules
 	prevVersion := policyStore.version
