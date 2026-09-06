@@ -1,9 +1,12 @@
 # Culvert Language & Terminology Governance Review — 2026-09-06
 
 > **Owner:** Language & Terminology Governance routine · **Status:** Point-in-time review (repeatable)
-> **Method:** Audited `e698a12..290e376` (315 commits, 21 on the first-parent path, 240 files changed —
-> the largest commit count this program has processed in one window, though smaller by file count than
-> 08-25's 154-file MCP Shadow-execution drop). The window is dominated by the continuation of that same MCP
+> **Method:** Audited `e698a12..290e376` (315 commits — confirmed via both `git log --oneline | wc -l` and
+> `git rev-list --count`, run twice against the unambiguous full commit hashes to rule out any abbreviation
+> collision — 21 on the first-parent path, 240 files changed). Both figures are the largest this program has
+> processed in one window: the commit count exceeds every prior review's, and the 240-file diff is itself
+> larger than 08-25's previous high-water mark (the 154-file MCP Shadow-execution drop). The window is
+> dominated by the continuation of that same MCP
 > program: Shadow soak/exit-gap closure, the MCP tool-trust approval slice (ADR-0034), the MCP kill
 > boundary, and the first Canary-tier work (activation gate, architecture, admission fairness rollback,
 > physical-effect-truth evidence preservation) plus three "Live"-tier PRs (execution trust, tier
