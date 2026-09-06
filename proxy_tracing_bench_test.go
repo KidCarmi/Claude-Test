@@ -50,6 +50,7 @@ package main
 // (bench_regression_test.go, -tags benchgate).
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -77,7 +78,7 @@ func newBenchTracingWriter() *benchTracingWriter {
 // reused across iterations by the benchmark bodies below, which reset only
 // what the function under test stamped.
 func benchTracingRequest(h http.Header) *http.Request {
-	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/", http.NoBody)
 	r.Header = h
 	return r
 }

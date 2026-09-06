@@ -12,6 +12,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
@@ -159,12 +160,12 @@ func cloneHeader(h http.Header) http.Header {
 func TestRequestTracing_CanonicalKeysAreWireIdentical(t *testing.T) {
 	for _, tc := range tracingCases() {
 		t.Run(tc.name, func(t *testing.T) {
-			newReq := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+			newReq := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/", http.NoBody)
 			newReq.Header = cloneHeader(tc.reqHeader)
 			newRec := httptest.NewRecorder()
 			newID := setupRequestTracing(newRec, newReq)
 
-			oldReq := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+			oldReq := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/", http.NoBody)
 			oldReq.Header = cloneHeader(tc.reqHeader)
 			oldRec := httptest.NewRecorder()
 			oldID := legacySetupRequestTracing(oldRec, oldReq)
@@ -325,7 +326,7 @@ func TestGenerateTraceparent_MatchesLoneForm(t *testing.T) {
 // in the rewrite (it now runs before the traceparent probe rather than after
 // the request-ID Set), so its effect is pinned rather than assumed.
 func TestRequestTracing_SanitisesClientRequestID(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/", http.NoBody)
 	r.Header.Set(headerRequestID, "abc\r\nX-Injected: 1\ndef")
 	rec := httptest.NewRecorder()
 
@@ -353,7 +354,7 @@ func TestRequestTracing_GeneratesOnlyWhatIsMissing(t *testing.T) {
 
 	// Client supplied a traceparent but no request ID: the traceparent must
 	// survive verbatim and a request ID must appear.
-	r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/", http.NoBody)
 	r.Header.Set(headerTraceparent, clientTP)
 	id := setupRequestTracing(httptest.NewRecorder(), r)
 	if got := r.Header.Get(headerTraceparent); got != clientTP {
@@ -365,7 +366,7 @@ func TestRequestTracing_GeneratesOnlyWhatIsMissing(t *testing.T) {
 
 	// Client supplied a request ID but no traceparent: the ID must survive and
 	// a well-formed traceparent must appear.
-	r2 := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	r2 := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/", http.NoBody)
 	r2.Header.Set(headerRequestID, "caller-id")
 	id2 := setupRequestTracing(httptest.NewRecorder(), r2)
 	if id2 != "caller-id" {
@@ -376,7 +377,7 @@ func TestRequestTracing_GeneratesOnlyWhatIsMissing(t *testing.T) {
 	}
 
 	// Client supplied both: nothing is generated, both survive.
-	r3 := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	r3 := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/", http.NoBody)
 	r3.Header.Set(headerRequestID, "caller-id")
 	r3.Header.Set(headerTraceparent, clientTP)
 	if id3 := setupRequestTracing(httptest.NewRecorder(), r3); id3 != "caller-id" {
