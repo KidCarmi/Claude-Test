@@ -17,6 +17,8 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -27,27 +29,51 @@ import (
 // the differential test below and the frozen baseline for the benchmarks in
 // proxy_tracing_bench_test.go, so the comparison stays reproducible in-tree.
 //
-// Do not "modernise" this copy — its whole value is being the old shape.
+// It calls the FROZEN generators below, never the production ones, and that is
+// the whole point rather than a stylistic choice. It first shipped calling
+// generateTraceparent — which this change rewrote to delegate to
+// generateTraceIDs — so the "before" side of the comparison was drawing 32
+// random bytes and keeping the NEW 71-byte combined allocation instead of the
+// old 24-byte draw and 55-byte string. That inflated the legacy row's B/op by
+// one size class and, worse, left the baseline free to move whenever
+// production moved: a future rewrite of either generator would have silently
+// re-based the very numbers this file exists to hold still (Codex review of
+// PR #1326). A frozen baseline must depend on NOTHING that can change.
+//
+// Do not "modernise" this copy or point it back at the production generators —
+// its whole value is being the old shape.
 func legacySetupRequestTracing(w http.ResponseWriter, r *http.Request) string {
 	reqID := strings.ReplaceAll(strings.ReplaceAll(r.Header.Get("X-Request-ID"), "\n", ""), "\r", "")
 	if reqID == "" {
-		reqID = generateRequestID()
+		reqID = legacyGenerateRequestID()
 		r.Header.Set("X-Request-ID", reqID)
 	}
 	w.Header().Set("X-Request-ID", reqID)
 
 	if r.Header.Get("Traceparent") == "" {
-		r.Header.Set("Traceparent", generateTraceparent())
+		r.Header.Set("Traceparent", legacyGenerateTraceparent())
 	}
 	return reqID
+}
+
+// legacyGenerateRequestID is a VERBATIM copy of generateRequestID. That
+// function is UNCHANGED by this PR, so this copy is byte-for-byte identical to
+// production today — it exists so the frozen baseline above cannot be re-based
+// by a future edit to the production generator.
+func legacyGenerateRequestID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "0000000000000000"
+	}
+	return hex.EncodeToString(b)
 }
 
 // legacyGenerateTraceparent is a VERBATIM copy of the standalone traceparent
 // encoder as it stood before generateTraceparent was folded onto
 // generateTraceIDs. It is the frozen baseline for
 // BenchmarkGenerateTraceIDs_Separate and the oracle for
-// TestGenerateTraceIDs_MatchesLegacyLayout, which proves the fold changed the
-// COST of producing a traceparent and not its FORM.
+// TestGenerateTraceIDs_ParsesInProductionConsumer, which proves the fold
+// changed the COST of producing a traceparent and not its FORM.
 func legacyGenerateTraceparent() string {
 	var buf [24]byte // 16 (trace-id) + 8 (parent-id)
 	if _, err := rand.Read(buf[:]); err != nil {
@@ -60,6 +86,56 @@ func legacyGenerateTraceparent() string {
 	hex.Encode(out[36:52], buf[16:])
 	out[52], out[53], out[54] = '-', '0', '1'
 	return string(out[:])
+}
+
+// TestLegacyBaselineIsSelfContained pins the property the finding above was
+// about: the frozen baseline must not reach a production symbol whose cost this
+// PR changed, or the "before" column silently tracks "after".
+//
+// It is a source scan rather than a behavioural check because the defect is
+// invisible at runtime — calling generateTraceparent produced a perfectly valid
+// traceparent, just at the new cost.
+func TestLegacyBaselineIsSelfContained(t *testing.T) {
+	// Anchored to pkgSourceDir() rather than the CWD — the repo's
+	// TestTestFileReadsAreCWDIndependent wall requires it, so a concurrent
+	// os.Chdir in another test cannot flake this one.
+	src, err := os.ReadFile(filepath.Join(pkgSourceDir(), "proxy_tracing_test.go"))
+	if err != nil {
+		t.Fatalf("read own source: %v", err)
+	}
+	body, ok := funcBodyOf(string(src), "func legacySetupRequestTracing(")
+	if !ok {
+		t.Fatal("could not locate legacySetupRequestTracing in this file")
+	}
+	for _, production := range []string{"generateTraceIDs(", "setupRequestTracing("} {
+		if strings.Contains(body, production) {
+			t.Errorf("legacySetupRequestTracing calls %s — the frozen baseline must not "+
+				"reach production code this PR changed", production)
+		}
+	}
+	// The two generators are the specific trap: the legacy* copies contain the
+	// production names as a SUFFIX, so match on a call that is not preceded by
+	// the "legacy" prefix.
+	for _, call := range []string{"generateTraceparent()", "generateRequestID()"} {
+		if strings.Contains(body, call) && !strings.Contains(body, "legacyG"+call[1:]) {
+			t.Errorf("legacySetupRequestTracing calls the production %s rather than the frozen copy", call)
+		}
+	}
+}
+
+// funcBodyOf returns the text between the first "{" after decl and the first
+// line consisting solely of "}" — enough for the single flat function above.
+func funcBodyOf(src, decl string) (string, bool) {
+	i := strings.Index(src, decl)
+	if i < 0 {
+		return "", false
+	}
+	rest := src[i:]
+	end := strings.Index(rest, "\n}\n")
+	if end < 0 {
+		return "", false
+	}
+	return rest[:end], true
 }
 
 // TestGenerateTraceIDs_ParsesInProductionConsumer closes the loop against the

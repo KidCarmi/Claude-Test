@@ -21,24 +21,32 @@ package main
 //     string allocations, where one draw and one allocation cover both.
 //
 // The *Legacy benchmarks drive legacySetupRequestTracing
-// (proxy_tracing_test.go) — a verbatim copy of the pre-change body — so the
-// comparison is reproducible in-tree rather than a number in a commit message.
+// (proxy_tracing_test.go) — a verbatim copy of the pre-change body, calling
+// verbatim copies of the pre-change generators — so the comparison is
+// reproducible in-tree rather than a number in a commit message.
+//
 // Measured on the CI dev-container class (linux/amd64, 4 vCPU Xeon @2.8GHz),
-// median of n=7:
+// median of n=7 / n=3:
 //
 //	                                       ns/op   B/op  allocs/op
-//	SetupRequestTracing_Fresh                584    128      4
-//	SetupRequestTracing_FreshLegacy          969    192      8     (-40% / -4 allocs)
-//	SetupRequestTracing_ClientIDs            164     16      1
-//	SetupRequestTracing_ClientIDsLegacy      320     48      3     (-49% / -2 allocs)
-//	SetupRequestTracing_FreshParallel        213    128      4
-//	SetupRequestTracing_FreshParallelLegacy  362    192      8     (-41%)
-//	GenerateTraceIDs                         190     80      1
-//	GenerateTraceIDs_Separate                255     80      2     (-25% / -1 alloc)
-//	HeaderKey_CanonicalGet                    29      0      0
-//	HeaderKey_NonCanonicalGet                 96     16      1
-//	HeaderKey_CanonicalSet                    66     16      1
-//	HeaderKey_NonCanonicalSet                145     32      2
+//	SetupRequestTracing_Fresh                400    128      4
+//	SetupRequestTracing_FreshLegacy          674    176      8     (-41% / -4 allocs)
+//	SetupRequestTracing_ClientIDs            114     16      1
+//	SetupRequestTracing_ClientIDsLegacy      235     48      3     (-52% / -2 allocs)
+//	SetupRequestTracing_FreshParallel        170    128      4
+//	SetupRequestTracing_FreshParallelLegacy  257    176      8     (-34%)
+//	GenerateTraceIDs                         160     80      1
+//	GenerateTraceIDs_Separate                189     80      2     (-15% / -1 alloc)
+//	HeaderKey_CanonicalGet                    21      0      0
+//	HeaderKey_NonCanonicalGet                 72     16      1
+//	HeaderKey_CanonicalSet                    44     16      1
+//	HeaderKey_NonCanonicalSet                 99     32      2
+//
+// Read the RATIOS and the allocation columns, not the absolute ns. This is a
+// shared 4-vCPU runner: the same tree measured Fresh at 584 ns and FreshLegacy
+// at 969 ns on a busier run — 40% apart either way. Allocation counts are
+// deterministic, which is why the gates key on them (see the file header of
+// bench_regression_test.go for the same reasoning).
 //
 // End to end, BenchmarkPerfQual_ProxyHTTPForward/rules=100 goes from 191 to
 // 187 allocs/op — the same 4 allocations, now visible against the whole
@@ -53,12 +61,26 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
 // benchTracingSink keeps the returned request ID observable so the compiler
-// cannot elide the call.
+// cannot elide the call. Only the SERIAL benchmarks write it — one goroutine,
+// no synchronisation needed, and no atomic in the timed loop.
 var benchTracingSink string
+
+// benchTracingParallelSink is the concurrent counterpart. Every RunParallel
+// worker publishes its last result, so a plain global would be a genuine data
+// race: `go test -race -bench BenchmarkSetupRequestTracing_FreshParallel`
+// reported WARNING: DATA RACE and failed the benchmark, which would have made
+// the parallel measurement unusable in any race-enabled performance check
+// (Codex review of PR #1326).
+//
+// The store is deliberately OUTSIDE the timed loop — once per worker, not once
+// per iteration — so keeping the result observable costs the measurement
+// nothing.
+var benchTracingParallelSink atomic.Pointer[string]
 
 // benchTracingWriter is a minimal http.ResponseWriter over one reusable header
 // map. httptest.NewRecorder costs ~3.8 µs and ~18 allocations per construction
@@ -162,7 +184,7 @@ func benchTracingParallel(b *testing.B, fn func(http.ResponseWriter, *http.Reque
 			delete(r.Header, headerTraceparent)
 			sink = fn(w, r)
 		}
-		benchTracingSink = sink
+		benchTracingParallelSink.Store(&sink)
 	})
 }
 
