@@ -3058,6 +3058,32 @@ against a "fix" that simply broke authentication:
   deferral class of `jwksStaleMaxAge` and the M1-3 release thresholds: a knob
   whose only use is widening a trust or availability window is not a feature.
 
+### 25.7b The cost that is actually paid: restart and mass reconnect
+
+The verification cache is memory-only, so a restart empties it and every active
+client's next request is an uncached verification arriving at once — the "mass
+reconnect storm" scenario. This is the one case where the governor legitimately
+refuses valid credentials, and it is worth stating plainly rather than
+discovering.
+
+The queue absorbs the first arrivals; the rest get a `407` and retry.
+Authentication drains at the ceiling rate (~25/s on four cores), so a
+1,000-client fleet re-authenticates over roughly 40–80 seconds with some clients
+seeing a retried 407.
+
+**That is strictly better than the behaviour it replaces**, and the comparison
+is the justification for the whole posture: pre-fix, the same 1,000 clients put
+1,000 goroutines into bcrypt simultaneously — ~40 seconds during which every
+core was consumed and **the proxy served nobody**, including clients that were
+already authenticated and only wanted to browse. The governor trades *slower
+authentication for some* against *the data plane keeps working for everyone*.
+
+The residual is real and recorded: a non-browser client that does not retry a
+`407` will see a hard failure during that window. The runbook names the three
+remedies (stagger restarts, move authentication to an IdP — which this control
+does not govern at all — or add cores) and, more importantly, says that a
+DECAYING post-restart spike is not an incident while a sustained one is.
+
 ### 25.8 The process lesson
 
 AU-3 sat open at **Medium** for the whole review series because its register

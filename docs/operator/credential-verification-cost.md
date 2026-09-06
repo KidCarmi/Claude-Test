@@ -85,6 +85,41 @@ rotation, or a restart that empties the cache. Those are what the bounded wait
 absorbs, and they show up as `culvert_auth_verify_waited_total` climbing
 *without* any refusals — which is your signal to look before users notice.
 
+## 3a. Restart and mass reconnect — the one case that legitimately queues
+
+The verification cache is **in memory only**. A restart empties it, so every
+active client's next request is an uncached verification arriving at
+approximately the same moment. This is the scenario worth understanding before
+you see it at 3 a.m.
+
+**What happens.** The queue (8 × the ceiling) absorbs the first arrivals; the
+rest are refused with `queue_full` and receive a `407`, which clients retry.
+Authentication drains at the ceiling rate — ~25/s on four cores, ~12/s on two —
+so a 1,000-client fleet re-authenticates over roughly 40–80 seconds, with some
+clients seeing one or two retried 407s on the way. You will see
+`culvert_auth_verify_waited_total` and `culvert_auth_verify_refused_total`
+spike and then decay to flat.
+
+**Why this is the better outcome, not a regression.** Before this control the
+same 1,000 clients put 1,000 goroutines into bcrypt simultaneously — roughly 40
+seconds during which **every core was consumed and the proxy served nobody**,
+including the clients that were already authenticated and just wanted to browse.
+The governor trades "slower authentication for some" against "the data plane
+keeps working for everyone", which is the graceful-degradation direction.
+
+**If the retries are a problem for your clients** (some non-browser API clients
+do not retry a `407`), the remedies are, in order of preference:
+
+1. **Stagger the restart** across nodes rather than restarting the fleet's
+   gateway at once.
+2. **Use an external IdP** for proxy authentication. Introspection and LDAP
+   binds are not governed by this control at all, and their results cache under
+   the CHAOS-47 plane.
+3. **Add cores.** The ceiling is `GOMAXPROCS/2`, so it scales directly.
+
+What you should *not* do is treat a decaying post-restart spike as an incident.
+A spike that does not decay is an incident — see §5.
+
 ## 4. Monitoring
 
 ### Metrics
