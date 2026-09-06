@@ -119,9 +119,17 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	// physical invocations — the accounting property blocker #6 exists to establish.
 	//
 	// A non-metered admission therefore names no reservation and no generation, and
-	// carries no Revalidate: there is no reserved generation to re-check. Its Release
-	// returns the lifecycle in-flight count ONLY — releasing a budget slot it never
-	// took would corrupt the concurrency accounting for the calls that did take one.
+	// carries no Revalidate: that predicate re-checks the generation a RESERVATION was
+	// made under, and there is none. Its Release returns the lifecycle in-flight count
+	// ONLY — releasing a budget slot it never took would corrupt the concurrency
+	// accounting for the calls that did take one.
+	//
+	// RESIDUAL: an auxiliary call admitted here can still cross the boundary if a
+	// demotion lands between this admit and Upstream.Call. The window is bounded by
+	// gate (1) — a leaving-live transition closes admission, so the NEXT auxiliary
+	// call is refused — and it is strictly narrower than skipping the gate outright.
+	// Closing it needs a "current generation" seam on this gate, which is a design
+	// change, not a regression fix.
 	if !in.Metered {
 		return execution.LiveGateDecision{Admit: true, Release: releaseAdmit}
 	}
