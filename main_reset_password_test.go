@@ -97,3 +97,46 @@ func TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten(t *testing.T) 
 		t.Fatalf("roster path was replaced (mode=%v) even though runResetPasswordCommand returned an error", fi.Mode())
 	}
 }
+
+// TestRunResetPasswordCommand_LstatItselfFailingIsNotProofOfAbsence pins the
+// Codex review finding on the first fix: the guard must treat an inability
+// to prove "usersPath is gone" as a reason to abort, not just usersPath
+// visibly existing. The original guard checked `statErr == nil` — so if
+// os.Lstat itself failed for its OWN reason (a transient I/O fault, or here
+// an ENOTDIR from a path component that resolved to a regular file instead
+// of a directory) it fell through as if the roster were confirmed absent,
+// and would still have overwritten an intact-but-momentarily-unprobable
+// roster once storage recovered. Only an affirmative os.IsNotExist result
+// may be trusted as "safe to create fresh".
+func TestRunResetPasswordCommand_LstatItselfFailingIsNotProofOfAbsence(t *testing.T) {
+	dir := t.TempDir()
+	// A regular file standing where a directory component is expected turns
+	// any Lstat/ReadFile under it into ENOTDIR — never ENOENT — regardless
+	// of privilege, so this is deterministic and root-safe like the socket
+	// case above.
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed blocker file: %v", err)
+	}
+	path := filepath.Join(blocker, "ui_users.json")
+
+	if _, err := os.Lstat(path); err == nil || os.IsNotExist(err) {
+		t.Fatalf("test setup invalid: expected a non-missing Lstat failure (ENOTDIR), got err=%v", err)
+	}
+
+	newCreds := "attacker:BrandNewPass1"
+	uiUsersFile := path
+	s := &startupState{
+		resetPwUser: &newCreds,
+		uiUsersFile: &uiUsersFile,
+	}
+
+	if err := runResetPasswordCommand(s); err == nil {
+		t.Fatal("expected runResetPasswordCommand to refuse when Lstat cannot confirm the roster is absent, got nil error")
+	}
+
+	// Nothing should have been created at or under the blocked path.
+	if _, err := os.Lstat(path); err == nil {
+		t.Fatal("runResetPasswordCommand created a roster file despite the unresolved Lstat failure")
+	}
+}

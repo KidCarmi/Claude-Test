@@ -440,8 +440,16 @@ func runResetPasswordCommand(s *startupState) error {
 		// SetUIUser+SaveUIUsersFile below would replace an intact roster
 		// with a single freshly-created admin, destroying every other
 		// admin/operator/viewer account and TOTP enrollment for good.
-		if _, statErr := os.Lstat(usersPath); statErr == nil {
-			return fmt.Errorf("refusing to reset password: %s exists but failed to load (%w); fix the underlying issue (permissions, file type) and retry — proceeding would destroy the existing admin roster", usersPath, err)
+		//
+		// Proceed ONLY when Lstat itself affirmatively proves usersPath is
+		// gone (os.IsNotExist). Any other Lstat outcome — the path exists,
+		// or Lstat fails for its own reason (e.g. a transient EIO, or an
+		// ENOTDIR from a path component that resolved to the wrong file
+		// type) — is not proof of absence, so it must abort too: falling
+		// through here would still risk destroying an intact roster once
+		// storage recovers and the save below succeeds (Codex review).
+		if _, statErr := os.Lstat(usersPath); !os.IsNotExist(statErr) {
+			return fmt.Errorf("refusing to reset password: %s failed to load (%w) and its presence could not be ruled out (stat: %v); fix the underlying issue (permissions, file type) and retry — proceeding would risk destroying the existing admin roster", usersPath, err, statErr)
 		}
 	}
 	if err := cfg.SetUIUser(parts[0], parts[1], RoleAdmin); err != nil {
