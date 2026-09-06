@@ -396,8 +396,8 @@ func runCDRStage(r *http.Request, req *http.Request, body, scanBody []byte, ct, 
 	res := safeCDRSanitize(r.Context(), cdrRequestContext{
 		Host:        hostOnly,
 		URL:         req.URL.Path,
-		RequestID:   req.Header.Get("X-Request-ID"),
-		TraceParent: req.Header.Get("Traceparent"),
+		RequestID:   req.Header.Get(headerRequestID),
+		TraceParent: req.Header.Get(headerTraceparent),
 	}, body, ct, id, cdrActiveConfig())
 	recordCDRTerminal(res.Status)
 	recordThreatDetections(res.Threats)
