@@ -1,12 +1,27 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// listenUnix binds a unix-domain socket at path using the context-aware
+// (*net.ListenConfig).Listen, matching this repo's convention (e.g.
+// cmd/culvert-maint/internal/server/server.go) of never using the bare
+// context-less net.Listen (noctx lint gate).
+func listenUnix(t *testing.T, path string) net.Listener {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "unix", path)
+	if err != nil {
+		t.Fatalf("bind unix socket at %s: %v", path, err)
+	}
+	return ln
+}
 
 // TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten reproduces a
 // realistic deployment edge case for --reset-password (the documented admin
@@ -56,10 +71,7 @@ func TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten(t *testing.T) 
 	if err := os.Remove(path); err != nil {
 		t.Fatalf("remove seeded file: %v", err)
 	}
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("bind unix socket at roster path: %v", err)
-	}
+	ln := listenUnix(t, path)
 	defer ln.Close()
 
 	if _, err := os.ReadFile(path); err == nil || os.IsNotExist(err) {
