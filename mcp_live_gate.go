@@ -80,6 +80,12 @@ func newMCPLiveSideEffectGate(capb rollout.Capability) *mcpLiveSideEffectGate {
 // AdmitSideEffect implements execution.LiveExecutionGate. It runs the four gates in order and
 // fails closed on any of them, releasing every slot it acquired along the way, so a denial can
 // never leak a lifecycle in-flight count or a budget concurrency slot.
+//
+// The four gates split into two TIER-level checks that run for every admission and two
+// TOOL-level checks that run only for a METERED one (in.Metered — an invocation that can
+// cause a physical tool side effect). See the non-metered early return below: metering and
+// authorization are different questions, and answering both with "skip the gate" is what let
+// discovery traffic cross an unarmed or quiescing tier's boundary.
 func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) execution.LiveGateDecision {
 	deny := func(reason mcperr.Reason) execution.LiveGateDecision {
 		if g.note != nil {
@@ -98,6 +104,26 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	if !g.readFirst(in.Operation) {
 		releaseAdmit()
 		return deny(mcperr.ReasonRolloutOutOfScope)
+	}
+
+	// NON-METERED TRAFFIC STOPS HERE, ADMITTED. Gates (1) and (2) above are TIER-level
+	// questions — is this tier armed and not quiescing, and may an operation of this
+	// class cross the boundary at all — and they apply to every outbound call this
+	// gateway makes, including the lifecycle/discovery traffic that invokes no tool.
+	//
+	// Gates (3) and (4) below are TOOL-level and are the two that must not run here.
+	// Live-trust revalidation resolves an approval for (tenant, server, TOOL); auxiliary
+	// traffic has no tool binding, so asking would deny a question it should never have
+	// been asked. A budget reservation would permanently spend a Canary slot on a call
+	// that can cause no side effect, and MaxTotalExecutions would stop measuring
+	// physical invocations — the accounting property blocker #6 exists to establish.
+	//
+	// A non-metered admission therefore names no reservation and no generation, and
+	// carries no Revalidate: there is no reserved generation to re-check. Its Release
+	// returns the lifecycle in-flight count ONLY — releasing a budget slot it never
+	// took would corrupt the concurrency accounting for the calls that did take one.
+	if !in.Metered {
+		return execution.LiveGateDecision{Admit: true, Release: releaseAdmit}
 	}
 
 	// (3) Runtime live-trust revalidation (§10), bound to the DECISION's fingerprint.

@@ -1,16 +1,21 @@
 package execution
 
-// auxiliary_admission_test.go — §4 at the ADMISSION boundary (Codex round 6, P1).
+// auxiliary_admission_test.go — §4 at the ADMISSION boundary.
 //
 // openAttempt has always refused to mint an attempt identity for lifecycle and
 // discovery traffic, and its comment states the contract: such traffic "must never
-// consume an execution reservation or inflate the physical-effect count". The
-// composition-layer gate ran ABOVE that check, unconditionally, so the contract held
-// for the durable intent and not for the reservation it is supposed to name.
+// consume an execution reservation or inflate the physical-effect count".
 //
-// These gates pin the admission side of the same sentence, in both directions, with
-// tools/call controls on every fixture so a passing gate can never mean the gate
-// simply stopped being consulted.
+// That contract is about METERING. It was briefly implemented by skipping the
+// composition-layer gate entirely for those methods, which also dropped the gate's
+// TIER-level admission checks — a different question with a different answer.
+// `tools/list` is a client-reachable decision-point method that reaches this
+// boundary on an EffectExecute disposition and makes a real, credentialed outbound
+// call, so "may this tier make ANY outbound call right now" (armed, not quiescing,
+// read-first) still has to be asked even when "charge it a reservation" must not be.
+//
+// These gates pin both halves of that split, with tools/call controls on every
+// fixture so a passing gate can never mean the gate simply stopped being consulted.
 
 import (
 	"testing"
@@ -20,20 +25,42 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 )
 
-// countingGate records every admission it is asked for and answers as configured.
-// The COUNT is the point: a gate that admits is indistinguishable from one that was
-// never consulted if you only look at the outcome, and "was never consulted" is
-// exactly the property under test.
+// auxiliaryMethods is every method the fail-closed classifier positively exempts
+// from metering. Listed once so a class added to the classifier without a decision
+// about its admission shows up as a missing case here.
+var auxiliaryMethods = []string{"initialize", "notifications/initialized", "notifications/cancelled", "ping", "tools/list"}
+
+// countingGate records every admission it is asked for, and what it was asked
+// ABOUT. The COUNT alone is no longer the whole property: an admitting gate is
+// indistinguishable from one that was never consulted if you only look at the
+// outcome, and now that auxiliary traffic IS consulted, the metered flag is what
+// separates "asked to admit" from "asked to charge a reservation".
 type countingGate struct {
-	calls  int
-	admit  bool
-	reason mcperr.Reason
+	calls int
+	// meteredCalls counts only the admissions asked to charge a budget slot.
+	meteredCalls int
+	// sawMetered records the Metered flag of every admission, in order.
+	sawMetered []bool
+	admit      bool
+	// refuseMeteredOnly makes the gate answer like the production one: a tool-level
+	// refusal (trust/budget) applies only to a metered admission.
+	refuseMeteredOnly bool
+	reason            mcperr.Reason
 }
 
-func (g *countingGate) AdmitSideEffect(LiveGateInput) LiveGateDecision {
+func (g *countingGate) AdmitSideEffect(in LiveGateInput) LiveGateDecision {
 	g.calls++
-	if !g.admit {
+	g.sawMetered = append(g.sawMetered, in.Metered)
+	if in.Metered {
+		g.meteredCalls++
+	}
+	if !g.admit && (in.Metered || !g.refuseMeteredOnly) {
 		return LiveGateDecision{Admit: false, Reason: g.reason}
+	}
+	if !in.Metered {
+		// A non-metered admission names no slot and no generation — exactly what the
+		// production gate returns, so openAttempt's identity gate is never reached.
+		return LiveGateDecision{Admit: true, Release: func() {}}
 	}
 	return LiveGateDecision{
 		Admit: true, Release: func() {},
@@ -41,12 +68,13 @@ func (g *countingGate) AdmitSideEffect(LiveGateInput) LiveGateDecision {
 	}
 }
 
-// TestAuxiliaryTraffic_NeverReachesTheSideEffectGate is the accounting half. A
+// TestAuxiliaryTraffic_IsAdmittedButNeverMetered is the accounting half. A
 // reservation is the unit MaxTotalExecutions counts, so spending one on a call that
 // can cause no side effect makes the budget stop measuring physical invocations —
-// the exact property blocker #6 exists to establish.
-func TestAuxiliaryTraffic_NeverReachesTheSideEffectGate(t *testing.T) {
-	for _, method := range []string{"initialize", "notifications/initialized", "notifications/cancelled", "ping", "tools/list"} {
+// the exact property blocker #6 exists to establish. The gate is still CONSULTED;
+// it is simply told this invocation is not metered.
+func TestAuxiliaryTraffic_IsAdmittedButNeverMetered(t *testing.T) {
+	for _, method := range auxiliaryMethods {
 		t.Run(method, func(t *testing.T) {
 			up := &fakeUpstream{}
 			gate := &countingGate{admit: true}
@@ -57,8 +85,15 @@ func TestAuxiliaryTraffic_NeverReachesTheSideEffectGate(t *testing.T) {
 			in.Method = method
 			out := e.Execute(t.Context(), in, rollout.Resolution{Disposition: rollout.EffectExecute})
 
-			if gate.calls != 0 {
-				t.Fatalf("%s consumed %d admission(s); auxiliary traffic must reserve nothing", method, gate.calls)
+			if gate.calls != 1 {
+				t.Fatalf("%s must still be admitted by the tier gate, got %d admission(s)", method, gate.calls)
+			}
+			if gate.meteredCalls != 0 {
+				t.Fatalf("%s consumed %d metered admission(s); auxiliary traffic must reserve nothing",
+					method, gate.meteredCalls)
+			}
+			if len(gate.sawMetered) != 1 || gate.sawMetered[0] {
+				t.Fatalf("%s must be presented to the gate as non-metered, saw %v", method, gate.sawMetered)
 			}
 			if up.calls != 1 {
 				t.Fatalf("%s must still reach the upstream, got %d calls; reason %v", method, up.calls, out.Reason)
@@ -67,16 +102,20 @@ func TestAuxiliaryTraffic_NeverReachesTheSideEffectGate(t *testing.T) {
 	}
 }
 
-// TestAuxiliaryTraffic_SurvivesARefusingGate is the availability half, and it is the
-// shape that actually bites in production: the real gate validates tool trust against
-// the invocation's tool binding, which auxiliary traffic does not have, so it
-// REFUSES. An armed Canary node could therefore not complete a session handshake or
-// list tools — the gate answering "no" to a question it should never have been asked.
-func TestAuxiliaryTraffic_SurvivesARefusingGate(t *testing.T) {
+// TestAuxiliaryTraffic_SurvivesAToolLevelRefusal is the availability half, and it is
+// the shape that actually bites in production: the real gate validates tool trust
+// against the invocation's tool binding, which auxiliary traffic does not have, so a
+// tool-level check would REFUSE. An armed Canary node must still be able to complete
+// a session handshake and list tools.
+//
+// The refusal is now scoped where it belongs — inside the gate, keyed on Metered —
+// rather than by not consulting the gate at all. The control below proves the same
+// gate still refuses the metered call.
+func TestAuxiliaryTraffic_SurvivesAToolLevelRefusal(t *testing.T) {
 	for _, method := range []string{"initialize", "ping", "tools/list"} {
 		t.Run(method, func(t *testing.T) {
 			up := &fakeUpstream{}
-			gate := &countingGate{admit: false, reason: mcperr.ReasonRolloutBudgetExhausted}
+			gate := &countingGate{admit: false, refuseMeteredOnly: true, reason: mcperr.ReasonRolloutBudgetExhausted}
 			e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
 			e.cfg.LiveGate = gate
 
@@ -85,18 +124,76 @@ func TestAuxiliaryTraffic_SurvivesARefusingGate(t *testing.T) {
 			out := e.Execute(t.Context(), in, rollout.Resolution{Disposition: rollout.EffectExecute})
 
 			if up.calls != 1 {
-				t.Fatalf("%s must not be refused by a gate it never needed, got %d calls; reason %v",
+				t.Fatalf("%s must not be refused by a tool-level check it has no binding for, got %d calls; reason %v",
 					method, up.calls, out.Reason)
+			}
+		})
+	}
+	t.Run("control: the same gate still refuses tools/call", func(t *testing.T) {
+		up := &fakeUpstream{}
+		gate := &countingGate{admit: false, refuseMeteredOnly: true, reason: mcperr.ReasonRolloutBudgetExhausted}
+		e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
+		e.cfg.LiveGate = gate
+
+		out := e.Execute(t.Context(), execInput(policy.ActionAllow, false), rollout.Resolution{Disposition: rollout.EffectExecute})
+
+		if up.calls != 0 {
+			t.Fatalf("control: a tool-level refusal must still block tools/call, got %d calls", up.calls)
+		}
+		if out.Executed {
+			t.Fatal("control: a refused tools/call must not report Executed")
+		}
+	})
+}
+
+// TestAuxiliaryTraffic_IsRefusedByATierLevelDenial is the REGRESSION gate for the
+// bypass this file's contract was rewritten to close.
+//
+// A tier-level denial — the tier is UNARMED (the deliberate fail-closed posture
+// after a restart, where the rollout mode is still Canary but the live tier is never
+// automatically re-armed) or has CLOSED admission mid-drain — is not a statement
+// about tools. It says this node may make no live outbound call at all right now.
+// Skipping the gate for auxiliary traffic silently exempted discovery from it, so an
+// unarmed node kept forwarding credentialed `tools/list` calls upstream.
+//
+// The gate here refuses UNCONDITIONALLY, which is exactly how the tier-level checks
+// answer: they do not consult the tool binding, so they cannot distinguish auxiliary
+// traffic and must not be made to.
+func TestAuxiliaryTraffic_IsRefusedByATierLevelDenial(t *testing.T) {
+	for _, method := range auxiliaryMethods {
+		t.Run(method, func(t *testing.T) {
+			up := &fakeUpstream{}
+			gate := &countingGate{admit: false, reason: mcperr.ReasonRolloutModeInvalid}
+			e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
+			e.cfg.LiveGate = gate
+
+			in := execInput(policy.ActionAllow, false)
+			in.Method = method
+			out := e.Execute(t.Context(), in, rollout.Resolution{Disposition: rollout.EffectExecute})
+
+			if gate.calls != 1 {
+				t.Fatalf("%s must be presented to the tier gate, got %d admission(s)", method, gate.calls)
+			}
+			if up.calls != 0 {
+				t.Fatalf("%s crossed the boundary of a tier that refused every call, got %d upstream call(s)",
+					method, up.calls)
+			}
+			if out.Executed {
+				t.Fatalf("%s reported Executed after a tier-level refusal", method)
+			}
+			if out.Reason != mcperr.ReasonRolloutModeInvalid {
+				t.Fatalf("%s must surface the gate's bounded reason, got %v", method, out.Reason)
 			}
 		})
 	}
 }
 
-// TestToolCallStillReachesTheSideEffectGate is the CONTROL for both gates above, on
+// TestToolCallStillReachesTheSideEffectGate is the CONTROL for the gates above, on
 // the same fixtures. Without it they would pass on an executor that had stopped
-// consulting the gate at all — which is the failure this PR must never introduce.
+// consulting the gate at all — which is the failure this contract must never
+// introduce, in either direction.
 func TestToolCallStillReachesTheSideEffectGate(t *testing.T) {
-	t.Run("admitting gate is consulted exactly once", func(t *testing.T) {
+	t.Run("admitting gate is consulted exactly once, and metered", func(t *testing.T) {
 		up := &fakeUpstream{}
 		gate := &countingGate{admit: true}
 		e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
@@ -104,8 +201,9 @@ func TestToolCallStillReachesTheSideEffectGate(t *testing.T) {
 
 		out := e.Execute(t.Context(), execInput(policy.ActionAllow, false), rollout.Resolution{Disposition: rollout.EffectExecute})
 
-		if gate.calls != 1 {
-			t.Fatalf("tools/call must consume exactly one admission, got %d", gate.calls)
+		if gate.calls != 1 || gate.meteredCalls != 1 {
+			t.Fatalf("tools/call must consume exactly one METERED admission, got calls=%d metered=%d",
+				gate.calls, gate.meteredCalls)
 		}
 		if up.calls != 1 || !out.Executed {
 			t.Fatalf("control: expected one executed upstream call, got calls=%d executed=%v reason=%v",
@@ -136,7 +234,7 @@ func TestToolCallStillReachesTheSideEffectGate(t *testing.T) {
 // method name.
 func TestUnclassifiedMethodIsStillMetered(t *testing.T) {
 	up := &fakeUpstream{}
-	gate := &countingGate{admit: false, reason: mcperr.ReasonRolloutBudgetExhausted}
+	gate := &countingGate{admit: false, refuseMeteredOnly: true, reason: mcperr.ReasonRolloutBudgetExhausted}
 	e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
 	e.cfg.LiveGate = gate
 
@@ -144,8 +242,8 @@ func TestUnclassifiedMethodIsStillMetered(t *testing.T) {
 	in.Method = "resources/write"
 	out := e.Execute(t.Context(), in, rollout.Resolution{Disposition: rollout.EffectExecute})
 
-	if gate.calls != 1 {
-		t.Fatalf("an unclassified method must be admitted like a tool call, got %d admissions", gate.calls)
+	if gate.meteredCalls != 1 {
+		t.Fatalf("an unclassified method must be metered like a tool call, got %d metered admission(s)", gate.meteredCalls)
 	}
 	if up.calls != 0 {
 		t.Fatalf("an unclassified method refused by the gate must not reach the upstream, got %d", up.calls)

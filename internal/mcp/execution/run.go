@@ -698,27 +698,31 @@ func (e *Executor) admitSideEffect(in runtime.ExecInput) (sideEffectAdmission, e
 	if e.cfg.LiveGate == nil {
 		return sideEffectAdmission{}, nil
 	}
-	// AUXILIARY TRAFFIC IS NOT ADMITTED, because it has nothing to admit. Lifecycle
-	// and discovery methods invoke no tool, so §4's contract — stated on openAttempt
-	// and previously enforced only there — is that they must never consume an
-	// execution reservation or inflate the physical-effect count. Running the gate
-	// for them contradicted that contract in both directions: the production gate
-	// validates tool trust against an empty tool binding and REFUSES, so an armed
-	// Canary node could not complete a session handshake or list tools; a gate that
-	// admitted instead would permanently spend a Canary slot on a call that can cause
-	// no side effect, and MaxTotalExecutions would stop measuring physical
-	// invocations — the accounting blocker #6 exists to make true.
+	// AUXILIARY TRAFFIC IS NOT METERED — AND IS STILL ADMITTED. Lifecycle and
+	// discovery methods invoke no tool, so §4's contract is that they must never
+	// consume an execution reservation or inflate the physical-effect count. That is
+	// a statement about METERING, and it was briefly implemented by skipping the gate
+	// entirely, which also dropped the gate's ADMISSION checks — a different question
+	// with a different answer.
 	//
-	// The classifier is the SAME fail-closed one openAttempt uses, and its default is
-	// side-effect-bearing: exemption is granted only to classes positively known to
-	// invoke no tool, so an unclassified method is metered, never exempted. Skipping
-	// the gate does not weaken the boundary — preCallGuard's tool-freshness check and
-	// the FINAL emergency-kill re-read read authoritative state directly
-	// (e.cfg.State.KillGeneration() against the admission generation passed in by the
-	// runtime), not through the gate, so they still run for every method.
-	if !upstreamclient.ClassifyMethod(in.Method).SideEffectBearing() {
-		return sideEffectAdmission{}, nil
-	}
+	// The two must not share one decision. `tools/list` is a client-reachable
+	// decision-point method that reaches this boundary on an EffectExecute
+	// disposition and makes a real, credentialed outbound call to the upstream MCP
+	// server. Skipping the gate for it removed the tier-level arming and quiesce
+	// checks (mcpLiveSideEffectGate's lifecycle admission) as well as the budget: an
+	// UNARMED tier — the deliberate fail-closed posture after a restart, where the
+	// rollout mode is still Canary but the live tier is never automatically re-armed
+	// (§17) — and a tier that had CLOSED admission mid-drain would both keep
+	// forwarding discovery traffic upstream. The emergency-kill re-read and the
+	// tool-freshness check do still run for every method (preCallGuard reads
+	// authoritative state directly), but neither of them is the arming control, so
+	// neither substitutes for it.
+	//
+	// The gate is therefore consulted for EVERY method, and the classifier decides
+	// only what it is consulted ABOUT. The classifier is the SAME fail-closed one
+	// openAttempt uses, and its default is side-effect-bearing: exemption is granted
+	// only to classes positively known to invoke no tool, so an unclassified method is
+	// metered, never exempted.
 	d := e.cfg.LiveGate.AdmitSideEffect(e.liveGateInput(in))
 	if !d.Admit {
 		return sideEffectAdmission{reason: d.Reason}, errLiveGateRefused

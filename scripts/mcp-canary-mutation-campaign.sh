@@ -492,12 +492,29 @@ run_mutation M38 \
   ./internal/mcp/execution/ internal/mcp/execution/recovery.go \
   's/\t\tif !out\.PhysicalSendState\.MayHaveReachedPeer\(\) \{\n\t\t\treturn mcperr\.New\(mcperr\.ReasonEventInvalid,\n\t\t\t\t"execution\.recovery", "witness reported received against an outcome that proves the peer was not reached"\)\n\t\t\}/\t\tif out.PhysicalSendState == model.SendDefinitelyNotSent {\n\t\t\treturn mcperr.New(mcperr.ReasonEventInvalid,\n\t\t\t\t"execution.recovery", "witness reported received against a provably never-sent outcome")\n\t\t}/'
 
-# ── (39) auxiliary traffic reaches the side-effect gate ────────────────────
+# ── (39) auxiliary traffic is METERED ──────────────────────────────────────
+#
+# The metering half of §4. Charging a reservation to a call that can cause no side
+# effect makes MaxTotalExecutions stop measuring physical invocations.
 run_mutation M39 \
   'lifecycle/discovery traffic consumes a Canary execution reservation' \
-  'TestAuxiliaryTraffic_NeverReachesTheSideEffectGate|TestAuxiliaryTraffic_SurvivesARefusingGate' \
+  'TestAuxiliaryTraffic_IsAdmittedButNeverMetered' \
+  ./internal/mcp/execution/ internal/mcp/execution/livegate.go \
+  's/\t\tMetered: upstreamclient\.ClassifyMethod\(in\.Method\)\.SideEffectBearing\(\),/\t\tMetered: true,/'
+
+# ── (39b) auxiliary traffic skips the gate ENTIRELY ────────────────────────
+#
+# The authorization half, and the defect this split exists to close. Answering
+# "should this be charged a reservation?" and "may this tier make any outbound call
+# right now?" with one decision let a client-reachable tools/call sibling —
+# tools/list — cross the boundary of an UNARMED or QUIESCING tier with a
+# materialized credential. The emergency-kill re-read and the tool-freshness check
+# still run for every method, so neither of them catches this: only the tier gates do.
+run_mutation M39b \
+  'auxiliary traffic bypasses the tier-level arming and quiesce gates' \
+  'TestAuxiliaryTraffic_IsRefusedByATierLevelDenial' \
   ./internal/mcp/execution/ internal/mcp/execution/run.go \
-  's/\tif !upstreamclient\.ClassifyMethod\(in\.Method\)\.SideEffectBearing\(\) \{\n\t\treturn sideEffectAdmission\{\}, nil\n\t\}\n\td := e\.cfg\.LiveGate\.AdmitSideEffect/\td := e.cfg.LiveGate.AdmitSideEffect/'
+  's/\td := e\.cfg\.LiveGate\.AdmitSideEffect\(e\.liveGateInput\(in\)\)/\tif !upstreamclient.ClassifyMethod(in.Method).SideEffectBearing() {\n\t\treturn sideEffectAdmission{}, nil\n\t}\n\td := e.cfg.LiveGate.AdmitSideEffect(e.liveGateInput(in))/'
 
 # ── (40) resolved reconciliation verdicts unchecked against their facts ─────
 run_mutation M40 \

@@ -8,6 +8,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/protocol"
 	"github.com/KidCarmi/Culvert/internal/mcp/runtime"
+	"github.com/KidCarmi/Culvert/internal/mcp/upstreamclient"
 )
 
 // LiveExecutionGate is the OPTIONAL composition-layer gate the live Executor consults at the
@@ -54,6 +55,24 @@ type LiveGateInput struct {
 	ToolName    string
 	Fingerprint string
 	Now         time.Time
+	// Metered reports whether this invocation can cause a tool side effect and must
+	// therefore be CHARGED to a Canary budget reservation and bound to a live tool
+	// approval. It is computed by the executor from the same fail-closed method
+	// classifier that decides whether a durable send intent is opened, so the two can
+	// never disagree about what counts as a physical invocation.
+	//
+	// It separates METERING from AUTHORIZATION, which are not the same question and
+	// must not share one answer. Lifecycle/discovery traffic invokes no tool, so
+	// charging it a reservation would make MaxTotalExecutions stop measuring physical
+	// invocations (§4) — but it is still an outbound, credentialed call from this
+	// gateway, so whether the tier may make ANY such call right now (armed, not
+	// quiescing, read-first) is still the gate's to answer.
+	//
+	// A gate MUST NOT read this as "skip the whole gate". It selects which of the
+	// gate's checks apply: the tier-level admission checks always run; the two checks
+	// that are meaningless without a tool binding — live-trust revalidation and budget
+	// reservation — run only when Metered.
+	Metered bool
 }
 
 // LiveGateDecision is the gate's verdict. Admit==false fails closed with Reason and Upstream.Call
@@ -77,12 +96,14 @@ type LiveGateDecision struct {
 	// authorized against. It binds a physical attempt to the reservation that paid
 	// for it, so an effect can never be attributed to an unauthorized slot and an
 	// orphan can be traced back to the exact grant. An empty value is tolerated:
-	// gates that do not meter (nil/legacy) keep the executor byte-identical.
+	// gates that do not meter (nil/legacy) keep the executor byte-identical, and a
+	// NON-METERED admission (LiveGateInput.Metered false) has no slot to name.
 	ReservationID string
 	// ActivationGeneration (set only when Admit) is the Canary activation generation
 	// in force at admission. It is recorded on the attempt so an orphan from a
 	// superseded generation stays recognizable after a restart and can never be
-	// mistaken for fresh execution allowance. Zero when the gate does not meter.
+	// mistaken for fresh execution allowance. Zero when the gate does not meter and
+	// on a non-metered admission.
 	ActivationGeneration uint64
 }
 
@@ -129,5 +150,10 @@ func (e *Executor) liveGateInput(in runtime.ExecInput) LiveGateInput {
 		ToolName:    toolName,
 		Fingerprint: fp,
 		Now:         e.cfg.Clock(), // the boundary instant, not the request-entry in.Now (see doc above)
+		// The SINGLE fail-closed classifier, read here so the gate's metering
+		// decision and openAttempt's durable-intent decision can never disagree about
+		// which invocations can cause a physical tool effect. An unclassified method
+		// answers true and is metered like a tool call.
+		Metered: upstreamclient.ClassifyMethod(in.Method).SideEffectBearing(),
 	}
 }

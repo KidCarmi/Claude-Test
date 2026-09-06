@@ -347,11 +347,28 @@ func newInjectedGate(s *gateSeams) *mcpLiveSideEffectGate {
 	}
 }
 
+// gateInput is a METERED admission — a side-effect-bearing tool invocation, the
+// shape the four-gate sequence exists for. Metered is explicit rather than left at
+// its zero value: the tool-level gates (§10 trust, §8 budget) run only for a metered
+// admission, so a fixture that silently defaulted to non-metered would pass every
+// refusal test by never reaching the check under test.
 func gateInput() execution.LiveGateInput {
 	return execution.LiveGateInput{
 		Capability: 0, Operation: policy.OpRead, Tenant: "t1", Principal: "p1",
 		ServerID: "s1", ToolName: "read_file", Fingerprint: "fp1", Now: time.Unix(0, 1),
+		Metered: true,
 	}
+}
+
+// auxiliaryGateInput is a NON-METERED admission: lifecycle/discovery traffic, which
+// invokes no tool and therefore carries no tool binding and must charge no budget
+// slot.
+func auxiliaryGateInput() execution.LiveGateInput {
+	in := gateInput()
+	in.Metered = false
+	in.Operation = policy.OpDiscovery
+	in.ToolName, in.Fingerprint = "", ""
+	return in
 }
 
 func TestLiveGate_QuiescingRejectsNewAdmission(t *testing.T) {
@@ -431,6 +448,93 @@ func TestLiveGate_AdmitReleasesBothSlots(t *testing.T) {
 	if admitRel != 1 || released != 1 {
 		t.Fatalf("release must return BOTH the lifecycle and budget slots: admit=%d budget=%d", admitRel, released)
 	}
+}
+
+// ── non-metered (lifecycle/discovery) admission: TIER gates yes, TOOL gates no ──
+
+// TestLiveGate_AuxiliaryIsAdmittedWithoutTrustOrBudget pins the metered/unmetered
+// split at the production gate. Auxiliary traffic invokes no tool, so it carries no
+// tool binding and must charge no budget slot — asking the tool-level gates about it
+// denies a question they cannot answer, and reserving for it makes
+// MaxTotalExecutions stop measuring physical invocations (§4).
+//
+// The seams here would REFUSE if consulted (trustOK false, budget denied), so the
+// admit is proof they were not, and the release counter is proof no budget slot was
+// taken.
+func TestLiveGate_AuxiliaryIsAdmittedWithoutTrustOrBudget(t *testing.T) {
+	admitRel, released := 0, 0
+	g := newInjectedGate(&gateSeams{
+		admitOK: true, readOK: true, trustOK: false, outcome: canary.BudgetDeniedTotal,
+		admitRel: &admitRel, released: &released,
+	})
+	d := g.AdmitSideEffect(auxiliaryGateInput())
+	if !d.Admit {
+		t.Fatalf("auxiliary traffic must not be refused by the tool-level gates, reason=%s", d.Reason.Code())
+	}
+	if d.ReservationID != "" || d.ActivationGeneration != 0 {
+		t.Fatalf("a non-metered admission must name no reservation: id=%q gen=%d",
+			d.ReservationID, d.ActivationGeneration)
+	}
+	if d.Revalidate != nil {
+		t.Fatal("a non-metered admission reserved no generation, so it has none to revalidate")
+	}
+	if d.Release == nil {
+		t.Fatal("an admitted call must return its lifecycle slot")
+	}
+	d.Release()
+	if admitRel != 1 {
+		t.Fatalf("release must return the lifecycle slot, releases=%d", admitRel)
+	}
+	if released != 0 {
+		t.Fatalf("a non-metered admission took no budget slot, so releaseBudget must not run, got %d", released)
+	}
+}
+
+// TestLiveGate_AuxiliaryStillObeysTheTierGates is the REGRESSION gate. Lifecycle
+// admission (§6) and read-first (§9) are TIER-level: they say whether this node may
+// make ANY live outbound call right now, and an unarmed tier — the fail-closed
+// posture after a restart, where the rollout mode is still Canary but the tier is
+// never automatically re-armed (§17) — or one quiescing mid-drain must refuse
+// credentialed discovery traffic exactly as it refuses a tool call.
+//
+// Exempting auxiliary traffic from METERING must never exempt it from these.
+func TestLiveGate_AuxiliaryStillObeysTheTierGates(t *testing.T) {
+	t.Run("unarmed or quiescing tier refuses auxiliary traffic", func(t *testing.T) {
+		admitRel := 0
+		g := newInjectedGate(&gateSeams{
+			admitOK: false, readOK: true, trustOK: true, outcome: canary.BudgetGranted, admitRel: &admitRel,
+		})
+		d := g.AdmitSideEffect(auxiliaryGateInput())
+		if d.Admit {
+			t.Fatal("an unarmed/quiescing tier must refuse auxiliary traffic too (§6)")
+		}
+		if d.Reason != mcperr.ReasonRolloutModeInvalid {
+			t.Fatalf("refusal reason=%s want rollout_mode_invalid", d.Reason.Code())
+		}
+		if admitRel != 0 {
+			t.Fatal("a rejected admission must not have taken (or released) a lifecycle slot")
+		}
+	})
+	t.Run("read-first still applies to auxiliary traffic", func(t *testing.T) {
+		admitRel, released := 0, 0
+		g := newInjectedGate(&gateSeams{
+			admitOK: true, readOK: false, trustOK: true, outcome: canary.BudgetGranted,
+			admitRel: &admitRel, released: &released,
+		})
+		d := g.AdmitSideEffect(auxiliaryGateInput())
+		if d.Admit {
+			t.Fatal("read-first is a tier-level scope check and must still apply (§9)")
+		}
+		if d.Reason != mcperr.ReasonRolloutOutOfScope {
+			t.Fatalf("refusal reason=%s want rollout_out_of_scope", d.Reason.Code())
+		}
+		if admitRel != 1 {
+			t.Fatalf("a read-first rejection must release the lifecycle slot, releases=%d", admitRel)
+		}
+		if released != 0 {
+			t.Fatal("a refusal before the reservation must not release a budget slot")
+		}
+	})
 }
 
 // ── §6 quiesce: reject new admissions, drain in-flight ──
