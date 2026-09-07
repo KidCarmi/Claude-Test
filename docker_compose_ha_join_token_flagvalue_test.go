@@ -10,17 +10,32 @@ package main
 // via an UNQUOTED `exec ./culvert $$ARGS` — word-splitting is what turns that
 // string back into separate argv tokens. That is fine as long as every
 // variable substituted into ARGS is non-empty, but `--ha-token $$HA_TOKEN`
-// is appended unconditionally inside the `if [ -n "$$HA_JOIN" ]` guard, which
-// checks HA_JOIN, never HA_TOKEN. If an operator sets HA_JOIN but leaves
-// HA_TOKEN empty/unset (a plausible copy-paste slip, since the GUI's deploy
-// command names both but nothing stops setting just one), the shell's
-// word-splitting drops the empty $$HA_TOKEN expansion ENTIRELY rather than
-// emitting an empty argv token — leaving a dangling `--ha-token` flag with no
-// value as the last word handed to the binary. Go's flag package rejects
-// that outright ("flag needs an argument: -ha-token") and, because main.go
-// calls the top-level flag.Parse() (ExitOnError), the process os.Exit(2)s
-// before ever reaching the proxy listener — the standby node crash-loops
-// under restart: unless-stopped instead of joining the cluster.
+// used to be appended unconditionally inside the `if [ -n "$$HA_JOIN" ]`
+// guard, which checked HA_JOIN, never HA_TOKEN. If an operator set HA_JOIN
+// but left HA_TOKEN empty/unset (a plausible copy-paste slip, since the
+// GUI's deploy command names both but nothing stops setting just one), the
+// shell's word-splitting dropped the empty $$HA_TOKEN expansion ENTIRELY
+// rather than emitting an empty argv token — leaving a dangling `--ha-token`
+// flag with no value as the last word handed to the binary. Go's flag
+// package rejected that outright ("flag needs an argument: -ha-token") and,
+// because main.go calls the top-level flag.Parse() (ExitOnError), the
+// process os.Exit(2)ed before ever reaching the proxy listener — the
+// standby node crash-looped under restart: unless-stopped instead of
+// joining the cluster.
+//
+// The first fix made `--ha-token` well-formed via the `=value` form even
+// when empty (`--ha-token=`) — which stopped the crash, but Codex review on
+// PR #1337 caught the real regression that traded it for: an EMPTY but
+// well-formed --ha-token satisfies flag.Parse, yet
+// clusterStartupConfig.haJoinMode() (cluster_startup_config.go) requires
+// BOTH --ha-join and --ha-token to be non-empty to treat the boot as a
+// standby join. The same ARGS string also sets -cp-grpc-addr :50051, so an
+// empty token makes loadCluster fall through to cpMode() instead — the
+// container comes up HEALTHY as an independent, ACTIVE Control Plane that
+// never joins or replicates from Server A (a silent split-brain, worse than
+// the crash it replaced, and invisible on healthchecks). The script now
+// fails fast (exit 1, explicit stderr message) when HA_JOIN is set and
+// HA_TOKEN is empty, before ever building ARGS or execing culvert.
 import (
 	"os"
 	"os/exec"
@@ -29,13 +44,12 @@ import (
 	"testing"
 )
 
-// TestDockerComposeHA_JoinWithoutTokenYieldsValidArgv extracts the proxy
-// service's real `command: >` shell script from docker-compose.ha.yml, runs
-// it under `sh` exactly as Compose would present it to the container
-// (mirroring the file's own `$$` → `$` escaping), and asserts that setting
-// only HA_JOIN (HA_TOKEN left empty, as an operator might by mistake) still
-// produces a well-formed argv — no dangling flag with a missing value.
-func TestDockerComposeHA_JoinWithoutTokenYieldsValidArgv(t *testing.T) {
+// extractHAProxyCommandScript isolates the proxy service's `command: >`
+// folded shell script from docker-compose.ha.yml and mirrors Compose's own
+// "$$" -> "$" escaping, so the returned script behaves exactly as it would
+// inside the container.
+func extractHAProxyCommandScript(t *testing.T) string {
+	t.Helper()
 	data, err := os.ReadFile("docker-compose.ha.yml")
 	if err != nil {
 		t.Fatalf("read docker-compose.ha.yml: %v", err)
@@ -50,37 +64,84 @@ func TestDockerComposeHA_JoinWithoutTokenYieldsValidArgv(t *testing.T) {
 	if m == nil {
 		t.Fatal("docker-compose.ha.yml: could not isolate the proxy service's `command: >` script — update this test if the file's shape changed")
 	}
-	script := m[1]
+	return strings.ReplaceAll(m[1], "$$", "$")
+}
 
-	// Compose escapes "$$" to a literal "$" before the string ever reaches
-	// the container's shell; mirror that so the extracted script behaves
-	// exactly as it would inside the container.
-	script = strings.ReplaceAll(script, "$$", "$")
+// runHAProxyCommandScript extracts docker-compose.ha.yml's proxy `command:`
+// script, replaces its terminal `exec ./culvert $ARGS` with a diagnostic
+// that prints the ACTUAL argv the shell would hand to the binary (one token
+// per line, via `set --` — the same unquoted-word-splitting mechanism the
+// real `exec` line relies on), and runs it under `sh` with the given
+// environment layered on top of the current process's own (matching
+// docker-compose.yml's own test helper convention in this package).
+func runHAProxyCommandScript(t *testing.T, env ...string) (argv []string, stderr string, exitErr error) {
+	t.Helper()
+	script := extractHAProxyCommandScript(t)
 
-	// Replace the terminal `exec ./culvert $ARGS` with a diagnostic that
-	// prints the ACTUAL argv the shell would hand to the binary, one token
-	// per line — via `set --`, the same unquoted-word-splitting mechanism
-	// the real `exec` line relies on.
 	execRE := regexp.MustCompile(`exec \./culvert \$ARGS`)
 	if !execRE.MatchString(script) {
 		t.Fatal("docker-compose.ha.yml: could not find the terminal `exec ./culvert $ARGS` line in the proxy command script — update this test if the file's shape changed")
 	}
 	script = execRE.ReplaceAllLiteralString(script, `set -- $ARGS; for a in "$@"; do printf "%s\n" "$a"; done`)
 
-	// The documented step-4 scenario: HA_JOIN is set, HA_TOKEN is not
-	// (everything else — enterprise TLS — left at its documented default of
-	// unset/empty).
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = append(os.Environ(),
+	// script is extracted verbatim from docker-compose.ha.yml (a file in
+	// this repo, not attacker/caller input) immediately above, and the
+	// command name/args here are fixed literals — nothing external reaches
+	// this exec.Command call.
+	cmd := exec.Command("sh", "-c", script) // #nosec G204 -- script is this repo's own docker-compose.ha.yml content, not external input
+	cmd.Env = append(os.Environ(), env...)
+	var stdout, errBuf strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &errBuf
+	exitErr = cmd.Run()
+	stderr = errBuf.String()
+	out := strings.TrimRight(stdout.String(), "\n")
+	if out == "" {
+		return nil, stderr, exitErr
+	}
+	return strings.Split(out, "\n"), stderr, exitErr
+}
+
+// TestDockerComposeHA_JoinWithoutTokenFailsFast proves the fix Codex review
+// on PR #1337 required: an operator setting HA_JOIN but leaving HA_TOKEN
+// empty must be refused up front, not silently promoted to an independent,
+// active Control Plane (see the package doc comment above). The script must
+// exit non-zero, print an explanatory message naming HA_TOKEN on stderr,
+// and never reach the point of building/execing an argv at all.
+func TestDockerComposeHA_JoinWithoutTokenFailsFast(t *testing.T) {
+	argv, stderr, runErr := runHAProxyCommandScript(t,
 		"HA_JOIN=server-a.internal:50051", "HA_TOKEN=",
 		"CP_CERT=", "CP_KEY=", "CP_CA=")
-	out, runErr := cmd.CombinedOutput()
-	if runErr != nil {
-		t.Fatalf("running the extracted proxy command script failed: %v\noutput:\n%s", runErr, out)
+
+	if runErr == nil {
+		t.Fatalf("expected the command script to exit non-zero when HA_JOIN is set and HA_TOKEN is empty "+
+			"(refusing to silently start as an independent Control Plane instead of a standby); it exited "+
+			"0 and produced argv: %v", argv)
 	}
-	argv := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	if len(argv) == 0 || argv[len(argv)-1] == "" {
-		t.Fatalf("extracted no argv tokens from the command script; raw output:\n%s", out)
+	if argv != nil {
+		t.Fatalf("expected no argv to be produced when HA_TOKEN is empty (the script must exit before "+
+			"reaching `exec ./culvert`), got: %v", argv)
+	}
+	if !strings.Contains(stderr, "HA_TOKEN") {
+		t.Fatalf("expected an error message naming HA_TOKEN on stderr, got: %q", stderr)
+	}
+}
+
+// TestDockerComposeHA_JoinWithTokenYieldsValidArgv is the control for the
+// fail-fast test above: with BOTH HA_JOIN and a real HA_TOKEN set (the
+// documented, correct step-4 usage), the script must still run to
+// completion and produce a well-formed argv containing the join flags —
+// the fail-fast guard must not false-positive on the working case.
+func TestDockerComposeHA_JoinWithTokenYieldsValidArgv(t *testing.T) {
+	argv, stderr, runErr := runHAProxyCommandScript(t,
+		"HA_JOIN=server-a.internal:50051", "HA_TOKEN=a3f8c1d2",
+		"CP_CERT=", "CP_KEY=", "CP_CA=")
+
+	if runErr != nil {
+		t.Fatalf("running the extracted proxy command script failed: %v\nstderr:\n%s", runErr, stderr)
+	}
+	if len(argv) == 0 {
+		t.Fatalf("extracted no argv tokens from the command script; stderr:\n%s", stderr)
 	}
 
 	// A flag token is well-formed here either because it isn't the LAST word
@@ -89,10 +150,22 @@ func TestDockerComposeHA_JoinWithoutTokenYieldsValidArgv(t *testing.T) {
 	// is a dangling flag with nothing for flag.Parse to consume as its value.
 	last := argv[len(argv)-1]
 	if strings.HasPrefix(last, "-") && !strings.Contains(last, "=") {
-		t.Fatalf("docker-compose.ha.yml: with HA_JOIN set and HA_TOKEN unset, the generated argv ends "+
-			"with a dangling flag %q that has no value (word-splitting drops the empty $HA_TOKEN "+
-			"expansion entirely instead of emitting an empty token) — `./culvert` would fail to start "+
-			"with \"flag needs an argument: -ha-token\" and flag.Parse's ExitOnError would exit the "+
-			"process before the standby ever joins the cluster. full argv: %v", last, argv)
+		t.Fatalf("docker-compose.ha.yml: generated argv ends with a dangling flag %q that has no value; "+
+			"full argv: %v", last, argv)
 	}
+	if !argvContains(argv, "--ha-join") || !argvContains(argv, "server-a.internal:50051") {
+		t.Fatalf("expected --ha-join server-a.internal:50051 in argv, got: %v", argv)
+	}
+	if !argvContains(argv, "--ha-token=a3f8c1d2") {
+		t.Fatalf("expected --ha-token=a3f8c1d2 in argv, got: %v", argv)
+	}
+}
+
+func argvContains(argv []string, want string) bool {
+	for _, a := range argv {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
