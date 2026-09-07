@@ -2962,6 +2962,61 @@ dependency, because at the time it was not a dependency but a coincidence. A
 reordering is not a refactor when a downstream invariant is holding the old
 order up.
 
+### 25.4c The third finding inside the fix — the governor denying service itself
+
+Found by CI, not by the local suite, and it is the most instructive of the
+three because the fix was behaving exactly as designed and the design was
+wrong.
+
+The per-client rule originally REFUSED a client already at its cap, immediately.
+That reads as obviously correct — "one source, one slot" — until you ask what a
+single ordinary client actually does. A browser opens six to eight parallel
+connections. When their cached verification results expire together, all of them
+present the same credential at the same moment, and all but one were **denied**:
+
+```
+6 concurrent VALID authentications from one workstation
+  -> 1 admitted, 5 refused (reason: per_client)
+```
+
+Measured on the real authentication path. No attacker, no flood, no load —
+just a workstation behaving normally. **A control built to stop an attacker
+denying service was denying it unprompted**, which is precisely the failure the
+CONTROL gates in this file exist to catch; they missed it because they only
+exercised the *cached* path, where the governor is never consulted.
+
+It surfaced as a `Deep · determinism` failure on CI and not locally, and that
+difference is the tell: whether a client's parallel requests overlap enough to
+collide depends on machine load, so the same code passed a quiet box twice
+(non-race and race) and failed a loaded runner.
+
+**The fix is that a client at its cap WAITS for its own earlier verification
+rather than being refused.** Fairness is untouched — the cap still bounds how
+many slots one source holds *at any instant*, which is the whole property — and
+only the excess changes: serialised behind its predecessor (~80 ms each)
+instead of rejected. Parked waiters are counted against the SAME bounded
+waiter budget as the global queue, so the goroutine bound this engine insists
+on is unchanged; and the wait is bounded, so a burst deeper than roughly
+`maxWait / verification cost` (about a dozen from one client) still ends in a
+refusal, which is stated in the runbook rather than implied away.
+
+The wakeup is a close-and-replace generation channel read under the same mutex
+that releases the reservation, so a release can never be missed by a caller
+about to park.
+
+Gates: `TestClientAtItsCapWaitsRatherThanBeingRefused` and
+`TestWaitingDoesNotWidenThePerClientCap` (engine, the pair — one proves waiting
+happens, the other proves the cap still binds while a caller waits), plus
+`TestChaos57_OneWorkstationsParallelRequestsAreNotDenied` end to end through the
+real authentication path. The end-to-end gate uses a long wait budget
+deliberately: the property is "none of them is refused", and tying it to how
+long bcrypt happens to take on a given build would make it fail under `-race`
+for a reason unrelated to the property.
+
+**The lesson:** "one source, one slot" is a correct fairness rule and an
+incorrect *admission* rule. Fairness is about what a client may HOLD; admission
+is about what happens to the rest. Conflating them turned a bound into a denial.
+
 ### 25.5 What shipped
 
 **`internal/authcost`** — the admission governor. Two bounds and one fairness
@@ -3050,6 +3105,17 @@ against a "fix" that simply broke authentication:
 - **The admin UI login path is untouched.** `VerifyUIUser` also runs bcrypt (two
   comparisons, in fact) but is bounded by the brute-force lockout
   (`loginLimiter`), which the proxy path never had.
+- **Per-client parked waiters share one budget** (§25.4c). Callers waiting on
+  their own client budget are counted against the same bounded waiter pool as
+  the global queue, and are not additionally capped per client — so one source
+  with many concurrent requests can occupy that pool and leave others unable to
+  QUEUE for a slot. It costs them no capacity (the fast path still admits
+  whenever a slot is genuinely free, and the flooding source still holds at
+  most its cap), so the fairness claim holds: a flood can take the queue, not
+  the slots. It is also strictly better than the shape it replaced, where those
+  requests were refused outright. Capping parked waiters per client would close
+  it; not done, because it adds a second bound to ration a wait that is already
+  bounded twice.
 - **The front-door limiters still ship disabled** (PX-6 remains open). The
   governor bounds the *cost* of the flood; it does not stop the flood arriving.
   The runbook says so explicitly and points at the three limiters.

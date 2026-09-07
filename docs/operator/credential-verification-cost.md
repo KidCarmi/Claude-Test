@@ -47,8 +47,8 @@ more than one verification slot.
 | Bound | Value | Why |
 |---|---|---|
 | Concurrent verifications (global) | `GOMAXPROCS / 2`, floored at 1 | The gateway's real work — TLS handshakes, scanning, policy, relaying — must keep running while somebody authenticates. |
-| Concurrent verifications per client | 1 | Stops one source from occupying the whole ceiling and denying everybody else. |
-| Wait for a free slot | 1 s | Absorbs a legitimate burst instead of refusing it. |
+| Concurrent verifications per client | 1 | Stops one source from occupying the whole ceiling and denying everybody else. A client at its cap **waits for its own** earlier verification — it is not refused on the spot — so one workstation's parallel connections serialise rather than failing. |
+| Wait for a free slot | 1 s | Absorbs a legitimate burst instead of refusing it. At ~80 ms per verification this covers a burst about a dozen deep from one client; a browser pool of six to eight fits with room to spare. |
 | Queue depth | 8 × the ceiling | The queue is bounded too: an unbounded one would just move the exhaustion from CPU to goroutines. |
 
 These are **constants derived from `GOMAXPROCS`**. There is deliberately no

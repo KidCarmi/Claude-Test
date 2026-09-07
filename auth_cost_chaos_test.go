@@ -612,3 +612,61 @@ func TestChaos57_CacheKeyIsInjective(t *testing.T) {
 		t.Fatalf("cacheKey is not deterministic: %q vs %q", first, second)
 	}
 }
+
+// ── One workstation's parallel connections ──────────────────────────────────
+
+// DEFECT GATE, raised against this PR's own first shape and reproduced
+// end-to-end through the real authentication path.
+//
+// The per-client rule originally REFUSED a client already at its cap, on the
+// spot. Measured on the real path: a single workstation opening its normal
+// parallel connection pool — six requests whose cached results expired
+// together — had FIVE of six VALID credentials denied, with no attacker
+// anywhere. A governor built to stop an attacker denying service was denying
+// it on its own, which is precisely the self-inflicted outage the CONTROL
+// gates in this file exist to catch.
+//
+// A client at its cap now WAITS for its own earlier verification instead. The
+// gate uses a long wait budget deliberately: the property under test is "none
+// of them is refused", and tying it to how long bcrypt happens to take on this
+// build would make it fail under -race (where bcrypt is several times slower)
+// for a reason that has nothing to do with the property. The BUDGET's own
+// behaviour is gated separately in internal/authcost.
+func TestChaos57_OneWorkstationsParallelRequestsAreNotDenied(t *testing.T) {
+	resetAuthCostHealthForTest()
+	t.Cleanup(resetAuthCostHealthForTest)
+	restore := swapAuthCostGate(authcost.New(2, 1, 5*time.Minute))
+	t.Cleanup(restore)
+
+	c := newAuthTestConfig(t, "realuser", "correct-horse-battery")
+
+	const n = 6 // a browser's default parallel connection pool
+	var wg sync.WaitGroup
+	ok := make([]bool, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Distinct passwords would be distinct credentials; the same one is
+			// the realistic case — every connection presents the SAME stored
+			// credential, and they race to be the one that warms the cache.
+			ok[i] = c.VerifyAuthFrom("10.0.0.9", "realuser", "correct-horse-battery")
+		}(i)
+	}
+	wg.Wait()
+
+	denied := 0
+	for _, v := range ok {
+		if !v {
+			denied++
+		}
+	}
+	s := authCostHealthStatus()
+	if denied != 0 {
+		t.Fatalf("%d of %d VALID concurrent credentials from ONE workstation were denied (per_client=%d queue_full=%d timeout=%d)",
+			denied, n, s.RefusedPerClient, s.RefusedQueueFull, s.RefusedTimeout)
+	}
+	if s.Refused != 0 {
+		t.Fatalf("Refused = %d, want 0", s.Refused)
+	}
+}

@@ -55,14 +55,27 @@
 //     rule can help.
 //
 //  2. A PER-CLIENT CEILING (DefaultMaxPerClient = 1) on how many of those
-//     slots one client key may occupy. Without it a single source could hold
-//     every slot and the global ceiling would bound the CPU while still
+//     slots one client key may occupy AT ONCE. Without it a single source could
+//     hold every slot and the global ceiling would bound the CPU while still
 //     denying every other user — the fault would be contained and the outage
-//     would not. With it, one source can consume at most one slot's worth of
-//     CPU and the remaining capacity stays available to everyone else. A
-//     legitimate workstation authenticates serially, so it never notices; a
-//     source with many verifications genuinely in flight at once is already
-//     anomalous.
+//     would not.
+//
+//     A client already at its cap WAITS for its own earlier verification to
+//     finish; it is NOT refused on the spot. Getting that wrong is a
+//     self-inflicted outage and it was the first shape of this engine: a single
+//     workstation opening its ordinary parallel connection pool, all of whose
+//     cached results expired together, had five of six VALID credentials denied
+//     with no attacker present. Waiting costs the fairness rule nothing — the
+//     cap still bounds how many slots one source holds at any instant — and
+//     only changes what happens to the excess: serialised behind its own
+//     predecessor rather than rejected.
+//
+//     The wait is bounded like every other, so a burst deeper than roughly
+//     DefaultMaxWait / (cost of one verification) — about a dozen concurrent
+//     requests from ONE client at the measured ~80 ms — still ends in a
+//     refusal. A browser pool is six to eight, so it fits with room to spare;
+//     a client genuinely needing more concurrent credential checks than that
+//     is not a shape this gateway should absorb silently.
 //
 //  3. A BOUNDED WAIT (DefaultMaxWait) with a BOUNDED QUEUE (maxWaiters). A
 //     legitimate burst — a fleet of clients whose cached results expired
@@ -244,6 +257,13 @@ type Gate struct {
 	// topHosts, the auth result cache).
 	perClient map[string]int
 
+	// released is closed-and-replaced under mu every time a reservation is
+	// returned, so a caller waiting for its OWN client budget to free up is
+	// woken without polling. Closing (rather than sending) wakes every waiter,
+	// and replacing it under the same lock means a wakeup can never be lost
+	// between a waiter reading the channel and parking on it.
+	released chan struct{}
+
 	queued       int
 	peakQueued   int
 	peakInFlight int
@@ -280,6 +300,7 @@ func New(maxConcurrent, maxPerClient int, maxWait time.Duration) *Gate {
 		maxWaiters:    maxConcurrent * waitersPerSlot,
 		maxWait:       maxWait,
 		perClient:     make(map[string]int),
+		released:      make(chan struct{}),
 	}
 }
 
@@ -322,22 +343,51 @@ func (g *Gate) Admit(client string) (result Refusal, queued bool) {
 	// which defeats the per-client rule outright and is strictly better for
 	// them than sharing one. The bound that actually caps CPU, the global
 	// ceiling, still applies either way.
-	g.mu.Lock()
-	if client != "" {
-		if g.perClient[client] >= g.maxPerClient {
-			g.refusedPerClient++
-			g.mu.Unlock()
-			return RefusedPerClient, false
-		}
-		g.perClient[client]++
-	}
-	g.mu.Unlock()
 
-	// Fast path: a free slot, no queueing, no timer.
+	// ONE deadline covers BOTH waits below. Created lazily so the fast path —
+	// budget free and a slot free — allocates no timer at all.
+	var (
+		deadline  <-chan time.Time
+		stopTimer func() bool
+	)
+	defer func() {
+		if stopTimer != nil {
+			stopTimer()
+		}
+	}()
+	armDeadline := func() <-chan time.Time {
+		if deadline == nil {
+			deadline, stopTimer = g.timer(g.maxWait)
+		}
+		return deadline
+	}
+
+	// ── Phase 1: the per-client reservation ──────────────────────────────────
+	//
+	// A client already at its cap WAITS for its own earlier verification to
+	// finish; it is not refused on the spot. That distinction is the whole
+	// point of the phase and it was got wrong first time round: refusing
+	// immediately means a single workstation opening its normal parallel
+	// connection pool, all of whose cached results expired together, has every
+	// request but one DENIED — measured 5 of 6 valid credentials rejected. The
+	// governor exists to stop an attacker from denying service, and that shape
+	// made it deny service on its own, to a legitimate client, with no attacker
+	// present at all.
+	//
+	// Waiting costs the fairness rule nothing: the reservation is still capped
+	// at maxPerClient, so one source still occupies at most that many of the
+	// global slots at any instant. It only changes what happens to the excess —
+	// serialised behind its own predecessor (~80 ms each) instead of refused.
+	waitedForBudget, r := g.reserveClient(client, armDeadline)
+	if r != Admitted {
+		return r, waitedForBudget
+	}
+
+	// ── Phase 2: the global slot ─────────────────────────────────────────────
 	select {
 	case g.slots <- struct{}{}:
-		g.noteAdmitted(false)
-		return Admitted, false
+		g.noteAdmitted(waitedForBudget)
+		return Admitted, waitedForBudget
 	default:
 	}
 
@@ -347,7 +397,7 @@ func (g *Gate) Admit(client string) (result Refusal, queued bool) {
 		g.refusedQueueFull++
 		g.releaseClientLocked(client)
 		g.mu.Unlock()
-		return RefusedQueueFull, false
+		return RefusedQueueFull, waitedForBudget
 	}
 	g.queued++
 	if g.queued > g.peakQueued {
@@ -355,20 +405,81 @@ func (g *Gate) Admit(client string) (result Refusal, queued bool) {
 	}
 	g.mu.Unlock()
 
-	timeout, stop := g.timer(g.maxWait)
 	select {
 	case g.slots <- struct{}{}:
-		stop()
 		g.leaveQueue()
 		g.noteAdmitted(true)
 		return Admitted, true
-	case <-timeout:
+	case <-armDeadline():
 		g.leaveQueue()
 		g.mu.Lock()
 		g.refusedTimeout++
 		g.releaseClientLocked(client)
 		g.mu.Unlock()
 		return RefusedTimeout, true
+	}
+}
+
+// reserveClient takes one unit of client's per-client budget, waiting for an
+// earlier verification by the SAME client to finish if the budget is full.
+//
+// Returns waited=true when it had to park. A refusal is RefusedQueueFull when
+// the shared waiter bound is already spent (so parked goroutines stay bounded
+// exactly as they are for the global queue) and RefusedPerClient when the
+// client was still at its cap when the deadline expired.
+//
+// RECORDED RESIDUAL: waiters here are counted against the SHARED waiter budget
+// and are not additionally capped per client, so one source with many
+// concurrent requests can occupy that budget and leave other clients unable to
+// QUEUE for a slot (they are refused queue_full instead of waiting). It does
+// not cost them capacity — the fast path still admits them whenever a slot is
+// actually free, and the flooding source still holds at most maxPerClient
+// slots — so the fairness claim this engine makes ("the remaining capacity
+// stays available to everyone else") holds; what a flood can take is the
+// queue, not the slots. It is also strictly better than the shape it replaced,
+// where those same requests were refused outright. Capping parked waiters per
+// client would close it and is deliberately not done here: it adds a second
+// bound whose only job is to ration a wait that is already bounded twice.
+func (g *Gate) reserveClient(client string, armDeadline func() <-chan time.Time) (waited bool, result Refusal) {
+	if client == "" {
+		return false, Admitted // unidentified peers are exempt; see Admit
+	}
+	for {
+		g.mu.Lock()
+		if g.perClient[client] < g.maxPerClient {
+			g.perClient[client]++
+			g.mu.Unlock()
+			return waited, Admitted
+		}
+		// At the cap. Park until somebody releases, under the SAME waiter bound
+		// the global queue uses — an unbounded per-client wait would be the
+		// goroutine-exhaustion trade this engine refuses to make.
+		if g.queued >= g.maxWaiters {
+			g.refusedQueueFull++
+			g.mu.Unlock()
+			return waited, RefusedQueueFull
+		}
+		g.queued++
+		if g.queued > g.peakQueued {
+			g.peakQueued = g.queued
+		}
+		// Read the current generation channel UNDER the lock: Release closes and
+		// replaces it under the same lock, so a wakeup cannot be lost between
+		// this read and the park below.
+		changed := g.released
+		g.mu.Unlock()
+
+		waited = true
+		select {
+		case <-changed:
+			g.leaveQueue() // a reservation was returned — re-check the budget
+		case <-armDeadline():
+			g.leaveQueue()
+			g.mu.Lock()
+			g.refusedPerClient++
+			g.mu.Unlock()
+			return true, RefusedPerClient
+		}
 	}
 }
 
@@ -388,6 +499,14 @@ func (g *Gate) Release(client string) {
 	g.mu.Unlock()
 }
 
+// signalReleasedLocked wakes every caller parked on its own client budget.
+// Caller holds mu; closing under the lock and immediately replacing the channel
+// is what makes the wakeup lossless (see reserveClient).
+func (g *Gate) signalReleasedLocked() {
+	close(g.released)
+	g.released = make(chan struct{})
+}
+
 // releaseClientLocked drops one unit of client's reservation. Caller holds mu.
 //
 // The empty key never took a reservation (see Admit), so releasing it is a
@@ -403,6 +522,7 @@ func (g *Gate) releaseClientLocked(client string) {
 	} else {
 		delete(g.perClient, client)
 	}
+	g.signalReleasedLocked()
 }
 
 func (g *Gate) leaveQueue() {

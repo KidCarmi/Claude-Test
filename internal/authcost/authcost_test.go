@@ -37,16 +37,29 @@ func mustAdmit(t *testing.T, g *Gate, client string) {
 // only observable that matters — how many verifications can be in flight.
 func TestCeilingBoundsConcurrentVerifications(t *testing.T) {
 	const ceiling = 3
-	g, _ := newTestGate(t, ceiling, ceiling) // per-client raised so only the ceiling binds
+	// DISTINCT clients throughout, so the per-client rule never binds and the
+	// only thing under test is the global ceiling.
+	g, fire := newTestGate(t, ceiling, 1)
 
 	for i := 0; i < ceiling; i++ {
-		mustAdmit(t, g, "c")
-	}
-	if r, _ := g.Admit("c"); r == Admitted {
-		t.Fatal("admitted past the global ceiling — credential verification is unbounded")
+		mustAdmit(t, g, fmt.Sprintf("client-%d", i))
 	}
 	if got := g.Stats().InFlight; got != ceiling {
 		t.Fatalf("InFlight = %d, want %d", got, ceiling)
+	}
+
+	// One more, from a client with its own budget free: it can only be waiting
+	// on the ceiling, and when its budget runs out it must be refused rather
+	// than admitted past it.
+	extra := make(chan Refusal, 1)
+	go func() { r, _ := g.Admit("client-extra"); extra <- r }()
+	waitForQueued(t, g, 1)
+	if got := g.Stats().InFlight; got != ceiling {
+		t.Fatalf("InFlight = %d while a caller waits, want %d — the ceiling was exceeded", got, ceiling)
+	}
+	fire <- time.Now()
+	if r := <-extra; r == Admitted {
+		t.Fatal("admitted past the global ceiling — credential verification is unbounded")
 	}
 }
 
@@ -80,20 +93,31 @@ func TestReleaseReturnsTheSlot(t *testing.T) {
 // every other user. This asserts the property that makes the difference —
 // after one client saturates its own budget, capacity remains for others.
 func TestOneClientCannotOccupyEverySlot(t *testing.T) {
-	g, _ := newTestGate(t, 4, DefaultMaxPerClient)
+	g, fire := newTestGate(t, 4, DefaultMaxPerClient)
 
 	mustAdmit(t, g, "flooder")
-	// The flooder is now at its per-client ceiling and must be refused, with
-	// the reason naming the fairness rule rather than the global one.
-	if r, _ := g.Admit("flooder"); r != RefusedPerClient {
-		t.Fatalf("second admit for the same client = %v, want RefusedPerClient", r)
-	}
-	// Three slots remain, and they are available to everybody else.
+
+	// The flooder's SECOND concurrent request parks on its own budget — it is
+	// not refused on the spot (see reserveClient) — so it never occupies a
+	// second slot while the first is outstanding.
+	second := make(chan Refusal, 1)
+	go func() { r, _ := g.Admit("flooder"); second <- r }()
+	waitForQueued(t, g, 1)
+
+	// THE PROPERTY: three slots remain, and they are available to everybody
+	// else even while the flooder is waiting for more.
 	for _, c := range []string{"alice", "bob", "carol"} {
 		mustAdmit(t, g, c)
 	}
 	if got := g.Stats().InFlight; got != 4 {
-		t.Fatalf("InFlight = %d, want 4", got)
+		t.Fatalf("InFlight = %d, want 4 — the flooder took a slot it should have had to wait for", got)
+	}
+
+	// And when its wait runs out it is refused by the FAIRNESS rule, not by the
+	// global one: the two reasons point at different operator actions.
+	fire <- time.Now()
+	if r := <-second; r != RefusedPerClient {
+		t.Fatalf("the flooder's parked request = %v, want RefusedPerClient", r)
 	}
 }
 
@@ -128,9 +152,13 @@ func TestRefusalDoesNotLeakTheClientReservation(t *testing.T) {
 	})
 
 	t.Run("per_client", func(t *testing.T) {
-		g, _ := newTestGate(t, 4, 1)
+		g, fire := newTestGate(t, 4, 1)
 		mustAdmit(t, g, "c")
-		if r, _ := g.Admit("c"); r != RefusedPerClient {
+		done := make(chan Refusal, 1)
+		go func() { r, _ := g.Admit("c"); done <- r }()
+		waitForQueued(t, g, 1)
+		fire <- time.Now()
+		if r := <-done; r != RefusedPerClient {
 			t.Fatalf("Admit = %v, want RefusedPerClient", r)
 		}
 		g.Release("c")
@@ -231,7 +259,11 @@ func TestRefusalsAreCountedByReason(t *testing.T) {
 	g, fire := newTestGate(t, 1, 1)
 	mustAdmit(t, g, "holder")
 
-	if r, _ := g.Admit("holder"); r != RefusedPerClient {
+	perClient := make(chan Refusal, 1)
+	go func() { r, _ := g.Admit("holder"); perClient <- r }()
+	waitForQueued(t, g, 1)
+	fire <- time.Now()
+	if r := <-perClient; r != RefusedPerClient {
 		t.Fatalf("got %v", r)
 	}
 	done := make(chan Refusal, 1)
@@ -375,5 +407,77 @@ func TestEmptyClientKeyIsExemptFromFairnessButNotFromTheCeiling(t *testing.T) {
 	}
 	if got := g.Stats().InFlight; got != 0 {
 		t.Fatalf("InFlight = %d after releasing every empty-key admission, want 0", got)
+	}
+}
+
+// DEFECT GATE, raised against this engine's own first shape.
+//
+// The per-client rule originally REFUSED a client that was already at its cap,
+// on the spot. That is wrong, and the measurement is unambiguous: a single
+// workstation opening its normal parallel connection pool — six requests whose
+// cached results expired together — had FIVE of six VALID credentials denied,
+// with no attacker anywhere and no flood in progress. A governor built to stop
+// an attacker denying service was denying it on its own.
+//
+// The fix is that a client at its cap WAITS for its own earlier verification
+// instead of being refused. Fairness is untouched: the cap still bounds how
+// many slots one source holds AT ONCE. Only the excess changes — serialised
+// behind its predecessor rather than rejected.
+func TestClientAtItsCapWaitsRatherThanBeingRefused(t *testing.T) {
+	// Real (short) deadline: the point is that the waiters get through on a
+	// release, long before any deadline is reached.
+	g := New(2, 1, 5*time.Second)
+
+	const n = 6
+	var wg sync.WaitGroup
+	results := make(chan Refusal, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, _ := g.Admit("one-workstation")
+			results <- r
+			if r == Admitted {
+				g.Release("one-workstation")
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	admitted := 0
+	for r := range results {
+		if r != Admitted {
+			t.Errorf("a concurrent request from one client was refused: %v", r)
+			continue
+		}
+		admitted++
+	}
+	if admitted != n {
+		t.Fatalf("%d/%d concurrent requests from ONE client were admitted; the rest were denied valid service", admitted, n)
+	}
+	if s := g.Stats(); s.Refusals() != 0 {
+		t.Fatalf("Refusals() = %d, want 0", s.Refusals())
+	}
+}
+
+// CONTROL for the gate above. Waiting must not mean the cap stopped binding:
+// at no instant may one client hold more slots than its cap allows. Asserted
+// by holding the cap and requiring the in-flight count to stay put while
+// another request from the same client is parked.
+func TestWaitingDoesNotWidenThePerClientCap(t *testing.T) {
+	g, fire := newTestGate(t, 4, 1)
+	mustAdmit(t, g, "c")
+
+	parked := make(chan Refusal, 1)
+	go func() { r, _ := g.Admit("c"); parked <- r }()
+	waitForQueued(t, g, 1)
+
+	if got := g.Stats().InFlight; got != 1 {
+		t.Fatalf("InFlight = %d while one client is parked on its own cap, want 1 — the cap stopped binding", got)
+	}
+	fire <- time.Now()
+	if r := <-parked; r != RefusedPerClient {
+		t.Fatalf("parked request = %v, want RefusedPerClient", r)
 	}
 }
