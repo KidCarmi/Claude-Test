@@ -24,29 +24,63 @@ package main
 //  2. The priority was rendered with fmt.Sprintf("%d", ...), which boxes the
 //     int into an interface and runs the reflection-based formatter.
 //
-// BenchmarkDecisionLog_LegacyOperands is the FROZEN pre-change shape, kept so
-// the comparison stays reproducible in-tree rather than living only in a commit
-// message. It is a verbatim copy of the code that was removed; it is not called
-// by production and must NOT be "kept in sync" with applyPolicyDecision — its
-// whole value is that it does not move.
+// BenchmarkDecisionLog_Legacy* are the FROZEN pre-change shapes, kept so the
+// comparison stays reproducible in-tree rather than living only in a commit
+// message. They are verbatim copies of the code that was removed; they are not
+// called by production and must NOT be "kept in sync" with applyPolicyDecision
+// — their whole value is that they do not move.
 //
-// Measured on this machine (Go 1.26, linux/amd64, 4 vCPU, log.Logger over
-// io.Discard so the measurement is the formatting cost, which is what the
-// async sink in internal/logsink leaves on the caller's goroutine):
+// ── THE PRIORITY VALUE IS LOAD-BEARING, so both sides of it are measured ─────
 //
-//	                              ns/op    B/op   allocs/op
-//	legacy operands               506       98        7
-//	current operands              377       96        6
-//	                             -25.5%    -2%       -1
+// strconv.Itoa returns a slice of a package-level constant for 0 <= n < 100 and
+// ALLOCATES at or above it. Rule priorities are auto-assigned by the admin UI
+// as `max existing + 10` (static/index.html, nextAutoPriority), so the TENTH
+// rule already gets priority 100 and every rule past it is outside the cached
+// range. A benchmark pinned to a two-digit priority therefore reports a
+// per-component allocation saving that most of a real rulebase never sees.
+// (Caught in review by Codex on PR #1336; the first version of this file
+// measured only 42 and claimed the render was allocation-free full stop.)
 //
-// Component isolation, same run:
+// So benchDLPriorityWide (1000, the 100th UI-created rule) is the
+// REPRESENTATIVE case and carries the headline numbers; benchDLPrioritySmall
+// (42) is kept to pin the boundary rather than to flatter the result.
 //
-//	fmt.Sprintf("%d") + ReplaceAll    68.1 ns    1 alloc
-//	strconv.Itoa      + ReplaceAll    10.0 ns    0 allocs
-//	sanitizeLog (clean 17-byte host)  48.6 ns    0 allocs   <- was paid twice
+// The priority is also passed as a PARAMETER rather than referenced as a
+// package constant, and that is load-bearing too: from a constant the compiler
+// can box the interface value into static data, so the fmt.Sprintf shape
+// measures one allocation cheaper than it ever is in production, where the
+// value is the runtime struct field match.Rule.Priority. The first version of
+// this file used a constant and understated the legacy cost by exactly that
+// allocation.
 //
-// The two component savings (58 ns + 49 ns = 107 ns) account for the measured
-// 129 ns delta; the remainder is one fewer interface box reaching fmt.
+// Measured on this machine (Go 1.26, linux/amd64, 4 vCPU, median of 5, logger
+// over io.Discard so the measurement is the formatting cost — which is what
+// the async sink in internal/logsink leaves on the caller's goroutine):
+//
+//	applyPolicyDecision allow branch   ns/op   B/op   allocs/op
+//	  priority 1000  legacy             881     160      11
+//	  priority 1000  current            725     148      10   -17.7%  -1 alloc
+//	  priority   42  legacy             846     146      10
+//	  priority   42  current            683     144       9   -19.3%  -1 alloc
+//
+//	operand rendering alone
+//	  priority 1000  legacy             528     112       8
+//	  priority 1000  current            391     100       7
+//	  priority   42  legacy             502      98       7
+//	  priority   42  current            370      96       6
+//
+//	priority render alone            ns/op   allocs/op
+//	  priority 1000  fmt.Sprintf       91.5       2   (boxing >=256 + result)
+//	  priority 1000  strconv.Itoa      26.6       1
+//	  priority   42  fmt.Sprintf       74.0       1
+//	  priority   42  strconv.Itoa      10.1       0
+//
+//	sanitizeLog, one clean pass        51 ns      0   (paid twice before)
+//
+// Read that honestly: the saving is -1 allocation and ~18% CPU at BOTH
+// priorities. What changes across the boundary is the absolute alloc count,
+// not the delta — which is why the gates bound each priority separately
+// instead of asserting one number.
 
 import (
 	"context"
@@ -69,28 +103,37 @@ const (
 	benchDLConditions = "fqdn=*.example.com;group=engineering"
 	benchDLReqID      = "01JC8ZQ4K7X2M9NRTVW6Y3B5AE"
 	benchDLIdentity   = "alice@corp.example.com"
-	benchDLPriority   = 42
+
+	// benchDLPriorityWide is the representative priority: the admin UI's
+	// max+10 allocator puts the 100th rule here, and everything from the 10th
+	// rule on is already outside strconv.Itoa's cached range.
+	benchDLPriorityWide = 1000
+	// benchDLPrioritySmall sits inside that cached range, so the pair pins the
+	// boundary instead of hiding it.
+	benchDLPrioritySmall = 42
 )
 
-// BenchmarkDecisionLog_LegacyOperands is the FROZEN pre-change shape: the rule
-// name sanitised twice, the priority rendered through fmt.Sprintf. Do not
-// modify it to match production.
-func BenchmarkDecisionLog_LegacyOperands(b *testing.B) {
+// ── Operand rendering: legacy vs current, at both priorities ─────────────────
+
+// benchLegacyOperands is the FROZEN pre-change shape: the rule name sanitised
+// twice, the priority rendered through fmt.Sprintf. Do not modify it to match
+// production.
+func benchLegacyOperands(b *testing.B, priority int) {
 	b.Cleanup(benchSilenceLogger())
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		logger.Printf("POLICY_ALLOW rule=%q pri=%s %s %s %q [%s] {req_id=%s identity=%s rule=%s action=allow}",
 			sanitizeLog(benchDLRule),
-			strings.ReplaceAll(fmt.Sprintf("%d", benchDLPriority), "\n", ""),
+			strings.ReplaceAll(fmt.Sprintf("%d", priority), "\n", ""),
 			benchDLClientIP, benchDLMethod, sanitizeLog(benchDLHost), sanitizeLog(benchDLConditions),
 			benchDLReqID, sanitizeLog(benchDLIdentity), sanitizeLog(benchDLRule))
 	}
 }
 
-// BenchmarkDecisionLog_Operands is the shipped shape: one hoisted sanitised
-// name, priority via strconv.Itoa behind the inline CodeQL sanitiser.
-func BenchmarkDecisionLog_Operands(b *testing.B) {
+// benchCurrentOperands is the shipped shape: one hoisted sanitised name, and
+// the priority via strconv.Itoa behind the inline CodeQL sanitiser.
+func benchCurrentOperands(b *testing.B, priority int) {
 	b.Cleanup(benchSilenceLogger())
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -98,64 +141,95 @@ func BenchmarkDecisionLog_Operands(b *testing.B) {
 		name := sanitizeLog(benchDLRule)
 		logger.Printf("POLICY_ALLOW rule=%q pri=%s %s %s %q [%s] {req_id=%s identity=%s rule=%s action=allow}",
 			name,
-			strings.ReplaceAll(strconv.Itoa(benchDLPriority), "\n", ""),
+			strings.ReplaceAll(strconv.Itoa(priority), "\n", ""),
 			benchDLClientIP, benchDLMethod, sanitizeLog(benchDLHost), sanitizeLog(benchDLConditions),
 			benchDLReqID, sanitizeLog(benchDLIdentity), name)
 	}
 }
 
-// ── Component isolation ───────────────────────────────────────────────────────
+// BenchmarkDecisionLog_LegacyOperands is the pre-change shape at the
+// representative priority.
+func BenchmarkDecisionLog_LegacyOperands(b *testing.B) { benchLegacyOperands(b, benchDLPriorityWide) }
 
-// BenchmarkDecisionLog_PrioritySprintf measures the pre-change priority render
-// on its own: fmt.Sprintf boxes the int and runs the reflection formatter.
-func BenchmarkDecisionLog_PrioritySprintf(b *testing.B) {
-	b.ReportAllocs()
-	var s string
-	for i := 0; i < b.N; i++ {
-		s = strings.ReplaceAll(fmt.Sprintf("%d", benchDLPriority), "\n", "")
-	}
-	keepDecisionLogString(s)
+// BenchmarkDecisionLog_Operands is the shipped shape at the representative
+// priority.
+func BenchmarkDecisionLog_Operands(b *testing.B) { benchCurrentOperands(b, benchDLPriorityWide) }
+
+// BenchmarkDecisionLog_LegacyOperandsSmallPriority is the pre-change shape
+// inside Itoa's cached range.
+func BenchmarkDecisionLog_LegacyOperandsSmallPriority(b *testing.B) {
+	benchLegacyOperands(b, benchDLPrioritySmall)
 }
 
-// BenchmarkDecisionLog_PriorityItoa measures the shipped priority render: the
-// same inline ReplaceAll sanitiser over strconv.Itoa instead of fmt.Sprintf.
-func BenchmarkDecisionLog_PriorityItoa(b *testing.B) {
+// BenchmarkDecisionLog_OperandsSmallPriority is the shipped shape inside
+// Itoa's cached range.
+func BenchmarkDecisionLog_OperandsSmallPriority(b *testing.B) {
+	benchCurrentOperands(b, benchDLPrioritySmall)
+}
+
+// ── Component isolation: the priority render alone ───────────────────────────
+
+func benchPrioritySprintf(b *testing.B, priority int) {
 	b.ReportAllocs()
-	var s string
 	for i := 0; i < b.N; i++ {
-		s = strings.ReplaceAll(strconv.Itoa(benchDLPriority), "\n", "")
+		benchDecisionLogSink = strings.ReplaceAll(fmt.Sprintf("%d", priority), "\n", "")
 	}
-	keepDecisionLogString(s)
+}
+
+func benchPriorityItoa(b *testing.B, priority int) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchDecisionLogSink = strings.ReplaceAll(strconv.Itoa(priority), "\n", "")
+	}
+}
+
+// BenchmarkDecisionLog_PrioritySprintf measures the pre-change priority render
+// at the representative priority: fmt.Sprintf boxes the int and runs the
+// reflection formatter.
+func BenchmarkDecisionLog_PrioritySprintf(b *testing.B) {
+	benchPrioritySprintf(b, benchDLPriorityWide)
+}
+
+// BenchmarkDecisionLog_PriorityItoa measures the shipped priority render at the
+// representative priority. Above 99 this allocates, exactly like the shape it
+// replaced — here the win is CPU, not allocations.
+func BenchmarkDecisionLog_PriorityItoa(b *testing.B) {
+	benchPriorityItoa(b, benchDLPriorityWide)
+}
+
+// BenchmarkDecisionLog_PrioritySprintfSmall is the sub-100 control.
+func BenchmarkDecisionLog_PrioritySprintfSmall(b *testing.B) {
+	benchPrioritySprintf(b, benchDLPrioritySmall)
+}
+
+// BenchmarkDecisionLog_PriorityItoaSmall is the sub-100 case — the only range
+// in which the priority render itself is allocation-free.
+func BenchmarkDecisionLog_PriorityItoaSmall(b *testing.B) {
+	benchPriorityItoa(b, benchDLPrioritySmall)
 }
 
 // BenchmarkDecisionLog_SanitizeRuleName measures one sanitizeLog pass over a
-// clean rule name — the cost the old line paid twice per request.
+// clean rule name — the cost the old line paid twice per request, at every
+// priority.
 func BenchmarkDecisionLog_SanitizeRuleName(b *testing.B) {
 	b.ReportAllocs()
-	var s string
 	for i := 0; i < b.N; i++ {
-		s = sanitizeLog(benchDLRule)
+		benchDecisionLogSink = sanitizeLog(benchDLRule)
 	}
-	keepDecisionLogString(s)
 }
 
 // benchDecisionLogSink defeats dead-store elimination without allocating.
 var benchDecisionLogSink string
 
-func keepDecisionLogString(s string) { benchDecisionLogSink = s }
-
 // ── Whole-branch, in context ─────────────────────────────────────────────────
 
-// BenchmarkDecisionLog_ApplyAllow drives the REAL applyPolicyDecision allow
-// branch, so the line's share is measured against the rest of the dispatch
-// (rule-hit metering, the request-log fan-out) rather than in isolation.
-func BenchmarkDecisionLog_ApplyAllow(b *testing.B) {
+func benchApplyAllow(b *testing.B, priority int) {
 	b.Cleanup(benchSilenceLogger())
 	logOff := false
 	match := &PolicyMatch{
 		Rule: &PolicyRule{
 			Name:       benchDLRule,
-			Priority:   benchDLPriority,
+			Priority:   priority,
 			Action:     ActionAllow,
 			LogTraffic: &logOff, // stats-only: keeps the JSONL sink out of the measurement
 		},
@@ -173,6 +247,18 @@ func BenchmarkDecisionLog_ApplyAllow(b *testing.B) {
 	}
 }
 
+// BenchmarkDecisionLog_ApplyAllow drives the REAL applyPolicyDecision allow
+// branch at the representative priority, so the line's share is measured
+// against the rest of the dispatch (rule-hit metering, the request-log
+// fan-out) rather than in isolation.
+func BenchmarkDecisionLog_ApplyAllow(b *testing.B) { benchApplyAllow(b, benchDLPriorityWide) }
+
+// BenchmarkDecisionLog_ApplyAllowSmallPriority is the same branch inside Itoa's
+// cached range, so the gate can bound both sides of the boundary.
+func BenchmarkDecisionLog_ApplyAllowSmallPriority(b *testing.B) {
+	benchApplyAllow(b, benchDLPrioritySmall)
+}
+
 // BenchmarkDecisionLog_ApplyAllowParallel is the concurrency shape: a gateway
 // runs this line on every core at once. It exists to show the change does not
 // introduce shared state — the hoisted operands are per-call locals, so the
@@ -185,7 +271,7 @@ func BenchmarkDecisionLog_ApplyAllowParallel(b *testing.B) {
 	logOff := false
 	rule := &PolicyRule{
 		Name:       benchDLRule,
-		Priority:   benchDLPriority,
+		Priority:   benchDLPriorityWide,
 		Action:     ActionAllow,
 		LogTraffic: &logOff,
 	}
