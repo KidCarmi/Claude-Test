@@ -112,7 +112,14 @@ services:
           ARGS="$$ARGS -cp-grpc-ca $$CP_CA"
         fi
         if [ -n "$$HA_JOIN" ]; then
-          ARGS="$$ARGS -cp-grpc-addr :50051 --ha-join $$HA_JOIN --ha-token $$HA_TOKEN"
+          # --ha-token uses the =value form (not a separate word) so an
+          # operator who sets HA_JOIN but leaves HA_TOKEN empty/unset still
+          # gets a well-formed flag: unquoted word-splitting on `exec $$ARGS`
+          # drops an empty $$HA_TOKEN expansion entirely, which left a
+          # dangling `--ha-token` with no value as the last argv token and
+          # made `./culvert` exit on "flag needs an argument: -ha-token"
+          # before the standby could ever join the cluster.
+          ARGS="$$ARGS -cp-grpc-addr :50051 --ha-join $$HA_JOIN --ha-token=$$HA_TOKEN"
         fi
 
         exec ./culvert $$ARGS
