@@ -37,6 +37,17 @@ func stubResolver(addrs []string, err error) (calls *atomic.Int64, restore func(
 	resolvedHostCache.inflight = map[string]*hostResolveCall{}
 	resolvedHostCache.mu.Unlock()
 	return &counter, func() {
+		// CHAOS-57: the warm pool's goroutines read lookupHostFn, and a warm
+		// outlives the test body that armed it — `defer restore()` runs BEFORE
+		// any t.Cleanup, so restoring here without waiting writes the seam
+		// while a live warm is still reading it. That is a test-harness race
+		// (production never reassigns these vars), but under -race it is a
+		// hard failure, so the seam waits for its users to finish. Bounded, so
+		// a wedged warm fails the test rather than hanging it.
+		deadline := time.Now().Add(5 * time.Second)
+		for geoWarm.inflight.Load() > 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
 		lookupHostFn = orig
 		resolvedHostCache.mu.Lock()
 		resolvedHostCache.entries = origCache

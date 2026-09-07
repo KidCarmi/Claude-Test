@@ -25,6 +25,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -605,5 +606,79 @@ func TestChaos57_APanickingLeaderStillPublishes(t *testing.T) {
 	// of the process lifetime.
 	if resolvedHostCache.resolving(host) {
 		t.Fatal("the single-flight slot was never released — every later caller for this host would block forever")
+	}
+}
+
+// TestChaos57_OneHotHostCannotMonopolizeTheWarmPool pins the per-host
+// reservation. Raised by Codex against the first version of this fix (P1).
+//
+// The warmer's "is this host already being resolved?" check was a PRE-check:
+// the single-flight claim was only registered later, by the goroutine, inside
+// resolveHost. Concurrent policy evaluations for one uncached hostname — the
+// reconnect-storm shape this whole change exists to survive — therefore ALL
+// passed the check, ALL consumed a semaphore slot, and all but one parked as
+// followers holding those slots for the resolver's full delay. One popular
+// destination could drain the entire pool, so warms for unrelated hosts were
+// dropped and THEIR country rules stayed unresolved: the exact degradation
+// this PR fixes, re-entered through its own fix.
+//
+// The reservation must therefore be taken BEFORE a slot is consumed.
+//
+// This is a MANY-TRIAL gate, deliberately, and for the reason
+// TestChaos54_StopIsPromptDuringAcceptBackoff is one: whether the leader's
+// goroutine happens to register its claim before the other callers reach the
+// pre-check is a scheduling coin flip, so a single trial passes a broken
+// build most of the time. The invariant asserted in each trial is exact —
+// one host, at most one slot — and only the number of trials is statistical.
+func TestChaos57_OneHotHostCannotMonopolizeTheWarmPool(t *testing.T) {
+	newGeoTestEngine(t)
+	_, restore := stubResolver([]string{"203.0.113.40"}, nil)
+	defer restore()
+
+	const (
+		pool    = 8
+		callers = pool * 4
+		trials  = 60
+	)
+	defer swapGeoWarmSemForTest(pool)()
+
+	for trial := range trials {
+		host := fmt.Sprintf("hot-host-%d.test.invalid", trial)
+
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		lookupHostFn = func(string) ([]string, error) {
+			<-release // hold the slot the way a slow resolver would
+			return []string{"203.0.113.40"}, nil
+		}
+
+		// All callers arrive at warmGeoHost together — the storm shape.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				warmGeoHost(host)
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		held := len(geoWarmSem)
+		releaseOnce.Do(func() { close(release) })
+		waitForGeo(t, 5*time.Second, "the trial's warms to drain", func() bool {
+			return geoResolveState().InFlight == 0
+		})
+
+		// Exactly one warm may be in flight for one host, however many callers
+		// asked. More than one held slot means unrelated destinations would
+		// have their warms dropped and their country rules left unresolved.
+		if held > 1 {
+			t.Fatalf("trial %d: %d concurrent warms for ONE host held %d/%d pool slots, want at most 1 — one hot destination must not be able to drain the pool",
+				trial, callers, held, pool)
+		}
+		resetGeoResolveHealthForTest()
 	}
 }

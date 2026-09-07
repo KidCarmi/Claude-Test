@@ -2813,7 +2813,7 @@ faults this codebase already has runbooks for.
 **Shipped:** `geoip.go` (single-flight + a genuinely cache-only accessor),
 `geoip_resolve_health.go` (bounded warmer + health plane), `policy.go`
 (unresolved-country counter, two corrected comments), `metrics.go` (six series),
-`geoip_resolve_chaos_test.go` (15 gates).
+`geoip_resolve_chaos_test.go` (17 gates).
 
 ### 25.1 Why this domain
 
@@ -2924,11 +2924,14 @@ the slot for the **true** duration of the call is what makes the bound real.
 A queue was rejected for the reason drop-on-full is used everywhere else here:
 it converts a resolver outage into unbounded memory and unbounded staleness.
 
-**Misses are single-flighted.** `hostIPCache.begin`/`finish` elect one leader
-per host; every concurrent caller waits on its result (the jwksCache shape from
-`auth_oidc_flow.go`). The warmer additionally skips spawning at all when a
-resolution for that host is already in flight, so a storm against one host
-costs one goroutine, not one per request.
+**Misses are single-flighted, and the host is claimed BEFORE a pool slot is
+taken.** `hostIPCache.begin`/`finish` elect one leader per host; every
+concurrent caller waits on its result (the jwksCache shape from
+`auth_oidc_flow.go`). The warmer takes that claim **synchronously**, before it
+consumes a slot or spawns anything, so N concurrent callers for one host cost
+exactly one slot and the other N−1 return having touched nothing. The ordering
+is not incidental — see §25.8, where getting it wrong re-entered this
+document's own finding.
 
 **The warm fills BOTH caches.** It calls `geoip.LookupByIP`, not just the
 resolver, so the enforcement path now owns its own populator and no longer
@@ -3006,7 +3009,7 @@ metrics carry the state. Recorded as a deliberate choice, not an oversight.
 
 ### 25.6 Gates
 
-`geoip_resolve_chaos_test.go` (15). **Five defect gates were verified failing
+`geoip_resolve_chaos_test.go` (17). **Five defect gates were verified failing
 against the reintroduced pre-fix shape**, with the numbers quoted above:
 
 | Gate | Pre-fix result |
@@ -3059,3 +3062,58 @@ future reader nothing.
 The practical consequence for this register: when a sweep confirms a ✓ row,
 it should confirm it against the code, not against the row. Two of the three
 sweeps' worth of confidence in this path came from re-reading the row.
+
+### 25.8 Review follow-up — the fix re-entered its own finding
+
+Codex raised a **P1** against the first version of this change, and it was
+right. The finding is worth recording in full because it is the same shape as
+GEO-2, one level down.
+
+`warmGeoHost` began with:
+
+```go
+if resolvedHostCache.resolving(key) { return }   // (A) pre-CHECK
+select { case sem <- struct{}{}: default: drop } // (B) take a slot
+go func() { … resolveHost(key) … }()             // (C) the claim is registered HERE
+```
+
+The claim is registered by `begin`, which runs inside `resolveHost` — in the
+**goroutine**, at (C). So (A) is a pre-check against a claim that does not
+exist yet, and the window between (A) and (C) is a goroutine scheduling round.
+Concurrent policy evaluations for one uncached hostname — precisely the
+reconnect-storm shape this change exists to survive — all pass (A), all consume
+a slot at (B), and all but one park as **followers holding those slots** for
+the resolver's full delay.
+
+One popular destination could therefore drain the whole 64-slot pool, and every
+*unrelated* host's warm would be dropped and its country rule left unresolved.
+That is the GEO-2 degradation — country rules silently not enforcing because a
+bounded pool ran out — re-entered through the fix for GEO-2.
+
+The fix is an ordering one: `begin` is now called **synchronously in the
+caller**, before any slot is taken. A non-leader returns immediately having
+touched nothing; a leader that then cannot get a slot **hands the claim back**
+(`finish` with a nil result, deliberately *without* a cache write — nothing was
+learned, and a negative entry would suppress the retry for a full TTL over a
+transient pool shortage). `finish` was made idempotent with a `sync.Once` so
+every hand-back path can call it unconditionally, which is what turns "a claim
+is never stranded" from a proof about ordering into a local property.
+
+**The gate that missed it is the more instructive part.**
+`WarmSkipsAHostAlreadyBeingResolved` claimed the single-flight, and passed — it
+pre-claimed the slot synchronously in the test and so only ever exercised the
+*post*-registration state, never the window. The first replacement gate missed
+it too, for a different reason: with all callers spawned as goroutines, the
+leader usually wins the race to register, so a single trial passes a broken
+build most of the time. It is now a **many-trial** gate (60 trials × 32
+concurrent callers, the `TestChaos54_StopIsPromptDuringAcceptBackoff`
+precedent) — the invariant asserted per trial is exact (one host, at most one
+held slot) and only the trial count is statistical. Against the pre-fix shape
+it fails at trial 6: *"32 concurrent warms for ONE host held 2/8 pool slots."*
+
+A second, smaller defect surfaced on the way: under `-race`, a warm goroutine
+outlives the test body that armed it, and `defer restore()` runs **before** any
+`t.Cleanup` — so the resolver seam was being restored while a live warm was
+still reading it. Production never reassigns those vars, so this is harness-only,
+but `stubResolver` now waits for in-flight warms before restoring: a seam must
+outlive its users.

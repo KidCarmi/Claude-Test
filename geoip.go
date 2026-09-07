@@ -97,7 +97,15 @@ type hostIPEntry struct {
 // hostResolveCall is one in-flight resolution. The leader closes done after
 // storing ip; followers read ip only after done is closed, so the field needs
 // no lock of its own (the channel close is the happens-before edge).
+//
+// `once` makes publication IDEMPOTENT. A claim can be handed back on more than
+// one path — the leader resolves and publishes, or the warmer decides not to
+// resolve after all because the pool was saturated — and an unguarded second
+// publish would close a closed channel and panic. Idempotence lets every one
+// of those paths call finish unconditionally, which is what makes "a claim is
+// never stranded" checkable rather than a matter of reasoning about ordering.
 type hostResolveCall struct {
+	once sync.Once
 	done chan struct{}
 	ip   net.IP
 }
@@ -174,16 +182,20 @@ func (c *hostIPCache) begin(host string) (call *hostResolveCall, leader, hit boo
 
 // finish publishes the leader's result to every follower and releases the
 // single-flight slot. Called by the leader exactly once, on every exit path.
+// Idempotent: only the first call publishes, so every path that might have to
+// hand a claim back can call it unconditionally.
 func (c *hostIPCache) finish(host string, call *hostResolveCall, ip net.IP) {
-	call.ip = ip
-	c.mu.Lock()
-	// Only clear the slot this call owns: a slot replaced by a later
-	// resolution must not be deleted out from under its own leader.
-	if c.inflight[host] == call {
-		delete(c.inflight, host)
-	}
-	c.mu.Unlock()
-	close(call.done)
+	call.once.Do(func() {
+		call.ip = ip
+		c.mu.Lock()
+		// Only clear the slot this call owns: a slot replaced by a later
+		// resolution must not be deleted out from under its own leader.
+		if c.inflight[host] == call {
+			delete(c.inflight, host)
+		}
+		c.mu.Unlock()
+		close(call.done)
+	})
 }
 
 // resolving reports whether a resolution for host is already in flight. Used

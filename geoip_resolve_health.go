@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,10 +32,14 @@ import (
 //     unbounded thread pool, which is worse than the fault it treats. Holding
 //     the slot for the TRUE duration of the call is what makes the bound real.
 //
-//  2. SINGLE-FLIGHTED. resolvedHostCache collapses concurrent misses for one
-//     host into one resolution, and the warmer skips spawning entirely when a
-//     resolution for that host is already in flight. Without this, a reconnect
-//     storm against one host multiplies into one DNS query per request.
+//  2. SINGLE-FLIGHTED, AND CLAIMED BEFORE A SLOT IS TAKEN. resolvedHostCache
+//     collapses concurrent misses for one host into one resolution, and the
+//     warmer reserves the host SYNCHRONOUSLY — before it consumes a pool slot
+//     or spawns anything — so N concurrent callers for one host cost exactly
+//     one slot. Without the single-flight, a reconnect storm against one host
+//     multiplies into one DNS query per request; without the ORDER, it instead
+//     multiplies into one held pool slot per request, which starves every
+//     other host's warm just as effectively (see warmGeoHost).
 //
 //  3. OBSERVABLE. A dropped warm means a country-scoped rule did not enforce
 //     on that request. That is a security-relevant degradation, so it is
@@ -79,15 +84,80 @@ var geoWarm struct {
 // warmGeoHost arms an off-path resolution + country lookup for host so that a
 // later evaluation of a country-scoped rule can answer from cache.
 //
-// It never blocks the caller: a saturated pool drops the warm (counted), and a
-// host already being resolved is skipped rather than queued behind itself.
+// It never blocks the caller. THE PER-HOST RESERVATION IS TAKEN BEFORE A SLOT
+// IS CONSUMED, and that order is the load-bearing part (Codex P1 against the
+// first version of this fix). The first shape pre-CHECKED whether the host was
+// already being resolved and left the actual claim to the spawned goroutine,
+// which registers it inside resolveHost. Concurrent evaluations for one
+// uncached hostname — the reconnect-storm shape this change exists to survive
+// — therefore all passed the check, all took a slot, and all but one parked as
+// followers holding those slots for the resolver's full delay. One popular
+// destination could drain the pool, so unrelated hosts had their warms dropped
+// and their country rules left unresolved: the degradation this whole change
+// fixes, re-entered through its own fix. Claiming first means N callers for
+// one host cost exactly one slot, and the other N-1 return having touched
+// nothing.
 func warmGeoHost(host string) {
 	key := geoHostKey(host)
-	if resolvedHostCache.resolving(key) {
-		// A resolution is already in flight; a second goroutine would only
-		// wait on it and then repeat a lookup the first one will perform.
+
+	// An IP literal has no host half to resolve — only the country half can be
+	// missing. Mirrors resolveHost/resolveHostCached so all three agree.
+	if lit := net.ParseIP(key); lit != nil {
+		if !isPrivateIP(lit) {
+			spawnGeoWarm(func() { geoLookupIPFn(lit) })
+		}
 		return
 	}
+
+	call, leader, hit, cached := resolvedHostCache.begin(key)
+	switch {
+	case hit:
+		// The address is known; it is the country that is missing. A nil entry
+		// is a negative cache (NXDOMAIN, resolver down, private-only) — there
+		// is no country to learn and its TTL governs the retry.
+		if cached != nil {
+			spawnGeoWarm(func() { geoLookupIPFn(cached) })
+		}
+	case !leader:
+		// Another warm already owns this host's resolution. Returning costs
+		// nothing; waiting would cost a slot to do nothing.
+	default:
+		warmGeoResolve(key, call)
+	}
+}
+
+// warmGeoResolve performs the resolution this caller was elected to lead, on
+// the bounded pool, and hands the claim back if it never gets to run.
+func warmGeoResolve(key string, call *hostResolveCall) {
+	spawned := spawnGeoWarm(func() {
+		// finish is idempotent, so this can never double-publish over
+		// resolveAsLeader's own deferred publish. It is here so that a panic
+		// BEFORE resolveAsLeader is entered cannot strand the claim — a
+		// stranded claim blocks every later caller for this host forever.
+		defer resolvedHostCache.finish(key, call, nil)
+		ip := resolveAsLeader(key, call)
+		if ip == nil {
+			geoWarm.failed.Add(1)
+			return
+		}
+		// Populates the IP→country cache that the policy path reads. The
+		// return value is deliberately discarded — the cache write is the
+		// whole point of the call.
+		geoLookupIPFn(ip)
+	})
+	if !spawned {
+		// Saturated: this warm is not going to happen, so hand the claim back
+		// and release anyone who attached to it. Deliberately WITHOUT a cache
+		// write — nothing was learned, and a negative entry would suppress the
+		// retry for a full TTL over a transient pool shortage.
+		resolvedHostCache.finish(key, call, nil)
+	}
+}
+
+// spawnGeoWarm runs fn on the bounded, drop-on-full warm pool and reports
+// whether it was admitted. A refused warm is counted and surfaced; it is never
+// queued.
+func spawnGeoWarm(fn func()) bool {
 	// Capture the semaphore rather than reading the global again on release:
 	// a slot must always be returned to the channel it was taken from, so a
 	// goroutine outliving a swap of geoWarmSem cannot release into a channel
@@ -101,7 +171,7 @@ func warmGeoHost(host string) {
 		if h := geoWarmHook; h != nil {
 			h()
 		}
-		return
+		return false
 	}
 	geoWarm.started.Add(1)
 	geoWarm.inflight.Add(1)
@@ -115,16 +185,9 @@ func warmGeoHost(host string) {
 		// panic in the resolver seam must cost one warm, not the process.
 		defer recoverGoroutine("geo-warm")
 		noteGeoWarmProgress()
-		ip := resolveHost(key)
-		if ip == nil {
-			geoWarm.failed.Add(1)
-			return
-		}
-		// Populates the IP→country cache that the policy path reads. The
-		// return value is deliberately discarded — the cache write is the
-		// whole point of the call.
-		geoLookupIPFn(ip)
+		fn()
 	}()
+	return true
 }
 
 // noteGeoCountryUnresolved records one country-scoped rule evaluation that
