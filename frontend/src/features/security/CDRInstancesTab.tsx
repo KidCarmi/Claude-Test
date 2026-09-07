@@ -711,6 +711,9 @@ export function CDRInstancesTab({
   const page = useObjectPage(["security", "cdr", "instances"], getCDRInstances);
   const d = page.q.data;
   // Subject binding for the recovery marker: the authenticated username.
+  // Outside the authenticated phase (or before it is known) this is "" and
+  // the marker read is "unresolved": nothing is surfaced, dispatched,
+  // resolved or cleared until the identity is authoritative (2F-G).
   const subject = useAuth().state.user;
   const [form, setForm] = useState<EnrollForm>(EMPTY_FORM);
   const [confirmEnroll, setConfirmEnroll] = useState(false);
@@ -749,6 +752,8 @@ export function CDRInstancesTab({
     form.endpoint.trim() !== "" &&
     form.serverFingerprint.trim() !== "" &&
     form.token !== "" &&
+    // "none" only: an unresolved subject, a pending marker, or an unreadable
+    // store all keep the ceremony closed.
     recovery.kind === "none";
 
   return (

@@ -26,6 +26,11 @@
 //    ceremony, or an authentication boundary. NEVER on component unmount.
 //  - READ is subject-bound: a marker written under a different
 //    authenticated identity is discarded, never inherited.
+//  - An UNRESOLVED subject (the authenticated identity not yet known — an
+//    empty or blank subject) is NOT an identity: the read reports
+//    "unresolved", touches nothing, and the caller must neither surface,
+//    dispatch, resolve nor clear anything until the subject is
+//    authoritative (2F-G closure of the defect recorded in 2F-E).
 import { isRecord } from "../../api/decode";
 import { registerAuthCleanup } from "../../auth/teardown";
 
@@ -44,7 +49,9 @@ export type EnrollRecoveryRead =
   | { kind: "none" }
   | { kind: "valid"; marker: EnrollRecoveryMarker }
   | { kind: "unavailable" }
-  | { kind: "unreadable" };
+  | { kind: "unreadable" }
+  /** the authenticated subject is not known yet — nothing was classified */
+  | { kind: "unresolved" };
 
 /** Mint the client-side operation identity: 128 bits, hex — the grammar
  * Sluice binds (16–64 chars of [A-Za-z0-9._-]). */
@@ -119,8 +126,13 @@ export function markerGrammarValid(v: {
 
 /** Inspect the recovery store for the CURRENT subject — TYPED: "cannot
  * read" and "cannot interpret" are NOT "absent". A well-formed marker bound
- * to a DIFFERENT subject is discarded (never inherited) and reads "none". */
+ * to a DIFFERENT subject is discarded (never inherited) and reads "none".
+ * An EMPTY subject is not a subject: the store is left untouched and the
+ * read is "unresolved" — ownership is decided only against an authoritative
+ * identity (a transient first render must never destroy a recoverable
+ * operation). */
 export function readEnrollRecovery(subject: string): EnrollRecoveryRead {
+  if (subject.trim() === "") return { kind: "unresolved" };
   let raw: string | null;
   try {
     // eslint-disable-next-line no-restricted-globals -- sanctioned narrow exception to contract §9.B1 (2E-C trust-lifecycle correction): the single NON-SECRET enrollment-recovery marker; field allowlist pinned by cdr-enroll-recovery.test.tsx.
