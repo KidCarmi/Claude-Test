@@ -255,6 +255,27 @@ func (f *canarySafetyFunnel) Breach(capability string, gen uint64, code string) 
 	f.rt.tripCanaryAbortForGeneration(f.capb, gen, code, canaryNow())
 }
 
+// canaryBreachReporterFor is the capability-scoped breach reporter for a caller that has no
+// capability argument to pass — the admission gate's tripBreach seam.
+//
+// It exists so that seam reports through the FUNNEL rather than reaching
+// tripCanaryAbortForGeneration itself. A direct trip is one line shorter and silently opts out of
+// both guards Breach carries: the capability check, and — the one that matters — the refusal to
+// forward a ZERO generation into what is a wildcard downstream. Round 18 closed that inversion at
+// the pipeline seam and at Breach; the admission gate is the third generation-bound reporter and
+// was still forwarding its snapshot raw. Sharing the guard is what stops the three from drifting.
+//
+// The funnel is built PER CALL, not captured once. newCanarySafetyFunnel reads globalCanaryRuntime,
+// so building it here preserves the late binding the closure it replaces had: a gate constructed
+// before a test swaps the runtime must still report to the runtime that is current when the breach
+// happens. Capturing it at construction would silently aim a gate at a retired runtime and make
+// every abort gate built that way vacuous — the failure mode is a test that passes.
+func canaryBreachReporterFor(capb rollout.Capability) func(gen uint64, code string) {
+	return func(gen uint64, code string) {
+		newCanarySafetyFunnel(capb).Breach(capb.String(), gen, code)
+	}
+}
+
 // Generation snapshots this capability's activation generation for a request that has not reserved
 // a slot yet. The runtime pipeline calls it ONCE, beside the rollout resolution, and carries the
 // value to any pre-executor breach it reports.

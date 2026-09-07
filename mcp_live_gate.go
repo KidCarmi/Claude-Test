@@ -83,9 +83,24 @@ func newMCPLiveSideEffectGate(capb rollout.Capability) *mcpLiveSideEffectGate {
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
 		note:              noteMCPLiveGateDenied,
-		tripBreach: func(gen uint64, code string) {
-			globalCanaryRuntime.tripCanaryAbortForGeneration(capb, gen, code, canaryNow())
-		},
+		// THE BREACH GOES THROUGH THE FUNNEL, not straight to the trip.
+		//
+		// The admission gate is a generation-BOUND reporter: it snapshots the activation admitting
+		// this request and carries the value here. Round 18's rule is that such a reporter must
+		// refuse a zero, because zero is not a null downstream —
+		// tripCanaryAbortForGeneration documents wantGen == 0 as "whatever is current" and SKIPS
+		// the generation check, a wildcard reserved for the unbound tripCanaryAbort. Reporting the
+		// snapshot directly meant a reading taken before an activation existed arrived as "stop
+		// whichever activation is running now": the sentinel for "attribute to none" acting as
+		// "attribute to all", which is the exact inversion round 18 closed at the other two
+		// reporters and did not reach here.
+		//
+		// Delegating to canarySafetyFunnel.Breach — the same object the pipeline and the execution
+		// engine report through — makes that guard SHARED rather than a third copy that is free to
+		// drift from the other two. For a non-zero generation this is byte-identical to the trip it
+		// replaces: the funnel's Breach forwards to tripCanaryAbortForGeneration with canaryNow(),
+		// which is what this closure did.
+		tripBreach:        canaryBreachReporterFor(capb),
 		currentGeneration: func() uint64 { return globalCanaryRuntime.currentGeneration(capb) },
 	}
 }

@@ -1096,6 +1096,21 @@ run_mutation M115 \
   . mcp_canary_autostop.go \
   's/\tif gen == 0 \{\n\t\treturn\n\t\}\n//'
 
+# M116 is round 18 applied to the reporter that sweep did not reach. M114/M115 cover the two
+# reporters round 18 knew about; the ADMISSION GATE is a third generation-bound reporter, and it
+# forwarded its snapshot straight to tripCanaryAbortForGeneration — opting out of the funnel's zero
+# guard entirely. The mutation restores that direct trip, which is the pre-fix shape.
+#
+# The lesson M114/M115 record is that a duplicated guard is independently breakable; the fix here
+# went the other way and made the gate REPORT THROUGH the funnel, so there is one guard rather than
+# a third copy. This mutation is what proves the delegation is load-bearing and not decoration.
+
+run_mutation M116 \
+  'the admission gate trips directly instead of reporting through the funnel' \
+  'TestAutoStop_AdmissionGateZeroGenerationBreachCannotStopALiveActivation' \
+  . mcp_live_gate.go \
+  's/\t\ttripBreach:        canaryBreachReporterFor\(capb\),\n/\t\ttripBreach: func(gen uint64, code string) \{\n\t\t\tglobalCanaryRuntime.tripCanaryAbortForGeneration(capb, gen, code, canaryNow())\n\t\t\},\n/'
+
 # ── (17) THE PROOF RULE ITSELF ──────────────────────────────────────────────
 #
 # The defect from M16 is invisible to a permissive test sink. This mutation proves

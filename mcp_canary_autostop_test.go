@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -724,6 +726,122 @@ func TestAutoStop_ServerIdentityDriftAbortsTheWholeCanary(t *testing.T) {
 	}
 	if code := rt.abortCodeNow(capb); code != "server_identity_drift" {
 		t.Fatalf("first cause must be server_identity_drift, got %q", code)
+	}
+}
+
+// TestAutoStop_AdmissionGateZeroGenerationBreachCannotStopALiveActivation is Codex round 18 applied
+// to the THIRD generation-bound reporter, the one that sweep did not reach.
+//
+// Round 18 established the rule and named where it holds: "the generation-BOUND reporter refuses
+// [a zero], at both the runtime seam that produces it and the funnel that forwards it". The
+// admission gate is a reporter of exactly that kind — it snapshots the activation admitting this
+// request and carries the value to the trip — but it forwarded its snapshot straight to
+// tripCanaryAbortForGeneration, which documents wantGen == 0 as "whatever is current" and SKIPS the
+// generation check. So the one value meaning "no activation was admitting when I looked" arrived
+// downstream meaning "stop whichever activation is running now".
+//
+// The race that produces the zero is the ordinary one this whole seam exists for: the gate takes
+// ONE generation reading, before the trust check, and an activation that began after that reading
+// is one the observation says nothing about. Stopping it is the direction §16 calls indistinguishable,
+// to an operator, from the control being wrong.
+//
+// The reading is pinned rather than raced, for the same reason swapCanaryClockSeq pins a clock step:
+// where a scheduler lands between two statements is not something a gate may depend on. 0 is the
+// exact value the production closure returns in that window.
+func TestAutoStop_AdmissionGateZeroGenerationBreachCannotStopALiveActivation(t *testing.T) {
+	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
+	capb := rollout.CapabilityGateway
+	g, sid, tool, fpHex, now := armDriftFixture(t, rt, capb)
+
+	if rt.currentGeneration(capb) == 0 {
+		t.Fatal("premise: an armed activation must report a non-zero generation")
+	}
+
+	// The gate's single generation reading landed BEFORE this activation existed.
+	g.currentGeneration = func() uint64 { return 0 }
+
+	republishToolWithNewFingerprint(t, sid, tool)
+	if d := g.AdmitSideEffect(driftGateInput(sid, tool, fpHex, now)); d.Admit {
+		t.Fatal("premise: a drifted request must still fail closed at the gate")
+	}
+	if rt.abortedNow(capb) {
+		t.Fatal("SECURITY: an unattributable admission breach stopped a live activation it says " +
+			"nothing about — zero is a WILDCARD downstream (\"whatever is current\"), not a null " +
+			"(Codex round 18, unreached at the admission gate)")
+	}
+	if st := canaryAbortStatusFor(capb); st.ExecutionAuthority != "granted" {
+		t.Fatalf("the live activation must keep its authority, got %q", st.ExecutionAuthority)
+	}
+
+	// THE CONTROL. With the reading the production closure actually takes, the SAME drift on the
+	// SAME gate must still stop the experiment — so this gate cannot be satisfied by severing the
+	// admission gate's breach routing, which is the failure mode a zero-guard invites.
+	g.currentGeneration = func() uint64 { return rt.currentGeneration(capb) }
+	if d := g.AdmitSideEffect(driftGateInput(sid, tool, fpHex, now)); d.Admit {
+		t.Fatal("control: the drifted request must still fail closed")
+	}
+	if !rt.abortedNow(capb) {
+		t.Fatal("control: an ATTRIBUTABLE drift observed at admission must still stop the whole Canary")
+	}
+	if code := rt.abortCodeNow(capb); code != "tool_fingerprint_drift" {
+		t.Fatalf("control: first cause must be tool_fingerprint_drift, got %q", code)
+	}
+}
+
+// TestAutoStopWall_GenerationBoundReportersGoThroughTheFunnel is the structural half of the gate
+// above, and it is the half that generalises.
+//
+// The zero guard is not a property of any one reporter; it is a property of the ONE place a
+// generation-bound observation may become an abort. Round 18 wrote the guard twice — at the runtime
+// seam and at the funnel — and the campaign records the reasoning: "the guard is deliberately
+// duplicated ... independently breakable". The cost of that shape is that a THIRD reporter can be
+// added without either copy noticing, which is exactly what the admission gate was: it called
+// tripCanaryAbortForGeneration itself and so opted out of both.
+//
+// So the wall is on the CALL, not on the guard. Only two root files may name the generation-bound
+// trip: the runtime that declares it (and the unbound tripCanaryAbort that intentionally owns the
+// wildcard), and the funnel that guards every bound report. A fourth reporter added anywhere else
+// fails here and is pointed at the funnel, rather than shipping a third copy of a guard — or none.
+func TestAutoStopWall_GenerationBoundReportersGoThroughTheFunnel(t *testing.T) {
+	const trip = "tripCanaryAbortForGeneration("
+	// mcp_canary_runtime.go declares it and owns the deliberate wildcard (tripCanaryAbort).
+	// mcp_canary_autostop.go is the funnel + the generation-checked window watchdog.
+	allowed := map[string]bool{
+		"mcp_canary_runtime.go":  true,
+		"mcp_canary_autostop.go": true,
+	}
+	// pkgSourceDir(), never ".": a CWD-relative read is flaky under a concurrent os.Chdir and is
+	// refused by TestTestFileReadsAreCWDIndependent.
+	dir := pkgSourceDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(raw), trip) {
+			continue
+		}
+		found++
+		if !allowed[name] {
+			t.Errorf("%s calls %s directly — a generation-bound breach must be reported through "+
+				"canarySafetyFunnel.Breach, which refuses a ZERO generation. Reaching the trip directly "+
+				"forwards that zero into a WILDCARD (\"whatever is current\"), stopping an activation the "+
+				"observation says nothing about (Codex round 18)", name, trip)
+		}
+	}
+	// The wall must not pass by finding nothing: a rename would otherwise silently retire it.
+	if found != len(allowed) {
+		t.Fatalf("expected the generation-bound trip to be named in exactly %d root files, found %d — "+
+			"the wall's own premise has drifted", len(allowed), found)
 	}
 }
 
