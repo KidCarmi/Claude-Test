@@ -87,8 +87,8 @@ func runHAProxyCommandScript(t *testing.T, env ...string) (argv []string, stderr
 	// script is extracted verbatim from docker-compose.ha.yml (a file in
 	// this repo, not attacker/caller input) immediately above, and the
 	// command name/args here are fixed literals — nothing external reaches
-	// this exec.Command call.
-	cmd := exec.Command("sh", "-c", script) // #nosec G204 -- script is this repo's own docker-compose.ha.yml content, not external input
+	// this exec.CommandContext call.
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", script) // #nosec G204 -- script is this repo's own docker-compose.ha.yml content, not external input
 	cmd.Env = append(os.Environ(), env...)
 	var stdout, errBuf strings.Builder
 	cmd.Stdout = &stdout
