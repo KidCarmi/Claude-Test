@@ -372,6 +372,35 @@ func TestAtomicBinding_TrustProbeMayNotReEnterTheRuntime(t *testing.T) {
 // as "whatever is current" and skips the generation check, a wildcard reserved for the unbound
 // entry point. A transaction that let a zero out as an attribution would hand the abort authority a
 // wildcard, so the guard is explicit and this pins it against a state no test could otherwise reach.
+func TestAtomicBinding_InactiveRuntimeIsNotAnActivation(t *testing.T) {
+	r := newAtomicRig(t)
+	r.arm(t, 3)
+
+	// Force the one shape the lifecycle cannot produce on its own: not active, but with the
+	// enforcer and aborter still in place. demoteCanary nils both, so without this the `!cr.active`
+	// clause is shadowed by the nil checks and a mutation removing it would survive unnoticed.
+	cr := r.rt.capRuntime(r.capb)
+	cr.mu.Lock()
+	cr.active = false
+	cr.mu.Unlock()
+
+	probed := false
+	adm := r.admit(func() (bool, string) {
+		probed = true
+		return false, "tool_fingerprint_drift"
+	})
+
+	if adm.Denial != canaryAdmitNoActivation {
+		t.Fatalf("SECURITY: an inactive runtime must not be treated as an activation, got %v", adm.Denial)
+	}
+	if adm.Latched || adm.Generation != 0 {
+		t.Fatalf("nothing may be attributed or latched: gen=%d latched=%v", adm.Generation, adm.Latched)
+	}
+	if probed {
+		t.Fatal("SECURITY: the trust probe ran against an inactive runtime")
+	}
+}
+
 func TestAtomicBinding_ActiveWithZeroGenerationIsNotAnActivation(t *testing.T) {
 	r := newAtomicRig(t)
 	r.arm(t, 3)
