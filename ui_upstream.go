@@ -257,6 +257,11 @@ func upstreamMutate(w http.ResponseWriter, r *http.Request, fn func(cur upstream
 		for k, val := range out.result {
 			v[k] = val
 		}
+		// The media type must be set BEFORE the status is written: the
+		// header snapshot goes out at WriteHeader, and a JSON body sent
+		// without it is sniffed as text/plain on the wire (2F-F finding —
+		// the v2 client's boundary refuses any non-JSON answer).
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(out.status)
 		jsonWrite(w, v)
 	}
