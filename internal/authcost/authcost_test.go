@@ -12,7 +12,7 @@ import (
 // than by the clock, so every timeout assertion below is deterministic. The
 // house rule (connlimit, threatfeed, socks5) is that a regression gate must
 // not be able to flake on a shared runner.
-func newTestGate(t *testing.T, maxConcurrent, maxPerClient int) (*Gate, chan time.Time) {
+func newTestGate(t *testing.T, maxConcurrent, maxPerClient int) (gate *Gate, fireTimer chan time.Time) {
 	t.Helper()
 	fire := make(chan time.Time, 64)
 	g := New(maxConcurrent, maxPerClient, time.Hour)

@@ -423,7 +423,7 @@ func (g *Gate) noteAdmitted(queued bool) {
 	g.mu.Unlock()
 }
 
-func (g *Gate) timer(d time.Duration) (<-chan time.Time, func() bool) {
+func (g *Gate) timer(d time.Duration) (fired <-chan time.Time, stop func() bool) {
 	if g.newTimer != nil {
 		return g.newTimer(d)
 	}

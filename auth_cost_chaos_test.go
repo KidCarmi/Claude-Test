@@ -600,8 +600,15 @@ func TestChaos57_CacheKeyIsInjective(t *testing.T) {
 		}
 		seen[k] = fmt.Sprintf("(%q,%q)", p.user, p.pass)
 	}
-	// And it must still be deterministic within a process.
-	if cacheKey("admin", "a:b") != cacheKey("admin", "a:b") {
-		t.Fatal("cacheKey is not deterministic")
+	// And it must still be deterministic within a process — the same credential
+	// has to land on the same key, or the cache never hits and every request
+	// pays a full bcrypt. Bound to separate variables rather than compared
+	// inline: staticcheck's SA4000 rightly rejects two syntactically identical
+	// operands, and the property under test is that two SEPARATE derivations of
+	// the same input agree.
+	first := cacheKey("admin", "a:b")
+	second := cacheKey("admin", "a:b")
+	if first != second {
+		t.Fatalf("cacheKey is not deterministic: %q vs %q", first, second)
 	}
 }
