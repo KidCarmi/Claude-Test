@@ -129,6 +129,10 @@ never be replaced or removed by omission. GET URLs never carry userinfo.
 
 The shipped admin panel (`static/index.html`) uses the per-entry endpoints;
 the adapter restrictions and the panel switch landed in the same commit.
+The new admin frontend (`CULVERT_EXPERIMENTAL_UI`, `/app/network/upstream`)
+uses the same per-entry endpoints and renders every refusal from the
+structured `code` + `current` facts; it never stores a password and refuses
+to render an entry that carries credential material.
 
 ## 4. Health, eligibility, and the effective mode
 

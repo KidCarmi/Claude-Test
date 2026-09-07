@@ -1161,6 +1161,106 @@ UI leans on C2 semantics and must not cut over onto a known enforcement gap).
 > recorded, not a regression. Contract artifacts regenerated (`openapi.yaml` →
 > bundle + `types.gen.ts`); route count unchanged (241).
 >
+> **2F-F IMPLEMENTATION RECORD (this branch, 2026-09-07).** Upstream React
+> at `/app/network/upstream` under the approved C1–C12 contract (C4, C6, C7,
+> C9, C11, C12), append-only on the FROZEN 2F-E baseline `ba2d852b`.
+> **Entry gate.** `origin/main` unchanged at `290e3768` (already integrated
+> by the 2F-E entry-gate merge); head = remote = `ba2d852b`, tree clean.
+> **RED-before.** `61a4cc34` commits the matrix on the frozen baseline and
+> the baseline evidence was executed there: `src/test/upstream-2ff-red.test.ts`
+> (A1–A7: read-model decoder with enum rejection, fence + bounded-refusal
+> classification from structured bodies, request shapes — document vs
+> entry revision, DELETE token in the query only, T2 password in the body
+> only, T3 confirm without a password key, bodiless probe, never
+> `credentialState` — fail-closed decoder on credential material, probe
+> summary, enum-derived mode/credential/coverage facts),
+> `src/test/upstream-2ff-red-page.test.tsx` (P1–P10: viewer posture, YAML
+> read-only rows, stale/precondition rendering without auto-retry,
+> `credential_bound` / `credential_present` as server facts, T2 password
+> hygiene across DOM/URL/storage, T3 typed entry id, probe rate-limit
+> rendering, `no_eligible_parent` + `requiresReplacement` banner vs the
+> `direct_fallback` bypass wording, `document_rejected`, unknown-outcome
+> latch) and `e2e/upstream-2ff.spec.ts` (J1–J5 real-binary journeys) — all
+> red on the baseline (both vitest files fail at import resolution; the five
+> journeys fail on the missing route, auth-setup alone passes).
+> **Surface.** `src/api/upstream.ts`: the credential-free v2 read model
+> through total decoders (`entries` nullable on the wire), a FAIL-CLOSED
+> guard that refuses an entry carrying `password` / `credential` /
+> `ciphertext` or a userinfo password in `url`/`authority` (a misbehaving
+> server can never put a secret into the DOM), `asUpstreamRefusal` /
+> `asUpstreamFence` over the bounded 2F-C/2F-D code set (unknown codes,
+> text bodies and transport deaths are never classified), and request
+> wrappers with the exact wire shapes. `features/network/upstream/`:
+> `upstreamFacts.ts` (facts derived from the server enums only — both
+> `no_eligible_parent` and `direct_fallback` are critical, only
+> `direct_fallback` says traffic is bypassing (C11); coverage is always
+> plain-HTTP-only and no copy says "protected" or "fully chained" (C7);
+> `requiresReplacement` is a distinct ineligible state (C12)),
+> `UpstreamPage.tsx` (effective mode with `since`, eligible/entries,
+> direct-fallback count, coverage line, periodic-probe cadence, key state,
+> migration state, scope node-local; the critical banners — mode,
+> `credentialsRequiringReplacement`, unusable/mismatch, rejected stored
+> document, refused YAML seed, degraded migration, missing/unreadable key;
+> the entries table with `data-entry-id` / `data-source` /
+> `data-credential-state` rows; managed rows carry the admin controls,
+> YAML rows are read-only), `upstreamEditors.tsx` (create/edit Tier 2 fenced
+> on the document / entry revision, delete Tier 2 with the token in the
+> query, replace credential Tier 2 — `type=password`, sent once in the body,
+> released with the dialog — clear credential Tier 3 built on the raw
+> `Dialog` so the typed input is labelled "Type the entry id (…) to confirm"
+> and the exact id is echoed verbatim under `confirm`), `upstreamShared.tsx`
+> (the fence callout and the bounded-refusal callout rendering `code` + the
+> server line + the facts under `current` — authority, credential state,
+> duplicate count, `retryAfterSeconds`, degraded reason). Manual probe is
+> admin-only, bodiless, and renders the counts-only `summary`; a 429
+> `probe_in_flight` / `probe_rate_limited` renders `retryAfterSeconds` and
+> is never retried. A transport death latches the page UNKNOWN (2A-M
+> doctrine) until a fresh successful refresh; the page persists NOTHING (no
+> storage, no recovery marker — an upstream mutation is refetch-idempotent
+> and the read model is the only truth, unlike the PAC lifecycle's
+> client-minted operation identity). RBAC C7: every mutation control is
+> admin-only; the viewer mounts zero write controls. Route `/network/upstream`
+> registered in the router, the Network nav section and the route-intent
+> table (viewer floor, matching `GET /api/upstream`).
+> **Server-fact rendering decisions (recorded, not compensations):** a
+> `requiresReplacement` entry keeps its Delete control because the appliance
+> permits the delete (only sealed material refuses `credential_present`);
+> Clear credential is offered whenever `credentialState ≠ none`
+> (`requiresReplacement` is T3-clearable by contract); an entry whose
+> credential is `unusable`/`mismatch` still offers Replace (T2 resolves it).
+> **Contract defect found ONLY against the real binary (backend correction,
+> explicitly identified).** J2/J3/J5 failed on the first real-binary run:
+> every successful `upstreamMutate` answer (create 201, update / delete /
+> credential 200) reached the browser WITHOUT `Content-Type:
+> application/json` — the handler wrote the status before `jsonWrite` set
+> the type, so the header snapshot went out untyped and the server's
+> sniffer labelled the JSON body `text/plain`; the v2 client's boundary
+> refuses any non-JSON media type by construction, while the legacy panel
+> never checked it (which is why 2F-C/2F-D did not observe it). RED
+> `63135d7d` (`upstream_mutation_content_type_red_test.go`, asserting the
+> WriteHeader-time header snapshot via `rec.Result()`, the refusal path as a
+> passing control; 5/5 answers untyped on `49f4182e`); correction
+> `aff12f91` sets the type before the status in `upstreamMutate` — no
+> schema, route or body change (the OpenAPI already declared
+> `application/json`). Second real-binary run: 7/7 (five 2F-F journeys +
+> the 2F-D legacy leak sweep + auth-setup).
+> **Transparent correction of the RED files (`3d85b832`, recorded):** the
+> repository lint bans `as` assertions in authored source, so three
+> `Object.keys(x as object)` key-list reads became `isRecord(x) ?
+> Object.keys(x) : []` and Prettier formatting was applied; every assertion,
+> fixture and expected value is byte-for-byte the same and `61a4cc34`
+> remains the baseline evidence.
+> **Harness note (J4, disclosed):** the manual-probe journey primes an
+> ACCEPTED run through the API (polling the appliance's own 10 s window —
+> a refused run does not re-arm it), proves the page's probe inside that
+> window is refused 429 and never retried, then waits exactly the
+> SERVER-DECLARED `Retry-After` before the accepted run — the protocol's own
+> instruction, not a guessed sleep.
+> **Scope exclusions honoured:** no 2F-G, no PX-1 data-plane chaining, no
+> YAML adopt transaction, no breaker/probe-interval GUI settings, no
+> secret-inclusive backups, no parity-doc correction (2F-G), no OpenAPI or
+> route-metadata change (route count unchanged at 243), no CDR work.
+>
 > **2F-E CORRECTION RECORD, ROUND 8 (this branch, 2026-09-06).** External
 > freeze review of the round-7 candidate (`bde20ba1`) accepted the ancestry
 > and qualification and found one source-level contract break; it was
