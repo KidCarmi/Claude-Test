@@ -426,3 +426,81 @@ func TestAtomicBinding_ActiveWithZeroGenerationIsNotAnActivation(t *testing.T) {
 		t.Fatal("SECURITY: the trust probe ran with no generation to charge its verdict to")
 	}
 }
+
+// ── Pre-admission drift evidence (§6) ────────────────────────────────────────
+//
+// The pre-executor refusal path binds to no activation, so it deliberately latches nothing. What
+// it MUST do is leave a bounded, readable trace: a counter nothing can read is not evidence, it is
+// dead state that only looks like observability. These gates pin both halves — that the write is
+// bounded and capability-scoped, and that the read actually reaches the operator surface.
+
+func resetPreAdmissionDriftForTest(t *testing.T) {
+	t.Helper()
+	mcpCanaryPreAdmissionDrift.mu.Lock()
+	mcpCanaryPreAdmissionDrift.m = map[string]map[string]uint64{}
+	mcpCanaryPreAdmissionDrift.mu.Unlock()
+	t.Cleanup(func() {
+		mcpCanaryPreAdmissionDrift.mu.Lock()
+		mcpCanaryPreAdmissionDrift.m = map[string]map[string]uint64{}
+		mcpCanaryPreAdmissionDrift.mu.Unlock()
+	})
+}
+
+func TestAtomicBinding_PreAdmissionDriftEvidenceIsBoundedAndReadable(t *testing.T) {
+	resetPreAdmissionDriftForTest(t)
+
+	gw := rollout.CapabilityGateway.String()
+	noteCanaryPreAdmissionDrift(gw, "tool_fingerprint_drift")
+	noteCanaryPreAdmissionDrift(gw, "tool_fingerprint_drift")
+	noteCanaryPreAdmissionDrift(gw, "server_identity_drift")
+
+	// The key space is bounded: an arbitrary code can never become a new key.
+	for _, junk := range []string{"", "attacker-controlled", "tool_fingerprint_drift ", "🙂"} {
+		noteCanaryPreAdmissionDrift(gw, junk)
+	}
+
+	got := canaryPreAdmissionDriftCounts(gw)
+	if got["tool_fingerprint_drift"] != 2 {
+		t.Fatalf("tool_fingerprint_drift = %d, want 2", got["tool_fingerprint_drift"])
+	}
+	if got["server_identity_drift"] != 1 {
+		t.Fatalf("server_identity_drift = %d, want 1", got["server_identity_drift"])
+	}
+	if got["other"] != 4 {
+		t.Fatalf("unrecognised codes must fold into exactly one bucket: other = %d, want 4", got["other"])
+	}
+	if len(got) != 3 {
+		t.Fatalf("SECURITY: the evidence key space is unbounded — %d keys: %v", len(got), got)
+	}
+
+	// The counter is capability-scoped: one capability's evidence never appears under another.
+	if other := canaryPreAdmissionDriftCounts(rollout.CapabilityManagement.String()); len(other) != 0 {
+		t.Fatalf("management must carry no gateway evidence, got %v", other)
+	}
+
+	// The mutation returns a COPY: a caller cannot reach in and rewrite the evidence.
+	got["tool_fingerprint_drift"] = 999
+	if again := canaryPreAdmissionDriftCounts(gw); again["tool_fingerprint_drift"] != 2 {
+		t.Fatalf("the accessor leaked its backing map: %d", again["tool_fingerprint_drift"])
+	}
+}
+
+func TestAtomicBinding_PreAdmissionDriftReachesTheOperatorSurface(t *testing.T) {
+	resetPreAdmissionDriftForTest(t)
+
+	noteCanaryPreAdmissionDrift(rollout.CapabilityGateway.String(), "server_identity_drift")
+
+	st := mcpCanaryStatus()
+	ar, ok := st["activation_runtime"].(map[string]any)
+	if !ok {
+		t.Fatal("activation_runtime missing from the Canary status surface")
+	}
+	counts, ok := ar["pre_admission_drift"].(map[string]uint64)
+	if !ok {
+		t.Fatalf("SECURITY: pre-admission drift evidence is write-only — it never reaches "+
+			"GET /api/mcp/rollout. activation_runtime keys: %v", keysOf(ar))
+	}
+	if counts["server_identity_drift"] != 1 {
+		t.Fatalf("server_identity_drift = %d on the operator surface, want 1", counts["server_identity_drift"])
+	}
+}

@@ -202,8 +202,8 @@ func (rt *canaryRuntime) tripLockedForGeneration(cr *canaryCapRuntime, capb roll
 // It is deliberately a COUNTER and not a control input: nothing reads it to make a decision.
 var mcpCanaryPreAdmissionDrift = struct {
 	mu sync.Mutex
-	m  map[string]uint64
-}{m: map[string]uint64{}}
+	m  map[string]map[string]uint64
+}{m: map[string]map[string]uint64{}}
 
 // canaryPreAdmissionDriftCodes bounds the key space to the taxonomy's drift codes, so a caller can
 // never grow the map with arbitrary strings.
@@ -220,15 +220,26 @@ func noteCanaryPreAdmissionDrift(capability, code string) {
 	}
 	mcpCanaryPreAdmissionDrift.mu.Lock()
 	defer mcpCanaryPreAdmissionDrift.mu.Unlock()
-	mcpCanaryPreAdmissionDrift.m[capability+":"+code]++
+	byCode := mcpCanaryPreAdmissionDrift.m[capability]
+	if byCode == nil {
+		byCode = map[string]uint64{}
+		mcpCanaryPreAdmissionDrift.m[capability] = byCode
+	}
+	byCode[code]++
 }
 
-// canaryPreAdmissionDriftCounts returns a copy of the bounded evidence counters.
-func canaryPreAdmissionDriftCounts() map[string]uint64 {
+// canaryPreAdmissionDriftCounts returns a copy of one capability's bounded evidence counters,
+// keyed by drift code. This is the READ half of the counter and it is not optional: a counter
+// nothing can read is not evidence, it is dead state that only looks like observability (the
+// write-only-latch class this repository has been bitten by before — see the sslInspectionLoadError
+// note in CLAUDE.md). It is surfaced under GET /api/mcp/rollout and read by nothing else; no
+// control path consults it.
+func canaryPreAdmissionDriftCounts(capability string) map[string]uint64 {
 	mcpCanaryPreAdmissionDrift.mu.Lock()
 	defer mcpCanaryPreAdmissionDrift.mu.Unlock()
-	out := make(map[string]uint64, len(mcpCanaryPreAdmissionDrift.m))
-	for k, v := range mcpCanaryPreAdmissionDrift.m {
+	byCode := mcpCanaryPreAdmissionDrift.m[capability]
+	out := make(map[string]uint64, len(byCode))
+	for k, v := range byCode {
 		out[k] = v
 	}
 	return out
