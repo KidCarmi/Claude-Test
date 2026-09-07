@@ -1782,14 +1782,28 @@ fifteen reasons a GO is forbidden, not the prohibition.
 6. ~~**The budget does not bound physical upstream invocations (§9).**~~ **CLOSED** — see
    "Blocker 6 closure" below. Idempotent read retries could send the POST ~3× per single budget
    reservation; the Canary path is now retry-free and the bound is proven at the wire.
-7. ~~**Whole-Canary auto-abort is incomplete (§14/§16) — a product defect.**~~ **CLOSED** — see
-   "Blocker 7 closure" in §25a. Only `budget_exhausted`/`scope_escape` auto-tripped, the other eight
-   declared breaches did not, nothing reconciled the independent witness, and the time-box was
-   request-driven (Codex round 31), so an elapsed window stopped nothing if no further request
-   arrived. Every declared `AbortCanary` code now has a wired trip path onto the one
-   `AbortController`, the two rate detectors are reachable inside the 3-execution corpus, and the
-   deadline is absolute and self-enforcing. The latch revokes EXECUTION AUTHORITY; it does not demote
-   the node, which stays governed by blockers 10 and 12.
+7. **Whole-Canary auto-abort is incomplete (§14/§16) — a product defect.** **REOPENED, then
+   CLOSED by the atomic-binding follow-up.** The first pass wired every declared `AbortCanary` code
+   onto the one `AbortController`, made both rate detectors reachable inside the 3-execution corpus,
+   and made the deadline absolute and self-enforcing — but it shipped with two open Round-19 P1
+   findings in the pre-admission drift path, and was merged in that state. It is recorded as
+   REOPENED rather than quietly amended, because for a release-readiness gate "CLOSED with two open
+   P1s" is not a status, it is a contradiction.
+
+   The defect both findings named is one thing: the activation generation was read AROUND an
+   unlocked trust observation and the two reads compared. Counter equality proves the value did not
+   CHANGE; it does not prove any activation was ACTIVE throughout — during the rollout publication
+   gap both reads are a stale value. Five review rounds produced a P1 against five different
+   arrangements of those reads, which is the signal that the invariant was not expressible that way.
+
+   It is now expressed by construction. `admitLiveExecution` verifies an armed activation, captures
+   its exact non-zero generation, evaluates live trust, latches an authoritative drift against that
+   generation, and reserves the budget — under ONE acquisition of the activation lock, which it owns
+   and never exposes. "Trust under G, reserve under G+1" is not a race made unlikely; it is a state
+   the code cannot express. The pre-executor observation, which happens before any reservation and
+   therefore binds to nothing, refuses the request as before and records bounded evidence instead of
+   latching. The latch revokes EXECUTION AUTHORITY; it does not demote the node, which stays
+   governed by blockers 10 and 12.
 8. **Durable outcome evidence is incomplete/success-only, with an unclosable post-send crash window
    (§15/§18) — a product defect.** **STILL OPEN, narrowed** — see "Blocker 8 status" below. The
    internal half (terminal outcome on every exit path, durable send intent, orphan recovery,

@@ -124,7 +124,14 @@ scope_escape, tool_fingerprint_drift, server_identity_drift, outcome_evidence_lo
 credential_safety_failure, budget_exhausted, elevated_error_rate, latency_pathology,
 unexpected_upstream_response, independent_witness_mismatch, window_expired.
 
-**AUTOMATIC (review §16, blocker 7 CLOSED).** Every code above has a wired trip path onto the
+**AUTOMATIC (review §16, blocker 7 REOPENED then CLOSED — see the ledger).** The whole-Canary
+latch for `tool_fingerprint_drift` / `server_identity_drift` is taken by the ATOMIC
+activation-bound admission transaction (`admitLiveExecution`), which evaluates live trust and
+latches under one acquisition of the activation lock and charges an exact, non-zero generation. The
+pre-executor drift refusal is fail-closed and records bounded evidence, but does NOT latch: it
+happens before any reservation, so nothing binds it to an activation, and an unattributable
+observation must never stop an experiment that may not have seen the drift. Every code above has a
+wired trip path onto the
 ONE `canary.AbortController`; the latch revokes EXECUTION AUTHORITY (no new reservation, and an
 already-admitted request fails the final live revalidation before `Upstream.Call`). Two of them —
 `window_expired` and `budget_exhausted` — stop the experiment with NO further request arriving:
