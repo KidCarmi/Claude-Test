@@ -252,6 +252,8 @@ export interface UpstreamConfig {
   ok?: boolean;
   summary?: UpstreamProbeSummary;
   entry?: UpstreamEntryDTO;
+  /** the id a delete answer names (the delete's action evidence) */
+  deleted?: string;
 }
 
 /** The client-authored entry spec — the password is NEVER part of it. */
@@ -450,6 +452,7 @@ export const decodeUpstreamConfig: Decoder<UpstreamConfig> = (
   const ok = opt(o, "ok", readBoolean, path);
   const summary = opt(o, "summary", decodeUpstreamProbeSummary, path);
   const entry = opt(o, "entry", decodeEntryDTO, path);
+  const deleted = opt(o, "deleted", readString, path);
   return {
     enabled: field(o, "enabled", readBoolean, path),
     mode: field(o, "mode", readEnum(UPSTREAM_MODES), path),
@@ -483,10 +486,21 @@ export const decodeUpstreamConfig: Decoder<UpstreamConfig> = (
     ...(ok !== undefined ? { ok } : {}),
     ...(summary !== undefined ? { summary } : {}),
     ...(entry !== undefined ? { entry } : {}),
+    ...(deleted !== undefined ? { deleted } : {}),
   };
 };
 
-// ── Refusals (structured, bounded) ──────────────────────────────────────────
+// ── Refusals (structured, bounded, status-bound, allowlisted facts) ─────────
+//
+// 2F-F correction: a refusal is a VERDICT ("nothing was changed") only when
+// the appliance's answer is well-formed — the bounded code with its
+// CONTRACTED HTTP status and its REQUIRED safe facts. Anything else (a
+// mismatched status, a malformed `current`, an unknown code, a non-JSON
+// body) is never a verdict: it is UNPROVEN and enters the authoritative
+// read-back flow. The facts that may be rendered are TYPED and allowlisted
+// here; the raw `current` record and the server's `error` line are kept
+// for tests/logs but are never rendered, and an authority that carries a
+// userinfo password is dropped from the facts.
 
 function parsedBody(err: unknown): Record<string, unknown> | null {
   if (!(err instanceof ApiError) || err.kind !== "http") return null;
@@ -500,36 +514,153 @@ function parsedBody(err: unknown): Record<string, unknown> | null {
   return isRecord(parsed) ? parsed : null;
 }
 
+/** Allowlisted, typed facts a refusal may carry into the DOM. */
+export interface UpstreamRefusalFacts {
+  id?: string;
+  revision?: number;
+  /** canonical `scheme://[username@]host:port` — never a userinfo password */
+  authority?: string;
+  credentialState?: UpstreamCredentialState;
+  count?: number;
+  retryAfterSeconds?: number;
+  /** equals `id` by contract (the T3 confirmation value) */
+  confirmValue?: string;
+  degradedReason?: string;
+  index?: number;
+}
+
 export interface UpstreamRefusal {
   status: number;
   code: UpstreamRefusalCode;
-  /** the server-owned facts (revision, id, authority, confirmValue, …) */
+  /** the raw server record — kept for tests/diagnostics, NEVER rendered */
   current: Readonly<Record<string, unknown>>;
   count?: number;
+  /** the server's error line — NEVER rendered */
   message: string;
+  facts: UpstreamRefusalFacts;
 }
+
+type RequiredFact =
+  "id" | "revision" | "credentialState" | "retryAfterSeconds" | "confirmValue";
+
+/** The contracted HTTP status + required facts per code (ui_upstream.go). */
+const REFUSAL_CONTRACT: Readonly<
+  Record<
+    UpstreamRefusalCode,
+    { status: number; required: readonly RequiredFact[] }
+  >
+> = {
+  precondition_required: { status: 428, required: ["revision"] },
+  stale: { status: 409, required: ["revision"] },
+  vanished: { status: 404, required: ["id"] },
+  yaml_owned: { status: 409, required: ["id"] },
+  credential_bound: {
+    status: 409,
+    required: ["id", "revision", "credentialState"],
+  },
+  credential_present: {
+    status: 409,
+    required: ["id", "revision", "credentialState"],
+  },
+  confirm_required: {
+    status: 409,
+    required: ["id", "revision", "confirmValue"],
+  },
+  credentialed_entries_present: { status: 409, required: [] },
+  duplicate_authority: { status: 409, required: [] },
+  no_credential: { status: 409, required: ["id", "revision"] },
+  invalid_entry: { status: 400, required: [] },
+  userinfo_not_allowed: { status: 400, required: [] },
+  credential_state_not_accepted: { status: 400, required: [] },
+  invalid_password: { status: 400, required: [] },
+  invalid_action: { status: 400, required: [] },
+  invalid_json: { status: 400, required: [] },
+  key_unusable: { status: 409, required: ["id", "revision"] },
+  document_rejected: { status: 409, required: [] },
+  persist_failed: { status: 500, required: [] },
+  seal_failed: { status: 500, required: [] },
+  probe_in_flight: { status: 429, required: ["retryAfterSeconds"] },
+  probe_rate_limited: { status: 429, required: ["retryAfterSeconds"] },
+};
+
+const SAFE_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const SAFE_TOKEN = /^[A-Za-z0-9_.-]{1,64}$/;
+const SAFE_AUTHORITY =
+  /^https?:\/\/(?:[A-Za-z0-9._~%+-]+@)?[A-Za-z0-9.\-[\]:]{1,253}:\d{1,5}$/;
 
 function isRefusalCode(v: unknown): v is UpstreamRefusalCode {
   return typeof v === "string" && UPSTREAM_REFUSAL_CODES.some((c) => c === v);
 }
 
-/** Any bounded 2F-C/2F-D refusal — decoded from {error, code, current}.
- * An unknown code, a text/plain body, or a transport death is NEVER
- * classified as a known refusal. */
+function safeId(v: unknown): string | undefined {
+  return typeof v === "string" && SAFE_ID.test(v) ? v : undefined;
+}
+function safeNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+function safeAuthority(v: unknown): string | undefined {
+  if (typeof v !== "string" || !SAFE_AUTHORITY.test(v)) return undefined;
+  return carriesUserinfoPassword(v) ? undefined : v;
+}
+function safeCredentialState(v: unknown): UpstreamCredentialState | undefined {
+  return UPSTREAM_CREDENTIAL_STATES.find((s) => s === v);
+}
+
+function refusalFacts(
+  current: Readonly<Record<string, unknown>>,
+  topCount: unknown,
+): UpstreamRefusalFacts {
+  const f: UpstreamRefusalFacts = {};
+  const id = safeId(current["id"]);
+  if (id !== undefined) f.id = id;
+  const revision = safeNumber(current["revision"]);
+  if (revision !== undefined) f.revision = revision;
+  const authority = safeAuthority(current["authority"]);
+  if (authority !== undefined) f.authority = authority;
+  const state = safeCredentialState(current["credentialState"]);
+  if (state !== undefined) f.credentialState = state;
+  const count = safeNumber(topCount) ?? safeNumber(current["count"]);
+  if (count !== undefined) f.count = count;
+  const retry = safeNumber(current["retryAfterSeconds"]);
+  if (retry !== undefined) f.retryAfterSeconds = retry;
+  const confirm = safeId(current["confirmValue"]);
+  if (confirm !== undefined && confirm === id) f.confirmValue = confirm;
+  const degraded = current["degraded"];
+  if (isRecord(degraded)) {
+    const reason = degraded["reason"];
+    if (typeof reason === "string" && SAFE_TOKEN.test(reason))
+      f.degradedReason = reason;
+  }
+  const index = safeNumber(current["index"]);
+  if (index !== undefined) f.index = index;
+  return f;
+}
+
+/** A bounded 2F-C/2F-D refusal — decoded from {error, code, current} and
+ * accepted ONLY with the code's contracted HTTP status and its required
+ * safe facts. An unknown code, a mismatched status, a malformed `current`,
+ * a text/plain body, or a transport death is NEVER a known refusal. */
 export function asUpstreamRefusal(err: unknown): UpstreamRefusal | null {
   const o = parsedBody(err);
   if (o === null || !(err instanceof ApiError) || err.status === undefined)
     return null;
   const code = o["code"];
   if (!isRefusalCode(code)) return null;
+  const contract = REFUSAL_CONTRACT[code];
+  if (err.status !== contract.status) return null;
   const current = o["current"];
-  const count = o["count"];
+  if (!isRecord(current)) return null;
+  const facts = refusalFacts(current, o["count"]);
+  for (const need of contract.required) {
+    if (facts[need] === undefined) return null;
+  }
   return {
     status: err.status,
     code,
-    current: isRecord(current) ? current : {},
-    ...(typeof count === "number" ? { count } : {}),
+    current,
+    ...(facts.count !== undefined ? { count: facts.count } : {}),
     message: typeof o["error"] === "string" ? o["error"] : "",
+    facts,
   };
 }
 
@@ -538,19 +669,22 @@ export interface UpstreamFence {
   code: "precondition_required" | "stale";
   current: Readonly<Record<string, unknown>>;
   message: string;
+  /** the server-owned current revision (always present on a fence) */
+  revision: number;
 }
 
-/** The revision fence: 428 precondition_required / 409 stale with the
- * server-owned `current.revision`. */
+/** The revision fence: 428 precondition_required / 409 stale with a
+ * numeric server-owned `current.revision`. */
 export function asUpstreamFence(err: unknown): UpstreamFence | null {
   const r = asUpstreamRefusal(err);
-  if (r === null) return null;
+  if (r === null || r.facts.revision === undefined) return null;
   if (r.code === "precondition_required" && r.status === 428)
     return {
       status: 428,
       code: r.code,
       current: r.current,
       message: r.message,
+      revision: r.facts.revision,
     };
   if (r.code === "stale" && r.status === 409)
     return {
@@ -558,6 +692,7 @@ export function asUpstreamFence(err: unknown): UpstreamFence | null {
       code: r.code,
       current: r.current,
       message: r.message,
+      revision: r.facts.revision,
     };
   return null;
 }
@@ -569,6 +704,34 @@ export function refusalCurrentNumber(
 ): number | undefined {
   const v = r.current[key];
   return typeof v === "number" ? v : undefined;
+}
+
+// ── Outcome classification ──────────────────────────────────────────────────
+
+/** Is a mutation's outcome UNPROVEN — the request may have been durably
+ * applied but the client holds no trustworthy verdict? True for a
+ * transport death (network / timeout / abort), for a 2xx whose media type,
+ * JSON or action-specific schema could not be verified, and for any
+ * non-2xx answer that is not a recognised refusal (an unknown code, a
+ * mismatched status, a malformed body). False ONLY for a recognised
+ * refusal, a 401 (the auth boundary owns it) and a 403 (the server refused
+ * before touching anything). */
+export function unprovenOutcome(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return true;
+  switch (err.kind) {
+    case "network":
+    case "timeout":
+    case "aborted":
+    case "contenttype":
+    case "decode":
+    case "toolarge":
+      return true;
+    case "target":
+      return false;
+    case "http":
+      if (err.status === 401 || err.status === 403) return false;
+      return asUpstreamRefusal(err) === null;
+  }
 }
 
 // ── Requests ────────────────────────────────────────────────────────────────
@@ -597,35 +760,87 @@ function specWire(
   };
 }
 
-/** POST /api/upstream/entries — fenced on the DOCUMENT revision. */
+/** The canonical authority the appliance derives from a submitted spec
+ * (`Normalize`: scheme + host lower-cased, trailing dot stripped, IDNA via
+ * the URL parser, the scheme default port). Used ONLY to bind a success
+ * answer to the request — never to render or to send. */
+export function canonicalAuthority(spec: UpstreamEntrySpec): string {
+  const scheme = spec.scheme.trim().toLowerCase();
+  let host = spec.host.trim().toLowerCase().replace(/\.+$/, "");
+  try {
+    const u = new URL(`${scheme}://${host}`);
+    if (u.hostname !== "") host = u.hostname;
+  } catch {
+    /* keep the lowered host; the appliance would have refused it anyway */
+  }
+  const port = spec.port === 0 ? (scheme === "https" ? 443 : 80) : spec.port;
+  const user = spec.username.trim();
+  return `${scheme}://${user !== "" ? `${user}@` : ""}${host}:${String(port)}`;
+}
+
+/** Wrap the read-model decoder with an ACTION-SPECIFIC evidence check: a
+ * schema-valid generic view is never proof of a mutation. A missing,
+ * contradictory or wrong-identity answer is a decode failure, which the
+ * page classifies as UNPROVEN (authoritative read-back). */
+function bound(
+  want: string,
+  check: (cfg: UpstreamConfig) => boolean,
+): Decoder<UpstreamConfig> {
+  return (v, path = "$") => {
+    const cfg = decodeUpstreamConfig(v, path);
+    if (!check(cfg)) throw new DecodeError(`${path}.entry`, want, v);
+    return cfg;
+  };
+}
+
+/** POST /api/upstream/entries — fenced on the DOCUMENT revision; the
+ * answer must name a MANAGED entry with the submitted canonical authority
+ * that the republished list contains. */
 export function createUpstreamEntry(
   spec: UpstreamEntrySpec,
   documentRevision: number,
   signal?: AbortSignal,
 ): Promise<UpstreamConfig> {
-  return apiRequest("/api/upstream/entries", decodeUpstreamConfig, {
-    method: "POST",
-    body: specWire(spec, documentRevision),
-    ...sig(signal),
-  });
+  const authority = canonicalAuthority(spec);
+  return apiRequest(
+    "/api/upstream/entries",
+    bound(
+      "the created managed entry with the submitted authority",
+      (cfg) =>
+        cfg.entry !== undefined &&
+        cfg.entry.source === "managed" &&
+        cfg.entry.authority === authority &&
+        cfg.entries.some((e) => e.id === cfg.entry?.id),
+    ),
+    { method: "POST", body: specWire(spec, documentRevision), ...sig(signal) },
+  );
 }
 
-/** PUT /api/upstream/entries/{id} — fenced on the ENTRY revision. */
+/** PUT /api/upstream/entries/{id} — fenced on the ENTRY revision; the
+ * answer must name the requested id with the submitted authority. */
 export function updateUpstreamEntry(
   id: string,
   spec: UpstreamEntrySpec,
   entryRevision: number,
   signal?: AbortSignal,
 ): Promise<UpstreamConfig> {
+  const authority = canonicalAuthority(spec);
   return apiRequest(
     `/api/upstream/entries/${encodeURIComponent(id)}`,
-    decodeUpstreamConfig,
+    bound(
+      "the updated entry (requested id, submitted authority)",
+      (cfg) =>
+        cfg.entry !== undefined &&
+        cfg.entry.id === id &&
+        cfg.entry.authority === authority &&
+        cfg.entries.some((e) => e.id === id && e.authority === authority),
+    ),
     { method: "PUT", body: specWire(spec, entryRevision), ...sig(signal) },
   );
 }
 
 /** DELETE /api/upstream/entries/{id}?revision= — the token travels in the
- * QUERY only; there is no body. */
+ * QUERY only; the answer must name the deleted id and no longer list it. */
 export function deleteUpstreamEntry(
   id: string,
   entryRevision: number,
@@ -633,13 +848,31 @@ export function deleteUpstreamEntry(
 ): Promise<UpstreamConfig> {
   return apiRequest(
     `/api/upstream/entries/${encodeURIComponent(id)}?revision=${encodeURIComponent(String(entryRevision))}`,
-    decodeUpstreamConfig,
+    bound(
+      "deleted == the requested id and the id absent from the list",
+      (cfg) => cfg.deleted === id && !cfg.entries.some((e) => e.id === id),
+    ),
     { method: "DELETE", ...sig(signal) },
   );
 }
 
+function credentialBound(
+  id: string,
+  state: UpstreamCredentialState,
+): Decoder<UpstreamConfig> {
+  return bound(
+    `entry ${id} with credentialState ${state}`,
+    (cfg) =>
+      cfg.entry !== undefined &&
+      cfg.entry.id === id &&
+      cfg.entry.credentialState === state &&
+      cfg.entries.some((e) => e.id === id && e.credentialState === state),
+  );
+}
+
 /** T2 — seal a new password under the node-local key. The password is in
- * the body ONLY and is not retained by this client. */
+ * the body ONLY and is not retained by this client; the answer must name
+ * the exact entry as `configured`. */
 export function replaceUpstreamCredential(
   id: string,
   password: string,
@@ -648,7 +881,7 @@ export function replaceUpstreamCredential(
 ): Promise<UpstreamConfig> {
   return apiRequest(
     `/api/upstream/entries/${encodeURIComponent(id)}/credential`,
-    decodeUpstreamConfig,
+    credentialBound(id, "configured"),
     {
       method: "POST",
       body: { action: "replace", password, revision: entryRevision },
@@ -657,7 +890,8 @@ export function replaceUpstreamCredential(
   );
 }
 
-/** T3 — clear the credential; `confirm` must equal the exact entry id. */
+/** T3 — clear the credential; `confirm` must equal the exact entry id; the
+ * answer must name the exact entry as `none`. */
 export function clearUpstreamCredential(
   id: string,
   confirm: string,
@@ -666,7 +900,7 @@ export function clearUpstreamCredential(
 ): Promise<UpstreamConfig> {
   return apiRequest(
     `/api/upstream/entries/${encodeURIComponent(id)}/credential`,
-    decodeUpstreamConfig,
+    credentialBound(id, "none"),
     {
       method: "POST",
       body: { action: "clear", confirm, revision: entryRevision },
@@ -675,12 +909,18 @@ export function clearUpstreamCredential(
   );
 }
 
-/** POST /api/upstream/health — the bounded, audited manual probe run. */
+/** POST /api/upstream/health — the bounded, audited manual probe run; the
+ * answer must carry the explicit result (`ok: true`) and its counts-only
+ * `summary`. */
 export function runUpstreamProbe(
   signal?: AbortSignal,
 ): Promise<UpstreamConfig> {
-  return apiRequest("/api/upstream/health", decodeUpstreamConfig, {
-    method: "POST",
-    ...sig(signal),
-  });
+  return apiRequest(
+    "/api/upstream/health",
+    bound(
+      "the explicit probe result with its summary",
+      (cfg) => cfg.ok === true && cfg.summary !== undefined,
+    ),
+    { method: "POST", ...sig(signal) },
+  );
 }
