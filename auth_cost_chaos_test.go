@@ -421,13 +421,83 @@ func TestChaos57_RecoveryRequiresObservedCapacity(t *testing.T) {
 		t.Fatal("the episode cleared on elapsed time alone")
 	}
 
-	// A real fast-path admission does.
+	// Nor does a fast-path admission WHILE refusals are still happening — see
+	// the dedicated gate below.
 	globalAuthCostGate.Release("holder")
 	if !c.VerifyAuthFrom("10.0.0.9", "realuser", "correct-horse-battery") {
 		t.Fatal("verification failed once capacity returned")
 	}
+	if !authCostHealthStatus().Refusing {
+		t.Fatal("the episode cleared on an admission taken moments after a refusal")
+	}
+
+	// Both halves of the evidence: an admission AND a quiet period since the
+	// last refusal. Backdating lastRefusal is how the quiet period is driven
+	// deterministically, the same way the alert gate backdates firstRefusal.
+	authCostHealth.mu.Lock()
+	authCostHealth.lastRefusal = time.Now().Add(-2 * authCostRecoveryQuiet)
+	authCostHealth.mu.Unlock()
+	if !c.VerifyAuthFrom("10.0.0.9", "realuser", "another-password") {
+		// wrong password, but it is still an ADMITTED verification, which is
+		// what recovery is evidence of — the verdict is irrelevant here.
+		_ = false
+	}
 	if authCostHealthStatus().Refusing {
-		t.Fatal("the episode did not clear on observed capacity")
+		t.Fatal("the episode did not clear on an admission after a quiet period")
+	}
+}
+
+// DEFECT GATE (Codex review, PR #1328 — P1).
+//
+// A fast-path admission proves a slot was free AT THAT INSTANT. It does not
+// prove refusals have stopped, and during a sustained flood the two coexist:
+// every in-flight bcrypt eventually releases its slot, so some arrival wins the
+// fast path roughly once per comparison while its siblings keep being refused.
+//
+// Clearing the episode on that alone made it restart every ~80 ms, so it could
+// never reach authCostDegradedAfter. The consequences were the whole
+// observability plane failing at its one job: the contract row flapping between
+// "refusing" and "recovered", an AUTH_VERIFY_RECOVERED line per comparison, and
+// `auth_verify_saturated` NEVER firing for the primary attack.
+func TestChaos57_RefusalEpisodeSurvivesInterleavedFastAdmissions(t *testing.T) {
+	installTestGate(t, 2, 2)
+	c := newAuthTestConfig(t, "realuser", "correct-horse-battery")
+
+	// Interleave, as a flood does: a refusal, then an admission that finds a
+	// slot free, repeatedly. The episode must persist across all of it.
+	for i := 0; i < 5; i++ {
+		// Occupy the ceiling so the next verification is refused.
+		var held []string
+		for globalAuthCostGate.Stats().InFlight < 2 {
+			k := fmt.Sprintf("holder-%d-%d", i, len(held))
+			if r, _ := globalAuthCostGate.Admit(k); r != authcost.Admitted {
+				t.Fatalf("could not pre-fill the ceiling")
+			}
+			held = append(held, k)
+		}
+		c.VerifyAuthFrom("10.0.0.9", "realuser", fmt.Sprintf("wrong-%d", i)) // refused
+		for _, k := range held {
+			globalAuthCostGate.Release(k)
+		}
+
+		// Now a fast-path admission succeeds, exactly as it would between two
+		// refusals during a flood.
+		c.VerifyAuthFrom("10.0.0.9", "realuser", fmt.Sprintf("admitted-%d", i))
+
+		if !authCostHealthStatus().Refusing {
+			t.Fatalf("round %d: the episode was cleared by an admission taken between refusals — "+
+				"under a sustained flood this restarts the episode every comparison, so it can never "+
+				"reach the degradation threshold and auth_verify_saturated never fires", i)
+		}
+	}
+
+	// And the episode must still be able to age into DEGRADED, which is the
+	// state the alert keys on.
+	authCostHealth.mu.Lock()
+	authCostHealth.firstRefusal = time.Now().Add(-2 * authCostDegradedAfter)
+	authCostHealth.mu.Unlock()
+	if !authCostHealthStatus().Degraded {
+		t.Fatal("a persistent episode never reaches Degraded, so the alert can never fire")
 	}
 }
 

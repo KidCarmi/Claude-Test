@@ -64,7 +64,7 @@ with a BOUNDED queue — an unbounded one would trade CPU exhaustion for gorouti
 (eight series, a `credential_verification` contract row, a rate-limited log pair, and a
 fire-once-per-episode `auth_verify_saturated` alert with evidence-based recovery). Bounds are
 CONSTANTS by design — a knob here could only widen a DoS window — with an order of magnitude of
-headroom over real demand. 33 gates; nine defect gates verified failing against the shape each replaces. A SECOND finding inside the fix, caught in self-review and fixed on the branch: moving the cache lookup ahead of the username comparison made a latent NON-INJECTIVE cache key (`user + ":" + pass`) reachable with a caller-chosen username — an AUTHENTICATION BYPASS whenever the configured password contains a colon. `cacheKey` is now length-framed. **AU-3e**, a
+headroom over real demand. 34 gates; eleven defect gates verified failing against the shape each replaces. A SECOND finding inside the fix, caught in self-review and fixed on the branch: moving the cache lookup ahead of the username comparison made a latent NON-INJECTIVE cache key (`user + ":" + pass`) reachable with a caller-chosen username — an AUTHENTICATION BYPASS whenever the configured password contains a colon. `cacheKey` is now length-framed. **AU-3e**, a
 PRE-EXISTING username-enumeration oracle reached by repetition (wrong-username negatives are not
 cached, correct-username ones are), is recorded and deliberately NOT fixed here: closing it changes a
 security control's behaviour and deserves its own review. See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, §25,
@@ -739,7 +739,7 @@ touch security-critical paths that warrant isolated review.
 | CA-1 | Seed an expired CA via `SetCAForTest`; assert `GetCert` errors + alert. |
 | CA-2 | Point `caPath` at a read-only dir; drive `RotateIfNeeded`; assert a failure alert (not a success alert). |
 | AU-2 | Mint a session with `Provider:"idpA"`; delete idpA; assert the cookie now fails to decode. |
-| AU-3 | **DONE** (CHAOS-57): 18 root gates in `auth_cost_chaos_test.go` + 15 engine gates in `internal/authcost`. Nine defect gates verified failing against the shape each replaces, including the asymmetric-gate variant that reintroduces the RISK-008 oracle, the non-injective cache key (an authentication bypass), and the immediate per-client refusal that denied a workstation's own parallel connections. |
+| AU-3 | **DONE** (CHAOS-57): 19 root gates in `auth_cost_chaos_test.go` + 15 engine gates in `internal/authcost`. Eleven defect gates verified failing against the shape each replaces, including the asymmetric-gate variant that reintroduces the RISK-008 oracle, the non-injective cache key (an authentication bypass), and the immediate per-client refusal that denied a workstation's own parallel connections. |
 | PX-3 | Open a tunnel, half-close the client without FIN; assert goroutine count returns to baseline within the idle window. |
 | PX-6 | Global cap K; open K+1 conns across distinct IPs; assert rejection + stable FD count. |
 | HA-7 | Resume denied → etcd becomes reachable → assert `WriteAllowed()` becomes true within a bounded time with no operator action. |
@@ -3017,6 +3017,53 @@ for a reason unrelated to the property.
 incorrect *admission* rule. Fairness is about what a client may HOLD; admission
 is about what happens to the rest. Conflating them turned a bound into a denial.
 
+### 25.4d The fourth finding inside the fix — the alert that could never fire
+
+Raised by Codex review against the observability plane, as a P1, and correct.
+
+The refusal episode was cleared by any FAST-PATH admission. The reasoning
+behind that was sound as far as it went — a queued admission proves nothing, a
+fast one proves a slot was free — but it stops one step short: **a slot being
+free at an instant is not evidence that refusals have stopped**, and during a
+sustained flood the two coexist by construction. Every in-flight bcrypt
+eventually releases its slot, so some arrival wins the fast path roughly once
+per comparison while its siblings continue to be refused.
+
+The consequence is that the whole observability plane failed at its one job:
+
+- the episode restarted every ~80 ms and so could **never** reach
+  `authCostDegradedAfter`,
+- the `credential_verification` contract row flapped between "refusing" and
+  "recovered",
+- an `AUTH_VERIFY_RECOVERED` line was emitted per comparison — a log flood
+  produced by the flood-detection code,
+- and `auth_verify_saturated` **would never have fired for the primary attack
+  this governor exists to expose.**
+
+Recovery now requires BOTH halves of the evidence: a fast-path admission AND no
+refusal for `authCostRecoveryQuiet` (5 s — comfortably longer than the 1 s wait
+budget, so a client timing out once a second keeps the episode alive, and far
+short of the 30 s degradation threshold, so a real recovery is still reported
+promptly).
+
+This is not a retreat to "recovery on elapsed time", the rule `ca_health.go` and
+`storage_health.go` exist to enforce. Elapsed time alone still clears nothing —
+an admission is still required, so a gateway nobody is authenticating against
+stays reported as refusing rather than being declared healthy by silence. The
+window supplies the half of the evidence that was missing, it does not replace
+the half that was there.
+
+Gates: `TestChaos57_RefusalEpisodeSurvivesInterleavedFastAdmissions` (drives the
+exact refuse/admit interleaving a flood produces, and then checks the episode
+can still age into Degraded — the state the alert keys on) and the extended
+`TestChaos57_RecoveryRequiresObservedCapacity`. Both verified failing against
+the pre-fix shape.
+
+**The lesson, and it is the same one as §25.4c in a different costume:** the
+evidence has to match the claim. "A slot was free" and "refusals have stopped"
+are different propositions, and the recovery signal was keyed on the one that
+was easy to observe rather than the one it was asserting.
+
 ### 25.5 What shipped
 
 **`internal/authcost`** — the admission governor. Two bounds and one fairness
@@ -3071,12 +3118,13 @@ nothing anywhere saying why.
 
 ### 25.6 Gates
 
-33 in total: 15 in `internal/authcost/authcost_test.go`, 18 in
-`auth_cost_chaos_test.go`. **Nine defect gates were verified failing against
+34 in total: 15 in `internal/authcost/authcost_test.go`, 19 in
+`auth_cost_chaos_test.go`. **Eleven defect gates were verified failing against
 the shape each replaces** — including the asymmetric-gate variant of §25.4,
 both halves of the §25.4b bypass, and the immediate-refusal shape of §25.4c
 (the engine's own first form, which the parallel-connection gate was
-reproduced against before it was changed).
+reproduced against before it was changed) and both halves of the §25.4d
+recovery defect.
 
 The controls are load-bearing, because several defect gates would also pass
 against a "fix" that simply broke authentication:

@@ -40,15 +40,25 @@ package main
 // HasSubscriber-gated alert, exactly as storage_health.go, ca_health.go,
 // auth_backend_health.go and socks5_health.go do it.
 //
-// # Recovery is on evidence, never on elapsed time
+// # Recovery needs evidence of BOTH halves
 //
-// The episode clears when a verification is admitted ON THE FAST PATH — that
-// is, with a slot free and no queueing. That is positive evidence that
-// capacity exists again. It deliberately does NOT clear on a timer, and it
-// deliberately does not clear on a merely-queued admission: a gate that is
-// still handing every caller a full wait has not recovered, and a gate that
-// has stopped refusing because the flood stopped SENDING looks identical to a
-// healthy one. Same rule, same reason, as ca_health.go and storage_health.go.
+// The episode clears only when a verification is admitted ON THE FAST PATH
+// (with a slot free and no queueing) AND no refusal has been recorded for
+// authCostRecoveryQuiet.
+//
+// Neither half is sufficient. A queued admission means the ceiling was still
+// full and the caller only got in because somebody else finished. And a fast
+// admission on its own proves a slot was free at that instant, nothing more —
+// during a sustained flood that is true constantly, so clearing on it alone
+// restarted the episode every ~80 ms and the saturation alert could never fire
+// for the attack this governor exists to expose (Codex review, PR #1328). The
+// quiet window supplies the missing half: that the refusals themselves have
+// stopped.
+//
+// Elapsed time alone still never clears anything — an admission is required, so
+// a gateway nobody is authenticating against stays reported as refusing rather
+// than being declared healthy by silence. That is the ca_health.go /
+// storage_health.go rule, with the evidence corrected to match the fault.
 
 import (
 	"fmt"
@@ -78,6 +88,17 @@ const (
 	// fire-once latch below is the primary control; this is the backstop for
 	// an episode that clears and re-arms repeatedly.
 	authCostAlertInterval = 5 * time.Minute
+
+	// authCostRecoveryQuiet is how long refusals must have STOPPED before an
+	// admission is accepted as recovery. See noteAuthCostAdmitted for why an
+	// admission alone is not sufficient evidence.
+	//
+	// It sits between the two timescales that matter: comfortably longer than
+	// the governor's own wait budget (a client that times out once per second
+	// keeps the episode alive), and far shorter than authCostDegradedAfter, so
+	// a genuine recovery is reported long before the degradation threshold
+	// would have been crossed.
+	authCostRecoveryQuiet = 5 * time.Second
 )
 
 // globalAuthCostGate is the process-wide credential-verification governor.
@@ -248,19 +269,43 @@ func noteAuthCostRefused(reason authcost.Refusal) {
 	}
 }
 
-// noteAuthCostAdmitted records an admission and, if it came on the FAST path,
-// clears any refusal episode.
+// noteAuthCostAdmitted records an admission and clears a refusal episode when
+// — and only when — the admission is evidence that the episode is over.
 //
-// Only a fast-path admission counts as recovery. A queued admission means the
-// ceiling is still fully occupied and the caller only got in because somebody
-// else finished — capacity has not returned, and reporting recovery there
-// would clear the operator's signal in the middle of the incident.
+// TWO conditions, and both are load-bearing.
+//
+//  1. The admission came on the FAST path. A queued admission means the ceiling
+//     was still fully occupied and the caller only got in because somebody else
+//     finished; capacity has not returned.
+//
+//  2. No refusal has been recorded for authCostRecoveryQuiet. A fast admission
+//     on its own proves a slot was free AT THAT INSTANT — nothing more — and
+//     during a sustained flood that is true constantly: every in-flight bcrypt
+//     eventually releases its slot, so some arrival wins the fast path roughly
+//     once per comparison while its siblings keep being refused. Clearing on
+//     that alone made the episode restart every ~80 ms, so it could never reach
+//     authCostDegradedAfter: the contract row flapped between "refusing" and
+//     "recovered", an AUTH_VERIFY_RECOVERED line was emitted per comparison,
+//     and `auth_verify_saturated` would NEVER have fired for the very attack
+//     this governor exists to expose. (Codex review, PR #1328.)
+//
+// The quiet window is not "recovery on elapsed time" — the house rule this
+// file follows elsewhere. Elapsed time alone never clears anything here: an
+// ADMISSION is still required, so a gateway nobody is authenticating against
+// stays reported as refusing. The window only adds the second half of the
+// evidence, that the refusals themselves have stopped.
 func noteAuthCostAdmitted(queued bool) {
 	if queued || !authCostEverRefused.Load() {
 		return
 	}
 	authCostHealth.mu.Lock()
 	if authCostHealth.firstRefusal.IsZero() {
+		authCostHealth.mu.Unlock()
+		return
+	}
+	if time.Since(authCostHealth.lastRefusal) < authCostRecoveryQuiet {
+		// Refusals are still happening; this admission says only that one slot
+		// happened to be free.
 		authCostHealth.mu.Unlock()
 		return
 	}
