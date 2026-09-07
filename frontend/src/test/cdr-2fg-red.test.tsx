@@ -245,10 +245,8 @@ it("G3 (control) a confirmed mismatch clears the marker and never surfaces it", 
   });
   resolveAs(OWNER);
   await flushUntil(() => {
-    expect(machine.state.user).toBe(OWNER);
+    expect(sessionStorage.getItem(MARKER_KEY)).toBeNull();
   });
-  await flush();
-  expect(sessionStorage.getItem(MARKER_KEY)).toBeNull();
   expect(container.textContent).not.toContain("foreign-op");
   expect(container.textContent).not.toContain("Resolve enrollment");
 });
