@@ -223,8 +223,7 @@ run_mutation M08 \
   'TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation' \
   . "$ADM" \
   's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \
-  's/\tif !cr\.active \|\| cr\.aborter == nil \|\| cr\.generation != gen \{\n\t\treturn canary\.TripCanaryLatched\n\t\}\n//' \
-  's/\tres := cr\.aborter\.Trip\(code, cr\.generation, now\)/\tres := cr\.aborter\.Trip\(code, gen, now\)/' \
+  's/\tif !cr\.active \|\| cr\.aborter == nil \|\| cr\.generation != gen \{\n\t\treturn canary\.TripCanaryLatched\n\t\}\n//'
 
 
 # ── (2) THE ACTIVATION GUARDS ───────────────────────────────────────────────
