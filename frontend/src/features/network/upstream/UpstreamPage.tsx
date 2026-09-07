@@ -32,13 +32,11 @@ import { SnapshotBar } from "../../../shared/snapshot";
 import { useAuth } from "../../../auth/AuthProvider";
 import { hasRole } from "../../../auth/rbac";
 import { useObjectPage } from "../../objects/useObjectPage";
-import {
-  serverErrorText,
-  unknownOutcome,
-} from "../../../shared/mutationOutcome";
+import { ApiError } from "../../../api/client";
 import {
   asUpstreamFence,
   asUpstreamRefusal,
+  unprovenOutcome,
   clearUpstreamCredential,
   createUpstreamEntry,
   deleteUpstreamEntry,
@@ -64,9 +62,11 @@ import type { FactSeverity } from "./upstreamFacts";
 import {
   COVERAGE_NOTE,
   NODE_LOCAL_NOTE,
+  UnprovenCallout,
   UpstreamFenceCallout,
   UpstreamRefusalCallout,
 } from "./upstreamShared";
+import type { UnprovenOutcome, UnprovenReason } from "./upstreamShared";
 import {
   ClearCredentialCeremony,
   DeleteEntryDialog,
@@ -125,6 +125,27 @@ function badgeStatus(s: FactSeverity): Status {
   }
 }
 
+/** A read failure rendered as its bounded class + HTTP status ONLY — the
+ * server's error body is never put into the DOM (2F-F correction). */
+function readErrorSummary(err: unknown): string {
+  if (err instanceof ApiError) {
+    switch (err.kind) {
+      case "http":
+        return `The appliance answered HTTP ${String(err.status ?? 0)}; the read model could not be read.`;
+      case "contenttype":
+      case "decode":
+        return `The appliance's answer${err.status !== undefined ? ` (HTTP ${String(err.status)})` : ""} could not be verified as the upstream read model.`;
+      case "timeout":
+        return "The read timed out.";
+      case "network":
+        return "The appliance could not be reached.";
+      default:
+        return "The upstream read model could not be read.";
+    }
+  }
+  return "The upstream read model could not be read.";
+}
+
 function plural(n: number, one: string, many: string): string {
   return `${String(n)} ${n === 1 ? one : many}`;
 }
@@ -144,7 +165,8 @@ export function UpstreamPage(): JSX.Element {
   const [notice, setNotice] = useState<string | null>(null);
   const [summary, setSummary] = useState<UpstreamProbeSummary | null>(null);
   const [probing, setProbing] = useState(false);
-  const [probeError, setProbeError] = useState<string | null>(null);
+  const [unproven, setUnproven] = useState<UnprovenOutcome | null>(null);
+  const [forbidden, setForbidden] = useState<string | null>(null);
 
   const blocked = page.unknown !== null;
   const canMutate = isAdmin && cfg !== undefined && !blocked;
@@ -154,14 +176,60 @@ export function UpstreamPage(): JSX.Element {
     setRefusal(null);
     setNotice(null);
     setSummary(null);
-    setProbeError(null);
+    setUnproven(null);
+    setForbidden(null);
   };
 
-  /** Classify a failed mutation from the STRUCTURED body; nothing is
-   * retried, nothing is re-worded. */
+  /** Why an answer could not be verified — a bounded class, never the
+   * server's text. */
+  const unprovenReason = (err: unknown): UnprovenReason => {
+    if (!(err instanceof ApiError)) return "unbound_answer";
+    switch (err.kind) {
+      case "network":
+      case "timeout":
+      case "aborted":
+        return "transport";
+      case "contenttype":
+        return "media_type";
+      case "decode":
+        return err.message.includes("not valid JSON")
+          ? "malformed_body"
+          : "unbound_answer";
+      case "http":
+        return "unrecognised_refusal";
+      default:
+        return "unbound_answer";
+    }
+  };
+
+  /** The UNPROVEN flow (2F-F correction): close and clear the ceremony,
+   * latch the page, block every mutation and the probe, re-read the
+   * authoritative state exactly once, never retry. The latch clears only
+   * after a genuinely successful read-back (useObjectPage). */
+  const markUnproven = (action: string, err: unknown): void => {
+    const reason = unprovenReason(err);
+    setEditor({ kind: "closed" });
+    setUnproven({
+      action,
+      reason,
+      status: err instanceof ApiError ? err.status : undefined,
+    });
+    page.latchUnknown("edit");
+    // An ANSWER that could not be verified is re-read at once (the
+    // appliance is reachable and answered). A transport death — no answer
+    // at all — REQUIRES the operator's Refresh: the network is not known
+    // to be back, and an automatic read would only fail the same way.
+    if (reason !== "transport") page.refreshToResolve();
+  };
+
+  /** Classify a failed mutation. A VERDICT ("nothing was changed") is
+   * rendered only from a well-formed refusal (contracted status + typed
+   * facts) or a 403; everything else — every unprovenOutcome — is UNPROVEN
+   * and enters the authoritative read-back flow. No server text is ever
+   * rendered. */
   const fail = (
     err: unknown,
-    fallback: string,
+    action: string,
     token: "document revision" | "entry revision",
   ): void => {
     const f = asUpstreamFence(err);
@@ -175,19 +243,16 @@ export function UpstreamPage(): JSX.Element {
       setRefusal(r);
       if (r.code !== "probe_in_flight" && r.code !== "probe_rate_limited")
         page.refreshToResolve();
-    } else if (unknownOutcome(err)) {
+    } else if (err instanceof ApiError && err.forbidden) {
       setEditor({ kind: "closed" });
-      page.latchUnknown("edit");
+      setForbidden(action);
+      page.refreshToResolve();
+    } else if (unprovenOutcome(err)) {
+      markUnproven(action, err);
     } else {
-      setEditor((e) =>
-        e.kind === "closed"
-          ? e
-          : {
-              ...e,
-              result: "failed",
-              errorText: serverErrorText(err, fallback),
-            },
-      );
+      // Unreachable by construction (every non-refusal, non-403 answer is
+      // unproven); kept fail-safe rather than rendering a verdict.
+      markUnproven(action, err);
     }
   };
 
@@ -205,12 +270,10 @@ export function UpstreamPage(): JSX.Element {
     try {
       const res = await createUpstreamEntry(spec, cfg.revision, signal);
       setEditor({ kind: "closed" });
-      setNotice(
-        `Entry ${res.entry?.authority ?? spec.host} created (unprobed).`,
-      );
+      setNotice(`Entry ${res.entry?.authority ?? ""} created (unprobed).`);
       page.refreshToResolve();
     } catch (err) {
-      fail(err, "Create refused.", "document revision");
+      fail(err, "create entry", "document revision");
     } finally {
       page.owner.settle(signal);
     }
@@ -234,10 +297,10 @@ export function UpstreamPage(): JSX.Element {
         signal,
       );
       setEditor({ kind: "closed" });
-      setNotice(`Entry ${res.entry?.authority ?? e.entry.id} updated.`);
+      setNotice(`Entry ${res.entry?.authority ?? ""} updated.`);
       page.refreshToResolve();
     } catch (err) {
-      fail(err, "Update refused.", "entry revision");
+      fail(err, "update entry", "entry revision");
     } finally {
       page.owner.settle(signal);
     }
@@ -254,7 +317,7 @@ export function UpstreamPage(): JSX.Element {
       setNotice(`Entry ${e.entry.authority} deleted.`);
       page.refreshToResolve();
     } catch (err) {
-      fail(err, "Delete refused.", "entry revision");
+      fail(err, "delete entry", "entry revision");
     } finally {
       page.owner.settle(signal);
     }
@@ -277,7 +340,7 @@ export function UpstreamPage(): JSX.Element {
       setNotice(`Credential sealed for ${e.entry.authority}.`);
       page.refreshToResolve();
     } catch (err) {
-      fail(err, "Credential replace refused.", "entry revision");
+      fail(err, "replace credential", "entry revision");
     } finally {
       page.owner.settle(signal);
     }
@@ -300,7 +363,7 @@ export function UpstreamPage(): JSX.Element {
       setNotice(`Credential cleared for ${e.entry.authority}.`);
       page.refreshToResolve();
     } catch (err) {
-      fail(err, "Credential clear refused.", "entry revision");
+      fail(err, "clear credential", "entry revision");
     } finally {
       page.owner.settle(signal);
     }
@@ -315,10 +378,7 @@ export function UpstreamPage(): JSX.Element {
       setSummary(res.summary ?? null);
       page.refreshToResolve();
     } catch (err) {
-      const r = asUpstreamRefusal(err);
-      if (r !== null) setRefusal(r);
-      else if (unknownOutcome(err)) page.latchUnknown("edit");
-      else setProbeError(serverErrorText(err, "Manual probe failed."));
+      fail(err, "manual probe", "document revision");
     } finally {
       page.owner.settle(signal);
       setProbing(false);
@@ -400,9 +460,17 @@ export function UpstreamPage(): JSX.Element {
           probed)
         </Callout>
       )}
-      {probeError !== null && (
-        <Callout variant="critical" title="Manual probe failed" role="alert">
-          {probeError}
+      {unproven !== null && (
+        <UnprovenCallout outcome={unproven} resolved={!blocked} />
+      )}
+      {forbidden !== null && (
+        <Callout
+          variant="warning"
+          title="Refused by the appliance (HTTP 403)"
+          role="alert"
+        >
+          Your session&apos;s role no longer permits &ldquo;{forbidden}&rdquo;.
+          Nothing was changed; the current state has been re-read.
         </Callout>
       )}
       {fence !== null && (
@@ -414,10 +482,7 @@ export function UpstreamPage(): JSX.Element {
       )}
       {cfg === undefined && page.q.isError && (
         <ErrorState title="Upstream proxies unavailable">
-          {serverErrorText(
-            page.q.error,
-            "The upstream read model could not be read.",
-          )}
+          {readErrorSummary(page.q.error)}
         </ErrorState>
       )}
       {cfg !== undefined && <Summary cfg={cfg} />}

@@ -1,12 +1,16 @@
-// 2F-F — shared Upstream surface pieces: the revision-fence callout and the
-// bounded-refusal callout. Every refusal is rendered from the STRUCTURED
-// server body (code + the facts under `current`) — never re-worded into a
-// claim the appliance did not make (C7).
+// 2F-F — shared Upstream surface pieces: the revision-fence callout, the
+// bounded-refusal callout and the UNPROVEN-outcome callout. Every refusal is
+// rendered from TYPED, allowlisted facts the client validated (code with its
+// contracted status, numeric revision, safe id/authority, enum credential
+// state, counts) — never the server's `error` line, never the raw `current`
+// record, never a stringified object (C7; 2F-F correction).
 import type { JSX } from "react";
 import { Callout, Mono } from "../../../design-system/primitives";
-import type { UpstreamFence, UpstreamRefusal } from "../../../api/upstream";
-import { refusalCurrentNumber } from "../../../api/upstream";
-import { isRecord } from "../../../api/decode";
+import type {
+  UpstreamFence,
+  UpstreamRefusal,
+  UpstreamRefusalFacts,
+} from "../../../api/upstream";
 
 export const NODE_LOCAL_NOTE =
   "Node-local: entries, sealed credentials, probe verdicts and the effective mode live on this appliance only — never cluster-synced, never on config-version rollback. Exports and backups omit every credential by construction.";
@@ -22,8 +26,7 @@ export function UpstreamFenceCallout({
   fence: UpstreamFence;
   tokenLabel: "document revision" | "entry revision";
 }): JSX.Element {
-  const n = refusalCurrentNumber(fence, "revision");
-  const shown = n !== undefined ? String(n) : JSON.stringify(fence.current);
+  const shown = String(fence.revision);
   return (
     <Callout
       variant="warning"
@@ -39,8 +42,7 @@ export function UpstreamFenceCallout({
   );
 }
 
-/** What each bounded code MEANS, in the appliance's own terms — the
- * server's `error` line is shown verbatim beside it. */
+/** What each bounded code MEANS, in the appliance's own terms. */
 function refusalTitle(code: UpstreamRefusal["code"]): string {
   switch (code) {
     case "credential_bound":
@@ -72,12 +74,17 @@ function refusalTitle(code: UpstreamRefusal["code"]): string {
     case "credentialed_entries_present":
       return "Refused — credentialed entries present";
     case "invalid_entry":
+      return "Refused — the entry is invalid";
     case "userinfo_not_allowed":
+      return "Refused — a proxy URL must not carry a username or password";
     case "credential_state_not_accepted":
+      return "Refused — credential state is derived by the server";
     case "invalid_password":
+      return "Refused — the password is required and at most 1024 bytes";
     case "invalid_action":
+      return "Refused — invalid credential action";
     case "invalid_json":
-      return "Refused — invalid request";
+      return "Refused — the request body was not accepted";
     case "precondition_required":
       return "Precondition required";
     case "stale":
@@ -85,23 +92,23 @@ function refusalTitle(code: UpstreamRefusal["code"]): string {
   }
 }
 
-function factLine(r: UpstreamRefusal): string | null {
+/** The typed facts, rendered one by one — never a serialised object. */
+function factLine(f: UpstreamRefusalFacts): string | null {
   const parts: string[] = [];
-  const authority = r.current["authority"];
-  if (typeof authority === "string") parts.push(`authority ${authority}`);
-  const state = r.current["credentialState"];
-  if (typeof state === "string") parts.push(`credential ${state}`);
-  const count = r.count ?? refusalCurrentNumber(r, "count");
-  if (count !== undefined)
+  if (f.authority !== undefined) parts.push(`authority ${f.authority}`);
+  if (f.credentialState !== undefined)
+    parts.push(`credential ${f.credentialState}`);
+  if (f.revision !== undefined)
+    parts.push(`current revision ${String(f.revision)}`);
+  if (f.count !== undefined)
     parts.push(
-      `${String(count)} duplicate authorit${count === 1 ? "y" : "ies"}`,
+      `${String(f.count)} duplicate authorit${f.count === 1 ? "y" : "ies"}`,
     );
-  const retry = refusalCurrentNumber(r, "retryAfterSeconds");
-  if (retry !== undefined) parts.push(`retry after ${String(retry)} s`);
-  const degraded = r.current["degraded"];
-  if (isRecord(degraded) && typeof degraded["reason"] === "string") {
-    parts.push(`degraded: ${degraded["reason"]}`);
-  }
+  if (f.retryAfterSeconds !== undefined)
+    parts.push(`retry after ${String(f.retryAfterSeconds)} s`);
+  if (f.degradedReason !== undefined)
+    parts.push(`degraded: ${f.degradedReason}`);
+  if (f.index !== undefined) parts.push(`entry index ${String(f.index)}`);
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
@@ -110,7 +117,7 @@ export function UpstreamRefusalCallout({
 }: {
   refusal: UpstreamRefusal;
 }): JSX.Element {
-  const facts = factLine(refusal);
+  const facts = factLine(refusal.facts);
   const variant =
     refusal.code === "no_credential" || refusal.code === "vanished"
       ? "info"
@@ -120,12 +127,80 @@ export function UpstreamRefusalCallout({
   return (
     <Callout variant={variant} title={refusalTitle(refusal.code)} role="alert">
       <div>
-        <Mono>{refusal.code}</Mono>
-        {refusal.message !== "" ? ` — ${refusal.message}` : ""}
+        <Mono>{refusal.code}</Mono> (HTTP {String(refusal.status)})
+        {refusal.facts.id !== undefined ? (
+          <>
+            {" "}
+            entry <Mono>{refusal.facts.id}</Mono>
+          </>
+        ) : null}
       </div>
       {facts !== null && <div>{facts}</div>}
       <div>
         Nothing was changed. Refresh to see the appliance&apos;s current state.
+      </div>
+    </Callout>
+  );
+}
+
+export type UnprovenReason =
+  | "transport"
+  | "media_type"
+  | "malformed_body"
+  | "unbound_answer"
+  | "unrecognised_refusal";
+
+export interface UnprovenOutcome {
+  action: string;
+  reason: UnprovenReason;
+  status: number | undefined;
+}
+
+function reasonText(r: UnprovenReason): string {
+  switch (r) {
+    case "transport":
+      return "the request was sent but no answer was observed";
+    case "media_type":
+      return "the appliance answered with an unexpected media type";
+    case "malformed_body":
+      return "the appliance's answer was not valid JSON";
+    case "unbound_answer":
+      return "the appliance's answer did not carry evidence for this action";
+    case "unrecognised_refusal":
+      return "the appliance's refusal was not in the contracted form";
+  }
+}
+
+/** An outcome the client could not verify: the mutation MAY be durably
+ * applied. Never a success, never a failure — only the authoritative
+ * read-back decides what the appliance now holds. */
+export function UnprovenCallout({
+  outcome,
+  resolved,
+}: {
+  outcome: UnprovenOutcome;
+  resolved: boolean;
+}): JSX.Element {
+  return (
+    <Callout
+      variant="unknown"
+      title={`Outcome unproven — ${outcome.action}`}
+      role="alert"
+    >
+      <div>
+        The answer to this action could not be verified
+        {outcome.status !== undefined
+          ? ` (HTTP ${String(outcome.status)})`
+          : ""}
+        : {reasonText(outcome.reason)}. The change may already be applied on the
+        appliance; nothing was retried.
+      </div>
+      <div>
+        {resolved
+          ? "The authoritative state has been re-read — review the entries below before acting again."
+          : outcome.reason === "transport"
+            ? "Refresh to re-read the authoritative state; every mutation stays blocked until a read succeeds."
+            : "Re-reading the authoritative state; every mutation stays blocked until a read succeeds."}
       </div>
     </Callout>
   );
