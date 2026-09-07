@@ -222,10 +222,10 @@ run_mutation M08 \
   'the lock is released after the observation and the latch stops re-verifying the generation' \
   'TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation' \
   . "$ADM" \
-  's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\truntime\.Gosched\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \
+  's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \
   's/\tif !cr\.active \|\| cr\.aborter == nil \|\| cr\.generation != gen \{\n\t\treturn canary\.TripCanaryLatched\n\t\}\n//' \
   's/\tres := cr\.aborter\.Trip\(code, cr\.generation, now\)/\tres := cr\.aborter\.Trip\(code, gen, now\)/' \
-  's/^package main\n\nimport \(\n/package main\n\nimport \(\n\t"runtime"\n/'
+
 
 # ── (2) THE ACTIVATION GUARDS ───────────────────────────────────────────────
 
@@ -253,8 +253,7 @@ run_mutation M07 \
   'the drift is latched against whatever generation is current at trip time' \
   'TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation' \
   . "$ADM" \
-  's/\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, gen, now\)/\t\tcr\.mu\.Unlock\(\)\n\t\truntime\.Gosched\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, cr\.generation, now\)/' \
-'s/^package main\n\nimport \(\n/package main\n\nimport \(\n\t"runtime"\n/'
+  's/\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, gen, now\)/\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, cr\.generation, now\)/'
 
 # ── (4) THE RESERVATION ─────────────────────────────────────────────────────
 
@@ -262,15 +261,13 @@ run_mutation M05 \
   'trust is taken under G and the reservation is taken under whatever is current' \
   'TestAtomicBinding_E_TrustAndReservationShareOneGeneration' \
   . "$ADM" \
-  's/\toutcome := rt\.reserveLocked\(cr, capb, gen, now, ident\)/\tcr\.mu\.Unlock\(\)\n\truntime\.Gosched\(\)\n\tcr\.mu\.Lock\(\)\n\toutcome := rt\.reserveLocked\(cr, capb, cr\.generation, now, ident\)/' \
-'s/^package main\n\nimport \(\n/package main\n\nimport \(\n\t"runtime"\n/'
+  's/\toutcome := rt\.reserveLocked\(cr, capb, gen, now, ident\)/\tcr\.mu\.Unlock\(\)\n\ttime\.Sleep\(100 \* time\.Millisecond\)\n\tcr\.mu\.Lock\(\)\n\toutcome := rt\.reserveLocked\(cr, capb, cr\.generation, now, ident\)/'
 
 run_mutation M09 \
   'the budget reservation is moved outside the generation transaction' \
   'TestAtomicBinding_E_TrustAndReservationShareOneGeneration' \
   . "$ADM" \
-  's/\toutcome := rt\.reserveLocked\(cr, capb, gen, now, ident\)/\tcr\.mu\.Unlock\(\)\n\truntime\.Gosched\(\)\n\toutcome, _ := rt\.reserveCanaryExecution\(capb, now, ident\)\n\tcr\.mu\.Lock\(\)/' \
-'s/^package main\n\nimport \(\n/package main\n\nimport \(\n\t"runtime"\n/'
+  's/\toutcome := rt\.reserveLocked\(cr, capb, gen, now, ident\)/\tcr\.mu\.Unlock\(\)\n\ttime\.Sleep\(100 \* time\.Millisecond\)\n\toutcome, _ := rt\.reserveCanaryExecution\(capb, now, ident\)\n\tcr\.mu\.Lock\(\)/'
 
 # ── (5) THE FINAL BOUNDARY (must remain undisturbed) ────────────────────────
 # §9: the emergency kill stays the LAST security check before the irreversible call. This
