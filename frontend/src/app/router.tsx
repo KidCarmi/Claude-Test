@@ -30,6 +30,7 @@ import { ContentSecurityPage } from "../features/security/ContentSecurityPage";
 import { DecryptionPage } from "../features/security/DecryptionPage";
 import { CDRPage } from "../features/security/CDRPage";
 import { PACPage } from "../features/network/pac/PACPage";
+import { UpstreamPage } from "../features/network/upstream/UpstreamPage";
 
 function NotFoundPage(): JSX.Element {
   return (
@@ -96,6 +97,10 @@ export function createAppRouter(): ReturnType<typeof createBrowserRouter> {
           {
             path: "network/pac",
             element: <PACPage />,
+          },
+          {
+            path: "network/upstream",
+            element: <UpstreamPage />,
           },
           { path: "diagnostics", element: <DiagnosticsPage /> },
           { path: "governance", element: <GovernancePage /> },

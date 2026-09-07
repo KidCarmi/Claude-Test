@@ -143,7 +143,7 @@ const NAV: readonly NavSection[] = [
     icon: <IconActivity />,
     entries: [
       { label: "PAC", to: "/network/pac", minRole: "viewer" },
-      { label: "Upstream Proxies", minRole: "viewer" },
+      { label: "Upstream Proxies", to: "/network/upstream", minRole: "viewer" },
     ],
   },
   {
