@@ -679,9 +679,7 @@ func TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock(t *testing.T) 
 	r.arm(t, 4)
 	cr := r.rt.capRuntime(r.capb)
 
-	inLookup := make(chan struct{})
-	release := make(chan struct{})
-	var peerAcquired bool
+	var calls, heldDuringLookup int
 
 	g := &mcpLiveSideEffectGate{
 		capb:          r.capb,
@@ -689,8 +687,17 @@ func TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock(t *testing.T) 
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckEligible,
 		approvalOK: func(canary.LiveTarget, time.Time) bool {
-			close(inLookup)
-			<-release
+			// Ask, at the moment of the durable lookup, whether the activation lock is held.
+			// sync.Mutex is not reentrant, so a failed TryLock on the single-threaded admission
+			// path means this call is running INSIDE the transaction. Checking it here catches the
+			// violation wherever the call is made from, which a barrier between two fixed points
+			// would not.
+			calls++
+			if cr.mu.TryLock() {
+				cr.mu.Unlock()
+			} else {
+				heldDuringLookup++
+			}
 			return true
 		},
 		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
@@ -701,34 +708,23 @@ func TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock(t *testing.T) 
 		note:              noteMCPLiveGateDenied,
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-inLookup
-		// The durable approval lookup is in flight. Nothing about it may hold the activation lock:
-		// an operator hitting the emergency stop right now must not queue behind a disk.
-		if cr.mu.TryLock() {
-			peerAcquired = true
-			cr.mu.Unlock()
-		}
-		close(release)
-	}()
-
 	dec := g.AdmitSideEffect(execution.LiveGateInput{
 		Capability: 0, Operation: policy.OpRead,
 		Tenant: "t1", Principal: "p1", ServerID: "s1", ToolName: "x",
 		Fingerprint: "fp", Now: canaryRuntimeTestNow,
 	})
-	wg.Wait()
 	if dec.Release != nil {
 		dec.Release()
 	}
 
-	if !peerAcquired {
-		t.Fatal("SECURITY (§5): the activation mutex was HELD while the durable approval store was " +
-			"being consulted. Store.mu is held across persistLocked's atomic file write by every " +
-			"approval mutation, so a stuck disk now sits in front of automatic abort, demotion and " +
-			"generation revalidation — the controls that stop the experiment")
+	if calls == 0 {
+		t.Fatal("premise: the admission path must consult the approval store at least once")
+	}
+	if heldDuringLookup != 0 {
+		t.Fatalf("SECURITY (§5): the durable approval store was consulted %d of %d times with the "+
+			"activation lock HELD. tooltrust.Store.mu is held across persistLocked's atomic file "+
+			"write by every approval mutation, so a stuck disk now sits in front of automatic "+
+			"abort, demotion and generation revalidation — the controls that stop the experiment",
+			heldDuringLookup, calls)
 	}
 }
