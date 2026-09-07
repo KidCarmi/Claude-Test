@@ -31,11 +31,16 @@ func stubResolver(addrs []string, err error) (calls *atomic.Int64, restore func(
 	origCache := resolvedHostCache.entries
 	resolvedHostCache.mu.Lock()
 	resolvedHostCache.entries = map[string]hostIPEntry{}
+	// CHAOS-57: the single-flight map is part of the cache's state — a slot
+	// left behind by a previous test would make the next one a follower
+	// waiting on a resolution that already finished.
+	resolvedHostCache.inflight = map[string]*hostResolveCall{}
 	resolvedHostCache.mu.Unlock()
 	return &counter, func() {
 		lookupHostFn = orig
 		resolvedHostCache.mu.Lock()
 		resolvedHostCache.entries = origCache
+		resolvedHostCache.inflight = map[string]*hostResolveCall{}
 		resolvedHostCache.mu.Unlock()
 	}
 }

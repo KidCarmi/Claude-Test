@@ -913,6 +913,57 @@ culvert_catfeeddb_quarantined_copies %d
 		cfdb.ResidualCopies,
 	)
 
+	// CHAOS-57: GeoIP resolution health. Emitted ONLY when a GeoIP database is
+	// loaded — on the default appliance (no .mmdb configured) these series are
+	// absent entirely, because a flat 0 on a node that has no GeoIP is
+	// indistinguishable from a node whose geo rules have stopped enforcing, and
+	// the paging rules below are all `> 0` (the socks5/cluster_ca precedent).
+	//
+	// policy_unresolved_total is the security-relevant one: it counts
+	// country-scoped rule evaluations that fell through because the
+	// destination's country was not cached. It is expected to be non-zero at a
+	// low rate (one per host per cache lifetime, the warm being off-path); a
+	// rate that tracks request rate means enforcement is not converging, and is
+	// almost always accompanied by warm_dropped_total climbing.
+	if geoEnabledFn() {
+		gr := geoResolveState()
+		saturated := 0
+		if gr.Saturated {
+			saturated = 1
+		}
+		_, _ = fmt.Fprintf(w, `# HELP culvert_geo_warm_total GeoIP resolutions started off the request path to warm the country caches
+# TYPE culvert_geo_warm_total counter
+culvert_geo_warm_total %d
+
+# HELP culvert_geo_warm_dropped_total GeoIP warm requests refused because the bounded resolution pool was saturated
+# TYPE culvert_geo_warm_dropped_total counter
+culvert_geo_warm_dropped_total %d
+
+# HELP culvert_geo_warm_failed_total GeoIP warm resolutions that yielded no usable public address
+# TYPE culvert_geo_warm_failed_total counter
+culvert_geo_warm_failed_total %d
+
+# HELP culvert_geo_warm_saturated 1 while the GeoIP resolution pool is full and warm requests are being dropped
+# TYPE culvert_geo_warm_saturated gauge
+culvert_geo_warm_saturated %d
+
+# HELP culvert_geo_warm_inflight GeoIP resolutions currently in flight off the request path
+# TYPE culvert_geo_warm_inflight gauge
+culvert_geo_warm_inflight %d
+
+# HELP culvert_geo_policy_unresolved_total Country-scoped policy rule evaluations that did not match because the destination country was unknown
+# TYPE culvert_geo_policy_unresolved_total counter
+culvert_geo_policy_unresolved_total %d
+`,
+			gr.Started,
+			gr.Dropped,
+			gr.Failed,
+			saturated,
+			gr.InFlight,
+			gr.Unresolved,
+		)
+	}
+
 	// CHAOS-54: SOCKS5 accept-loop health. Emitted ONLY when a SOCKS5 listener
 	// is configured — on the ordinary appliance (-socks5-port 0) these series
 	// are absent entirely, because `listener_up 0` on a node that never had
