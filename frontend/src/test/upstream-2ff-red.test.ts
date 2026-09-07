@@ -37,7 +37,7 @@
 //       ever says "protected" or "fully chained" (C7); `requiresReplacement`
 //       is a distinct, ineligible state (C12).
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { DecodeError } from "../api/decode";
+import { DecodeError, isRecord } from "../api/decode";
 import {
   UPSTREAM_CREDENTIAL_STATES,
   UPSTREAM_MODES,
@@ -130,7 +130,12 @@ const CONFIG = {
 };
 
 function httpErr(status: number, body: unknown): ApiError {
-  return new ApiError("http", `HTTP ${String(status)}`, status, JSON.stringify(body));
+  return new ApiError(
+    "http",
+    `HTTP ${String(status)}`,
+    status,
+    JSON.stringify(body),
+  );
 }
 
 // ── A1 ──────────────────────────────────────────────────────────────────────
@@ -186,7 +191,12 @@ describe("A1 read model decoder", () => {
     const c = decodeUpstreamConfig({
       ...CONFIG,
       mode: "no_pool",
-      effective: { ...CONFIG.effective, mode: "no_pool", entries: 0, eligible: 0 },
+      effective: {
+        ...CONFIG.effective,
+        mode: "no_pool",
+        entries: 0,
+        eligible: 0,
+      },
       entries: null,
       proxies: null,
     });
@@ -216,7 +226,10 @@ describe("A1 read model decoder", () => {
       {
         ...CONFIG,
         entries: [
-          { ...MANAGED, health: { status: "unhealthy", reason: "dial tcp: refused" } },
+          {
+            ...MANAGED,
+            health: { status: "unhealthy", reason: "dial tcp: refused" },
+          },
         ],
       },
     ],
@@ -270,7 +283,8 @@ describe("A2 fence", () => {
   it("428 precondition_required carries the server's current revision", () => {
     const f = asUpstreamFence(
       httpErr(428, {
-        error: "precondition required: echo the current revision you loaded (5)",
+        error:
+          "precondition required: echo the current revision you loaded (5)",
         code: "precondition_required",
         current: { revision: 5 },
       }),
@@ -308,10 +322,27 @@ describe("A2 fence", () => {
 
 describe("A3 bounded refusals", () => {
   it.each([
-    [409, "credential_bound", { id: "x", revision: 3, authority: "http://svc@a:1", credentialState: "configured" }],
-    [409, "credential_present", { id: "x", revision: 3, credentialState: "unusable" }],
+    [
+      409,
+      "credential_bound",
+      {
+        id: "x",
+        revision: 3,
+        authority: "http://svc@a:1",
+        credentialState: "configured",
+      },
+    ],
+    [
+      409,
+      "credential_present",
+      { id: "x", revision: 3, credentialState: "unusable" },
+    ],
     [409, "yaml_owned", { id: "yaml-x", source: "yaml" }],
-    [409, "document_rejected", { degraded: { reason: "duplicate_authority", count: 2 } }],
+    [
+      409,
+      "document_rejected",
+      { degraded: { reason: "duplicate_authority", count: 2 } },
+    ],
     [404, "vanished", { id: "x" }],
     [409, "key_unusable", { id: "x", revision: 3 }],
     [409, "no_credential", { id: "x", revision: 3 }],
@@ -368,7 +399,9 @@ describe("A3 bounded refusals", () => {
 
   it("an unknown code, a text/plain body, or a transport death is never classified", () => {
     expect(
-      asUpstreamRefusal(httpErr(409, { error: "x", code: "made_up", current: {} })),
+      asUpstreamRefusal(
+        httpErr(409, { error: "x", code: "made_up", current: {} }),
+      ),
     ).toBeNull();
     expect(
       asUpstreamRefusal(new ApiError("http", "forbidden", 403, "forbidden\n")),
@@ -380,7 +413,12 @@ describe("A3 bounded refusals", () => {
 // ── A4 ──────────────────────────────────────────────────────────────────────
 
 describe("A4 request shapes", () => {
-  let calls: Array<{ url: string; method: string; body: unknown; rawBody: unknown }>;
+  let calls: Array<{
+    url: string;
+    method: string;
+    body: unknown;
+    rawBody: unknown;
+  }>;
   beforeEach(() => {
     calls = [];
     vi.stubGlobal(
@@ -422,7 +460,12 @@ describe("A4 request shapes", () => {
   it("update carries the ENTRY revision on PUT /entries/{id}", async () => {
     await updateUpstreamEntry(
       MANAGED.id,
-      { scheme: "https", host: "parent-a.example", port: 3129, username: "svc" },
+      {
+        scheme: "https",
+        host: "parent-a.example",
+        port: 3129,
+        username: "svc",
+      },
       3,
     );
     expect(calls[0]?.method).toBe("PUT");
@@ -439,14 +482,18 @@ describe("A4 request shapes", () => {
   it("delete carries the token in the QUERY only, with no body", async () => {
     await deleteUpstreamEntry(MANAGED.id, 3);
     expect(calls[0]?.method).toBe("DELETE");
-    expect(calls[0]?.url).toBe(`/api/upstream/entries/${MANAGED.id}?revision=3`);
+    expect(calls[0]?.url).toBe(
+      `/api/upstream/entries/${MANAGED.id}?revision=3`,
+    );
     expect(calls[0]?.rawBody).toBeUndefined();
   });
 
   it("replace (T2) sends the password in the BODY only, never the URL", async () => {
     await replaceUpstreamCredential(MANAGED.id, "Canary-PW-2ff", 3);
     expect(calls[0]?.method).toBe("POST");
-    expect(calls[0]?.url).toBe(`/api/upstream/entries/${MANAGED.id}/credential`);
+    expect(calls[0]?.url).toBe(
+      `/api/upstream/entries/${MANAGED.id}/credential`,
+    );
     expect(calls[0]?.url).not.toContain("Canary");
     expect(calls[0]?.body).toEqual({
       action: "replace",
@@ -462,7 +509,10 @@ describe("A4 request shapes", () => {
       confirm: MANAGED.id,
       revision: 3,
     });
-    expect(Object.keys(calls[0]?.body as object)).not.toContain("password");
+    const clearBody = calls[0]?.body;
+    expect(isRecord(clearBody) ? Object.keys(clearBody) : []).not.toContain(
+      "password",
+    );
   });
 
   it("the manual probe is a bodiless POST /api/upstream/health", async () => {
@@ -485,7 +535,7 @@ describe("A4 request shapes", () => {
     await replaceUpstreamCredential(MANAGED.id, "pw", 3);
     await clearUpstreamCredential(MANAGED.id, MANAGED.id, 3);
     for (const c of calls) {
-      const keys = Object.keys((c.body ?? {}) as object);
+      const keys = isRecord(c.body) ? Object.keys(c.body) : [];
       expect(keys).not.toContain("credentialState");
       expect(keys).not.toContain("credential_configured");
       expect(keys).not.toContain("credential");
@@ -500,7 +550,10 @@ describe("A5 fail-closed on credential material", () => {
     ["password", { ...MANAGED, password: "leaked" }],
     ["credential", { ...MANAGED, credential: { ciphertext: "AAAA" } }],
     ["ciphertext", { ...MANAGED, ciphertext: "AAAA" }],
-    ["url userinfo password", { ...MANAGED, url: "http://svc:leaked@parent-a.example:3128" }],
+    [
+      "url userinfo password",
+      { ...MANAGED, url: "http://svc:leaked@parent-a.example:3128" },
+    ],
     [
       "authority userinfo password",
       { ...MANAGED, authority: "http://svc:leaked@parent-a.example:3128" },
@@ -528,7 +581,12 @@ describe("A6 manual probe answer", () => {
       ok: true,
       summary: { probed: 1, healthy: 0, unhealthy: 1, skipped: 1 },
     });
-    expect(c.summary).toEqual({ probed: 1, healthy: 0, unhealthy: 1, skipped: 1 });
+    expect(c.summary).toEqual({
+      probed: 1,
+      healthy: 0,
+      unhealthy: 1,
+      skipped: 1,
+    });
   });
 });
 
@@ -576,7 +634,9 @@ describe("A7 presentation facts are enum-derived", () => {
 
   it("credential states: requiresReplacement is distinct and ineligible (C12)", () => {
     expect(credentialFacts("requiresReplacement").eligible).toBe(false);
-    expect(credentialFacts("requiresReplacement").label).toMatch(/replacement/i);
+    expect(credentialFacts("requiresReplacement").label).toMatch(
+      /replacement/i,
+    );
     expect(credentialFacts("unusable").eligible).toBe(false);
     expect(credentialFacts("mismatch").eligible).toBe(false);
     expect(credentialFacts("configured").eligible).toBe(true);
@@ -588,8 +648,12 @@ describe("A7 presentation facts are enum-derived", () => {
   });
 
   it("health renders the bounded reason enum only", () => {
-    expect(healthFacts({ status: "unprobed", reason: "none" }).label).toMatch(/unprobed/i);
-    expect(healthFacts({ status: "healthy", reason: "none" }).severity).toBe("ok");
+    expect(healthFacts({ status: "unprobed", reason: "none" }).label).toMatch(
+      /unprobed/i,
+    );
+    expect(healthFacts({ status: "healthy", reason: "none" }).severity).toBe(
+      "ok",
+    );
     const h = healthFacts({ status: "unhealthy", reason: "proxy_auth_failed" });
     expect(h.severity).toBe("critical");
     expect(h.label).toContain("proxy_auth_failed");

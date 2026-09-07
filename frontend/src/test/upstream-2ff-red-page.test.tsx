@@ -131,7 +131,12 @@ const CANARY = "Canary-Page-PW-2ff-7d1c";
 let container: HTMLDivElement;
 let root: Root;
 let requested: string[];
-let mutations: Array<{ method: string; url: string; body: unknown; raw: unknown }>;
+let mutations: Array<{
+  method: string;
+  url: string;
+  body: unknown;
+  raw: unknown;
+}>;
 let onMutate: (method: string, url: string, body: unknown) => Promise<Response>;
 let config: Record<string, unknown>;
 
@@ -517,7 +522,10 @@ it("P6 admin: T3 clear needs the exact entry id typed; the body carries confirm 
     confirm: MANAGED_ID,
     revision: 3,
   });
-  expect(Object.keys(mutations[0]?.body as object)).not.toContain("password");
+  const clearBody = mutations[0]?.body;
+  expect(isRecord(clearBody) ? Object.keys(clearBody) : []).not.toContain(
+    "password",
+  );
 });
 
 // ── P7 ──────────────────────────────────────────────────────────────────────
@@ -587,7 +595,9 @@ it("P8a: no_eligible_parent + requiresReplacement render the critical banner wit
   expect(a).toMatch(/requires? replacement/i);
   expect(a).toMatch(/no eligible parent/i);
   expect(a).not.toMatch(/bypass/i);
-  expect(row(MANAGED_ID).dataset["credentialState"]).toBe("requiresReplacement");
+  expect(row(MANAGED_ID).dataset["credentialState"]).toBe(
+    "requiresReplacement",
+  );
   expect(row(MANAGED_ID).textContent).toMatch(/replacement/i);
 });
 

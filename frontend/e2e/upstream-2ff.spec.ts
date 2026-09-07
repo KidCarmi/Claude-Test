@@ -123,7 +123,10 @@ async function createViaApi(
 }
 
 /** Restore: Tier-3 clear (typed confirm) then delete, both fenced. */
-async function removeEntry(api: APIRequestContext, host: string): Promise<void> {
+async function removeEntry(
+  api: APIRequestContext,
+  host: string,
+): Promise<void> {
   const cur = await findEntry(api, host);
   if (cur === null) return;
   if (cur.credentialState !== "none") {
@@ -331,7 +334,9 @@ test("admin: create → seal credential (canary) → no browser sink carries it 
     expect((await findEntry(api, HOST2))?.id).toBe(id);
 
     // delete → credential_present (exactly one DELETE, token in the query)
-    await rowFor(page, HOST2).getByRole("button", { name: "Delete entry" }).click();
+    await rowFor(page, HOST2)
+      .getByRole("button", { name: "Delete entry" })
+      .click();
     await page.getByRole("button", { name: "Delete now" }).click();
     await expect(page.getByText("credential_present").first()).toBeVisible();
     const dels = calls.filter((c) => c.method === "DELETE");
@@ -356,16 +361,21 @@ test("admin: create → seal credential (canary) → no browser sink carries it 
         if (b.body.includes(n.value))
           leaks.push(`${n.label} in response body of ${b.url}`);
       for (const c of calls)
-        if (c.url.includes(n.value)) leaks.push(`${n.label} in request URL ${c.url}`);
+        if (c.url.includes(n.value))
+          leaks.push(`${n.label} in request URL ${c.url}`);
       if (dom.includes(n.value)) leaks.push(`${n.label} in DOM`);
       if (storage.includes(n.value)) leaks.push(`${n.label} in web storage`);
       if (page.url().includes(n.value)) leaks.push(`${n.label} in page URL`);
     }
     expect(leaks).toEqual([]);
     expect(
-      bodies.some((b) => b.url.includes("/api/upstream") && b.body.includes(HOST2)),
+      bodies.some(
+        (b) => b.url.includes("/api/upstream") && b.body.includes(HOST2),
+      ),
     ).toBe(true);
-    const credResp = bodies.find((b) => b.url.includes(`/entries/${id}/credential`));
+    const credResp = bodies.find((b) =>
+      b.url.includes(`/entries/${id}/credential`),
+    );
     expect(credResp).toBeDefined();
     expect(credResp?.body ?? "").not.toContain(CANARY_PW);
     if (cts === null) {
@@ -377,7 +387,9 @@ test("admin: create → seal credential (canary) → no browser sink carries it 
     }
 
     // clear (T3): the exact entry id must be typed
-    await rowFor(page, HOST2).getByRole("button", { name: "Clear credential" }).click();
+    await rowFor(page, HOST2)
+      .getByRole("button", { name: "Clear credential" })
+      .click();
     const clearNow = page.getByRole("button", { name: "Clear now" });
     await expect(clearNow).toBeDisabled();
     await page.getByLabel("Type the entry id").fill("not-the-id");
@@ -385,11 +397,16 @@ test("admin: create → seal credential (canary) → no browser sink carries it 
     await page.getByLabel("Type the entry id").fill(id);
     await expect(clearNow).toBeEnabled();
     await clearNow.click();
-    await expect(rowFor(page, HOST2)).toHaveAttribute("data-credential-state", "none");
+    await expect(rowFor(page, HOST2)).toHaveAttribute(
+      "data-credential-state",
+      "none",
+    );
     expect((await findEntry(api, HOST2))?.credentialState).toBe("none");
 
     // delete (T2) — now permitted
-    await rowFor(page, HOST2).getByRole("button", { name: "Delete entry" }).click();
+    await rowFor(page, HOST2)
+      .getByRole("button", { name: "Delete entry" })
+      .click();
     await page.getByRole("button", { name: "Delete now" }).click();
     await expect(rowFor(page, HOST2)).toHaveCount(0);
     expect(await findEntry(api, HOST2)).toBeNull();
@@ -477,15 +494,23 @@ test("admin: a manual probe inside the appliance's window is refused 429 (render
     expect(resp.status()).toBe(429);
     const retryAfter = Number(resp.headers()["retry-after"] ?? "0");
     expect(retryAfter).toBeGreaterThan(0);
-    await expect(page.getByText(/probe_(rate_limited|in_flight)/).first()).toBeVisible();
-    await expect(page.getByText(new RegExp(`${String(retryAfter)}\\s*s`)).first()).toBeVisible();
-    expect(calls.filter((c) => c.path === "/api/upstream/health")).toHaveLength(1);
+    await expect(
+      page.getByText(/probe_(rate_limited|in_flight)/).first(),
+    ).toBeVisible();
+    await expect(
+      page.getByText(new RegExp(`${String(retryAfter)}\\s*s`)).first(),
+    ).toBeVisible();
+    expect(calls.filter((c) => c.path === "/api/upstream/health")).toHaveLength(
+      1,
+    );
     // The SERVER-declared Retry-After is the protocol's own instruction —
     // waiting exactly that long is channel-controlled, not a guess.
     await page.waitForTimeout(retryAfter * 1000);
     await page.getByRole("button", { name: "Probe now" }).click();
     await expect(page.getByText(/probed \d+/i).first()).toBeVisible();
-    expect(calls.filter((c) => c.path === "/api/upstream/health")).toHaveLength(2);
+    expect(calls.filter((c) => c.path === "/api/upstream/health")).toHaveLength(
+      2,
+    );
     assertNoCrossSurface(calls);
   } finally {
     await api.dispose();
@@ -550,13 +575,19 @@ test("admin: an imported declared credential lands in requiresReplacement; the b
     await expect(banner.first()).toBeVisible();
     await expect(banner.first()).not.toContainText(/bypass/i);
     const row = rowFor(page, HOST5);
-    await expect(row).toHaveAttribute("data-credential-state", "requiresReplacement");
+    await expect(row).toHaveAttribute(
+      "data-credential-state",
+      "requiresReplacement",
+    );
     await expect(row).toContainText(/replacement/i);
     // T2 replace resolves the marker
     await row.getByRole("button", { name: "Replace credential" }).click();
     await page.getByLabel("Password").fill(CANARY_PW);
     await page.getByRole("button", { name: "Seal credential" }).click();
-    await expect(rowFor(page, HOST5)).toHaveAttribute("data-credential-state", "configured");
+    await expect(rowFor(page, HOST5)).toHaveAttribute(
+      "data-credential-state",
+      "configured",
+    );
     expect((await findEntry(api, HOST5))?.credentialState).toBe("configured");
     expect(calls.some((c) => c.url.includes(CANARY_PW))).toBe(false);
     assertNoCrossSurface(calls);
