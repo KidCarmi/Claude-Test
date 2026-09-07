@@ -70,6 +70,13 @@ async function findEntry(
   return null;
 }
 
+async function docRevision(api: APIRequestContext): Promise<number> {
+  const v: unknown = await (await api.get("/api/upstream")).json();
+  if (!isRecord(v) || typeof v["revision"] !== "number")
+    throw new Error("no document revision");
+  return v["revision"];
+}
+
 async function removeEntry(
   api: APIRequestContext,
   host: string,
@@ -132,6 +139,25 @@ function rowFor(page: Page, host: string) {
 const UNPROVEN = /unproven|could not be verified/i;
 const LATCH = /Last change unconfirmed/;
 
+/** Hold the authoritative read-back down (GET /api/upstream → 500) so the
+ * latched state is OBSERVABLE deterministically; `release` lets the next
+ * read succeed. The mutation routes are untouched. */
+async function holdReadBack(page: Page): Promise<() => Promise<void>> {
+  let held = true;
+  await page.route("**/api/upstream", (route) => {
+    if (route.request().method() !== "GET" || !held) return route.continue();
+    return route.fulfill({
+      status: 500,
+      headers: { "content-type": "text/plain" },
+      body: "read-back held by the harness",
+    });
+  });
+  return async () => {
+    held = false;
+    await page.unroute("**/api/upstream");
+  };
+}
+
 async function expectNoVerdict(page: Page): Promise<void> {
   await expect(page.getByText(LATCH)).toBeVisible();
   await expect(page.getByText(UNPROVEN).first()).toBeVisible();
@@ -172,14 +198,24 @@ test("K1/K2 admin: a landed create with its media type stripped, then a T2 repla
       });
     });
     await openSurface(page);
+    let release = await holdReadBack(page);
     await page.getByRole("button", { name: "New entry" }).click();
     await page.getByLabel("Host").fill(HOST);
     await page.getByLabel("Port").fill(String(PORT));
     await page.getByLabel("Username").fill("svc");
     await page.getByRole("button", { name: "Create entry" }).click();
     await expectNoVerdict(page);
-    // the mutation landed on the appliance; the page's read-back shows it
+    // every mutation control + the probe stays blocked while latched
+    await expect(
+      page.getByRole("button", { name: "New entry" }),
+    ).toBeDisabled();
+    await expect(
+      page.getByRole("button", { name: "Probe now" }),
+    ).toBeDisabled();
+    // the mutation landed on the appliance; a genuine read-back shows it
     expect((await findEntry(api, HOST))?.credentialState).toBe("none");
+    await release();
+    await page.getByRole("button", { name: "Refresh" }).first().click();
     await expect(rowFor(page, HOST)).toBeVisible();
     await expect(page.getByText(LATCH)).toHaveCount(0);
     expect(
@@ -203,6 +239,7 @@ test("K1/K2 admin: a landed create with its media type stripped, then a T2 repla
         });
       },
     );
+    release = await holdReadBack(page);
     await rowFor(page, HOST)
       .getByRole("button", { name: "Replace credential" })
       .click();
@@ -210,6 +247,8 @@ test("K1/K2 admin: a landed create with its media type stripped, then a T2 repla
     await page.getByRole("button", { name: "Seal credential" }).click();
     await expectNoVerdict(page);
     expect((await findEntry(api, HOST))?.credentialState).toBe("configured");
+    await release();
+    await page.getByRole("button", { name: "Refresh" }).first().click();
     await expect(rowFor(page, HOST)).toHaveAttribute(
       "data-credential-state",
       "configured",
@@ -248,9 +287,7 @@ test("K3/K4 admin: secret-bearing refusals never reach the DOM; a status/code mi
         host: HOST,
         port: PORT,
         username: "svc",
-        revision: Number(
-          (await (await api.get("/api/upstream")).json())["revision"],
-        ),
+        revision: await docRevision(api),
       },
     });
     expect(created.status(), await created.text()).toBe(201);
@@ -304,7 +341,9 @@ test("K3/K4 admin: secret-bearing refusals never reach the DOM; a status/code mi
     expect(await storageDump(page)).not.toContain(CANARY_PW);
     await page.unroute(`**/api/upstream/entries/${id}/credential`);
 
-    // K4: status/code mismatch on the (real) update
+    // K4: status/code mismatch on the (real) update — read-back held so
+    // the latch is observable, then released
+    const releaseK4 = await holdReadBack(page);
     await page.route(`**/api/upstream/entries/${id}`, (route) => {
       if (route.request().method() !== "PUT") return route.continue();
       return route.fulfill({
@@ -321,10 +360,13 @@ test("K3/K4 admin: secret-bearing refusals never reach the DOM; a status/code mi
     await page.getByLabel("Port").fill("3129");
     await page.getByRole("button", { name: "Save entry" }).click();
     await expect(page.getByText(UNPROVEN).first()).toBeVisible();
+    await expect(page.getByText(LATCH)).toBeVisible();
     await expect(page.getByText(/Precondition required/)).toHaveCount(0);
     await expect(page.getByText(/Nothing was changed/)).toHaveCount(0);
     await page.unroute(`**/api/upstream/entries/${id}`);
-    // the read-back (a real GET) resolves the latch
+    // a genuine read-back (a real GET) resolves the latch
+    await releaseK4();
+    await page.getByRole("button", { name: "Refresh" }).first().click();
     await expect(page.getByText(LATCH)).toHaveCount(0);
     await expect(
       rowFor(page, HOST).getByRole("button", { name: "Edit" }),

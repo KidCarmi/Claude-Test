@@ -129,6 +129,103 @@ const CONFIG = {
   scope: "node-local",
 };
 
+/** The appliance's action-bound 2xx shapes for the request-shape stub. */
+function boundAnswer(
+  url: string,
+  method: string,
+  body: unknown,
+): { status: number; body: unknown } {
+  const spec = isRecord(body) ? body : {};
+  const scheme = typeof spec["scheme"] === "string" ? spec["scheme"] : "http";
+  const host = typeof spec["host"] === "string" ? spec["host"] : MANAGED.host;
+  const port =
+    typeof spec["port"] === "number" && spec["port"] !== 0
+      ? spec["port"]
+      : scheme === "https"
+        ? 443
+        : 80;
+  const username = typeof spec["username"] === "string" ? spec["username"] : "";
+  const authority = `${scheme}://${username !== "" ? `${username}@` : ""}${host.toLowerCase()}:${String(port)}`;
+  const dto = (id: string, credentialState: string) => ({
+    id,
+    scheme,
+    host: host.toLowerCase(),
+    port,
+    username,
+    authority,
+    source: "managed",
+    revision: 4,
+    credentialState,
+  });
+  const row = (id: string, credentialState: string) => ({
+    ...MANAGED,
+    id,
+    scheme,
+    host: host.toLowerCase(),
+    port,
+    username,
+    url: `${scheme}://${host.toLowerCase()}:${String(port)}`,
+    authority,
+    credentialState,
+  });
+  if (method === "POST" && url === "/api/upstream/entries") {
+    const id = "01HZZCREATED000000000000X";
+    return {
+      status: 201,
+      body: {
+        ...CONFIG,
+        ok: true,
+        entry: dto(id, "none"),
+        entries: [MANAGED, YAML, row(id, "none")],
+      },
+    };
+  }
+  if (method === "PUT") {
+    return {
+      status: 200,
+      body: {
+        ...CONFIG,
+        ok: true,
+        entry: dto(MANAGED.id, "configured"),
+        entries: [row(MANAGED.id, "configured"), YAML],
+      },
+    };
+  }
+  if (method === "DELETE") {
+    return {
+      status: 200,
+      body: { ...CONFIG, ok: true, deleted: MANAGED.id, entries: [YAML] },
+    };
+  }
+  if (method === "POST" && url.endsWith("/credential")) {
+    const state = spec["action"] === "clear" ? "none" : "configured";
+    return {
+      status: 200,
+      body: {
+        ...CONFIG,
+        ok: true,
+        entry: {
+          ...dto(MANAGED.id, state),
+          host: MANAGED.host,
+          authority: MANAGED.authority,
+        },
+        entries: [{ ...MANAGED, credentialState: state }, YAML],
+      },
+    };
+  }
+  if (method === "POST" && url === "/api/upstream/health") {
+    return {
+      status: 200,
+      body: {
+        ...CONFIG,
+        ok: true,
+        summary: { probed: 1, healthy: 1, unhealthy: 0, skipped: 0 },
+      },
+    };
+  }
+  return { status: 200, body: CONFIG };
+}
+
 function httpErr(status: number, body: unknown): ApiError {
   return new ApiError(
     "http",
@@ -431,9 +528,18 @@ describe("A4 request shapes", () => {
           body: typeof raw === "string" ? JSON.parse(raw) : undefined,
           rawBody: raw,
         });
+        // Fixture completion (2F-F correction, harness not assertion): the
+        // client now binds every 2xx to the requested action, so the stub
+        // answers with that action's evidence (the shapes the appliance
+        // sends) instead of a generic view.
+        const { status, body: answer } = boundAnswer(
+          String(input),
+          init?.method ?? "GET",
+          typeof raw === "string" ? JSON.parse(raw) : undefined,
+        );
         return Promise.resolve(
-          new Response(JSON.stringify({ ...CONFIG, ok: true }), {
-            status: 200,
+          new Response(JSON.stringify(answer), {
+            status,
             headers: { "Content-Type": "application/json" },
           }),
         );

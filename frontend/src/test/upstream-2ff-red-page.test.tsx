@@ -128,6 +128,96 @@ function baseConfig(): Record<string, unknown> {
 
 const CANARY = "Canary-Page-PW-2ff-7d1c";
 
+/** The appliance's action-bound 2xx shapes for the default mutation stub. */
+function boundAnswer(
+  method: string,
+  url: string,
+  body: unknown,
+): Promise<Response> {
+  const spec = isRecord(body) ? body : {};
+  const scheme = typeof spec["scheme"] === "string" ? spec["scheme"] : "http";
+  const host = (
+    typeof spec["host"] === "string" ? spec["host"] : MANAGED.host
+  ).toLowerCase();
+  const port =
+    typeof spec["port"] === "number" && spec["port"] !== 0
+      ? spec["port"]
+      : scheme === "https"
+        ? 443
+        : 80;
+  const username = typeof spec["username"] === "string" ? spec["username"] : "";
+  const authority = `${scheme}://${username !== "" ? `${username}@` : ""}${host}:${String(port)}`;
+  const dto = (id: string, credentialState: string) => ({
+    id,
+    scheme,
+    host,
+    port,
+    username,
+    authority,
+    source: "managed",
+    revision: 4,
+    credentialState,
+  });
+  const row = (id: string, credentialState: string) => ({
+    ...MANAGED,
+    id,
+    scheme,
+    host,
+    port,
+    username,
+    url: `${scheme}://${host}:${String(port)}`,
+    authority,
+    credentialState,
+  });
+  if (method === "POST" && url === "/api/upstream/entries") {
+    const id = "01HZZCREATED000000000000X";
+    return okJSON(
+      {
+        ...config,
+        ok: true,
+        entry: dto(id, "none"),
+        entries: [MANAGED, YAML, row(id, "none")],
+      },
+      201,
+    );
+  }
+  if (method === "PUT")
+    return okJSON({
+      ...config,
+      ok: true,
+      entry: dto(MANAGED_ID, "configured"),
+      entries: [row(MANAGED_ID, "configured"), YAML],
+    });
+  if (method === "DELETE")
+    return okJSON({
+      ...config,
+      ok: true,
+      deleted: MANAGED_ID,
+      entries: [YAML],
+    });
+  if (method === "POST" && url.endsWith("/credential")) {
+    const state = spec["action"] === "clear" ? "none" : "configured";
+    return okJSON({
+      ...config,
+      ok: true,
+      entry: {
+        ...dto(MANAGED_ID, state),
+        host: MANAGED.host,
+        port: MANAGED.port,
+        authority: MANAGED.authority,
+      },
+      entries: [{ ...MANAGED, credentialState: state }, YAML],
+    });
+  }
+  if (method === "POST" && url === "/api/upstream/health")
+    return okJSON({
+      ...config,
+      ok: true,
+      summary: { probed: 1, healthy: 1, unhealthy: 0, skipped: 0 },
+    });
+  return okJSON({ ...config, ok: true });
+}
+
 let container: HTMLDivElement;
 let root: Root;
 let requested: string[];
@@ -162,7 +252,10 @@ beforeEach(() => {
   sessionStorage.clear();
   localStorage.clear();
   config = baseConfig();
-  onMutate = () => okJSON({ ...config, ok: true });
+  // Fixture completion (2F-F correction, harness not assertion): the page
+  // binds every 2xx to the requested action, so the default answer carries
+  // that action's evidence (the shapes the appliance sends).
+  onMutate = (method, url, body) => boundAnswer(method, url, body);
   vi.stubGlobal(
     "fetch",
     vi.fn((input: unknown, init?: RequestInit) => {

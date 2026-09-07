@@ -315,12 +315,14 @@ const STATUS: Record<Action, number> = {
   replace: 200,
   clear: 200,
 };
+// The page's success notices (never the snapshot bar's "Updated HH:MM:SS"
+// freshness stamp, which is not a verdict).
 const SUCCESS_WORDS = [
-  /created/i,
-  /updated/i,
-  /deleted/i,
-  /sealed/i,
-  /cleared/i,
+  /Entry .* created/i,
+  /Entry .* updated/i,
+  /Entry .* deleted/i,
+  /Credential sealed/i,
+  /Credential cleared/i,
 ];
 const VERDICT_WORDS = [/Action failed/i, /Refused/i, /Nothing was changed/i];
 
@@ -443,6 +445,7 @@ it("Q3c a 2xx malformed body carrying the password never reaches the DOM", async
       }),
     );
   await mountPage();
+  getMode = "fail"; // the read-back fails first, so the latch must HOLD
   perform("replace");
   await flushUntil(() => {
     expect(container.textContent).toContain("Last change unconfirmed");
