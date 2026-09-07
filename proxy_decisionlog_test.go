@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"math"
@@ -136,7 +137,7 @@ func captureDecisionLog(t *testing.T, rule *PolicyRule, action PolicyAction, met
 		Action:            action,
 		MatchedConditions: "fqdn=*.example.com",
 	}
-	r := httptest.NewRequest(method, "http://files.example.com/a/b", nil)
+	r := httptest.NewRequestWithContext(context.Background(), method, "http://files.example.com/a/b", http.NoBody)
 	r.Host = "files.example.com"
 	w := httptest.NewRecorder()
 

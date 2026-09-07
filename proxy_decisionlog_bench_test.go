@@ -49,6 +49,7 @@ package main
 // 129 ns delta; the remainder is one fewer interface box reaching fmt.
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -105,6 +106,8 @@ func BenchmarkDecisionLog_Operands(b *testing.B) {
 
 // ── Component isolation ───────────────────────────────────────────────────────
 
+// BenchmarkDecisionLog_PrioritySprintf measures the pre-change priority render
+// on its own: fmt.Sprintf boxes the int and runs the reflection formatter.
 func BenchmarkDecisionLog_PrioritySprintf(b *testing.B) {
 	b.ReportAllocs()
 	var s string
@@ -114,6 +117,8 @@ func BenchmarkDecisionLog_PrioritySprintf(b *testing.B) {
 	keepDecisionLogString(s)
 }
 
+// BenchmarkDecisionLog_PriorityItoa measures the shipped priority render: the
+// same inline ReplaceAll sanitiser over strconv.Itoa instead of fmt.Sprintf.
 func BenchmarkDecisionLog_PriorityItoa(b *testing.B) {
 	b.ReportAllocs()
 	var s string
@@ -123,6 +128,8 @@ func BenchmarkDecisionLog_PriorityItoa(b *testing.B) {
 	keepDecisionLogString(s)
 }
 
+// BenchmarkDecisionLog_SanitizeRuleName measures one sanitizeLog pass over a
+// clean rule name — the cost the old line paid twice per request.
 func BenchmarkDecisionLog_SanitizeRuleName(b *testing.B) {
 	b.ReportAllocs()
 	var s string
@@ -155,7 +162,7 @@ func BenchmarkDecisionLog_ApplyAllow(b *testing.B) {
 		Action:            ActionAllow,
 		MatchedConditions: benchDLConditions,
 	}
-	r := httptest.NewRequest(benchDLMethod, "http://"+benchDLHost+"/a/b", nil)
+	r := httptest.NewRequestWithContext(context.Background(), benchDLMethod, "http://"+benchDLHost+"/a/b", http.NoBody)
 	r.Host = benchDLHost
 	w := httptest.NewRecorder()
 
@@ -187,7 +194,7 @@ func BenchmarkDecisionLog_ApplyAllowParallel(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		match := &PolicyMatch{Rule: rule, Action: ActionAllow, MatchedConditions: benchDLConditions}
-		r := httptest.NewRequest(benchDLMethod, "http://"+benchDLHost+"/a/b", nil)
+		r := httptest.NewRequestWithContext(context.Background(), benchDLMethod, "http://"+benchDLHost+"/a/b", http.NoBody)
 		r.Host = benchDLHost
 		w := httptest.NewRecorder()
 		for pb.Next() {
