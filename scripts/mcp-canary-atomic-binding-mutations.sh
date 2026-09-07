@@ -278,6 +278,39 @@ run_mutation M10 \
   ./internal/mcp/execution/ internal/mcp/execution/run.go \
   's/\tif e\.cfg\.State\.KillGeneration\(\) != admKillGen \{/\tif false \{/'
 
+# ── (6) THE PRE-EXECUTOR DRIFT LATCH ───────────────────────────────────────
+# Codex round 20: a rug-pull landing BEFORE policy resolution is refused upstream of the
+# admission transaction, and later requests resolve cleanly against the new fingerprint and
+# fail approval validation — request-scoped, not drift. So a whole-Canary breach condition
+# that is only ever latched inside admitLiveExecution stops nothing at all.
+#
+# M11 is deliberately aimed at the WIRING rather than the primitive: the §8 matrix drives
+# latchDriftUnderActivation directly and stays green when the sink stops calling it.
+
+run_mutation M11 \
+  'the pre-executor path counts the drift as evidence and never latches' \
+  'TestPreAdmissionDrift_E2E_ServerIdentityDriftStopsTheActivation' \
+  . "$ADM" \
+  's/\tglobalCanaryRuntime\.latchDriftUnderActivation\(capb, now, func\(\) \(bool, string\) \{\n\t\treturn mcpLiveTrustRevalidate\(obs\.Tenant, obs\.ServerID, obs\.ToolName, obs\.DecisionFP, now\)\n\t\}\)\n/\t_ = capb\n\t_ = now\n/'
+
+run_mutation M12 \
+  'the latch trusts the callers unlocked verdict instead of re-deriving under the lock' \
+  'TestAtomicBinding_I_PreExecutorLatchNeverInventsABreach' \
+  . "$ADM" \
+  's/\tcode := ""\n\tif trust != nil \{\n\t\t_, code = trust\(\)\n\t\}\n/\tcode := "tool_fingerprint_drift"\n/'
+
+run_mutation M13 \
+  'a pre-executor drift seen in the publication gap latches the next activation' \
+  'TestAtomicBinding_H_PreExecutorDriftInThePublicationGapLatchesNothing' \
+  . "$ADM" \
+  's/\tif !cr\.active \|\| cr\.aborter == nil \|\| cr\.generation == 0 \{\n\t\t\/\/ §6 THE PUBLICATION GAP\./\tif false \{\n\t\t\/\/ §6 THE PUBLICATION GAP\./'
+
+run_mutation M14 \
+  'the drift target is dropped, so the root re-derives against an unmatchable target' \
+  'TestCanaryBreach_PreExecutorDriftCarriesItsTarget' \
+  ./internal/mcp/runtime/ internal/mcp/runtime/execute.go \
+  's/\t\t\tServerID:   toolServerID\(in\),/\t\t\tServerID:   "",/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

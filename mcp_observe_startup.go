@@ -273,14 +273,9 @@ func assembleGatewayConfig(sc mcpObserveStartupConfig, modes gatewayModes, tlsCf
 		// and no credential/upstream/broker/side-effect runs. Still Observe-only.
 		Policy: pol,
 		// The pipeline refuses a drifted decision BEFORE the executor is reached. That refusal is
-		// fail-closed and unchanged; this seam records it as EVIDENCE and nothing more.
-		//
-		// It used to route to the abort authority (Codex round 14). It cannot: the observation
-		// happens before any reservation, so nothing binds it to an activation, and five review
-		// rounds established that no arrangement of unlocked generation reads can supply one. The
-		// whole-Canary latch for authoritative drift is taken by the atomic activation-bound
-		// admission transaction instead, which charges an exact generation it held a lock over.
-		CanaryDriftObserved: noteCanaryPreAdmissionDrift,
+		// fail-closed and unchanged; this seam counts it and then takes the whole-Canary latch
+		// where the latch can actually be attributed — see canaryPreAdmissionDrift.
+		CanaryDriftObserved: canaryPreAdmissionDrift,
 	}
 	if modes.senderProfile.RequiresDPoP() {
 		deps.Replay = senderconstraint.NewReplayCache(limits.DefaultAuth(), nil)

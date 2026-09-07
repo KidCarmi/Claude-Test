@@ -4,6 +4,8 @@ import (
 	"sync"
 	"time"
 
+	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
+
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 )
@@ -243,4 +245,88 @@ func canaryPreAdmissionDriftCounts(capability string) map[string]uint64 {
 		out[k] = v
 	}
 	return out
+}
+
+// ── Pre-executor drift: the activation-bound latch ───────────────────────────
+
+// canaryDriftLatch is the bounded result of a pre-executor drift latch attempt. Every field is a
+// fact established INSIDE the activation critical section.
+type canaryDriftLatch struct {
+	// Active reports whether an activation owned this evaluation at all. False is the §6
+	// publication gap: nothing was latched and no future activation can inherit the observation.
+	Active bool
+	// Generation is the exact non-zero generation the re-derivation ran under. Zero iff !Active.
+	Generation uint64
+	// DriftCode is the drift RE-DERIVED under the lock — not the caller's earlier observation.
+	// Empty means the drift did not reproduce against live state, so nothing is latched.
+	DriftCode string
+	Latched   bool
+}
+
+// latchDriftUnderActivation takes the whole-Canary latch for an authoritative drift observed BEFORE
+// the executor was reached.
+//
+// The caller's observation is NOT the input to the decision. The caller saw drift outside any
+// critical section, so its verdict is unattributable by construction — the exact defect five review
+// rounds were spent on. What this does instead is re-run the trust probe against LIVE state inside
+// the activation lock, so the drift that decides the latch and the generation it is charged to are
+// established together, atomically, and the §2 invariant holds for the same reason it holds in
+// admitLiveExecution: G is verified active before the probe runs, the lock is held for the
+// complete probe, and the trip is taken against that same G without ever releasing it.
+//
+// It never reserves budget and never admits anything — the request is already refused, fail-closed,
+// by the caller. Its only effect is to stop the experiment that owns the drift.
+//
+// §5 applies unchanged: the probe passed here must be local control-plane state only.
+func (rt *canaryRuntime) latchDriftUnderActivation(capb rollout.Capability, now time.Time, trust canaryTrustProbe) canaryDriftLatch {
+	cr := rt.capRuntime(capb)
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if !cr.active || cr.aborter == nil || cr.generation == 0 {
+		// §6 THE PUBLICATION GAP. ModeCanary with no live activation is not an activation, and an
+		// observation made in that interval must never latch one created later. It stays evidence.
+		return canaryDriftLatch{}
+	}
+	gen := cr.generation
+	code := ""
+	if trust != nil {
+		_, code = trust()
+	}
+	if code == "" {
+		// The drift did not reproduce against live state under the lock. It may have been repaired,
+		// or it may never have belonged to this activation. Either way there is no authoritative
+		// breach to charge, and inventing one would stop a healthy experiment.
+		return canaryDriftLatch{Active: true, Generation: gen}
+	}
+	res := rt.tripLockedForGeneration(cr, capb, code, gen, now)
+	return canaryDriftLatch{
+		Active: true, Generation: gen, DriftCode: code,
+		Latched: res == canary.TripCanaryLatched,
+	}
+}
+
+// canaryPreAdmissionDrift is the composition-root sink for an authoritative drift the runtime
+// pipeline observed BEFORE the executor was reached. It does two separable things, in this order:
+//
+//  1. counts the observation as bounded evidence, unconditionally — an operator learns the catalog
+//     moved under a decision even when there is no activation to stop; and
+//  2. attempts the whole-Canary latch by RE-DERIVING the drift live inside the activation critical
+//     section, so the breach and the generation it is charged to are established atomically.
+//
+// The runtime's own verdict is deliberately not trusted as the latch input. It was computed outside
+// any critical section, so it cannot be attributed to a generation; only the value re-derived under
+// the lock can be. When no activation is live, step 2 latches nothing at all (§6).
+func canaryPreAdmissionDrift(capability string, obs mcpruntime.CanaryDriftTarget) {
+	noteCanaryPreAdmissionDrift(capability, obs.Code)
+
+	capb, err := rollout.ParseCapability(capability)
+	if err != nil {
+		// Fail closed: an unrecognised capability names no activation, so there is nothing to
+		// latch. The evidence above is already recorded.
+		return
+	}
+	now := time.Now()
+	globalCanaryRuntime.latchDriftUnderActivation(capb, now, func() (bool, string) {
+		return mcpLiveTrustRevalidate(obs.Tenant, obs.ServerID, obs.ToolName, obs.DecisionFP, now)
+	})
 }

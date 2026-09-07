@@ -504,3 +504,131 @@ func TestAtomicBinding_PreAdmissionDriftReachesTheOperatorSurface(t *testing.T) 
 		t.Fatalf("server_identity_drift = %d on the operator surface, want 1", counts["server_identity_drift"])
 	}
 }
+
+// ── G-I. The pre-executor drift latch ────────────────────────────────────────
+//
+// A rug-pull that lands BEFORE policy resolution never reaches the admission transaction: the
+// pipeline refuses it upstream. Codex round 20 showed why "it will be caught on the next request"
+// is false — after the catalog moves, later requests resolve cleanly against the NEW fingerprint
+// and fail approval validation, which is request-scoped, not drift. So an authoritative
+// whole-Canary breach would stop nothing at all.
+//
+// latchDriftUnderActivation closes that by re-deriving the drift under the activation lock. These
+// cases pin the three outcomes that matter: it latches when an activation owns the observation, it
+// latches NOTHING in the publication gap, and it never invents a breach.
+
+func (r *atomicRig) latchDrift(trust canaryTrustProbe) canaryDriftLatch {
+	return r.rt.latchDriftUnderActivation(r.capb, canaryRuntimeTestNow, trust)
+}
+
+// TestAtomicBinding_G_PreExecutorDriftLatchesTheActiveGeneration is the case Codex round 20 proved
+// unreachable: the drift is seen before the executor, and it must still stop the experiment.
+func TestAtomicBinding_G_PreExecutorDriftLatchesTheActiveGeneration(t *testing.T) {
+	r := newAtomicRig(t)
+	g := r.arm(t, 4)
+
+	got := r.latchDrift(probeDrift("tool_fingerprint_drift"))
+
+	if !got.Active || got.Generation != g {
+		t.Fatalf("latch ran under generation %d (active=%v), want %d", got.Generation, got.Active, g)
+	}
+	if got.DriftCode != "tool_fingerprint_drift" {
+		t.Fatalf("DriftCode = %q, want the code re-derived under the lock", got.DriftCode)
+	}
+	if !got.Latched {
+		t.Fatal("SECURITY: an authoritative pre-executor drift did not latch the whole Canary — " +
+			"the breach condition is declared but unreachable (Codex round 20)")
+	}
+	// The activation must now be dead: no later request may execute under it.
+	if r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
+		t.Fatal("SECURITY: the activation is still execution-eligible after a latched drift")
+	}
+	// And the latch must be the SAME authority the admission path uses, not a parallel one.
+	if adm := r.admit(probeTrusted()); adm.Denial != canaryAdmitAborted {
+		t.Fatalf("a request after the latch was denied %v, want canaryAdmitAborted", adm.Denial)
+	}
+}
+
+// TestAtomicBinding_H_PreExecutorDriftInThePublicationGapLatchesNothing pins §6. During ModeCanary
+// with no live activation there is nothing to attribute the observation to, and it must never be
+// inherited by an activation created afterwards.
+func TestAtomicBinding_H_PreExecutorDriftInThePublicationGapLatchesNothing(t *testing.T) {
+	r := newAtomicRig(t)
+	// Deliberately NOT armed: this is the publication gap.
+
+	got := r.latchDrift(probeDrift("server_identity_drift"))
+
+	if got.Active || got.Generation != 0 || got.Latched {
+		t.Fatalf("SECURITY: a drift observed with no live activation reported %+v — it must "+
+			"latch nothing and name no generation", got)
+	}
+
+	// Now an activation is published. It must be born healthy: it never saw that drift.
+	g := r.arm(t, 4)
+	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
+		t.Fatalf("SECURITY: activation %d inherited a drift observed before it existed", g)
+	}
+	if adm := r.admit(probeTrusted()); !adm.Granted() || adm.Generation != g {
+		t.Fatalf("a healthy request under the new activation was denied: %+v", adm)
+	}
+}
+
+// TestAtomicBinding_I_PreExecutorLatchNeverInventsABreach is the anti-vacuity control. The caller's
+// upstream verdict is NOT the latch input — only the value re-derived under the lock is — so a
+// probe that finds live state healthy must leave the experiment running. Without this, "latch
+// whenever the pipeline reports drift" would pass every gate above while being able to stop a
+// healthy Canary on a stale observation.
+func TestAtomicBinding_I_PreExecutorLatchNeverInventsABreach(t *testing.T) {
+	r := newAtomicRig(t)
+	g := r.arm(t, 4)
+
+	got := r.latchDrift(probeTrusted())
+
+	if got.Latched || got.DriftCode != "" {
+		t.Fatalf("SECURITY: the latch fired without re-deriving a drift: %+v", got)
+	}
+	if got.Generation != g {
+		t.Fatalf("Generation = %d, want %d", got.Generation, g)
+	}
+	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
+		t.Fatal("SECURITY: a healthy Canary was stopped by an observation that did not reproduce")
+	}
+}
+
+// TestAtomicBinding_PreExecutorLatchHoldsTheActivationLockAcrossItsProbe is the structural twin of
+// the admission-path gate: the re-derivation is worthless if the activation can change under it.
+func TestAtomicBinding_PreExecutorLatchHoldsTheActivationLockAcrossItsProbe(t *testing.T) {
+	r := newAtomicRig(t)
+	r.arm(t, 4)
+	cr := r.rt.capRuntime(r.capb)
+
+	var (
+		wg           sync.WaitGroup
+		peerAcquired bool
+	)
+	released := make(chan struct{})
+	tried := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-released
+		if cr.mu.TryLock() {
+			peerAcquired = true
+			cr.mu.Unlock()
+		}
+		close(tried)
+	}()
+
+	r.latchDrift(func() (bool, string) {
+		close(released)
+		<-tried
+		return false, "tool_fingerprint_drift"
+	})
+	wg.Wait()
+
+	if peerAcquired {
+		t.Fatal("SECURITY: the activation mutex was ACQUIRABLE while the pre-executor drift " +
+			"re-derivation was running — the observation is not activation-bound, which is the " +
+			"exact defect five review rounds were spent on")
+	}
+}

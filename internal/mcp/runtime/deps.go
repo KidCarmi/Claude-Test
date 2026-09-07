@@ -56,35 +56,49 @@ type Deps struct {
 	// tools/call (credential broker + PR-8 commit-before-materialization + upstream
 	// client + response DLP). A nil executor is the disabled-by-default posture.
 	Executor ExecutionProvider
-	// CanaryDriftObserved is the OPTIONAL narrow seam for recording that this pipeline observed
+	// CanaryDriftObserved is the OPTIONAL narrow seam for reporting that this pipeline observed
 	// authoritative tool drift BEFORE the executor was reached. Nil ⇒ nothing composed and nothing
-	// recorded, which is the disabled-by-default posture.
+	// reported, which is the disabled-by-default posture.
 	//
-	// IT IS EVIDENCE, NOT AN ABORT TRIGGER, and the distinction is the whole point of the seam.
+	// THIS PIPELINE DOES NOT DECIDE THE LATCH, AND IT DOES NOT SUPPLY THE VALUE THAT DOES.
 	//
-	// This observation happens before ADMISSION, and admission — the budget reservation taken under
-	// the activation lock — is the only thing that binds a request to an activation. So at this point
-	// there is no generation this observation belongs to, and PR #1314 spent five review rounds
-	// discovering that no arrangement of unlocked generation reads can manufacture one: counter
-	// equality either side of the observation proves the value did not change, not that any
-	// activation was live throughout (the rollout publication gap makes both reads a stale value).
+	// The observation here is made outside any activation critical section, so on its own it cannot
+	// be attributed to a generation — that is what PR #1314 spent five review rounds failing to do
+	// with reads around the observation, and counter equality proves only that a value did not
+	// change, never that it was continuously active.
 	//
-	// Latching on an unattributable observation is exactly what the invariant forbids, and it fails
-	// in the dangerous direction — a request decided under a since-demoted activation stopping the
-	// experiment that replaced it, which never saw the drift. So this pipeline REFUSES the drifted
-	// request (unchanged, fail-closed) and records the fact; the whole-Canary latch for drift is
-	// taken by the atomic activation-bound admission transaction, which has a real generation to
-	// charge and evaluates trust under the same lock that latches.
-	CanaryDriftObserved func(capability, code string)
+	// But "cannot latch from here" is NOT the same as "must not latch", and treating them as the
+	// same was its own defect (Codex round 20): a rug-pull landing before policy resolution is
+	// refused here, and every later request then resolves cleanly against the NEW fingerprint and is
+	// denied for a missing approval — request-scoped, not drift — so an authoritative whole-Canary
+	// breach would stop nothing at all. That is the round-14 finding rebuilt.
+	//
+	// So the seam carries the TARGET, not just a verdict. The root re-evaluates the drift live
+	// INSIDE the activation critical section and latches against the exact generation that is active
+	// for that evaluation; if no activation is live (the §6 publication gap), nothing is latched and
+	// no future activation can inherit the observation. What is passed here is evidence and an
+	// identity to re-check — never the latch input itself.
+	CanaryDriftObserved func(capability string, obs CanaryDriftTarget)
 	// Clock is injected for deterministic tests; nil ⇒ time.Now.
 	Clock func() time.Time
 }
 
-// noteCanaryDriftObserved records a pre-executor drift observation when a sink is composed.
-// Nil-safe so call sites stay free of branching. It records; it never stops the Canary.
-func (d Deps) noteCanaryDriftObserved(capability, code string) {
+// CanaryDriftTarget names the exact target a pre-executor drift observation was made against.
+// It exists so the root can RE-DERIVE the drift live under the activation lock rather than trust a
+// verdict computed outside one: the re-derived value is what decides the latch.
+type CanaryDriftTarget struct {
+	Code       string
+	Tenant     string
+	ServerID   string
+	ToolName   string
+	DecisionFP string
+}
+
+// noteCanaryDriftObserved reports a pre-executor drift observation when a sink is composed.
+// Nil-safe so call sites stay free of branching.
+func (d Deps) noteCanaryDriftObserved(capability string, obs CanaryDriftTarget) {
 	if d.CanaryDriftObserved != nil {
-		d.CanaryDriftObserved(capability, code)
+		d.CanaryDriftObserved(capability, obs)
 	}
 }
 

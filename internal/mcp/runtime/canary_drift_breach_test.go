@@ -21,14 +21,22 @@ import (
 // before any reservation, so there is no activation it belongs to and none is offered. A seam that
 // still carried one would invite the caller to attribute an unattributable fact.
 type breachRecorder struct {
-	mu   sync.Mutex
-	seen []string
+	mu      sync.Mutex
+	seen    []string
+	targets []CanaryDriftTarget
 }
 
-func (r *breachRecorder) report(_ string, code string) {
+func (r *breachRecorder) report(_ string, obs CanaryDriftTarget) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.seen = append(r.seen, code)
+	r.seen = append(r.seen, obs.Code)
+	r.targets = append(r.targets, obs)
+}
+
+func (r *breachRecorder) observations() []CanaryDriftTarget {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]CanaryDriftTarget(nil), r.targets...)
 }
 
 func (r *breachRecorder) codes() []string {
@@ -59,6 +67,7 @@ func driftFixture(t *testing.T, rec *breachRecorder) (p *pipeline, stale, fresh 
 	mk := func(fp string) policy.DecisionInput {
 		return policy.DecisionInput{
 			Capability: policy.CapGateway,
+			Principal:  policy.Principal{Tenant: driftTenant},
 			Tool: &policy.Tool{
 				Name: "x", ServerID: testServerID, FingerprintHash: fp,
 				Disposition: disp, Drift: drift,
@@ -199,5 +208,64 @@ func TestCanaryBreach_EligibilityDriftIsNotCalledFingerprintDrift(t *testing.T) 
 		t.Fatalf("SECURITY: an eligibility change must be reported as server_identity_drift — the "+
 			"fingerprint did not move, and the admission-time classifier calls this same condition "+
 			"by that name; reported=%v", got)
+	}
+}
+
+const driftTenant = "tenant-drift-fixture"
+
+// TestCanaryBreach_PreExecutorDriftCarriesItsTarget pins that the observation reaches the root with
+// the identity of the target it was made against.
+//
+// This is not bookkeeping. The root does NOT trust the verdict computed here — it re-derives the
+// drift live inside the activation critical section, and it can only do that if it knows which
+// tenant/server/tool/fingerprint to re-check. Drop any of those fields and the re-derivation looks
+// up a target it cannot match, which mcpLiveTrustRevalidate correctly classifies as request-scoped
+// rather than drift — so the whole-Canary latch silently never fires and the failure looks exactly
+// like a healthy Canary. An empty target is therefore a security defect that is invisible at every
+// other surface, which is why it is pinned at the seam.
+func TestCanaryBreach_PreExecutorDriftCarriesItsTarget(t *testing.T) {
+	rec := &breachRecorder{}
+	p, stale, _ := driftFixture(t, rec)
+
+	rb := p.newRecord(Request{}, fixedClock())
+	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, true); !refused {
+		t.Fatal("the fixture must produce an authoritative drift refusal")
+	}
+
+	obs := rec.observations()
+	if len(obs) != 1 {
+		t.Fatalf("want exactly one observation, got %d", len(obs))
+	}
+	got := obs[0]
+	if got.Code == "" {
+		t.Fatal("the drift code is empty")
+	}
+	if got.Tenant != driftTenant {
+		t.Fatalf("Tenant = %q, want %q — the root cannot re-derive a drift for an unnamed tenant", got.Tenant, driftTenant)
+	}
+	if got.ServerID != testServerID {
+		t.Fatalf("ServerID = %q, want %q", got.ServerID, testServerID)
+	}
+	if got.ToolName != "x" {
+		t.Fatalf("ToolName = %q, want %q", got.ToolName, "x")
+	}
+	if got.DecisionFP != stale.Tool.FingerprintHash {
+		t.Fatalf("DecisionFP = %q, want the DECISION's fingerprint %q — re-deriving against the "+
+			"live fingerprint instead of the decision's would compare a value to itself and never "+
+			"report drift", got.DecisionFP, stale.Tool.FingerprintHash)
+	}
+}
+
+// TestCanaryBreach_PreExecutorDriftToleratesAMissingTool pins that a malformed input cannot panic
+// the refusal path. It yields an unmatchable target, which fails closed to "no latch".
+func TestCanaryBreach_PreExecutorDriftToleratesAMissingTool(t *testing.T) {
+	if got := toolServerID(policy.DecisionInput{}); got != "" {
+		t.Fatalf("toolServerID = %q, want empty", got)
+	}
+	if got := toolName(policy.DecisionInput{}); got != "" {
+		t.Fatalf("toolName = %q, want empty", got)
+	}
+	if got := toolFingerprint(policy.DecisionInput{}); got != "" {
+		t.Fatalf("toolFingerprint = %q, want empty", got)
 	}
 }

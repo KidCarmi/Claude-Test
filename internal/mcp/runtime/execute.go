@@ -276,14 +276,29 @@ func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id
 	// to an operator, from the control being wrong. The seam is nil in every non-Canary composition,
 	// so this is a no-op there as well.
 	if canaryScoped {
-		// EVIDENCE ONLY — this refusal never stops the Canary, and that is deliberate.
+		// REPORTED WITH ITS TARGET, so the latch can be taken where it can be attributed.
 		//
-		// No reservation exists yet, so nothing binds this request to an activation, and an
+		// No reservation exists yet, so nothing here binds this request to an activation, and an
 		// observation that cannot be attributed must not latch one: charging it to whatever is
-		// current stops an experiment that may never have seen the drift. The whole-Canary latch for
-		// authoritative drift is taken by the atomic activation-bound admission transaction, which
-		// evaluates trust under the same lock that latches and charges an exact generation.
-		p.deps.noteCanaryDriftObserved(p.capability.String(), code)
+		// current stops an experiment that may never have seen the drift.
+		//
+		// But the answer to that is to GIVE the observation a binding, not to drop the latch. A
+		// rug-pull that lands before policy resolution is refused right here, and every later
+		// request then resolves cleanly against the NEW fingerprint and fails approval validation
+		// instead — request-scoped, not drift — so nothing downstream would ever latch it and an
+		// authoritative whole-Canary breach would stop nothing (Codex round 20; the round-14
+		// finding rebuilt). "Self-heals on the next request" was simply not true.
+		//
+		// So the TARGET goes with the observation and the root re-derives the drift live inside the
+		// activation critical section, latching against the exact generation active for that
+		// evaluation — and latching nothing at all when no activation is live (§6).
+		p.deps.noteCanaryDriftObserved(p.capability.String(), CanaryDriftTarget{
+			Code:       code,
+			Tenant:     in.Principal.Tenant,
+			ServerID:   toolServerID(in),
+			ToolName:   toolName(in),
+			DecisionFP: toolFingerprint(in),
+		})
 	}
 	p.ctr.requestsRejected.Add(1)
 	rb.rec.PolicyAction = "BLOCKED_BY_DECISION_STALE"
@@ -293,4 +308,28 @@ func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id
 		Status: 200, Disposition: DispRejected, Reason: mcperr.ReasonDecisionSnapshotStale,
 		ResponseBody: inspectionError(id, mcperr.ReasonDecisionSnapshotStale),
 	}), true
+}
+
+// toolServerID / toolName / toolFingerprint read the drift target off the decision input without
+// assuming a tool is present. A malformed input yields empty strings, which the root's live
+// re-derivation treats as a target it cannot match — request-scoped, never a latch.
+func toolServerID(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.ServerID
+}
+
+func toolName(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.Name
+}
+
+func toolFingerprint(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.FingerprintHash
 }
