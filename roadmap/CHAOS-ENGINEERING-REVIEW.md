@@ -64,7 +64,7 @@ with a BOUNDED queue — an unbounded one would trade CPU exhaustion for gorouti
 (eight series, a `credential_verification` contract row, a rate-limited log pair, and a
 fire-once-per-episode `auth_verify_saturated` alert with evidence-based recovery). Bounds are
 CONSTANTS by design — a knob here could only widen a DoS window — with an order of magnitude of
-headroom over real demand. 30 gates; seven defect gates verified failing pre-fix. A SECOND finding inside the fix, caught in self-review and fixed on the branch: moving the cache lookup ahead of the username comparison made a latent NON-INJECTIVE cache key (`user + ":" + pass`) reachable with a caller-chosen username — an AUTHENTICATION BYPASS whenever the configured password contains a colon. `cacheKey` is now length-framed. **AU-3e**, a
+headroom over real demand. 33 gates; nine defect gates verified failing against the shape each replaces. A SECOND finding inside the fix, caught in self-review and fixed on the branch: moving the cache lookup ahead of the username comparison made a latent NON-INJECTIVE cache key (`user + ":" + pass`) reachable with a caller-chosen username — an AUTHENTICATION BYPASS whenever the configured password contains a colon. `cacheKey` is now length-framed. **AU-3e**, a
 PRE-EXISTING username-enumeration oracle reached by repetition (wrong-username negatives are not
 cached, correct-username ones are), is recorded and deliberately NOT fixed here: closing it changes a
 security control's behaviour and deserves its own review. See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, §25,
@@ -739,7 +739,7 @@ touch security-critical paths that warrant isolated review.
 | CA-1 | Seed an expired CA via `SetCAForTest`; assert `GetCert` errors + alert. |
 | CA-2 | Point `caPath` at a read-only dir; drive `RotateIfNeeded`; assert a failure alert (not a success alert). |
 | AU-2 | Mint a session with `Provider:"idpA"`; delete idpA; assert the cookie now fails to decode. |
-| AU-3 | **DONE** (CHAOS-57): 15 root gates in `auth_cost_chaos_test.go` + 12 engine gates in `internal/authcost`. Five defect gates verified failing against the pre-fix tree, including the asymmetric-gate variant that reintroduces the RISK-008 oracle. |
+| AU-3 | **DONE** (CHAOS-57): 18 root gates in `auth_cost_chaos_test.go` + 15 engine gates in `internal/authcost`. Nine defect gates verified failing against the shape each replaces, including the asymmetric-gate variant that reintroduces the RISK-008 oracle, the non-injective cache key (an authentication bypass), and the immediate per-client refusal that denied a workstation's own parallel connections. |
 | PX-3 | Open a tunnel, half-close the client without FIN; assert goroutine count returns to baseline within the idle window. |
 | PX-6 | Global cap K; open K+1 conns across distinct IPs; assert rejection + stable FD count. |
 | HA-7 | Resume denied → etcd becomes reachable → assert `WriteAllowed()` becomes true within a bounded time with no operator action. |
@@ -3071,10 +3071,12 @@ nothing anywhere saying why.
 
 ### 25.6 Gates
 
-30 in total: 13 in `internal/authcost/authcost_test.go`, 17 in
-`auth_cost_chaos_test.go`. **Seven defect gates were verified failing against
-the pre-fix tree**, including the asymmetric-gate variant of §25.4 and both
-halves of the §25.4b bypass.
+33 in total: 15 in `internal/authcost/authcost_test.go`, 18 in
+`auth_cost_chaos_test.go`. **Nine defect gates were verified failing against
+the shape each replaces** — including the asymmetric-gate variant of §25.4,
+both halves of the §25.4b bypass, and the immediate-refusal shape of §25.4c
+(the engine's own first form, which the parallel-connection gate was
+reproduced against before it was changed).
 
 The controls are load-bearing, because several defect gates would also pass
 against a "fix" that simply broke authentication:
