@@ -1161,6 +1161,77 @@ UI leans on C2 semantics and must not cut over onto a known enforcement gap).
 > recorded, not a regression. Contract artifacts regenerated (`openapi.yaml` →
 > bundle + `types.gen.ts`); route count unchanged (241).
 >
+> **2F-F CORRECTION RECORD (this branch, 2026-09-07; external review of
+> `d391b12f` REJECTED — one append-only round).** The rejected candidate
+> is untouched; the round is `4f28a221` (RED) → `71329312` / `97686d39`
+> (correction) → `89eb49b4` (fixture completions) → `492c914d` (dist).
+> **Blocker 1 — an untrusted 2xx was reported as a failure.** After
+> `aff12f91` removed the Content-Type trigger, the FRONTEND invariant was
+> still missing: `apiRequest` throws `contenttype`/`decode` with a 2xx
+> status, `unknownOutcome` recognised only transport deaths, and the page
+> rendered "Action failed" while the mutation was durably committed and
+> every control stayed live. **Blocker 2 — success was not bound to the
+> action.** Every mutation shared `decodeUpstreamConfig`, where `ok`,
+> `entry`, `summary` were optional and `deleted` was ignored, so a
+> schema-valid generic view was accepted as proof of any mutation and the
+> success notice was written from request-side values. **Adjacent —
+> refusal boundary.** `asUpstreamRefusal` accepted a known code under any
+> status with an arbitrary `current`; the fence callout stringified the
+> record; the server's `error` line and selected `current` strings were
+> rendered verbatim.
+> **RED (`4f28a221`, executed on `d391b12f`: 62 failed / 7 positive
+> controls; both K journeys red).** `upstream-2ff-c-red.test.ts` B1–B7
+> (action binding through the existing wrappers), R1–R4 (status/code
+> binding, malformed fence, required facts, userinfo-password dropped);
+> `upstream-2ff-c-red-unproven.test.ts` U1–U3 (classifier);
+> `upstream-2ff-c-red-page.test.tsx` Q1 (5 actions × wrong media type /
+> malformed JSON / generic view), Q2 (probe), Q3a–d (secret-bearing refusal,
+> 400 echoing the T2 password, malformed 2xx carrying it, failed GET body),
+> Q4 (malformed fence never stringified, never a verdict), Q5 (status/code
+> mismatch); `e2e/upstream-2ff-c.spec.ts` K1–K4 — the REAL appliance's
+> answers corrupted in flight by a Playwright route (the mutation lands
+> durably): media type stripped, generic view, password-bearing refusals,
+> status/code mismatch.
+> **Correction.** `src/api/upstream.ts`: `REFUSAL_CONTRACT` binds every
+> code to its contracted HTTP status and REQUIRED safe facts (numeric
+> `revision` for the fences; safe id for `vanished`/`yaml_owned`/the
+> credential codes; enum `credentialState`; numeric `retryAfterSeconds`;
+> `confirmValue == id`); the renderable part is the typed, allowlisted
+> `facts` (an authority carrying a userinfo password is dropped; `current`
+> and `error` are kept for tests and never rendered); `unprovenOutcome`
+> classifies transport deaths, every unverifiable 2xx and every
+> unrecognised non-2xx as UNPROVEN (only a recognised refusal, 401 and 403
+> are verdicts); every wrapper binds the 2xx to its action — create: a
+> MANAGED `entry` with the submitted `canonicalAuthority` (scheme/host
+> lower-cased, trailing dot stripped, IDNA via the URL parser, default
+> port) present in the returned list; update: the requested id with the
+> submitted authority; replace/clear: the exact id as
+> `configured`/`none` in DTO and row; delete: `deleted` equals the id and
+> the list no longer carries it; probe: `ok: true` + `summary`. Page: the
+> classifier renders a verdict only from a well-formed refusal or a 403;
+> everything else closes the ceremony (the password is released with the
+> dialog), latches UNKNOWN, blocks every mutation and the probe, re-reads
+> the authoritative model exactly once (a TRANSPORT death instead REQUIRES
+> the operator's Refresh — the directive's "perform or require"; the
+> network is not known to be back, and the accepted P10 assertion pins
+> that the latch holds), never retries, and clears the latch only after a
+> genuinely successful read-back (`useObjectPage`); the fence callout
+> renders the numeric revision, the refusal callout the code + status +
+> typed facts, the read-error state a bounded class + status — no server
+> body or line reaches the DOM anywhere on the surface.
+> **Fixture completions / harness corrections (`89eb49b4`, recorded, no
+> accepted assertion changed):** the A4 request-shape stub and the page
+> tests' default mutation answer served a generic view — they now serve
+> each action's own evidence (the appliance's shapes); in the new RED page
+> file the success-notice words matched the snapshot bar's "Updated
+> HH:MM:SS" freshness stamp (not a verdict) and Q3c did not hold the
+> read-back down — corrected, assertions unchanged; the K journeys hold the
+> read-back down (GET → 500 by a route) while the latched state is
+> asserted, then release and Refresh, because the latch→resolved
+> transition against the real appliance is otherwise a race.
+> **Scope:** frontend only (no Go, no OpenAPI, no route change); 2F-G,
+> PX-1, CDR untouched.
+>
 > **2F-F IMPLEMENTATION RECORD (this branch, 2026-09-07).** Upstream React
 > at `/app/network/upstream` under the approved C1–C12 contract (C4, C6, C7,
 > C9, C11, C12), append-only on the FROZEN 2F-E baseline `ba2d852b`.
