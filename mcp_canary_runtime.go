@@ -427,7 +427,16 @@ func (rt *canaryRuntime) reserveCanaryExecution(capb rollout.Capability, now tim
 	if !cr.aborter.ExecutionEligible(generation) {
 		return canary.BudgetDeniedInvalid, generation // the Canary is aborted — no execution
 	}
-	outcome = cr.enforcer.Reserve(generation, now, ident)
+	return rt.reserveLocked(cr, capb, generation, now, ident), generation
+}
+
+// reserveLocked is the budget-reservation core with cr.mu ALREADY HELD and the activation already
+// verified active + execution-eligible by the caller, which also supplies the generation it
+// captured. Extracted so the atomic admission transaction (mcp_canary_admission.go) can reserve
+// inside the SAME critical section that computed the trust verdict — the property that makes
+// "trust under G, reserve under G+1" unrepresentable rather than merely unlikely.
+func (rt *canaryRuntime) reserveLocked(cr *canaryCapRuntime, capb rollout.Capability, generation uint64, now time.Time, ident canary.ExecutionIdentity) canary.BudgetOutcome {
+	outcome := cr.enforcer.Reserve(generation, now, ident)
 	switch {
 	case outcome == canary.BudgetDeniedWindow:
 		// The TIME BOX closed, not the allowance. Both are whole-Canary stops, but the first cause
@@ -462,10 +471,10 @@ func (rt *canaryRuntime) reserveCanaryExecution(capb rollout.Capability, now tim
 			// denies every later reserve on concurrency until restart). The monotonic TOTAL spend stays
 			// consumed (Release never decrements it), so the budget is never replayed (Codex P2).
 			cr.enforcer.Release()
-			return canary.BudgetDeniedInvalid, generation
+			return canary.BudgetDeniedInvalid
 		}
 	}
-	return outcome, generation
+	return outcome
 }
 
 // releaseCanaryExecution returns one in-flight concurrency slot after an execution reserved under

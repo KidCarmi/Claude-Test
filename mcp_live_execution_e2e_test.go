@@ -31,8 +31,8 @@ func liveRealGate(capb rollout.Capability, trustOK bool) *mcpLiveSideEffectGate 
 		admit:     mcpLiveTierFor(capb).admitExecution,
 		readFirst: canary.IsReadFirstOperation,
 		trustOK:   func(string, string, string, string, time.Time) (bool, string) { return trustOK, "" },
-		reserve: func(now time.Time, ident canary.ExecutionIdentity) (canary.BudgetOutcome, uint64) {
-			return globalCanaryRuntime.reserveCanaryExecution(capb, now, ident)
+		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return globalCanaryRuntime.admitLiveExecution(capb, now, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },

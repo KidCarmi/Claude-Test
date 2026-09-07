@@ -334,11 +334,9 @@ func newInjectedGate(s *gateSeams) *mcpLiveSideEffectGate {
 				}
 			}, true
 		},
-		readFirst: func(policy.OperationClass) bool { return s.readOK },
-		trustOK:   func(string, string, string, string, time.Time) (bool, string) { return s.trustOK, "" },
-		reserve: func(time.Time, canary.ExecutionIdentity) (canary.BudgetOutcome, uint64) {
-			return s.outcome, 7
-		},
+		readFirst:            func(policy.OperationClass) bool { return s.readOK },
+		trustOK:              func(string, string, string, string, time.Time) (bool, string) { return s.trustOK, "" },
+		admitUnderActivation: stubAdmitUnderActivation(s.outcome, 7),
 		releaseBudget: func(uint64) {
 			if s.released != nil {
 				*s.released++

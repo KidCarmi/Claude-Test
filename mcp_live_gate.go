@@ -46,9 +46,16 @@ type mcpLiveSideEffectGate struct {
 	// has no approval" but authoritative evidence that the reviewed target changed underneath the
 	// experiment. "" means request-scoped: deny this request, the Canary continues.
 	trustOK func(tenant, serverID, toolName, fingerprint string, now time.Time) (bool, string)
-	// reserve reserves a Canary budget slot for the execution identity, returning the outcome and
-	// the generation the reservation was made under.
-	reserve func(now time.Time, ident canary.ExecutionIdentity) (canary.BudgetOutcome, uint64)
+	// admitUnderActivation is THE atomic activation-bound admission transaction: it verifies an
+	// armed activation, captures its exact generation, evaluates the trust probe, latches an
+	// authoritative drift against that generation, and reserves the budget — all under one
+	// acquisition of the activation lock, which it owns and never exposes.
+	//
+	// It replaces the reserve / tripBreach / currentGeneration trio this gate used to sequence
+	// itself. That composition was the defect: no ordering of unlocked reads can establish that the
+	// generation being latched was continuously active across the trust observation, and Codex
+	// rounds 15-19 produced a P1 against every arrangement of them.
+	admitUnderActivation func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission
 	// releaseBudget returns the in-flight concurrency slot for a reservation made under gen.
 	releaseBudget func(gen uint64)
 	// generationCurrent is the final-boundary revalidation: it reports whether the activation
@@ -58,12 +65,6 @@ type mcpLiveSideEffectGate struct {
 	generationCurrent func(gen uint64) bool
 	// note records a bounded denial reason for metrics/telemetry (never a secret). Optional.
 	note func(reason mcperr.Reason)
-	// tripBreach routes an authoritative whole-Canary breach detected at admission to the ONE
-	// abort authority (rt.tripCanaryAbort). nil in tests that do not exercise the abort path.
-	tripBreach func(gen uint64, code string)
-	// currentGeneration reports the activation generation admitting right now, so a breach observed
-	// during admission can be charged to it rather than to a later one.
-	currentGeneration func() uint64
 }
 
 var _ execution.LiveExecutionGate = (*mcpLiveSideEffectGate)(nil)
@@ -77,16 +78,12 @@ func newMCPLiveSideEffectGate(capb rollout.Capability) *mcpLiveSideEffectGate {
 		admit:     lt.admitExecution,
 		readFirst: canary.IsReadFirstOperation,
 		trustOK:   mcpLiveTrustRevalidate,
-		reserve: func(now time.Time, ident canary.ExecutionIdentity) (canary.BudgetOutcome, uint64) {
-			return globalCanaryRuntime.reserveCanaryExecution(capb, now, ident)
+		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return globalCanaryRuntime.admitLiveExecution(capb, now, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
 		note:              noteMCPLiveGateDenied,
-		tripBreach: func(gen uint64, code string) {
-			globalCanaryRuntime.tripCanaryAbortForGeneration(capb, gen, code, canaryNow())
-		},
-		currentGeneration: func() uint64 { return globalCanaryRuntime.currentGeneration(capb) },
 	}
 }
 
@@ -113,45 +110,50 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		return deny(mcperr.ReasonRolloutOutOfScope)
 	}
 
-	// (3) Runtime live-trust revalidation (§10), bound to the DECISION's fingerprint.
+	// (3+4) ATOMIC activation-bound trust revalidation, drift latch and budget reservation.
 	//
-	// The activation is captured BEFORE the check so an authoritative drift is charged to the
-	// activation that was admitting this request, not to whatever is current by the time the trip
-	// runs. A demote-and-reactivate in between makes the observation stale, and a stale observation
-	// must not stop a fresh experiment.
-	// Optional seam: a gate built without it (the injected doubles) reports 0, which the trip reads
-	// as "no activation named" and treats as the current one — the pre-existing behaviour.
-	var admittingGen uint64
-	if g.currentGeneration != nil {
-		admittingGen = g.currentGeneration()
-	}
-	trustedNow, driftCode := g.trustOK(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint, in.Now)
-	if driftCode != "" {
-		// AUTHORITATIVE DRIFT (blocker #7 §17). The reviewed tool/server is no longer the one the
-		// approval was granted against. That is not a request that happens to lack authorization —
-		// it is proof the experiment's premise (a pinned, reviewed target) no longer holds, so the
-		// request fails closed AND the whole Canary latches. The trip goes through the one abort
-		// authority; it never latches anything locally.
-		if g.tripBreach != nil {
-			g.tripBreach(admittingGen, driftCode)
-		}
-	}
-	if !trustedNow {
-		releaseAdmit()
-		return deny(mcperr.ReasonLiveTrustRevalidationFailed)
-	}
-
-	// (4) Budget reservation (§8). The spend is persisted before the grant; a denial trips the
-	// whole-Canary abort inside reserveCanaryExecution for a blast-radius breach.
-	outcome, gen := g.reserve(in.Now, canary.ExecutionIdentity{
+	// These were three steps this gate sequenced itself, reading the activation generation around
+	// them. That is the shape Codex rounds 15-19 defeated five times: no arrangement of unlocked
+	// reads proves the generation being latched was continuously active across the trust
+	// observation, and counter equality proves only that the value did not change — not that it was
+	// ever live (the rollout publication gap, §6). They are now ONE transaction that owns the
+	// activation lock for its whole duration and hands back facts.
+	//
+	// The gate does not manage activation locking and never sees the mutex. The probe it supplies
+	// is local control-plane state only — no network I/O, no credential materialization, no DNS, no
+	// upstream call — which is what makes holding the lock across it legitimate (§5).
+	adm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{
 		Principal: in.Principal,
 		Tool:      in.ToolName,
 		Server:    in.ServerID,
+	}, func() (bool, string) {
+		return g.trustOK(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint, in.Now)
 	})
-	if !outcome.Granted() {
+	// The denial class is read from an EXPLICIT field, never inferred from which other field is
+	// zero: an already-aborted Canary and an untrusted request both leave Trusted false, and
+	// inferring from that reported a stopped experiment to the client as a trust failure.
+	switch adm.Denial {
+	case canaryAdmitNoActivation:
+		// No activation owned this transaction — the rollout publication gap, a demotion, or an
+		// unarmed runtime. Admission fails CLOSED, and because there was no generation to attribute
+		// to, NOTHING was latched: a drift seen here can never stop an activation created later (§6).
+		releaseAdmit()
+		return deny(mcperr.ReasonRolloutModeInvalid)
+	case canaryAdmitDrift:
+		// AUTHORITATIVE DRIFT (blocker #7 §17). The reviewed tool/server is no longer the one the
+		// approval was granted against — proof the experiment's premise no longer holds, so the
+		// request fails closed AND the whole Canary latches. The latch already happened INSIDE the
+		// transaction, against the exact generation the probe ran under.
+		releaseAdmit()
+		return deny(mcperr.ReasonLiveTrustRevalidationFailed)
+	case canaryAdmitUntrusted:
+		releaseAdmit()
+		return deny(mcperr.ReasonLiveTrustRevalidationFailed)
+	case canaryAdmitAborted, canaryAdmitBudget:
 		releaseAdmit()
 		return deny(mcperr.ReasonRolloutBudgetExhausted)
 	}
+	gen := adm.Generation
 
 	// Admitted. Revalidate is the final-boundary re-check the executor runs right before the kill
 	// re-read: it fails closed if the generation this reservation was made under is no longer current
