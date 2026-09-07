@@ -1229,6 +1229,25 @@ UI leans on C2 semantics and must not cut over onto a known enforcement gap).
 > read-back down (GET → 500 by a route) while the latched state is
 > asserted, then release and Refresh, because the latch→resolved
 > transition against the real appliance is otherwise a race.
+> **Requalification finding (harness environment, recorded):** both full
+> Playwright runs on the corrected head failed exactly one unrelated
+> journey — `policy-2a` "real Traffic ruleId deep-links to the exact
+> highlighted Access Rule" — with the Traffic page reporting an EMPTY
+> retained history. Root cause (reproduced on the real binary, not a
+> flake): the appliance measures disk usage from statfs `Bavail`, and the
+> qualification host's session disk allowance read 99.02 % used (2.6 GB
+> available of 270 GB) — at the harness's `criticalDiskPct: 99` ceiling,
+> which is the product's maximum configurable threshold. At the retention
+> janitor's first 60 s tick `handleDiskCritical` deleted the appliance's
+> own retained history (`LogGuard: cleanup (critical disk usage (overrides
+> retention)) removed N entries`) and engaged emergency minimal mode —
+> correct product behaviour that destroyed the seeded newest-history
+> premise minutes into the run, after the early Traffic journeys had
+> already read it. Remedy: freed the runner (stale build cache), and the
+> harness now PREFLIGHTS the appliance's own guard reading from
+> `GET /api/logs/retention` and refuses to start within one point of the
+> threshold, naming the cause, instead of letting the premise decay
+> mid-suite. No product, test-assertion, timeout or skip change.
 > **Scope:** frontend only (no Go, no OpenAPI, no route change); 2F-G,
 > PX-1, CDR untouched.
 >

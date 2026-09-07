@@ -220,6 +220,30 @@ curl -s -o /dev/null -c "$SEED_JAR" -X POST -H 'Content-Type: application/json' 
 curl -s -o /dev/null -b "$SEED_JAR" -X PUT -H 'Content-Type: application/json' \
   -d '{"enabled":true,"retentionDays":7,"retentionMaxGB":1,"criticalDiskPct":99}' \
   "http://127.0.0.1:$UI_PORT/api/logs/retention"
+# Disk-pressure PREFLIGHT (2F-F requalification finding): the appliance
+# measures disk usage from statfs Bavail — the UNPRIVILEGED available space —
+# and a session disk allowance on this class of runner can read >= 99%
+# (the product's maximum configurable threshold) while df shows tens of GB
+# free elsewhere. At or above the threshold the retention janitor's
+# disk-critical cleanup deletes the appliance's own retained history
+# (logguard.go handleDiskCritical — correct product behavior, it can only
+# ever free its own logs), so the seed above is destroyed minutes into the
+# run and the Traffic -> Policy deep-link journey fails on its
+# newest-history premise with nothing in the harness naming the cause.
+# Refuse to START within one point of the threshold instead of letting the
+# premise decay mid-suite: free space on the runner, then rerun.
+GUARD_JSON="$(curl -s -b "$SEED_JAR" "http://127.0.0.1:$UI_PORT/api/logs/retention")"
+DISK_USED="$(printf '%s' "$GUARD_JSON" | sed -n 's/.*"diskUsedPct":\([0-9.]*\).*/\1/p')"
+DISK_CRIT="$(printf '%s' "$GUARD_JSON" | sed -n 's/.*"criticalDiskPct":\([0-9]*\).*/\1/p')"
+if [ -z "$DISK_USED" ] || [ -z "$DISK_CRIT" ]; then
+  echo "e2e-smoke: could not read the disk-guard reading from /api/logs/retention; refusing to run (retained-history premise unverifiable)" >&2
+  exit 1
+fi
+if awk -v u="$DISK_USED" -v c="$DISK_CRIT" 'BEGIN { exit !(u + 0 >= c - 1) }'; then
+  echo "e2e-smoke: appliance disk-usage reading ${DISK_USED}% is within one point of the critical threshold ${DISK_CRIT}% — the seeded retained history would be deleted mid-suite; free space on this host and rerun" >&2
+  exit 1
+fi
+echo "e2e-smoke: disk-guard preflight ok (used ${DISK_USED}%, critical ${DISK_CRIT}%)"
 # Trusted-proxy premise (supported admin API, RISK-019): the admin-plane
 # per-IP rate limiter (60 mutations/min, hard-coded — a deliberate security
 # posture) keys on realClientIP, and every suite client shares 127.0.0.1, so
