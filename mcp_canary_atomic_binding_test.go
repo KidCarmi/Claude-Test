@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
+	"github.com/KidCarmi/Culvert/internal/mcp/execution"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 )
 
@@ -346,13 +348,38 @@ func TestAtomicBinding_TrustProbeRunsUnderTheActivationLock(t *testing.T) {
 // mcp_canary_admission.go: the probe runs with cr.mu held, so a probe that called back into the
 // activation runtime would self-deadlock. Nothing in the trust path does today — this fails loudly
 // if that ever changes, rather than hanging CI.
+//
+// IT DRIVES THE PRODUCTION PROBE, NOT A CLOSURE. An earlier version passed probeTrusted, which
+// traverses nothing — so it would have kept passing if mcpLiveTrustPrecheck later grew a reverse
+// edge into canaryRuntime and every production admission self-deadlocked (Codex round 21). A gate
+// presented as pinning an audited lock order has to walk the audited path, so this composes real
+// tool-trust state and calls the real precheck: coordinator -> inventory -> catalog -> registry.
 func TestAtomicBinding_TrustProbeMayNotReEnterTheRuntime(t *testing.T) {
+	resetInventory(t)
+	resetExecDeps(t)
+	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
+	_, fn := liveFakeClock()
+	composeToolTrust(t, fn)
+	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+
 	r := newAtomicRig(t)
 	r.arm(t, 3)
 
+	// The PRODUCTION probe, shaped exactly as the gate supplies it under the lock.
+	realProbe := func() (bool, string) {
+		live := mcpLiveTrustPrecheck(ttTenant, sid, tool, fpHex)
+		if live.DriftCode != "" {
+			return false, live.DriftCode
+		}
+		return live.Eligible, ""
+	}
+	if ok, code := realProbe(); !ok || code != "" {
+		t.Fatalf("premise: the composed fixture must be trusted with no drift, got ok=%v code=%q", ok, code)
+	}
+
 	done := make(chan canaryAdmission, 1)
 	go func() {
-		done <- r.admit(probeTrusted()) // the REAL probe shape: no re-entry
+		done <- r.admit(realProbe)
 	}()
 	select {
 	case adm := <-done:
@@ -630,5 +657,78 @@ func TestAtomicBinding_PreExecutorLatchHoldsTheActivationLockAcrossItsProbe(t *t
 		t.Fatal("SECURITY: the activation mutex was ACQUIRABLE while the pre-executor drift " +
 			"re-derivation was running — the observation is not activation-bound, which is the " +
 			"exact defect five review rounds were spent on")
+	}
+}
+
+// ── §5. The approval store must stay OUT of the activation critical section ──
+
+// TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock is the §5 gate, and it pins a
+// LIVENESS property rather than a correctness one — which is why an audited lock ORDER did not
+// catch the defect it exists for.
+//
+// The approval store's mutex is held across an atomic file write by every mutation
+// (Store.persistLocked), so consulting it under cr.mu puts a stuck disk in front of automatic
+// abort, demotion and generation revalidation — the controls whose entire job is to stop the
+// experiment (Codex round 21). There is no deadlock to find here: the ordering is consistent and
+// the system is simply blocked for as long as the disk is.
+//
+// So the gate blocks inside the approval lookup and requires the activation mutex to be ACQUIRABLE
+// while it blocks. Move that lookup back inside the transaction and this fails deterministically.
+func TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock(t *testing.T) {
+	r := newAtomicRig(t)
+	r.arm(t, 4)
+	cr := r.rt.capRuntime(r.capb)
+
+	inLookup := make(chan struct{})
+	release := make(chan struct{})
+	var peerAcquired bool
+
+	g := &mcpLiveSideEffectGate{
+		capb:          r.capb,
+		admit:         func() (func(), bool) { return func() {}, true },
+		readFirst:     func(policy.OperationClass) bool { return true },
+		trustPrecheck: stubTrustPrecheckEligible,
+		approvalOK: func(canary.LiveTarget, time.Time) bool {
+			close(inLookup)
+			<-release
+			return true
+		},
+		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, ident, trust)
+		},
+		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
+		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },
+		note:              noteMCPLiveGateDenied,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-inLookup
+		// The durable approval lookup is in flight. Nothing about it may hold the activation lock:
+		// an operator hitting the emergency stop right now must not queue behind a disk.
+		if cr.mu.TryLock() {
+			peerAcquired = true
+			cr.mu.Unlock()
+		}
+		close(release)
+	}()
+
+	dec := g.AdmitSideEffect(execution.LiveGateInput{
+		Capability: 0, Operation: policy.OpRead,
+		Tenant: "t1", Principal: "p1", ServerID: "s1", ToolName: "x",
+		Fingerprint: "fp", Now: canaryRuntimeTestNow,
+	})
+	wg.Wait()
+	if dec.Release != nil {
+		dec.Release()
+	}
+
+	if !peerAcquired {
+		t.Fatal("SECURITY (§5): the activation mutex was HELD while the durable approval store was " +
+			"being consulted. Store.mu is held across persistLocked's atomic file write by every " +
+			"approval mutation, so a stuck disk now sits in front of automatic abort, demotion and " +
+			"generation revalidation — the controls that stop the experiment")
 	}
 }

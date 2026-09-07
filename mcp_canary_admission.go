@@ -26,11 +26,10 @@ import (
 // one. So they do.
 //
 // LOCK-ORDER AUDIT (required before implementation). The trust probe runs while cr.mu is held, so
-// the order it establishes is load-bearing and was verified against the tree, not assumed:
+// what it may touch is load-bearing and was verified against the tree, not assumed:
 //
-//	cr.mu ─→ mcpInventory.mu     (RLock; returns two pointers immediately)
-//	      ─→ mcpToolTrust.mu     (RLock; returns the store pointer immediately)
-//	      ─→ tooltrust.Store.mu  (in-memory map walk + clone + sort)
+//	cr.mu ─→ mcpInventory.mu   (RLock; returns two pointers immediately)
+//	      ─→ mcpToolTrust.mu   (RLock; returns the store pointer immediately)
 //
 //	catalog.Current() / registry.Current() are atomic.Pointer loads and take NO lock.
 //
@@ -39,13 +38,30 @@ import (
 // contain no path back — so the edge cannot close into a cycle. (2) cr.mu previously reached NONE
 // of those packages, so this introduces the FIRST edge between them and it is one-way by
 // construction. A future change that makes any of those packages call into canaryRuntime creates
-// the cycle; TestAdmission_TrustProbeMayNotReEnterTheRuntime pins that it does not today.
+// the cycle; TestAtomicBinding_TrustProbeMayNotReEnterTheRuntime pins that it does not today, and
+// it drives the REAL production probe rather than a closure so it can actually see such an edge
+// appear.
 //
-// The probe also performs no network I/O, no credential materialization, no DNS and no upstream
-// call — mcpLiveTrustRevalidate documents the credential rule itself, and ActiveLiveApprovals is a
-// read-only in-memory walk. The durable persist that happens under this lock is the SAME
-// persistLocked every other canary-runtime mutation already performs under it; this change does
-// not add I/O to the critical section, it adds a local-state predicate.
+// ONE EDGE WAS DELIBERATELY REMOVED RATHER THAN ORDERED, and the reason is worth stating because
+// the first version of this audit got it wrong. It concluded the probe was safe because
+// "ActiveLiveApprovals is a read-only in-memory walk". That is true and it is not the question:
+// the walk takes tooltrust.Store.mu, and EVERY approval mutation holds that same mutex across
+// persistLocked and its atomic file write. So one stuck disk would have blocked cr.mu, and with it
+// automatic abort, demotion and generation revalidation — the controls whose whole job is to stop
+// the experiment (Codex round 21). §5 forbids exactly that, and no ordering argument helps: the
+// hazard is DURATION, not deadlock, and a correct lock order is perfectly compatible with being
+// blocked for as long as the disk is.
+//
+// The split that fixes it is described on mcpLiveTrustPrecheck. What matters here is why it is
+// sound: every signal that can latch the whole Canary comes from pointer-published inventory
+// state, and the approval lookup — the only blocking part — can produce nothing but a
+// request-scoped verdict, which needs no activation attribution at all. So the durable store is
+// consulted BEFORE the lock is taken, and the transaction keeps its atomic binding.
+// TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock pins that structurally.
+//
+// The probe performs no network I/O, no credential materialization, no DNS and no upstream call.
+// The durable persist that DOES happen under this lock is the SAME persistLocked every other
+// canary-runtime mutation already performs under it — pre-existing, and the abort path's own write.
 
 // canaryTrustProbe is the live-trust predicate evaluated INSIDE the activation critical section.
 //

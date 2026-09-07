@@ -311,6 +311,17 @@ run_mutation M14 \
   ./internal/mcp/runtime/ internal/mcp/runtime/execute.go \
   's/\t\t\tServerID:   toolServerID\(in\),/\t\t\tServerID:   "",/'
 
+# ── (7) §5: THE APPROVAL STORE STAYS OUT OF THE CRITICAL SECTION ───────────
+# tooltrust.Store.mu is held across persistLocked's atomic file write by every approval
+# mutation, so consulting the store under cr.mu puts a stuck disk in front of automatic
+# abort and demotion. This is a LIVENESS defect a lock-order audit cannot see.
+
+run_mutation M15 \
+  'the blocking approval lookup is moved back inside the activation critical section' \
+  'TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock' \
+  . mcp_live_gate.go \
+  's/\t\treturn live\.Eligible && approved, ""/\t\treturn live.Eligible \&\& g.approvalOK(live.Target, in.Now), ""/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

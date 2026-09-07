@@ -40,12 +40,19 @@ type mcpLiveSideEffectGate struct {
 	admit func() (release func(), ok bool)
 	// readFirst decides whether the operation class may cross the boundary.
 	readFirst func(policy.OperationClass) bool
-	// trustOK revalidates the exact current live approval for (tenant, server, tool) as of now,
-	// bound to the DECISION's fingerprint (the fingerprint the request was actually decided against).
-	// It returns ok, plus a whole-Canary DRIFT code when the denial is not merely "this request
-	// has no approval" but authoritative evidence that the reviewed target changed underneath the
-	// experiment. "" means request-scoped: deny this request, the Canary continues.
-	trustOK func(tenant, serverID, toolName, fingerprint string, now time.Time) (bool, string)
+	// trustPrecheck is the LOCK-FREE half of live-execution trust revalidation, bound to the
+	// DECISION's fingerprint (the fingerprint the request was actually decided against). It is the
+	// only half that can report a whole-Canary DRIFT code, and it reads only pointer-published
+	// inventory state — which is what makes it legal to run inside the activation critical section
+	// (§5). It is called TWICE per admission by design: once before the lock to decide whether the
+	// approval lookup is worth doing, and once INSIDE the lock, where its verdict is the one the
+	// latch is actually charged to.
+	trustPrecheck func(tenant, serverID, toolName, fingerprint string) liveTrustPrecheck
+	// approvalOK is the BLOCKING half: it consults the durable approval store, so it runs OUTSIDE
+	// the activation lock. It can only ever produce a request-scoped verdict — it never reports
+	// drift and never latches anything, which is exactly why it does not need to be attributed to
+	// an activation generation.
+	approvalOK func(tgt canary.LiveTarget, now time.Time) bool
 	// admitUnderActivation is THE atomic activation-bound admission transaction: it verifies an
 	// armed activation, captures its exact generation, evaluates the trust probe, latches an
 	// authoritative drift against that generation, and reserves the budget — all under one
@@ -74,10 +81,11 @@ var _ execution.LiveExecutionGate = (*mcpLiveSideEffectGate)(nil)
 func newMCPLiveSideEffectGate(capb rollout.Capability) *mcpLiveSideEffectGate {
 	lt := mcpLiveTierFor(capb)
 	return &mcpLiveSideEffectGate{
-		capb:      capb,
-		admit:     lt.admitExecution,
-		readFirst: canary.IsReadFirstOperation,
-		trustOK:   mcpLiveTrustRevalidate,
+		capb:          capb,
+		admit:         lt.admitExecution,
+		readFirst:     canary.IsReadFirstOperation,
+		trustPrecheck: mcpLiveTrustPrecheck,
+		approvalOK:    mcpLiveApprovalSatisfied,
 		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 			return globalCanaryRuntime.admitLiveExecution(capb, now, ident, trust)
 		},
@@ -122,12 +130,30 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	// The gate does not manage activation locking and never sees the mutex. The probe it supplies
 	// is local control-plane state only — no network I/O, no credential materialization, no DNS, no
 	// upstream call — which is what makes holding the lock across it legitimate (§5).
+	//
+	// THE APPROVAL LOOKUP IS DELIBERATELY DONE FIRST, OUTSIDE THE LOCK. It reads the durable
+	// approval store, whose mutex is held across an atomic file write by every mutation, so calling
+	// it under the activation lock would put a stuck disk in front of automatic abort and demotion
+	// (Codex round 21, §5). It is safe out here precisely because it can only ever produce a
+	// REQUEST-SCOPED verdict: it never reports drift, so nothing it decides needs to be attributed
+	// to a generation. Everything that CAN latch the whole Canary stays inside the transaction and
+	// reads only pointer-published inventory state.
+	pre := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
+	approved := pre.Eligible && g.approvalOK(pre.Target, in.Now)
+
 	adm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{
 		Principal: in.Principal,
 		Tool:      in.ToolName,
 		Server:    in.ServerID,
 	}, func() (bool, string) {
-		return g.trustOK(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint, in.Now)
+		// RE-DERIVED under the lock: the drift verdict the latch is charged to is the one taken
+		// here, not the one computed above. The pre-lock precheck exists only to decide whether the
+		// approval lookup was worth doing; its drift verdict is discarded.
+		live := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
+		if live.DriftCode != "" {
+			return false, live.DriftCode
+		}
+		return live.Eligible && approved, ""
 	})
 	// The denial class is read from an EXPLICIT field, never inferred from which other field is
 	// zero: an already-aborted Canary and an untrusted request both leave Trusted false, and
@@ -211,14 +237,51 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 //     for a DIFFERENT fingerprint (e.g. an F2 approval when this request was decided under F1) can
 //     never authorize this side effect. The approval is then validated against that same fingerprint.
 func mcpLiveTrustRevalidate(tenant, serverID, toolName, decisionFP string, now time.Time) (trusted bool, driftCode string) {
+	pre := mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP)
+	if pre.DriftCode != "" || !pre.Eligible {
+		return false, pre.DriftCode
+	}
+	return mcpLiveApprovalSatisfied(pre.Target, now), ""
+}
+
+// liveTrustPrecheck is the LOCK-FREE half of live-execution trust revalidation: everything that can
+// produce an authoritative whole-Canary DRIFT verdict, and nothing that can block.
+type liveTrustPrecheck struct {
+	// DriftCode is non-empty only for an AUTHORITATIVE drift — the whole-Canary breach codes.
+	DriftCode string
+	// Eligible reports that the target is present, is this tenant's, is usable, and still carries
+	// the decision's fingerprint. False with an empty DriftCode is a request-scoped denial.
+	Eligible bool
+	Target   canary.LiveTarget
+}
+
+// mcpLiveTrustPrecheck decides everything the whole-Canary latch depends on, reading ONLY
+// pointer-published inventory state.
+//
+// WHY THIS IS SPLIT OUT, and it is a safety property rather than a tidiness one. The activation
+// critical section latches aborts and gates demotion, so anything that can BLOCK inside it can
+// block the controls that stop the experiment. The approval lookup can: Store.ActiveLiveApprovals
+// takes Store.mu, and every approval mutation holds that same mutex across persistLocked and its
+// atomic file write — so one stuck disk would sit in front of automatic abort, demotion and
+// generation revalidation (Codex round 21). §5 forbids exactly that, and an audited lock ORDER
+// would not have helped: the hazard is duration, not deadlock.
+//
+// The separation is clean because of what each half decides. Every authoritative drift signal —
+// the server no longer usable, the fingerprint no longer the decision's — is derived from the
+// inventory, which is published through atomic pointers (catalog.Current / registry.Current) behind
+// one RLock that returns immediately. The approval lookup NEVER produces a drift code; it only
+// distinguishes an authorized request from an unauthorized one, which is request-scoped and needs
+// no activation attribution at all. So the latch keeps its atomic binding while the blocking read
+// moves out of the critical section entirely — removing the edge rather than ordering it.
+func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTrustPrecheck {
 	if mcpToolTrust == nil {
-		return false, ""
+		return liveTrustPrecheck{}
 	}
 	ti := mcpToolTrust.loadTarget(serverID, toolName)
 	if !ti.found || ti.target.Tenant == "" || ti.target.Tenant != tenant {
 		// Request-scoped: this request names a target that is not this tenant's reviewed one. A
 		// Canary that correctly refuses such a request is a Canary working, not a breach.
-		return false, ""
+		return liveTrustPrecheck{}
 	}
 	// The reviewed server must still be usable at the boundary (P1b): an operator disable or a lost
 	// identity verification after runExecute snapshotted in.Server fails closed here.
@@ -230,7 +293,7 @@ func mcpLiveTrustRevalidate(tenant, serverID, toolName, decisionFP string, now t
 	// no longer the one in force, and the safe response to "the approved anchor is gone" is to stop
 	// changing reality, not to keep going because one of the two possible causes was benign.
 	if !ti.target.ServerUsable {
-		return false, "server_identity_drift"
+		return liveTrustPrecheck{DriftCode: "server_identity_drift"}
 	}
 	// Bind trust to the DECISION's fingerprint, not merely whichever fingerprint is current (P1a): the
 	// current target must STILL equal the fingerprint this request was decided against, so an
@@ -241,26 +304,38 @@ func mcpLiveTrustRevalidate(tenant, serverID, toolName, decisionFP string, now t
 	// it means this request never carried one, which is a malformed request, not evidence the
 	// target changed.
 	if decisionFP == "" {
-		return false, ""
+		return liveTrustPrecheck{}
 	}
 	if hex.EncodeToString(ti.target.Fingerprint[:]) != decisionFP {
-		return false, "tool_fingerprint_drift"
+		return liveTrustPrecheck{DriftCode: "tool_fingerprint_drift"}
 	}
-	tgt := canary.LiveTarget{
-		Tenant:            tenant,
-		ServerID:          serverID,
-		ToolName:          toolName,
-		Fingerprint:       ti.target.Fingerprint,
-		FingerprintFormat: ti.target.FingerprintFormatVersion,
+	return liveTrustPrecheck{
+		Eligible: true,
+		Target: canary.LiveTarget{
+			Tenant:            tenant,
+			ServerID:          serverID,
+			ToolName:          toolName,
+			Fingerprint:       ti.target.Fingerprint,
+			FingerprintFormat: ti.target.FingerprintFormatVersion,
+		},
+	}
+}
+
+// mcpLiveApprovalSatisfied is the BLOCKING half: it consults the durable approval store, so it must
+// never be called while the activation lock is held (see mcpLiveTrustPrecheck). It can only ever
+// return a request-scoped verdict — it never reports drift and never latches anything.
+func mcpLiveApprovalSatisfied(tgt canary.LiveTarget, now time.Time) bool {
+	if mcpToolTrust == nil {
+		return false
 	}
 	for _, a := range mcpToolTrust.activeLiveApprovals(now) {
 		if canary.SatisfiesLiveExecution(a, tgt, now) == canary.TrustOK {
-			return true, ""
+			return true
 		}
 	}
 	// No satisfying approval: request-scoped. The target still matches what was reviewed; this
 	// request simply is not authorized (expired, revoked, never granted).
-	return false, ""
+	return false
 }
 
 // mcpLiveGateDenials counts live side-effect gate denials by bounded reason code, for the
