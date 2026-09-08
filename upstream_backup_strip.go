@@ -33,7 +33,7 @@ import (
 )
 
 // upstreamSettingsCredentialKeys are the keys a sealed record carries; none
-// may survive in an archived settings file (pinned by the RED matrix).
+// may survive inside the archived v2 document (pinned by the RED matrix).
 var upstreamSettingsCredentialKeys = []string{`"ciphertext"`, `"keyId"`, `"authorityHash"`}
 
 // stripUpstreamCredentialsFromSettings returns the sanitized representation
@@ -96,16 +96,37 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 	if stripped == 0 {
 		return body, 0, nil
 	}
+	// PR-C25 R15-A: the post-strip check verifies removal WITHIN the v2
+	// document, never by forbidding the sealed-record key names throughout
+	// the sanitized settings — an operator-controlled map (`otlp_headers`)
+	// or an unrelated section may legitimately use `keyId` or `ciphertext`
+	// as a name, and refusing a sound backup after the credential had been
+	// removed was the defect. The v2 document is upstream-owned in full, so
+	// any of these names surviving anywhere inside it is material the
+	// strip cannot account for and still refuses the archive.
+	if err := verifyV2CredentialsRemoved(root["upstream_proxies_v2"]); err != nil {
+		return nil, 0, err
+	}
 	out, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
 		return nil, 0, fmt.Errorf("re-serialize sanitized admin_settings.json: %w", err)
 	}
+	return out, stripped, nil
+}
+
+// verifyV2CredentialsRemoved re-serializes the v2 document alone and refuses
+// it if any sealed-record key name survives inside it after the strip.
+func verifyV2CredentialsRemoved(doc any) error {
+	sub, err := json.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("re-serialize sanitized upstream_proxies_v2: %w", err)
+	}
 	for _, k := range upstreamSettingsCredentialKeys {
-		if bytes.Contains(out, []byte(k)) {
-			return nil, 0, fmt.Errorf("sanitized admin_settings.json still carries %s", strings.Trim(k, `"`))
+		if bytes.Contains(sub, []byte(k)) {
+			return fmt.Errorf("sanitized upstream_proxies_v2 still carries %s", strings.Trim(k, `"`))
 		}
 	}
-	return out, stripped, nil
+	return nil
 }
 
 // errUpstreamSettingsDuplicateKey is the refusal for a settings body that

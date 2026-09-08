@@ -3646,6 +3646,20 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C25 — the fifteenth Codex round (one P2).** Confirmed and pinned
+> before the correction (`upstream_codex_r15_red_test.go`). (R15-A, P2)
+> After stripping a v2 credential the sanitizer scanned the WHOLE
+> re-serialized settings document for the sealed-record key names
+> (`ciphertext`, `keyId`, `authorityHash`) and refused the backup on any
+> hit, so an OTLP header or an unrelated section using one of those names
+> combined with a real v2 credential refused a sound backup after the
+> credential had already been removed. The post-strip check now verifies
+> removal within the v2 document alone (`verifyV2CredentialsRemoved`
+> re-serializes that subtree and refuses any surviving name inside it — the
+> document is upstream-owned in full, so the fail-closed posture there is
+> kept, pinned by two controls) and unrelated sections may use any name.
+> Backend only.
+>
 > **PR-C24 — a newly published dependency advisory in the generator
 > workspace.** `Gate · frontend / Frontend · verify + determinism` failed on
 > the PR-C23 head at the last verify step — `npm audit --audit-level=high`
