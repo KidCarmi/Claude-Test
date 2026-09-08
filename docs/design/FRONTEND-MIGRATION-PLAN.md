@@ -3399,6 +3399,25 @@ frozen program branch is untouched.
 > latch and the degradation surface with the rest of the upstream process
 > state (`upstream_v2_env_isolation_red_test.go`).
 >
+> **PR-C7 — two more order dependencies under the same seed.** With the
+> PR-C2 latch cleared, `-shuffle=1788866999688368609 -count=2` reached the
+> next two: `TestLoadAdminSettings_CorruptFileQuarantinedNotOverwritten`
+> asserts the settings file is absent after the corrupt copy is quarantined,
+> but `LoadAdminSettings` finalizes the YAML-seeded rewrite identities on
+> every load path and deliberately writes a fresh minimal ledger there
+> whenever a predecessor left rules in the global rewriter
+> (`TestAPIRewrite_Add` added one through the API and never restored it);
+> `TestAPIPolicyReorder_Post_Success` sends a two-rule list, which the 2E-C
+> reorder contract refuses with `409` whenever a predecessor left another
+> access rule in the global policy store. Both were rebuilt deterministically
+> in-process (`test_order_isolation_red_test.go`: seed the leaked state, run
+> the victim unchanged), and the corrections are isolation only — the
+> quarantine tests own an EMPTY rewriter (`isolateRewriterForTest`, a
+> snapshot/restore), the reorder test owns its policy store
+> (`withFreshPolicyStore`), and the leaking rewrite test restores the
+> rewriter it mutated. No product code changed and no accepted assertion
+> changed.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
