@@ -547,6 +547,13 @@ func (c *DataPlaneClient) rateLimitGossipLoop(ctx context.Context, interval time
 			clusterRateLimitEnabled.Store(false)
 			return
 		case <-ticker.C:
+			// CHAOS-57: evaluate broadcast freshness on EVERY tick, before the
+			// enabled check and before the RPC. A tick that returns early (rate
+			// limiting off) or fails still has to report whether this node is
+			// enforcing a broadcast that can no longer describe the current
+			// window — reporting it only from the success branch would mean the
+			// state is never reported during the outage that causes it.
+			noteClusterRateLimitFreshness(clusterRateLimitFreshness())
 			if !rl.Enabled() {
 				continue
 			}

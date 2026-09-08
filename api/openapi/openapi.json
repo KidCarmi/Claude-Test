@@ -714,6 +714,26 @@
         "properties": {
           "enabled": {
             "type": "boolean"
+          },
+          "remote_counts_age_secs": {
+            "description": "Age of the last applied broadcast, in seconds. Absent when none has ever been applied.",
+            "type": "number"
+          },
+          "remote_counts_applied": {
+            "description": "Whether any Control Plane broadcast has ever been received by this node.",
+            "type": "boolean"
+          },
+          "remote_counts_max_age_secs": {
+            "description": "How long an applied broadcast can still describe the current window — the rate limiter's own window. Past it the broadcast counts timestamps that have all aged out, so it contributes nothing.",
+            "type": "number"
+          },
+          "remote_counts_stale": {
+            "description": "True while the last Control Plane broadcast is older than the rate-limit window, so other nodes' request counts are no longer added to this node's local counts. Local rate limits are still enforced; the cluster-wide aggregate is not.",
+            "type": "boolean"
+          },
+          "remote_counts_stale_episodes": {
+            "description": "Times the broadcast went stale since startup (one continuous outage counts once).",
+            "type": "integer"
           }
         },
         "required": [

@@ -1109,6 +1109,14 @@ func addRequestLogHealth(resp map[string]any) {
 	if n := auditWriteErrors(); n > 0 {
 		resp["auditLogWriteErrors"] = n
 	}
+	// CHAOS-57: the CLUSTER half of the same compliance record. A Data Plane
+	// that cannot reach its Control Plane drops the oldest unsent audit events
+	// once its bounded push queue fills, so the centralized log has a gap that
+	// the local file does not. Reported separately because the remedy differs:
+	// this one is fixed by restoring the CP link, not by freeing disk.
+	if n := auditPendingDrops(); n > 0 {
+		resp["auditClusterPushDrops"] = n
+	}
 	// Saturation of the async JSONL queue: no entry is lost, but request
 	// goroutines are waiting on the disk again, so latency is affected.
 	if n := reqlog.Backpressure(); n > 0 {
