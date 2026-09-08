@@ -3477,7 +3477,11 @@ frozen program branch is untouched.
 > `applyAdminLogStore`, `reconcileMemberRotation` (per member, reports
 > whether the registry changed), `validateAuthReorderBody` (the
 > state-independent grammar check). The full linter no longer reports the
-> three; the diff-scoped gate stays at 0.
+> three; the diff-scoped gate stays at 0. The pass on that head then
+> reached two `noctx` findings in `admin_settings_upstream_test.go` (bare
+> `httptest.NewRequest` on lines this program's edits brought into the
+> review context); both use the repo's `NewRequestWithContext(t.Context(), …)`
+> convention now.
 >
 > **PR-C9 — the owner-triggered Codex review of the PR head (three P2s).**
 > Each was confirmed against the code, pinned in
