@@ -123,18 +123,41 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 	return out, stripped, nil
 }
 
-// verifyV2CredentialsRemoved re-serializes the v2 document alone and refuses
-// it if any sealed-record key name is present inside it after the strip —
-// which, for a document that carried no credential object, means anywhere
-// the strip could not reach (PR-C26 R16-A).
+// verifyV2CredentialsRemoved walks the v2 document's object KEYS at every
+// depth and refuses it if any sealed-record key name — or a `credential`
+// key the strip did not remove — is present after the strip; for a document
+// that carried no credential object that means anywhere the strip could
+// not reach (PR-C26 R16-A). PR-C27 R17-A: it inspects KEYS only, never
+// values — a sound entry whose username is `keyId` or `ciphertext` is
+// ordinary, and the earlier byte scan of the serialized subtree refused
+// every backup over it.
 func verifyV2CredentialsRemoved(doc any) error {
-	sub, err := json.Marshal(doc)
-	if err != nil {
-		return fmt.Errorf("re-serialize sanitized upstream_proxies_v2: %w", err)
-	}
-	for _, k := range upstreamSettingsCredentialKeys {
-		if bytes.Contains(sub, []byte(k)) {
-			return fmt.Errorf("sanitized upstream_proxies_v2 still carries %s", strings.Trim(k, `"`))
+	return walkV2Keys(doc)
+}
+
+// walkV2Keys recurses through objects and arrays and refuses the first
+// sealed-record key it meets.
+func walkV2Keys(v any) error {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, child := range t {
+			for _, name := range upstreamSettingsCredentialKeys {
+				if `"`+k+`"` == name {
+					return fmt.Errorf("sanitized upstream_proxies_v2 still carries %s", k)
+				}
+			}
+			if k == "credential" {
+				return errors.New("sanitized upstream_proxies_v2 still carries credential")
+			}
+			if err := walkV2Keys(child); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if err := walkV2Keys(child); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

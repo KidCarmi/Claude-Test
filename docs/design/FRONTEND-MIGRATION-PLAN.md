@@ -3646,6 +3646,21 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C27 — the seventeenth Codex round (one P2).** Confirmed and pinned
+> before the correction (`upstream_codex_r17_red_test.go`). (R17-A, P2)
+> `verifyV2CredentialsRemoved` searched the re-serialized v2 document's
+> BYTES for the quoted sealed-record key names, so a sound entry whose
+> VALUE equals one of them — an uncredentialed parent whose username is
+> `keyId` or `ciphertext`, a host spelled `authorityhash`, a document-level
+> note — matched the same quoted bytes though no sealed-record key
+> remained, and because PR-C26 runs the verifier for every present
+> document such a settings file refused every backup. The verifier now
+> walks the document's object KEYS at every depth (`walkV2Keys`) and
+> refuses a sealed-record key or a surviving `credential` key; values are
+> never inspected. The fail-closed controls (an entry-level `keyId` key, a
+> document-level `ciphertext` key, a nested `authorityHash` key) stay
+> refused. Backend only.
+>
 > **PR-C26 — the sixteenth Codex round (one P1).** Confirmed and pinned
 > before the correction (`upstream_codex_r16_red_test.go`). (R16-A, P1)
 > The PR-C25 v2-document verification ran only AFTER at least one
