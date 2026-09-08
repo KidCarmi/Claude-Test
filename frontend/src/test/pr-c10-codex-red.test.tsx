@@ -51,7 +51,7 @@ function managed(host: string, authority: string) {
 function configWith(
   entry: ReturnType<typeof managed>,
   status: number,
-): { status: number; body: unknown } {
+): { status: number; body: Record<string, unknown> } {
   return {
     status,
     body: {
@@ -249,7 +249,7 @@ describe("K5 mutations are blocked while a manual probe is in flight", () => {
       "parent-a.example",
       "http://svc@parent-a.example:3128",
     );
-    const config = configWith(entry, 200).body as Record<string, unknown>;
+    const config = configWith(entry, 200).body;
     delete config["entry"];
     let releaseProbe: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
