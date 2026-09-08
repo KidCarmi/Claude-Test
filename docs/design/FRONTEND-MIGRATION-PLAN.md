@@ -3353,6 +3353,19 @@ frozen program branch is untouched.
 > cannot land unnoticed. The PAC, network and CDR journeys pass under the
 > read-only-`/data` shape after this.
 >
+> **PR-C1c — the Go race gate had the same dependence.** The frozen head's
+> `Gate · go test -race + coverage floors` run failed four
+> `TestAPIPACLifecycle_*` journeys with `409 operation_pending`: their
+> environment helper isolated every PAC store but left the config-version
+> store on the process default `/data/config_versions`, which the CI
+> runner's unprivileged user cannot create, so the first publish's version
+> capture failed and the next publish was refused. A root-run qualification
+> never saw it. Correction: `resetPACPublishGlobals` swaps the
+> config-version store to the test's temp dir (the shape `pacFenceEnv`
+> already used), pinned by `pac_publish_env_red_test.go` (the store must
+> never sit under the process data root and must be writable), and the
+> root suite is now also qualified under `-race` with `/data` unwritable.
+>
 > **PR-C2 — determinism gate.** Under `-shuffle -count=2` the
 > process-global "stored document rejected at load" latch armed by the R3
 > rejected-document test outlived its environment and handed a 409
