@@ -303,12 +303,17 @@ object that repeats a key at any nesting level (a JSON decoder keeps only
 the last value of a repeated key, so the gate could otherwise be shown a
 value the archive would not carry), and so is a legacy `upstream_proxies`
 value that is not the persisted shape (an array of objects each carrying
-a non-empty `url` string), and so is any upstream key spelled in a case
-variant (`UPSTREAM_PROXIES`, `Entries`, `CREDENTIAL`) or repeated under a
-case-only difference — the settings loader matches keys
+a non-empty `url` string), an `upstream_proxies_v2` document whose
+document, `entries`, item or `credential` is not the persisted shape, and
+any upstream key spelled in a case variant (`UPSTREAM_PROXIES`, `Entries`,
+`CREDENTIAL`) or repeated under a case-only difference inside the
+upstream structures — the settings loader matches those keys
 case-insensitively, the sanitizer reads exact spellings, and the appliance
-never writes a variant: only a sound settings file is archived, and
-nothing the gate did not inspect is ever packed.
+never writes a variant. The case rules apply only inside the upstream
+structures: an operator-controlled map such as `otlp_headers` may carry a
+header named `URL` or `KeyId`, and unrelated sections may use any name.
+Only a sound settings file is archived, and nothing the gate did not
+inspect is ever packed.
 
 **Restore** boots every formerly credentialed entry into the distinct
 state `requiresReplacement`: ineligible, never probed, never sent

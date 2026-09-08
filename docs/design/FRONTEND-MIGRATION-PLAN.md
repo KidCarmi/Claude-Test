@@ -3646,6 +3646,27 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C23 — the fourteenth Codex round (one P1, one P2).** Both
+> confirmed and pinned before the correction
+> (`upstream_codex_r14_red_test.go`). (R14-A, P1) The sanitizer asserted
+> the v2 document to an object and its `entries` to an array and on any
+> other shape fell through to the no-op path, which hands back the
+> ORIGINAL bytes — so an `entries` object or string, a non-object item, an
+> array/string/`null` document, or a non-object `credential` carried
+> sealed material into the archive under `credentialsOmitted: true`. A
+> present document, `entries`, item or `credential` of any other shape
+> now refuses the archive. (R14-B, P2) The PR-C22 case-variant and
+> case-collision checks ran for every object at every depth, so a
+> legitimate operator-controlled map key — an OTLP header named `URL` or
+> `KeyId` under `otlp_headers`, a case-colliding header pair, or an
+> unrelated section using those names — refused every backup even with no
+> upstream credential anywhere. The token walker now tracks the
+> STRUCTURAL ROLE of every container (`jsonRole`: root, legacy list/item,
+> v2 document/entries/entry/credential, other) and applies the alias check
+> and the case-fold collision check only where the settings loader binds
+> the key to an upstream field (`upstreamBoundKeys`); an exact duplicate is
+> still refused anywhere. Runbook §8 updated. Backend only.
+>
 > **PR-C22 — the thirteenth Codex round (one P1).** Confirmed and pinned
 > before the correction (`upstream_codex_r13_red_test.go`, with a
 > loader-evidence test proving `encoding/json` reads the variants into

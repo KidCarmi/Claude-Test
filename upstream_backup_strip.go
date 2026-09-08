@@ -82,24 +82,16 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 	if err := refuseCredentialBearingLegacyUpstreams(root); err != nil {
 		return nil, 0, err
 	}
-	doc, ok := root["upstream_proxies_v2"].(map[string]any)
-	if !ok {
-		return body, 0, nil
-	}
-	entries, ok := doc["entries"].([]any)
-	if !ok {
-		return body, 0, nil
-	}
-	for i := range entries {
-		e, ok := entries[i].(map[string]any)
-		if !ok {
-			continue
-		}
-		if _, has := e["credential"]; has {
-			delete(e, "credential")
-			e["requiresReplacement"] = true
-			stripped++
-		}
+	// PR-C23 R14-A: the v2 CONTAINER shape is part of what the sanitizer
+	// reads. A present document that is not an object, a present `entries`
+	// that is not an array, an item that is not an object, or a present
+	// `credential` that is not an object is a settings file the strip
+	// cannot sanitize — and it used to fall through a failed type assertion
+	// to the no-op path, which hands back the ORIGINAL bytes, sealed
+	// material included. Every such shape now refuses the archive.
+	stripped, err = stripV2Credentials(root)
+	if err != nil {
+		return nil, 0, err
 	}
 	if stripped == 0 {
 		return body, 0, nil
@@ -123,39 +115,87 @@ var errUpstreamSettingsDuplicateKey = errors.New("admin_settings.json repeats a 
 
 // errUpstreamSettingsKeyCase is the refusal for a settings body that spells
 // a key the sanitizer reads in a case variant the settings loader would
-// still accept (see sanitizerReadKeys).
+// still accept (see upstreamBoundKeys).
 var errUpstreamSettingsKeyCase = errors.New("admin_settings.json spells an upstream key in a case variant; a backup archives only a sound settings file")
 
-// sanitizerReadKeys are the keys the sanitizer reads by exact spelling.
-// PR-C22 R13-A: encoding/json matches struct fields CASE-INSENSITIVELY, so
-// the settings loader reads `UPSTREAM_PROXIES` or `Upstream_Proxies_V2`
-// exactly as the canonical spelling while an exact map lookup treats the
-// variant as absent — a credential-bearing list under a variant bypassed
-// the gate, a sealed record under a variant was never stripped, and a
-// variant prepared-downgrade marker never refused. Any key, at any depth,
-// that equals one of these under case folding without being its exact
-// spelling refuses the archive: the appliance never writes a variant, so
-// one is a hand-edited file the sanitizer cannot read as the loader does.
-var sanitizerReadKeys = []string{
-	"upstream_proxies", "upstream_proxies_v2", "upstream_prepared_downgrade",
-	"entries", "credential", "url", "requiresReplacement",
-	"ciphertext", "keyId", "authorityHash",
+// errUpstreamSettingsV2Malformed is the refusal for a settings body whose
+// upstream_proxies_v2 document, entries, item or credential is not the
+// persisted shape the strip can sanitize (PR-C23 R14-A).
+var errUpstreamSettingsV2Malformed = errors.New("admin_settings.json carries an upstream_proxies_v2 document the sanitizer cannot read; a backup archives only a sound settings file")
+
+// jsonRole is the structural position of a JSON container in a settings
+// body, as the settings loader would bind it. PR-C23 R14-B: the case
+// checks below apply ONLY where the loader could bind a key to an upstream
+// field. An operator-controlled map such as `otlp_headers`
+// (map[string]string, where encoding/json keeps case-distinct keys apart)
+// legitimately carries a header named `URL` or `KeyId`, and an unrelated
+// section may use any of these names; neither reaches an upstream field.
+type jsonRole uint8
+
+const (
+	roleOther      jsonRole = iota // not bound to an upstream field
+	roleRoot                       // the AdminSettings object
+	roleLegacyList                 // upstream_proxies (array)
+	roleLegacyItem                 // one upstream_proxies item (object)
+	roleV2Doc                      // upstream_proxies_v2 (object)
+	roleV2Entries                  // upstream_proxies_v2.entries (array)
+	roleV2Entry                    // one v2 entry (object)
+	roleV2Cred                     // a v2 entry's credential (object)
+)
+
+// upstreamBoundKeys are, per role, the keys the sanitizer reads by exact
+// spelling and the settings loader binds case-insensitively (PR-C22
+// R13-A): a case variant of one of these, in that role, is a spelling the
+// loader accepts and the sanitizer cannot read — the appliance never
+// writes one, so it refuses the archive.
+var upstreamBoundKeys = map[jsonRole][]string{
+	roleRoot:       {"upstream_proxies", "upstream_proxies_v2", "upstream_prepared_downgrade"},
+	roleLegacyItem: {"url"},
+	roleV2Doc:      {"entries"},
+	roleV2Entry:    {"credential", "requiresReplacement"},
+	roleV2Cred:     {"ciphertext", "keyId", "authorityHash"},
+}
+
+// childRole is the role of the value stored under key in a container of
+// role parent (arrays hand their element role down through elemRole).
+func childRole(parent jsonRole, key string) jsonRole {
+	switch {
+	case parent == roleRoot && key == "upstream_proxies":
+		return roleLegacyList
+	case parent == roleRoot && key == "upstream_proxies_v2":
+		return roleV2Doc
+	case parent == roleV2Doc && key == "entries":
+		return roleV2Entries
+	case parent == roleV2Entry && key == "credential":
+		return roleV2Cred
+	}
+	return roleOther
+}
+
+// elemRole is the role of one element of an array of role parent.
+func elemRole(parent jsonRole) jsonRole {
+	switch parent {
+	case roleLegacyList:
+		return roleLegacyItem
+	case roleV2Entries:
+		return roleV2Entry
+	}
+	return roleOther
 }
 
 // rejectDuplicateJSONKeys walks the raw token stream of body and refuses
 // any JSON object that carries the same key twice, at every nesting level
-// (an object inside an array inside an object included), and any key that
-// is a case variant of one the sanitizer reads. Two keys that differ only
-// by case are a collision too: encoding/json resolves one to the struct
-// field by a preference rule the sanitizer cannot see. It reports nothing
-// about VALUES — the same key in two different objects is normal — and
-// never decodes into a map, which is exactly the representation that
-// discards the earlier value. Syntax errors are left to the decoder that
-// follows.
+// (an object inside an array inside an object included) — and, inside the
+// containers the settings loader binds to upstream fields, any two keys
+// that differ only by case and any case variant of a key the sanitizer
+// reads. It reports nothing about VALUES — the same key in two different
+// objects is normal — and never decodes into a map, which is exactly the
+// representation that discards the earlier value. Syntax errors are left
+// to the decoder that follows.
 func rejectDuplicateJSONKeys(body []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
-	var w jsonKeyWalker
+	w := jsonKeyWalker{nextRole: roleRoot}
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -167,18 +207,22 @@ func rejectDuplicateJSONKeys(body []byte) error {
 	}
 }
 
-// jsonObjectFrame is one open JSON container on the walker's stack: for an
-// object, the keys seen so far and whether the next token is a key.
+// jsonObjectFrame is one open JSON container on the walker's stack: its
+// role, and for an object the keys seen so far, whether the next token is
+// a key, and the role the value under the last key will take.
 type jsonObjectFrame struct {
 	object    bool
+	role      jsonRole
 	keys      []string
 	expectKey bool
+	valueRole jsonRole
 }
 
 // jsonKeyWalker tracks the open containers of a token stream and reports a
 // key repeated inside one object.
 type jsonKeyWalker struct {
-	stack []*jsonObjectFrame
+	stack    []*jsonObjectFrame
+	nextRole jsonRole // the role of the next container opened
 }
 
 // step consumes one token and reports a duplicate or case-variant key.
@@ -186,16 +230,22 @@ func (w *jsonKeyWalker) step(tok json.Token) error {
 	if top := w.top(); top != nil && top.object && top.expectKey {
 		return w.stepKeyPosition(top, tok)
 	}
-	if top := w.top(); top != nil && top.object {
-		top.expectKey = true // the value has been consumed, or begins below
+	if top := w.top(); top != nil {
+		if top.object {
+			top.expectKey = true // the value has been consumed, or begins below
+			w.nextRole = top.valueRole
+		} else {
+			w.nextRole = elemRole(top.role)
+		}
 	}
 	w.stepDelim(tok)
 	return nil
 }
 
 // stepKeyPosition handles a token where an object expects a key: the closing
-// brace, or the key itself (a duplicate under case folding, or a case
-// variant of a key the sanitizer reads, is refused).
+// brace, or the key itself (an exact duplicate anywhere; inside an
+// upstream-bound container also a duplicate under case folding or a case
+// variant of a bound key).
 func (w *jsonKeyWalker) stepKeyPosition(top *jsonObjectFrame, tok json.Token) error {
 	if d, ok := tok.(json.Delim); ok && d == '}' {
 		w.pop()
@@ -205,18 +255,23 @@ func (w *jsonKeyWalker) stepKeyPosition(top *jsonObjectFrame, tok json.Token) er
 	if !ok {
 		return nil // not a key where one is required: a syntax error
 	}
+	bound := upstreamBoundKeys[top.role]
 	for _, seen := range top.keys {
-		if strings.EqualFold(seen, key) {
+		if seen == key {
+			return errUpstreamSettingsDuplicateKey
+		}
+		if len(bound) > 0 && top.role != roleRoot && strings.EqualFold(seen, key) {
 			return errUpstreamSettingsDuplicateKey
 		}
 	}
-	for _, name := range sanitizerReadKeys {
+	for _, name := range bound {
 		if key != name && strings.EqualFold(key, name) {
 			return errUpstreamSettingsKeyCase
 		}
 	}
 	top.keys = append(top.keys, key)
 	top.expectKey = false
+	top.valueRole = childRole(top.role, key)
 	return nil
 }
 
@@ -228,12 +283,13 @@ func (w *jsonKeyWalker) stepDelim(tok json.Token) {
 	}
 	switch d {
 	case '{':
-		w.stack = append(w.stack, &jsonObjectFrame{object: true, expectKey: true})
+		w.stack = append(w.stack, &jsonObjectFrame{object: true, role: w.nextRole, expectKey: true})
 	case '[':
-		w.stack = append(w.stack, &jsonObjectFrame{})
+		w.stack = append(w.stack, &jsonObjectFrame{role: w.nextRole})
 	case '}', ']':
 		w.pop()
 	}
+	w.nextRole = roleOther
 }
 
 func (w *jsonKeyWalker) top() *jsonObjectFrame {
@@ -247,6 +303,47 @@ func (w *jsonKeyWalker) pop() {
 	if len(w.stack) > 0 {
 		w.stack = w.stack[:len(w.stack)-1]
 	}
+}
+
+// stripV2Credentials removes every sealed credential from the v2 document
+// in root (marking its entry requiresReplacement) and returns the count. An
+// absent document or entries key strips nothing; a present document,
+// entries, item or credential of any other shape is refused (PR-C23 R14-A).
+func stripV2Credentials(root map[string]any) (int, error) {
+	rawDoc, present := root["upstream_proxies_v2"]
+	if !present {
+		return 0, nil
+	}
+	doc, ok := rawDoc.(map[string]any)
+	if !ok {
+		return 0, errUpstreamSettingsV2Malformed
+	}
+	rawEntries, present := doc["entries"]
+	if !present {
+		return 0, nil
+	}
+	entries, ok := rawEntries.([]any)
+	if !ok {
+		return 0, errUpstreamSettingsV2Malformed
+	}
+	stripped := 0
+	for i := range entries {
+		e, ok := entries[i].(map[string]any)
+		if !ok {
+			return 0, errUpstreamSettingsV2Malformed
+		}
+		rawCred, has := e["credential"]
+		if !has {
+			continue
+		}
+		if _, ok := rawCred.(map[string]any); !ok {
+			return 0, errUpstreamSettingsV2Malformed
+		}
+		delete(e, "credential")
+		e["requiresReplacement"] = true
+		stripped++
+	}
+	return stripped, nil
 }
 
 // countUpstreamCredentialsRequiringReplacement counts the entries an
