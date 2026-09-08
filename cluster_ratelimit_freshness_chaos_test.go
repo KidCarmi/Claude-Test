@@ -277,6 +277,110 @@ func extractClusterRLMetrics(body string) string {
 	return strings.Join(out, "\n")
 }
 
+// ── The armed condition (Codex review, PR #1346) ────────────────────────────
+
+// withClusterGossipButLimiterOff reproduces the DEFAULT posture of a Data Plane
+// node: rateLimitGossipLoop has set clusterRateLimitEnabled, but the rate
+// limiter itself is off (Configure enables it only for a limit > 0), so the
+// loop skips every RPC and no broadcast can ever be applied.
+func withClusterGossipButLimiterOff(t *testing.T) {
+	t.Helper()
+	oldRL := rl
+	oldArmed := clusterRateLimitEnabled.Load()
+	rl = newRateLimiter() // never Configured: enabled == false
+	clusterRateLimitEnabled.Store(true)
+	resetClusterRateLimitFreshnessForTest()
+	t.Cleanup(func() {
+		rl = oldRL
+		clusterRateLimitEnabled.Store(oldArmed)
+		resetClusterRateLimitFreshnessForTest()
+	})
+}
+
+// TestChaos57_LimiterOffIsNeverReportedStale is the regression gate for the
+// false alarm: on a node that is not rate limiting, no remote count is ever
+// consulted (AllowClusterAware short-circuits), so nothing can be degraded —
+// yet a cluster-flag-only armed condition pinned every surface at "degraded"
+// permanently, on the DEFAULT posture.
+func TestChaos57_LimiterOffIsNeverReportedStale(t *testing.T) {
+	withClusterGossipButLimiterOff(t)
+
+	st := clusterRateLimitFreshness()
+	if st.Armed {
+		t.Fatal("Armed is true while the rate limiter is off — AllowClusterAware never reaches a remote count there")
+	}
+	if st.Stale {
+		t.Fatal("a node that is not rate limiting is reported stale: a permanent false alarm on the default posture")
+	}
+
+	// Ticking the gossip loop's reporter must not log, count an episode, or
+	// arm any surface. A hundred ticks is an ordinary few minutes of uptime.
+	for i := 0; i < 100; i++ {
+		noteClusterRateLimitFreshness(clusterRateLimitFreshness())
+	}
+	if got := clusterRLStaleEpisodes.Load(); got != 0 {
+		t.Fatalf("stale episodes on a node that is not rate limiting = %d, want 0", got)
+	}
+	if body := renderMetrics(t); strings.Contains(body, "culvert_cluster_ratelimit_remote_stale") {
+		t.Fatal("/metrics exports the cluster rate-limit gauges on a node whose limiter is off")
+	}
+}
+
+// TestChaos57_LimiterOffStillReportsWhatArrived pins that suppressing the ALARM
+// does not suppress the FACTS: a broadcast that did land is still reported, so
+// the surface stays diagnostic rather than going blank.
+func TestChaos57_LimiterOffStillReportsWhatArrived(t *testing.T) {
+	withClusterGossipButLimiterOff(t)
+	clusterCounts.applyAtForTest(map[string]int{"203.0.113.20": 5}, time.Now().Add(-2*time.Hour))
+
+	st := clusterRateLimitFreshness()
+	if !st.Applied {
+		t.Fatal("Applied is false after a broadcast landed — the un-armed path is hiding a fact, not just an alarm")
+	}
+	if st.Age <= 0 {
+		t.Fatalf("Age = %s after a broadcast landed 2h ago", st.Age)
+	}
+	if st.Stale {
+		t.Fatal("an expired broadcast is reported stale on a node that consults no remote count")
+	}
+}
+
+// TestChaos57_ArmedNeedsBothHalves is the control: suppressing the false alarm
+// must not suppress the REAL one. Turning the limiter on — the other half of
+// the condition AllowAuto → AllowClusterAware requires — arms the surface and
+// the genuine degradation is reported again.
+func TestChaos57_ArmedNeedsBothHalves(t *testing.T) {
+	withClusterGossipButLimiterOff(t)
+	if clusterRateLimitFreshness().Armed {
+		t.Fatal("armed with the limiter off")
+	}
+
+	// Cluster flag on AND limiter on, with no broadcast ever applied: the real
+	// degradation this whole file exists to surface.
+	rl.Configure(10, time.Minute)
+	st := clusterRateLimitFreshness()
+	if !st.Armed {
+		t.Fatal("not armed with both the gossip loop running and the limiter enabled")
+	}
+	if !st.Stale {
+		t.Fatal("a genuinely armed node with no broadcast is not reported stale — the fix silenced the real alarm")
+	}
+	noteClusterRateLimitFreshness(st)
+	if got := clusterRLStaleEpisodes.Load(); got != 1 {
+		t.Fatalf("stale episodes = %d on a real degradation, want 1", got)
+	}
+	if body := renderMetrics(t); !strings.Contains(body, "culvert_cluster_ratelimit_remote_stale 1") {
+		t.Fatal("/metrics does not report the real degradation once both halves are armed")
+	}
+
+	// And the other half in isolation: limiter on but no gossip loop running
+	// (a standalone proxy) must stay un-armed.
+	clusterRateLimitEnabled.Store(false)
+	if clusterRateLimitFreshness().Armed {
+		t.Fatal("armed on a standalone node with no DP gossip loop")
+	}
+}
+
 // ── Concurrency ─────────────────────────────────────────────────────────────
 
 // TestChaos57_FreshCountRacesApply runs the hot-path reader against the gossip

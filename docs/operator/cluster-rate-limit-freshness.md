@@ -59,9 +59,12 @@ outage — this was the cause.
 
 ## Surfaces
 
-**Prometheus** (emitted only on a node where cluster rate limiting is armed —
+**Prometheus** (emitted only on a node where cluster rate limiting is *armed* —
 a `0` on a standalone proxy would be indistinguishable from a healthy clustered
-node):
+node). Armed means both halves of what the request path actually requires: the
+Data Plane gossip loop is running **and** the rate limiter itself is enabled
+(a limit > 0). A node with rate limiting off consults no remote count at all,
+so it is never reported stale and emits none of these series:
 
 | Series | Meaning |
 |---|---|

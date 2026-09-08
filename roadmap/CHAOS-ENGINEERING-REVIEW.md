@@ -2931,6 +2931,39 @@ distributed rate limiter. `TestChaos57_FreshBroadcastStillSuppresses` and
 `TestChaos57_BroadcastAppliesForTheWholeWindow` pin the healthy path from both
 sides, so a fix that passes by deleting the feature fails.
 
+### 25.4b Review follow-up — a defect in the fix itself (Codex, PR #1346)
+
+The freshness plane's emission rule is stated in its own header — a 0/1 gauge on
+a node that never had the feature is indistinguishable from a broken one, so
+emit only when ARMED — and the first version broke it in the same file. `Armed`
+checked only `clusterRateLimitEnabled`, but `rateLimitGossipLoop` sets that flag
+UNCONDITIONALLY when it starts and then skips every RPC while `rl.Enabled()` is
+false. That is the DEFAULT posture: `Configure` enables the limiter only for a
+limit > 0, so on a Data Plane with no rate limit configured no broadcast can
+ever be applied — and every freshness surface reported a permanent,
+un-clearable degradation on a node that is not rate limiting at all: gauge
+pinned at 1, an episode counted, a warning logged, the panel banner shown.
+
+The condition was applied to *"is gossip running"* but not to *"is anything
+being decided"*. `Armed` now requires BOTH halves of what the request path
+itself requires — the gossip loop running (so `AllowAuto` dispatches to the
+cluster-aware path) AND `rl.Enabled()` (`AllowClusterAware` returns true
+immediately when the limiter is off, before `FreshCount` is ever reached) — and
+an un-armed node is never `Stale`, because staleness is a statement about
+ENFORCEMENT, not about the age of a value nobody reads. `Applied` and `Age`
+stay honest there, so suppressing the ALARM does not blank the FACTS.
+
+Three gates, each verified failing against the pre-fix condition:
+`LimiterOffIsNeverReportedStale`, `LimiterOffStillReportsWhatArrived`, and
+`ArmedNeedsBothHalves` — the last being the control that suppressing the false
+alarm did not also silence the real one.
+
+The lesson is narrower than the finding: **a health surface's armed condition
+must be the same predicate as the code path it reports on.** The request path
+needs two facts to consult a remote count; the reporter checked one, and a
+false alarm on the default posture is the kind of noise that trains operators
+to ignore the gauge before the real outage arrives.
+
 ### 25.5 What is deliberately left
 
 * **HA-1 itself is unchanged.** Config staleness is a posture decision with a

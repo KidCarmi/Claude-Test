@@ -39,19 +39,41 @@ import (
 // clusterRateLimitStatus is the read-side snapshot of the cluster rate-limit
 // broadcast's freshness. Every field is derived at read time.
 type clusterRateLimitStatus struct {
-	// Armed is true while this node runs the DP gossip loop, i.e. while
-	// AllowClusterAware (rather than plain Allow) makes the decision.
+	// Armed is true only when this node's allow/deny decisions ACTUALLY consult
+	// remote counts. That needs BOTH halves of the condition AllowAuto →
+	// AllowClusterAware requires: the DP gossip loop is running (so AllowAuto
+	// dispatches to the cluster-aware path) AND the rate limiter itself is
+	// enabled (AllowClusterAware returns true immediately when it is not,
+	// before FreshCount is ever reached).
+	//
+	// Both halves are load-bearing, and the second one was missed in the first
+	// version of this file. rateLimitGossipLoop sets clusterRateLimitEnabled
+	// unconditionally when it starts, but skips every RPC while rl.Enabled() is
+	// false — which is the DEFAULT posture, since Configure only enables the
+	// limiter for a limit > 0. On such a node no broadcast can ever be applied,
+	// so a cluster-flag-only Armed reported a permanent, un-clearable
+	// degradation — gauge pinned at 1, an episode counted, a warning logged, a
+	// banner shown — on a node that is not rate limiting at all and for which
+	// no remote count is ever consulted. That is precisely the failure this
+	// file's own emission rule exists to prevent (a 0/1 gauge on a node that
+	// never had the feature is indistinguishable from a broken one), applied to
+	// "is gossip running" but not to "is anything being decided". Found by
+	// Codex review on PR #1346.
 	Armed bool
 	// Applied is true once any broadcast has been received. False on a node
-	// that has never reached its Control Plane.
+	// that has never reached its Control Plane. Reported honestly regardless of
+	// Armed — it is a fact about what arrived, not about what is enforced.
 	Applied bool
 	// Age is how long ago the last broadcast landed (0 when none has).
 	Age time.Duration
 	// MaxAge is the window past which a broadcast can no longer describe the
 	// current window — the rate limiter's own window.
 	MaxAge time.Duration
-	// Stale is true when the remote half of every decision is being ignored:
-	// no broadcast has ever landed, or the last one is at least MaxAge old.
+	// Stale is true when the remote half of a decision this node is ACTUALLY
+	// MAKING is not being applied: it is armed, and either no broadcast has ever
+	// landed or the last one is at least MaxAge old. An un-armed node is never
+	// stale — there is no decision for an expired broadcast to degrade, so
+	// reporting one would be a false alarm on every surface at once.
 	Stale bool
 	// Episodes counts fresh→stale transitions observed by the gossip loop since
 	// startup. It is the operator's "has this happened before" signal; the
@@ -63,17 +85,24 @@ type clusterRateLimitStatus struct {
 // from any goroutine and from a scrape handler.
 func clusterRateLimitFreshness() clusterRateLimitStatus {
 	st := clusterRateLimitStatus{
-		Armed:    clusterRateLimitEnabled.Load(),
+		Armed:    clusterRateLimitEnabled.Load() && rl.Enabled(),
 		MaxAge:   clusterRemoteCountMaxAge(rl.Window()),
 		Episodes: clusterRLStaleEpisodes.Load(),
 	}
-	appliedAt, ok := clusterCounts.AppliedAt()
-	if !ok {
+	if appliedAt, ok := clusterCounts.AppliedAt(); ok {
+		st.Applied = true
+		st.Age = time.Since(appliedAt)
+	}
+	if !st.Armed {
+		// Nothing on this node consults a remote count, so no broadcast — absent,
+		// current or long expired — can be degrading anything. Staleness is a
+		// statement about enforcement, not about the age of a value nobody reads.
+		return st
+	}
+	if !st.Applied {
 		st.Stale = true // nothing applied yet: the remote half contributes nothing
 		return st
 	}
-	st.Applied = true
-	st.Age = time.Since(appliedAt)
 	if st.Age < 0 {
 		// Clock rollback between the stamp and this read. Treating a negative
 		// age as fresh would honour a broadcast for however far back the clock
