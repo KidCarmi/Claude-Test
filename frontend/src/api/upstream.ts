@@ -760,11 +760,23 @@ function specWire(
   };
 }
 
-/** The canonical authority the appliance derives from a submitted spec
+/** The canonical FIELDS the appliance derives from a submitted spec
  * (`Normalize`: scheme + host lower-cased, trailing dot stripped, IDNA via
- * the URL parser, the scheme default port). Used ONLY to bind a success
- * answer to the request — never to render or to send. */
-export function canonicalAuthority(spec: UpstreamEntrySpec): string {
+ * the URL parser, the scheme default port, the username trimmed). Used
+ * ONLY to bind a success answer to the request — never to render or to
+ * send. The answer is bound FIELD BY FIELD, never through a rebuilt
+ * authority string: the appliance percent-escapes the username inside
+ * `authority` (url.PathEscape — `?`, `#`, `%`, `;`, non-ASCII), and a
+ * client-side re-implementation of that escaping would turn a genuine
+ * success into an unproven outcome on exactly the usernames it got wrong
+ * (PR-C9 K2). */
+export interface CanonicalSpec {
+  scheme: string;
+  host: string;
+  port: number;
+  username: string;
+}
+export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
   const scheme = spec.scheme.trim().toLowerCase();
   let host = spec.host.trim().toLowerCase().replace(/\.+$/, "");
   try {
@@ -774,8 +786,19 @@ export function canonicalAuthority(spec: UpstreamEntrySpec): string {
     /* keep the lowered host; the appliance would have refused it anyway */
   }
   const port = spec.port === 0 ? (scheme === "https" ? 443 : 80) : spec.port;
-  const user = spec.username.trim();
-  return `${scheme}://${user !== "" ? `${user}@` : ""}${host}:${String(port)}`;
+  return { scheme, host, port, username: spec.username.trim() };
+}
+
+function matchesSpec(
+  e: { scheme: string; host: string; port: number; username: string },
+  want: CanonicalSpec,
+): boolean {
+  return (
+    e.scheme === want.scheme &&
+    e.host === want.host &&
+    e.port === want.port &&
+    e.username === want.username
+  );
 }
 
 /** Wrap the read-model decoder with an ACTION-SPECIFIC evidence check: a
@@ -801,7 +824,7 @@ export function createUpstreamEntry(
   documentRevision: number,
   signal?: AbortSignal,
 ): Promise<UpstreamConfig> {
-  const authority = canonicalAuthority(spec);
+  const want = canonicalSpec(spec);
   return apiRequest(
     "/api/upstream/entries",
     bound(
@@ -809,7 +832,7 @@ export function createUpstreamEntry(
       (cfg) =>
         cfg.entry !== undefined &&
         cfg.entry.source === "managed" &&
-        cfg.entry.authority === authority &&
+        matchesSpec(cfg.entry, want) &&
         cfg.entries.some((e) => e.id === cfg.entry?.id),
     ),
     { method: "POST", body: specWire(spec, documentRevision), ...sig(signal) },
@@ -824,7 +847,7 @@ export function updateUpstreamEntry(
   entryRevision: number,
   signal?: AbortSignal,
 ): Promise<UpstreamConfig> {
-  const authority = canonicalAuthority(spec);
+  const want = canonicalSpec(spec);
   return apiRequest(
     `/api/upstream/entries/${encodeURIComponent(id)}`,
     bound(
@@ -832,8 +855,8 @@ export function updateUpstreamEntry(
       (cfg) =>
         cfg.entry !== undefined &&
         cfg.entry.id === id &&
-        cfg.entry.authority === authority &&
-        cfg.entries.some((e) => e.id === id && e.authority === authority),
+        matchesSpec(cfg.entry, want) &&
+        cfg.entries.some((e) => e.id === id && matchesSpec(e, want)),
     ),
     { method: "PUT", body: specWire(spec, entryRevision), ...sig(signal) },
   );
@@ -909,11 +932,35 @@ export function clearUpstreamCredential(
   );
 }
 
+/** The appliance bounds each probe at 5 s and runs the entries
+ * SEQUENTIALLY (`internal/upstream` probeTimeout — pinned in lockstep by
+ * the Go side), so a manual run legitimately takes up to
+ * entries x 5 s. */
+export const PROBE_PER_ENTRY_MS = 5_000;
+/** Headroom above the appliance's worst case for the answer itself. */
+export const PROBE_DEADLINE_MARGIN_MS = 10_000;
+const PROBE_DEADLINE_FLOOR_MS = 30_000;
+
+/** The client deadline for a manual probe run over `entryCount` entries:
+ * never below the default request deadline, never below the appliance's
+ * sequential worst case plus the margin. A run the appliance is still
+ * executing must not be aborted into an unproven outcome (PR-C9 K3). */
+export function probeDeadlineMs(entryCount: number): number {
+  const n = Number.isFinite(entryCount) && entryCount > 0 ? entryCount : 0;
+  return Math.max(
+    PROBE_DEADLINE_FLOOR_MS,
+    n * PROBE_PER_ENTRY_MS + PROBE_DEADLINE_MARGIN_MS,
+  );
+}
+
 /** POST /api/upstream/health — the bounded, audited manual probe run; the
  * answer must carry the explicit result (`ok: true`) and its counts-only
- * `summary`. */
+ * `summary`. `entryCount` is the read model's entry count (an upper bound
+ * of the eligible entries the appliance will probe) and sizes the request
+ * deadline. */
 export function runUpstreamProbe(
   signal?: AbortSignal,
+  entryCount = 0,
 ): Promise<UpstreamConfig> {
   return apiRequest(
     "/api/upstream/health",
@@ -921,6 +968,6 @@ export function runUpstreamProbe(
       "the explicit probe result with its summary",
       (cfg) => cfg.ok === true && cfg.summary !== undefined,
     ),
-    { method: "POST", ...sig(signal) },
+    { method: "POST", timeoutMs: probeDeadlineMs(entryCount), ...sig(signal) },
   );
 }

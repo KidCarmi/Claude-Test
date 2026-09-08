@@ -374,7 +374,7 @@ export function UpstreamPage(): JSX.Element {
     setProbing(true);
     const signal = page.owner.begin();
     try {
-      const res = await runUpstreamProbe(signal);
+      const res = await runUpstreamProbe(signal, cfg?.entries.length ?? 0);
       setSummary(res.summary ?? null);
       page.refreshToResolve();
     } catch (err) {

@@ -50,14 +50,14 @@ describe("K1 deep links on every route the program added are honored", () => {
 
 // ── K2 ──────────────────────────────────────────────────────────────────────
 const ID = "01HZZMANAGED0000000000001";
-function managed(username: string, authority: string) {
+function managed(username: string, authority: string, port = 3128) {
   return {
     id: ID,
-    url: "http://parent-a.example:3128",
+    url: `http://parent-a.example:${String(port)}`,
     authority,
     scheme: "http",
     host: "parent-a.example",
-    port: 3128,
+    port,
     username,
     source: "managed",
     revision: 3,
@@ -104,7 +104,7 @@ function configWith(entry: ReturnType<typeof managed>, status: number) {
         id: ID,
         scheme: "http",
         host: "parent-a.example",
-        port: 3128,
+        port: entry.port,
         username: entry.username,
         authority: entry.authority,
         source: "managed",
@@ -188,8 +188,14 @@ describe("K2 a success whose username the appliance escaped is still bound", () 
       configWith(managed("a?c", "http://a%3Fc@parent-a.example:3128"), 201),
     );
     await rejectsUnproven(createUpstreamEntry(spec, 5));
+    // The appliance reports the port it normalized, in the fields AND in the
+    // authority — a fixture that disagrees only in the authority string
+    // would describe an answer no appliance produces.
     stubAnswer(
-      configWith(managed("a?b", "http://a%3Fb@parent-a.example:3129"), 200),
+      configWith(
+        managed("a?b", "http://a%3Fb@parent-a.example:3129", 3129),
+        200,
+      ),
     );
     await rejectsUnproven(updateUpstreamEntry(ID, spec, 3));
   });

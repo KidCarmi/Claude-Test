@@ -862,6 +862,11 @@ const healthCheckURL = "http://detectportal.firefox.com/success.txt"
 // probeTimeout bounds one probe.
 const probeTimeout = 5 * time.Second
 
+// ProbeTimeout is the per-entry probe bound, exported so the admin frontend's
+// manual-probe deadline (frontend/src/api/upstream.ts PROBE_PER_ENTRY_MS) can
+// be pinned to it in lockstep; the engine itself reads probeTimeout.
+const ProbeTimeout = probeTimeout
+
 // HealthCheck probes every credential-eligible parent with the shared
 // classifier and stores the bounded outcome. Credential-ineligible entries
 // (unusable, mismatch, requiresReplacement) are not probed and keep their
