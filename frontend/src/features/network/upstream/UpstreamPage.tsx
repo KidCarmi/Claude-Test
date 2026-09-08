@@ -169,7 +169,11 @@ export function UpstreamPage(): JSX.Element {
   const [forbidden, setForbidden] = useState<string | null>(null);
 
   const blocked = page.unknown !== null;
-  const canMutate = isAdmin && cfg !== undefined && !blocked;
+  // A manual probe and every mutation share one run owner (begin() aborts
+  // the predecessor), so nothing may be confirmed while a probe is in
+  // flight: it would abort the probe's request into an unproven outcome
+  // while the appliance keeps probing (PR-C10 K5).
+  const canMutate = isAdmin && cfg !== undefined && !blocked && !probing;
 
   const clearOutcome = (): void => {
     setFence(null);

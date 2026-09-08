@@ -779,11 +779,19 @@ export interface CanonicalSpec {
 export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
   const scheme = spec.scheme.trim().toLowerCase();
   let host = spec.host.trim().toLowerCase().replace(/\.+$/, "");
-  try {
-    const u = new URL(`${scheme}://${host}`);
-    if (u.hostname !== "") host = u.hostname;
-  } catch {
-    /* keep the lowered host; the appliance would have refused it anyway */
+  if (host.includes(":")) {
+    // An IPv6 literal: the appliance brackets a bare one and keeps the
+    // literal AS TYPED (lower-cased, never compressed) — the URL parser
+    // throws on a bare literal and compresses a bracketed one, so it must
+    // not see it (PR-C10 K4).
+    host = `[${host.replace(/^\[|\]$/g, "")}]`;
+  } else {
+    try {
+      const u = new URL(`${scheme}://${host}`);
+      if (u.hostname !== "") host = u.hostname;
+    } catch {
+      /* keep the lowered host; the appliance would have refused it anyway */
+    }
   }
   const port = spec.port === 0 ? (scheme === "https" ? 443 : 80) : spec.port;
   return { scheme, host, port, username: spec.username.trim() };
