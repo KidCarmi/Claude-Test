@@ -450,7 +450,7 @@ func handleOneShotCommands(s *startupState) {
 		}
 		usersPath := *s.uiUsersFile
 		if usersPath == "" {
-			usersPath = "/data/ui_users.json"
+			usersPath = filepath.Join(dataDir, "ui_users.json")
 		}
 		cfg.SetUIUsersFile(usersPath)
 		_ = cfg.LoadUIUsersFile() // may not exist yet, that's fine
@@ -873,7 +873,7 @@ func initCDR(s *startupState) {
 		log.Fatalf("Invalid -cdr-fail-mode %q: must be \"open\" or \"closed\"", fm)
 	}
 	loadCDR(
-		resolveCDRStartupConfig(s.fc, cdrCLIFlags{
+		resolveCDRStartupConfig(s.fc, dataDir, cdrCLIFlags{
 			Enabled:     *s.cdrEnabledFlag,
 			Endpoint:    *s.cdrEndpointFlag,
 			FailMode:    *s.cdrFailModeFlag,

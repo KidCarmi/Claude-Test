@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/KidCarmi/Culvert/internal/alerts"
+	"github.com/KidCarmi/Culvert/internal/configver"
 )
 
 // dataDirEnv is the startup-scoped override of the persisted-state root
@@ -59,6 +62,22 @@ func applyDataDirFromEnv() {
 		os.Exit(1)
 	}
 	dataDir = d
+	rebindDataDirPaths()
+}
+
+// rebindDataDirPaths re-derives every persisted-state path that is NOT
+// computed from dataDir at its own startup — the package-level defaults that
+// were historically literal "/data/..." values (PR-C1b): the config-version
+// store, the registry settings file, the CDR certs root and runtime-enabled
+// marker, and the alert retry queue. Called once from applyDataDirFromEnv
+// (and by tests that swap dataDir); with the default root every value is
+// byte-identical to the historical literal.
+func rebindDataDirPaths() {
+	configVersions = configver.New(filepath.Join(dataDir, "config_versions"), 0)
+	registrySettingsFile = filepath.Join(dataDir, "registry_settings.json")
+	cdrCertsRoot = filepath.Join(dataDir, "integrations", "sluice")
+	cdrRuntimeEnabledPath = filepath.Join(dataDir, "cdr_enabled")
+	alerts.SetRetryQueuePath(filepath.Join(dataDir, "alert_retry_queue.json"))
 }
 
 // dataDirOverridden reports whether the effective root differs from the

@@ -17,13 +17,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KidCarmi/Culvert/internal/alerts"
 )
 
 func TestDataDirOverride_RebindsHardcodedDefaults(t *testing.T) {
 	root := t.TempDir()
-	prevDataDir, prevVersions, prevMarker := dataDir, configVersions, cdrRuntimeEnabledPath
+	prevDataDir, prevVersions := dataDir, configVersions
 	t.Cleanup(func() {
-		dataDir, configVersions, cdrRuntimeEnabledPath = prevDataDir, prevVersions, prevMarker
+		dataDir = prevDataDir
+		rebindDataDirPaths()
+		configVersions = prevVersions // the pre-test store object, not a fresh one
 	})
 	t.Setenv(dataDirEnv, root)
 	applyDataDirFromEnv()
@@ -36,6 +40,10 @@ func TestDataDirOverride_RebindsHardcodedDefaults(t *testing.T) {
 		"registry settings file":     registrySettingsFile,
 		"CDR certs root":             cdrCertsRoot,
 		"CDR runtime-enabled marker": cdrRuntimeEnabledPath,
+		"alert retry queue":          alerts.RetryQueuePath(),
+		"CDR instances store":        resolveCDRStartupConfig(&FileConfig{}, dataDir, cdrCLIFlags{}).InstancesPath,
+		"CDR policies store":         resolveCDRStartupConfig(&FileConfig{}, dataDir, cdrCLIFlags{}).PoliciesPath,
+		"CDR enrollment receipts":    resolveCDRStartupConfig(&FileConfig{}, dataDir, cdrCLIFlags{}).EnrollReceiptsPath,
 	}
 	for name, p := range checks {
 		if !strings.HasPrefix(p, inside) {

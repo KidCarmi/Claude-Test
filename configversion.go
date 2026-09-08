@@ -31,9 +31,11 @@ import (
 // ConfigVersion is metadata for a stored config snapshot.
 type ConfigVersion = configver.Meta
 
-// configVersions is the process-wide snapshot store. Tests redirect it via
-// SetDirForTest/SetSeqForTest (production code never does).
-var configVersions = configver.New("/data/config_versions", 0)
+// configVersions is the process-wide snapshot store. It is re-bound to the
+// effective persisted-state root by rebindDataDirPaths (CULVERT_DATA_DIR)
+// before anything reads it; tests redirect it via SetDirForTest/
+// SetSeqForTest or swap the variable.
+var configVersions = configver.New(defaultDataDir+"/config_versions", 0)
 
 func initConfigVersioning() {
 	configVersions.Init()

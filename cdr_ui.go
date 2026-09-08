@@ -736,9 +736,10 @@ func validateEnrollRequest(req cdrEnrollRequest) error {
 }
 
 // cdrCertsRoot is the parent directory under which every enrolled
-// instance's mTLS bundle lives.  Constant — never constructed from
-// user input.
-const cdrCertsRoot = "/data/integrations/sluice"
+// instance's mTLS bundle lives.  Fixed for the life of the process and
+// never constructed from user input: it is bound once, at boot, to the
+// effective persisted-state root (rebindDataDirPaths / CULVERT_DATA_DIR).
+var cdrCertsRoot = defaultDataDir + "/integrations/sluice"
 
 // cdrInstanceCertsDir returns the per-instance cert directory after
 // verifying that the resolved path is STILL inside cdrCertsRoot even if
