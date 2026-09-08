@@ -343,6 +343,11 @@ func canaryPreAdmissionDrift(capability string, obs mcpruntime.CanaryDriftTarget
 	}
 	now := time.Now()
 	globalCanaryRuntime.latchDriftUnderActivation(capb, now, func() (bool, string) {
-		return mcpLiveTrustRevalidate(obs.Tenant, obs.ServerID, obs.ToolName, obs.DecisionFP, now)
+		// DRIFT-ONLY. The latch's sole output is a drift code, so consulting the approval store
+		// here would be work whose answer is discarded — and it would drag the durable store into
+		// the activation critical section for nothing (Codex round 22). The precheck reads only
+		// pointer-published inventory.
+		live := mcpLiveTrustPrecheck(obs.Tenant, obs.ServerID, obs.ToolName, obs.DecisionFP)
+		return false, live.DriftCode
 	})
 }

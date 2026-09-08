@@ -131,29 +131,32 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	// is local control-plane state only — no network I/O, no credential materialization, no DNS, no
 	// upstream call — which is what makes holding the lock across it legitimate (§5).
 	//
-	// THE APPROVAL LOOKUP IS DELIBERATELY DONE FIRST, OUTSIDE THE LOCK. It reads the durable
-	// approval store, whose mutex is held across an atomic file write by every mutation, so calling
-	// it under the activation lock would put a stuck disk in front of automatic abort and demotion
-	// (Codex round 21, §5). It is safe out here precisely because it can only ever produce a
-	// REQUEST-SCOPED verdict: it never reports drift, so nothing it decides needs to be attributed
-	// to a generation. Everything that CAN latch the whole Canary stays inside the transaction and
-	// reads only pointer-published inventory state.
-	pre := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
-	approved := pre.Eligible && g.approvalOK(pre.Target, in.Now)
-
+	// EVERY PART OF TRUST IS EVALUATED INSIDE THE TRANSACTION, INCLUDING THE APPROVAL.
+	//
+	// An earlier revision hoisted the approval lookup out of the lock to keep the durable
+	// approval store's mutex off the critical section (§5). That was a real hazard, but hoisting
+	// was the wrong fix and it bought a worse one: a request that read approved=true and then
+	// waited for cr.mu could be admitted after the approval was REVOKED in that window, and
+	// nothing downstream would catch it — the final boundary re-reads tool freshness, generation
+	// and kill state, not approval status. Revoking a LIVE approval does not disturb the
+	// fingerprint or eligibility either, because catalog promotion is derived from SHADOW-purpose
+	// approvals (rederiveTool), so the in-lock precheck would still report Eligible. A stale
+	// yes would have authorized an irreversible call (Codex round 22).
+	//
+	// The store read is now LOCK-FREE at the source (tooltrust publishes a copy-on-write snapshot
+	// through an atomic pointer), so the §5 hazard is removed rather than relocated, and the
+	// admission transaction can evaluate the whole predicate under one lock exactly as it did
+	// before the split.
 	adm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{
 		Principal: in.Principal,
 		Tool:      in.ToolName,
 		Server:    in.ServerID,
 	}, func() (bool, string) {
-		// RE-DERIVED under the lock: the drift verdict the latch is charged to is the one taken
-		// here, not the one computed above. The pre-lock precheck exists only to decide whether the
-		// approval lookup was worth doing; its drift verdict is discarded.
 		live := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
 		if live.DriftCode != "" {
 			return false, live.DriftCode
 		}
-		return live.Eligible && approved, ""
+		return live.Eligible && g.approvalOK(live.Target, in.Now), ""
 	})
 	// The denial class is read from an EXPLICIT field, never inferred from which other field is
 	// zero: an already-aborted Canary and an untrusted request both leave Trusted false, and

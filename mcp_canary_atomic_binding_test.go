@@ -660,45 +660,43 @@ func TestAtomicBinding_PreExecutorLatchHoldsTheActivationLockAcrossItsProbe(t *t
 	}
 }
 
-// ── §5. The approval store must stay OUT of the activation critical section ──
+// ── §5 + revocation: trust is evaluated WHOLLY inside the transaction ────────
 
-// TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock is the §5 gate, and it pins a
-// LIVENESS property rather than a correctness one — which is why an audited lock ORDER did not
-// catch the defect it exists for.
+// TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction is the round-22 regression gate.
 //
-// The approval store's mutex is held across an atomic file write by every mutation
-// (Store.persistLocked), so consulting it under cr.mu puts a stuck disk in front of automatic
-// abort, demotion and generation revalidation — the controls whose entire job is to stop the
-// experiment (Codex round 21). There is no deadlock to find here: the ordering is consistent and
-// the system is simply blocked for as long as the disk is.
+// An earlier revision hoisted the approval lookup OUT of the activation lock to keep the durable
+// store's mutex off the critical section. That fixed a real liveness hazard and bought a security
+// one: a request that read approved=true and then waited for cr.mu could be admitted after the
+// approval was REVOKED in that window. Nothing downstream catches it — the final boundary re-reads
+// tool freshness, generation and kill state, not approval status — and revoking a LIVE approval
+// disturbs neither the fingerprint nor eligibility, because catalog promotion derives from
+// SHADOW-purpose approvals (rederiveTool). So the in-lock precheck still reports Eligible and a
+// stale yes authorizes an irreversible call.
 //
-// So the gate blocks inside the approval lookup and requires the activation mutex to be ACQUIRABLE
-// while it blocks. Move that lookup back inside the transaction and this fails deterministically.
-func TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock(t *testing.T) {
+// The gate answers "revoked" at the moment of the lookup and requires the admission to be refused.
+// Hoist the lookup back out and the cached yes wins, which fails this deterministically.
+func TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction(t *testing.T) {
 	r := newAtomicRig(t)
 	r.arm(t, 4)
+
 	cr := r.rt.capRuntime(r.capb)
-
-	var calls, heldDuringLookup int
-
+	askedInsideLock := false
 	g := &mcpLiveSideEffectGate{
 		capb:          r.capb,
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckEligible,
 		approvalOK: func(canary.LiveTarget, time.Time) bool {
-			// Ask, at the moment of the durable lookup, whether the activation lock is held.
-			// sync.Mutex is not reentrant, so a failed TryLock on the single-threaded admission
-			// path means this call is running INSIDE the transaction. Checking it here catches the
-			// violation wherever the call is made from, which a barrier between two fixed points
-			// would not.
-			calls++
+			// The store answers DIFFERENTLY either side of the lock, which is the whole point:
+			// a constant answer cannot tell a cached read from a live one. sync.Mutex is not
+			// reentrant, so on this single-threaded path a successful TryLock means we are NOT
+			// inside the transaction — i.e. this is the hoisted, pre-lock read.
 			if cr.mu.TryLock() {
 				cr.mu.Unlock()
-			} else {
-				heldDuringLookup++
+				return true // the stale pre-revocation answer
 			}
-			return true
+			askedInsideLock = true
+			return false // the revocation the transaction must observe
 		},
 		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 			return r.rt.admitLiveExecution(r.capb, now, ident, trust)
@@ -717,14 +715,16 @@ func TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock(t *testing.T) 
 		dec.Release()
 	}
 
-	if calls == 0 {
-		t.Fatal("premise: the admission path must consult the approval store at least once")
+	if !askedInsideLock {
+		t.Fatal("SECURITY: the approval store was never consulted from INSIDE the transaction — " +
+			"the verdict is being read before the activation lock and cached across it")
 	}
-	if heldDuringLookup != 0 {
-		t.Fatalf("SECURITY (§5): the durable approval store was consulted %d of %d times with the "+
-			"activation lock HELD. tooltrust.Store.mu is held across persistLocked's atomic file "+
-			"write by every approval mutation, so a stuck disk now sits in front of automatic "+
-			"abort, demotion and generation revalidation — the controls that stop the experiment",
-			heldDuringLookup, calls)
+	if dec.Admit {
+		t.Fatal("SECURITY: an admission was granted against an approval the transaction itself " +
+			"observed as absent — the approval verdict is cached across the activation-lock " +
+			"acquisition, so a revocation in that window authorizes an irreversible call")
+	}
+	if got := r.remaining(); got != 4 {
+		t.Fatalf("budget remaining = %d, want 4 — a trust-refused request reserved anyway", got)
 	}
 }

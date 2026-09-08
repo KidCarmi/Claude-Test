@@ -322,6 +322,41 @@ run_mutation M15 \
   . mcp_live_gate.go \
   's/\t\treturn live\.Eligible && approved, ""/\t\treturn live.Eligible \&\& approved \&\& g.approvalOK(live.Target, in.Now), ""/'
 
+# ── (8) TRUST IS EVALUATED WHOLLY INSIDE THE TRANSACTION ───────────────────
+# Round 22: hoisting the approval lookup out of the lock to satisfy §5 bought a worse
+# defect — a revocation landing during the lock wait was missed, and nothing downstream
+# re-reads approval status. The store read is lock-free at the source instead.
+
+run_mutation M16 \
+  'the approval verdict is read before the lock and cached across it' \
+  'TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction' \
+  . mcp_live_gate.go \
+  's/\t\treturn live\.Eligible && g\.approvalOK\(live\.Target, in\.Now\), ""/\t\t_ = live\n\t\treturn g.approvalOK(liveTrustPrecheck{}.Target, in.Now), ""/'
+
+run_mutation M18 \
+  'the live-approval read takes the durable store lock again' \
+  'TestLiveView_ActiveLiveApprovalsTakesNoStoreLock' \
+  ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
+  's/\tview := s\.liveView\.Load\(\)/\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\tview := s.liveView.Load()/'
+
+run_mutation M19 \
+  'the commit chokepoint stops republishing the lock-free view' \
+  'TestLiveView_EveryMutatorRepublishes' \
+  ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
+  's/\ts\.publishLiveViewLocked\(\)\n\treturn nil\n\}\n\n\/\/ capacityCheckLocked/\treturn nil\n}\n\n\/\/ capacityCheckLocked/'
+
+run_mutation M20 \
+  'Load stops republishing, so a recovered store serves an empty view' \
+  'TestLiveView_EveryMutatorRepublishes' \
+  ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
+  's/\ts\.publishLiveViewLocked\(\)\n\treturn nil\n\}/\treturn nil\n}/'
+
+run_mutation M21 \
+  'the lock-free view publishes stored pointers instead of clones' \
+  'TestLiveView_SnapshotHoldsClonesNotStoredPointers' \
+  ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
+  's/\t\tsnap = append\(snap, a\.clone\(\)\)/\t\tsnap = append(snap, a)/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

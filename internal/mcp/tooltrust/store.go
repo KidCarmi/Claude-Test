@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -89,6 +90,38 @@ type Store struct {
 	// in-memory state byte-unchanged (durable-before-effect); production never
 	// replaces it.
 	writeFile func(path string, data []byte, perm os.FileMode) error
+	// liveView is a COPY-ON-WRITE snapshot of every record, published under mu and read
+	// WITHOUT it by ActiveLiveApprovals. See publishLiveViewLocked.
+	liveView atomic.Pointer[[]*ToolApproval]
+}
+
+// publishLiveViewLocked republishes the lock-free read snapshot. It MUST be called, with mu
+// held, by every path that mutates byID or any record it holds.
+//
+// WHY A LOCK-FREE READ EXISTS AT ALL. ActiveLiveApprovals is on the live-execution admission
+// path, which runs inside the Canary activation critical section — and that section also
+// latches automatic aborts and gates demotion. Every mutation here holds mu across
+// persistLocked and its atomic file write, so a blocking read would put a stuck disk in front
+// of the controls whose job is to stop the experiment (Codex round 21). Reading through an
+// atomic pointer removes that coupling entirely rather than ordering it, which is what lets
+// the admission path evaluate approval INSIDE the lock, where a concurrent revocation cannot
+// be missed (Codex round 22).
+//
+// THE SNAPSHOT HOLDS CLONES, and that is not defensive habit: mutators edit records IN PLACE
+// (Reject sets a.Status on the live pointer), so publishing the stored pointers would let a
+// lock-free reader observe a half-applied mutation. Cloning is bounded by maxRecords and
+// happens only on admin-rate writes.
+//
+// Adding a mutator without a publishLiveViewLocked call is a SECURITY failure, not a
+// staleness one: a revoked approval that keeps authorizing live execution. Pinned per mutator
+// by TestLiveView_EveryMutatorRepublishes.
+func (s *Store) publishLiveViewLocked() {
+	snap := make([]*ToolApproval, 0, len(s.byID))
+	for _, a := range s.byID {
+		snap = append(snap, a.clone())
+	}
+	sortApprovals(snap)
+	s.liveView.Store(&snap)
 }
 
 // NewStore constructs a Store bound to cfg. It does NOT read the durable file;
@@ -197,6 +230,10 @@ func (s *Store) Load() error {
 		return err
 	}
 	s.byID = byID
+	// Load replaces the whole index without going through persistLocked, so it publishes
+	// directly. Without this a recovered store would serve an EMPTY live view until the first
+	// admin write — every restored approval silently unable to authorize execution.
+	s.publishLiveViewLocked()
 	return nil
 }
 
@@ -816,15 +853,19 @@ func (s *Store) ActiveApprovals(now time.Time) []*ToolApproval {
 // ceiling, and the exact target. It NEVER materializes catalog.Usable: live trust is orthogonal
 // to Shadow usability (§15), so no live grant reaches the ActiveApprovals→Usable projection.
 func (s *Store) ActiveLiveApprovals(now time.Time) []*ToolApproval {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// LOCK-FREE by design — see publishLiveViewLocked. The snapshot is filtered here rather
+	// than at publication because liveness depends on now (expiry), which the writer cannot
+	// know; the entries are already clones, so no caller can reach the stored records.
+	view := s.liveView.Load()
+	if view == nil {
+		return nil
+	}
 	var out []*ToolApproval
-	for _, a := range s.byID {
+	for _, a := range *view {
 		if a.activeLiveAsOf(now) {
-			out = append(out, a.clone())
+			out = append(out, a)
 		}
 	}
-	sortApprovals(out)
 	return out
 }
 
@@ -851,6 +892,12 @@ func (s *Store) persistLocked() error {
 		// recovers. Classify it as service-unavailable (503), never invalid-input (400).
 		return mcperr.Wrap(mcperr.ReasonApprovalStoreUnavailable, "tooltrust.persist", "atomic write", err)
 	}
+	// The lock-free read snapshot is republished HERE — the single commit chokepoint every
+	// mutator already funnels through — rather than at five separate call sites, so a new
+	// mutator cannot forget it. Publishing AFTER the durable write (never before) keeps the
+	// view consistent with the store's durable-before-effect rule: on a write failure the
+	// caller reverts in memory and the un-republished view still describes committed state.
+	s.publishLiveViewLocked()
 	return nil
 }
 
@@ -1152,3 +1199,9 @@ func cloneTimePtr(t *time.Time) *time.Time {
 	v := *t
 	return &v
 }
+
+// LockForTest / UnlockForTest expose the store mutex so a test can hold it and prove that a
+// reader which must never block on it does not. Test-only by convention; production code takes
+// mu through the methods above.
+func (s *Store) LockForTest()   { s.mu.Lock() }
+func (s *Store) UnlockForTest() { s.mu.Unlock() }
