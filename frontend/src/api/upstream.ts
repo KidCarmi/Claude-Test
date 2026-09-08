@@ -776,6 +776,11 @@ export interface CanonicalSpec {
   port: number;
   username: string;
 }
+// A trailing label appended ONLY while the browser maps a host through the
+// URL parser (see canonicalSpec); it is stripped again and never reaches the
+// appliance.
+const HOST_MAP_SENTINEL = ".culvert-host-map-sentinel";
+
 export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
   const scheme = spec.scheme.trim().toLowerCase();
   let host = spec.host.trim().toLowerCase().replace(/\.+$/, "");
@@ -786,9 +791,20 @@ export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
     // not see it (PR-C10 K4).
     host = `[${host.replace(/^\[|\]$/g, "")}]`;
   } else {
+    // Every other host is an IDNA name to the appliance: normalizeHost
+    // recognises only a full dotted-quad as IPv4 and otherwise keeps the
+    // UTS-46 mapping of what was typed (`127.1`, `2130706433`, `0x7f.1`
+    // stay verbatim; full-width digits map to ASCII). The URL parser gives
+    // the same UTS-46 mapping, but treats a LAST label that ends in a
+    // number as an IPv4 literal and collapses those spellings to
+    // `127.0.0.1` — so it is asked to map the host with a sentinel label
+    // appended (never a last label, never numeric) and the sentinel is
+    // stripped again (PR-C11 K6).
     try {
-      const u = new URL(`${scheme}://${host}`);
-      if (u.hostname !== "") host = u.hostname;
+      const u = new URL(`http://${host}${HOST_MAP_SENTINEL}`);
+      if (u.hostname.endsWith(HOST_MAP_SENTINEL)) {
+        host = u.hostname.slice(0, -HOST_MAP_SENTINEL.length);
+      }
     } catch {
       /* keep the lowered host; the appliance would have refused it anyway */
     }
