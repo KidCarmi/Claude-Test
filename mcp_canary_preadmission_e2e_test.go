@@ -38,7 +38,7 @@ func TestPreAdmissionDrift_E2E_ServerIdentityDriftStopsTheActivation(t *testing.
 	// Precondition: with the approved target intact, the sink must latch NOTHING. Without this the
 	// test could pass by latching unconditionally.
 	canaryPreAdmissionDrift(rollout.CapabilityGateway.String(), mcpruntime.CanaryDriftTarget{
-		Code: "server_identity_drift", Tenant: ttTenant,
+		Generation: g, Code: "server_identity_drift", Tenant: ttTenant,
 		ServerID: sid, ToolName: tool, DecisionFP: fpHex,
 	})
 	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
@@ -62,7 +62,7 @@ func TestPreAdmissionDrift_E2E_ServerIdentityDriftStopsTheActivation(t *testing.
 	publishMCPInventory(mcpInvLoaded, "", reg2, cat2)
 
 	canaryPreAdmissionDrift(rollout.CapabilityGateway.String(), mcpruntime.CanaryDriftTarget{
-		Code: "server_identity_drift", Tenant: ttTenant,
+		Generation: g, Code: "server_identity_drift", Tenant: ttTenant,
 		ServerID: sid, ToolName: tool, DecisionFP: fpHex,
 	})
 
@@ -110,7 +110,7 @@ func TestPreAdmissionDrift_E2E_PublicationGapLatchesNothing(t *testing.T) {
 
 	r := newAtomicRig(t) // deliberately NOT armed — the publication gap
 	canaryPreAdmissionDrift(rollout.CapabilityGateway.String(), mcpruntime.CanaryDriftTarget{
-		Code: "server_identity_drift", Tenant: ttTenant,
+		Generation: 1, Code: "server_identity_drift", Tenant: ttTenant,
 		ServerID: sid, ToolName: tool, DecisionFP: fpHex,
 	})
 	if got := canaryPreAdmissionDriftCounts(rollout.CapabilityGateway.String()); got["server_identity_drift"] != 1 {
@@ -120,5 +120,116 @@ func TestPreAdmissionDrift_E2E_PublicationGapLatchesNothing(t *testing.T) {
 	g := r.arm(t, 4)
 	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
 		t.Fatalf("SECURITY: activation %d inherited a drift observed before it existed (§6)", g)
+	}
+}
+
+// TestPreAdmissionDrift_E2E_StaleObservationCannotStopTheReplacement is the round-22 scope gate.
+//
+// A request resolved under G1 can detect drift and then pause. If G1 is demoted and G2 activated
+// with a scope that EXCLUDES this target, latching G2 stops an unrelated experiment for something
+// outside its own blast radius — the round-15 lesson from the other side. The activation runtime
+// holds no scope (scope is computed per request by the pipeline from rollout.State), so the latch
+// cannot ask "is this target in G2's scope"; it asks the question it CAN answer exactly — is the
+// activation still the one this observation was made under.
+//
+// Generations are strictly monotonic and never reused (TestAutoStop_ActivationGenerationIsStrictly-
+// Monotonic), so a mismatch means an activation intervened. That is a statement about the window,
+// not a counter-equality argument: the comparison value is captured before the resolution and the
+// comparison itself happens inside the activation lock.
+func TestPreAdmissionDrift_E2E_StaleObservationCannotStopTheReplacement(t *testing.T) {
+	resetInventory(t)
+	resetExecDeps(t)
+	resetPreAdmissionDriftForTest(t)
+
+	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
+	_, fn := liveFakeClock()
+	composeToolTrust(t, fn)
+	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+
+	r := newAtomicRig(t)
+	g1 := r.arm(t, 4)
+
+	// Real, authoritative drift: the server is republished disabled.
+	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + ttTenant + `","servers":[
+	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"id","enabled":false,
+	   "tools":[{"name":"` + tool + `","input_schema":{"type":"object"}}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("decode disabled inventory: %v", err)
+	}
+	reg2, cat2, err := seedInventory(doc, limits.DefaultCatalog())
+	if err != nil {
+		t.Fatalf("seed disabled inventory: %v", err)
+	}
+	publishMCPInventory(mcpInvLoaded, "", reg2, cat2)
+
+	// G1 goes away and G2 takes its place while the observation is in flight.
+	r.rt.demoteCanary(r.capb)
+	g2 := r.arm(t, 4)
+	if g2 == g1 {
+		t.Fatalf("premise: a re-activation must never reuse a generation (%d)", g1)
+	}
+
+	// The stale G1 observation arrives.
+	canaryPreAdmissionDrift(rollout.CapabilityGateway.String(), mcpruntime.CanaryDriftTarget{
+		Generation: g1, Code: "server_identity_drift", Tenant: ttTenant,
+		ServerID: sid, ToolName: tool, DecisionFP: fpHex,
+	})
+
+	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
+		t.Fatalf("SECURITY: a drift observed under activation %d stopped activation %d, whose "+
+			"scope may exclude this target entirely — a stale observation must never stop the "+
+			"experiment that replaced the one it was made under (Codex round 22)", g1, g2)
+	}
+	// The evidence is still recorded: the operator learns the catalog moved either way.
+	if got := canaryPreAdmissionDriftCounts(rollout.CapabilityGateway.String()); got["server_identity_drift"] != 1 {
+		t.Fatalf("evidence must be recorded even when the latch is skipped: %v", got)
+	}
+	// And a fresh observation under G2 DOES stop it — the skip is not a silent hole.
+	canaryPreAdmissionDrift(rollout.CapabilityGateway.String(), mcpruntime.CanaryDriftTarget{
+		Generation: g2, Code: "server_identity_drift", Tenant: ttTenant,
+		ServerID: sid, ToolName: tool, DecisionFP: fpHex,
+	})
+	if r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
+		t.Fatalf("an in-generation observation failed to stop activation %d", g2)
+	}
+}
+
+// TestPreAdmissionDrift_E2E_GenerationZeroLatchesNothing pins §7: 0 names no activation and is
+// NEVER read as "whatever is current". That wildcard is how an earlier revision inverted its own
+// fix into the defect it was closing.
+func TestPreAdmissionDrift_E2E_GenerationZeroLatchesNothing(t *testing.T) {
+	resetInventory(t)
+	resetExecDeps(t)
+	resetPreAdmissionDriftForTest(t)
+
+	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
+	_, fn := liveFakeClock()
+	composeToolTrust(t, fn)
+	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+
+	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + ttTenant + `","servers":[
+	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"id","enabled":false,
+	   "tools":[{"name":"` + tool + `","input_schema":{"type":"object"}}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("decode disabled inventory: %v", err)
+	}
+	reg2, cat2, err := seedInventory(doc, limits.DefaultCatalog())
+	if err != nil {
+		t.Fatalf("seed disabled inventory: %v", err)
+	}
+	publishMCPInventory(mcpInvLoaded, "", reg2, cat2)
+
+	r := newAtomicRig(t)
+	g := r.arm(t, 4)
+
+	canaryPreAdmissionDrift(rollout.CapabilityGateway.String(), mcpruntime.CanaryDriftTarget{
+		Generation: 0, Code: "server_identity_drift", Tenant: ttTenant,
+		ServerID: sid, ToolName: tool, DecisionFP: fpHex,
+	})
+	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
+		t.Fatalf("SECURITY (§7): an observation naming NO activation stopped activation %d — "+
+			"generation 0 is being read as \"whatever is current\"", g)
 	}
 }

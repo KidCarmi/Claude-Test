@@ -346,6 +346,30 @@ run_mutation M21 \
   ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
   's/\t\tsnap = append\(snap, a\.clone\(\)\)/\t\tsnap = append(snap, a)/'
 
+# ── (9) THE PRE-EXECUTOR LATCH IS BOUND TO ITS OWN ACTIVATION ──────────────
+# Round 22: the activation runtime holds no scope, so a stale observation from a superseded
+# activation could stop a replacement whose scope excludes the target. The latch compares the
+# generation captured before the resolution against one read inside the lock; generations are
+# monotonic, so a mismatch means an activation intervened.
+
+run_mutation M22 \
+  'the latch ignores which activation the observation was made under' \
+  'TestPreAdmissionDrift_E2E_StaleObservationCannotStopTheReplacement' \
+  . "$ADM" \
+  's/\tif cr\.generation != wantGen \{/\tif false \{/'
+
+run_mutation M23 \
+  'generation 0 is read as whatever is current (the round-18 wildcard)' \
+  'TestPreAdmissionDrift_E2E_GenerationZeroLatchesNothing' \
+  . "$ADM" \
+  's/\tif wantGen == 0 \{.*?\n\t\treturn canaryDriftLatch\{\}\n\t\}\n//s; s/\tif cr\.generation != wantGen \{/\tif wantGen != 0 \&\& cr.generation != wantGen \{/'
+
+run_mutation M24 \
+  'the pipeline reports no generation, silently disabling every pre-executor latch' \
+  'TestCanaryBreach_PreExecutorDriftCarriesItsTarget' \
+  ./internal/mcp/runtime/ internal/mcp/runtime/execute.go \
+  's/\t\t\tGeneration: genAtResolve,/\t\t\tGeneration: 0,/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

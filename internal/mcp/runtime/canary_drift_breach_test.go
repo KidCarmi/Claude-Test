@@ -89,7 +89,7 @@ func TestCanaryBreach_PreExecutorToolDriftIsReported(t *testing.T) {
 	p, stale, _ := driftFixture(t, rec)
 
 	rb := p.newRecord(Request{}, fixedClock())
-	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, true); !refused {
+	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, true, driftTestGen); !refused {
 		t.Fatal("premise: a stale fingerprint must be refused here")
 	}
 
@@ -107,7 +107,7 @@ func TestCanaryBreach_CurrentFingerprintReportsNothing(t *testing.T) {
 	p, _, fresh := driftFixture(t, rec)
 
 	rb := p.newRecord(Request{}, fixedClock())
-	if _, refused := p.refuseOnToolDrift(rb, fresh, jsonrpc.ID{}, true); refused {
+	if _, refused := p.refuseOnToolDrift(rb, fresh, jsonrpc.ID{}, true, driftTestGen); refused {
 		t.Fatal("premise: a current fingerprint must not be refused")
 	}
 	if got := rec.codes(); len(got) != 0 {
@@ -122,7 +122,7 @@ func TestCanaryBreach_NoSeamComposedIsAPlainRefusal(t *testing.T) {
 	p, stale, _ := driftFixture(t, nil)
 
 	rb := p.newRecord(Request{}, fixedClock())
-	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, true); !refused {
+	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, true, driftTestGen); !refused {
 		t.Fatal("a stale fingerprint must still be refused with no seam composed")
 	}
 }
@@ -141,7 +141,7 @@ func TestCanaryBreach_ShadowEvaluationDoesNotStopTheCanary(t *testing.T) {
 
 	rb := p.newRecord(Request{}, fixedClock())
 	// canaryScoped=false is what dispatchExecute passes for a shadow evaluation.
-	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, false); !refused {
+	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, false, driftTestGen); !refused {
 		t.Fatal("premise: the request must still be REFUSED — only the whole-Canary stop is scoped")
 	}
 	if got := rec.codes(); len(got) != 0 {
@@ -183,7 +183,7 @@ func TestCanaryBreach_EligibilityDriftIsNotCalledFingerprintDrift(t *testing.T) 
 		},
 	}
 	rb := p.newRecord(Request{}, fixedClock())
-	if _, refused := p.refuseOnToolDrift(rb, in, jsonrpc.ID{}, true); refused {
+	if _, refused := p.refuseOnToolDrift(rb, in, jsonrpc.ID{}, true, driftTestGen); refused {
 		t.Fatal("premise: nothing has drifted yet")
 	}
 
@@ -200,7 +200,7 @@ func TestCanaryBreach_EligibilityDriftIsNotCalledFingerprintDrift(t *testing.T) 
 		t.Fatal("premise: DisableServer must preserve the fingerprint, or this test proves nothing")
 	}
 
-	if _, refused := p.refuseOnToolDrift(rb, in, jsonrpc.ID{}, true); !refused {
+	if _, refused := p.refuseOnToolDrift(rb, in, jsonrpc.ID{}, true, driftTestGen); !refused {
 		t.Fatal("an eligibility change must still be refused")
 	}
 	got := rec.codes()
@@ -228,7 +228,7 @@ func TestCanaryBreach_PreExecutorDriftCarriesItsTarget(t *testing.T) {
 	p, stale, _ := driftFixture(t, rec)
 
 	rb := p.newRecord(Request{}, fixedClock())
-	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, true); !refused {
+	if _, refused := p.refuseOnToolDrift(rb, stale, jsonrpc.ID{}, true, driftTestGen); !refused {
 		t.Fatal("the fixture must produce an authoritative drift refusal")
 	}
 
@@ -239,6 +239,11 @@ func TestCanaryBreach_PreExecutorDriftCarriesItsTarget(t *testing.T) {
 	got := obs[0]
 	if got.Code == "" {
 		t.Fatal("the drift code is empty")
+	}
+	if got.Generation != driftTestGen {
+		t.Fatalf("Generation = %d, want %d — the root refuses to latch an observation that names "+
+			"no activation, so reporting 0 here silently disables the whole-Canary latch for "+
+			"every pre-executor drift", got.Generation, driftTestGen)
 	}
 	if got.Tenant != driftTenant {
 		t.Fatalf("Tenant = %q, want %q — the root cannot re-derive a drift for an unnamed tenant", got.Tenant, driftTenant)
@@ -269,3 +274,8 @@ func TestCanaryBreach_PreExecutorDriftToleratesAMissingTool(t *testing.T) {
 		t.Fatalf("toolFingerprint = %q, want empty", got)
 	}
 }
+
+// driftTestGen is a non-zero activation generation for the refusal fixtures. It must be non-zero:
+// the root refuses to latch on generation 0, so a fixture passing 0 would exercise the
+// fail-closed branch rather than the path under test.
+const driftTestGen uint64 = 7

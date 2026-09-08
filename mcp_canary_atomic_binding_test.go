@@ -544,8 +544,16 @@ func TestAtomicBinding_PreAdmissionDriftReachesTheOperatorSurface(t *testing.T) 
 // cases pin the three outcomes that matter: it latches when an activation owns the observation, it
 // latches NOTHING in the publication gap, and it never invents a breach.
 
+// latchDrift drives the latch for the CURRENT activation generation — the healthy case, where the
+// activation the request resolved under is still the one in force.
 func (r *atomicRig) latchDrift(trust canaryTrustProbe) canaryDriftLatch {
-	return r.rt.latchDriftUnderActivation(r.capb, canaryRuntimeTestNow, trust)
+	return r.latchDriftAs(r.rt.currentGeneration(r.capb), trust)
+}
+
+// latchDriftAs drives the latch for an EXPLICIT observed generation, so a test can present a stale
+// observation from a superseded activation.
+func (r *atomicRig) latchDriftAs(wantGen uint64, trust canaryTrustProbe) canaryDriftLatch {
+	return r.rt.latchDriftUnderActivation(r.capb, wantGen, canaryRuntimeTestNow, trust)
 }
 
 // TestAtomicBinding_G_PreExecutorDriftLatchesTheActiveGeneration is the case Codex round 20 proved

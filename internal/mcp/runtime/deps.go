@@ -79,6 +79,20 @@ type Deps struct {
 	// no future activation can inherit the observation. What is passed here is evidence and an
 	// identity to re-check — never the latch input itself.
 	CanaryDriftObserved func(capability string, obs CanaryDriftTarget)
+	// CanaryGeneration reports the activation generation currently in force for a capability,
+	// or 0 when none is. Nil ⇒ 0, which fails closed: an observation carrying no generation
+	// latches nothing.
+	//
+	// THIS IS A NARROWING FILTER, NOT A PROOF OF ATTRIBUTION, and the difference is the whole
+	// reason it may exist at all. An earlier revision of this work read the generation around an
+	// UNLOCKED observation and treated equality as proof the generation had been live throughout;
+	// five review rounds established that it is not — equality shows a value did not change, never
+	// that it was ever active. Here the value is captured BEFORE the rollout resolution and
+	// compared against a read taken INSIDE the activation critical section. Generations are
+	// strictly monotonic and never reused, so equality across those two points means no activation
+	// intervened; a mismatch simply skips the latch, which is the safe direction (an in-scope
+	// request under the new activation observes the same drift and latches it there).
+	CanaryGeneration func(capability string) uint64
 	// Clock is injected for deterministic tests; nil ⇒ time.Now.
 	Clock func() time.Time
 }
@@ -87,6 +101,11 @@ type Deps struct {
 // It exists so the root can RE-DERIVE the drift live under the activation lock rather than trust a
 // verdict computed outside one: the re-derived value is what decides the latch.
 type CanaryDriftTarget struct {
+	// Generation is the activation generation in force when this request's rollout disposition
+	// was resolved. The root refuses to latch unless it is non-zero and still current under the
+	// activation lock — so a stale observation can never stop an activation that replaced the one
+	// it was made under (Codex round 22).
+	Generation uint64
 	Code       string
 	Tenant     string
 	ServerID   string
@@ -96,6 +115,14 @@ type CanaryDriftTarget struct {
 
 // noteCanaryDriftObserved reports a pre-executor drift observation when a sink is composed.
 // Nil-safe so call sites stay free of branching.
+// canaryGenerationAt reads the in-force activation generation, or 0 when nothing is composed.
+func (d Deps) canaryGenerationAt(capability string) uint64 {
+	if d.CanaryGeneration == nil {
+		return 0
+	}
+	return d.CanaryGeneration(capability)
+}
+
 func (d Deps) noteCanaryDriftObserved(capability string, obs CanaryDriftTarget) {
 	if d.CanaryDriftObserved != nil {
 		d.CanaryDriftObserved(capability, obs)

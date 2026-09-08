@@ -142,7 +142,7 @@ func (p *pipeline) buildExecInput(req Request, msg jsonrpc.Message, ident *ident
 // (dispatchPolicy), so a composed evaluator never displaces the decision-event commit.
 // It receives the resolution the runtime already resolved and passes it to Execute, so
 // the disposition is never re-resolved.
-func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, ei ExecInput, res rollout.Resolution) Outcome {
+func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, ei ExecInput, res rollout.Resolution, genAtResolve uint64) Outcome {
 	// OVN-09 — decision/execution TOCTOU. The policy decision was computed against
 	// a catalog SNAPSHOT. Between then and the irreversible upstream call there is a
 	// real window (inspection, durable commit, credential planning, provider fetch)
@@ -153,7 +153,7 @@ func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, ei ExecI
 	// prevent, and the executor never re-checked it.
 	// canaryScoped: only the ENFORCING execute disposition is the Canary's own reviewed traffic. A
 	// shadow evaluation (including the Canary-mode out-of-scope fallback) is not.
-	if out, stale := p.refuseOnToolDrift(rb, ei.Input, ei.MessageID, res.Disposition == rollout.EffectExecute); stale {
+	if out, stale := p.refuseOnToolDrift(rb, ei.Input, ei.MessageID, res.Disposition == rollout.EffectExecute, genAtResolve); stale {
 		return out
 	}
 	// SEC-MCP-03. The executor performs the REAL upstream side effect and must
@@ -254,7 +254,7 @@ func (p *pipeline) toolDriftClass(in policy.DecisionInput) string {
 	return ""
 }
 
-func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id jsonrpc.ID, canaryScoped bool) (Outcome, bool) {
+func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id jsonrpc.ID, canaryScoped bool, genAtResolve uint64) (Outcome, bool) {
 	code := p.toolDriftClass(in)
 	if code == "" {
 		return Outcome{}, false
@@ -293,6 +293,7 @@ func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id
 		// activation critical section, latching against the exact generation active for that
 		// evaluation — and latching nothing at all when no activation is live (§6).
 		p.deps.noteCanaryDriftObserved(p.capability.String(), CanaryDriftTarget{
+			Generation: genAtResolve,
 			Code:       code,
 			Tenant:     in.Principal.Tenant,
 			ServerID:   toolServerID(in),

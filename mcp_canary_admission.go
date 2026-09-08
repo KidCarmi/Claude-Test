@@ -294,7 +294,13 @@ type canaryDriftLatch struct {
 // by the caller. Its only effect is to stop the experiment that owns the drift.
 //
 // §5 applies unchanged: the probe passed here must be local control-plane state only.
-func (rt *canaryRuntime) latchDriftUnderActivation(capb rollout.Capability, now time.Time, trust canaryTrustProbe) canaryDriftLatch {
+func (rt *canaryRuntime) latchDriftUnderActivation(capb rollout.Capability, wantGen uint64, now time.Time, trust canaryTrustProbe) canaryDriftLatch {
+	if wantGen == 0 {
+		// §7. An observation that names no activation latches nothing, and 0 is NEVER read as
+		// "whatever is current" — that wildcard is exactly how an earlier revision inverted its
+		// own fix into the defect it was closing.
+		return canaryDriftLatch{}
+	}
 	cr := rt.capRuntime(capb)
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
@@ -302,6 +308,19 @@ func (rt *canaryRuntime) latchDriftUnderActivation(capb rollout.Capability, now 
 		// §6 THE PUBLICATION GAP. ModeCanary with no live activation is not an activation, and an
 		// observation made in that interval must never latch one created later. It stays evidence.
 		return canaryDriftLatch{}
+	}
+	if cr.generation != wantGen {
+		// THE ACTIVATION MOVED UNDER THIS OBSERVATION. The request's scope decision was made
+		// against wantGen; the activation now in force is a different experiment whose scope may
+		// exclude this target entirely, so latching it would stop an unrelated Canary for
+		// something outside its blast radius (Codex round 22 — the round-15 lesson from the other
+		// side). Generations are strictly monotonic and never reused, so this comparison against a
+		// value captured before the resolution is a real statement about the window, not a
+		// counter-equality argument: a mismatch means an activation intervened.
+		//
+		// Skipping is the safe direction. If the target IS in the new activation's scope, that
+		// activation's own requests observe the same drift and latch it there.
+		return canaryDriftLatch{Active: true, Generation: cr.generation}
 	}
 	gen := cr.generation
 	code := ""
@@ -342,7 +361,7 @@ func canaryPreAdmissionDrift(capability string, obs mcpruntime.CanaryDriftTarget
 		return
 	}
 	now := time.Now()
-	globalCanaryRuntime.latchDriftUnderActivation(capb, now, func() (bool, string) {
+	globalCanaryRuntime.latchDriftUnderActivation(capb, obs.Generation, now, func() (bool, string) {
 		// DRIFT-ONLY. The latch's sole output is a drift code, so consulting the approval store
 		// here would be work whose answer is discarded — and it would drag the durable store into
 		// the activation critical section for nothing (Codex round 22). The precheck reads only
@@ -350,4 +369,17 @@ func canaryPreAdmissionDrift(capability string, obs mcpruntime.CanaryDriftTarget
 		live := mcpLiveTrustPrecheck(obs.Tenant, obs.ServerID, obs.ToolName, obs.DecisionFP)
 		return false, live.DriftCode
 	})
+}
+
+// canaryGenerationForCapability is the Deps.CanaryGeneration seam: the activation generation
+// currently in force for a capability, or 0 for an unrecognised capability or a dormant runtime.
+// Its only consumer is the pre-executor drift latch, where it NARROWS which activation an
+// observation may stop — see Deps.CanaryGeneration for why that is not the attribution proof
+// earlier revisions wrongly tried to build from a generation read.
+func canaryGenerationForCapability(capability string) uint64 {
+	capb, err := rollout.ParseCapability(capability)
+	if err != nil {
+		return 0
+	}
+	return globalCanaryRuntime.currentGeneration(capb)
 }
