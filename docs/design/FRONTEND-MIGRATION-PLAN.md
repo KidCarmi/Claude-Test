@@ -3646,6 +3646,22 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C21 — the twelfth Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r12_red_test.go`). (R12-A, P1)
+> The backup sanitizer asserted the legacy `upstream_proxies` value to a
+> JSON array and silently skipped the credential gate on any other shape
+> (an object, a string, `null`, a number, a nested array) and, inside a
+> well-formed array, on an item that is not an object, an object whose
+> `url` is not a string, and an object with no `url` — every one of which
+> carried the plaintext material past the gate into a verbatim archive
+> under `credentialsOmitted: true`. The container shape is now part of
+> what the gate reads: the persisted shape of
+> `AdminSettings.UpstreamProxies` is an array of objects each carrying a
+> non-empty `url` string (the settings loader can read nothing else), and
+> a present key of any other shape is counted as malformed and refuses the
+> archive (counts only); an absent key and the persisted shape stay
+> ordinary (pinned as controls). Runbook §8 updated. Backend only.
+>
 > **PR-C20 — the eleventh Codex round (one P1).** Confirmed and pinned
 > before the correction (`upstream_codex_r11_red_test.go`). (R11-A, P1)
 > The backup sanitizer decoded the settings object into a map, and

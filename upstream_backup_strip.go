@@ -258,19 +258,28 @@ var errUpstreamBackupPreparedDowngrade = errors.New("admin_settings.json carries
 // credentialsOmitted. Fail CLOSED: every URL in the list must parse to an
 // absolute URL with a host, and none may carry a password; anything else
 // is counted as unparseable and refuses the archive.
+//
+// PR-C21 R12-A: the CONTAINER shape is part of what the gate reads. The
+// persisted shape of AdminSettings.UpstreamProxies is an array of objects
+// each carrying a `url` string, and the settings loader can read nothing
+// else — so a present `upstream_proxies` that is not an array, an item
+// that is not an object, an object with no `url`, or a `url` that is not
+// a non-empty string is a settings file the gate cannot inspect, and it
+// used to be SKIPPED (a type assertion that silently failed) with the
+// material inside it archived verbatim. Every such shape now fails the
+// backup closed, counted as malformed.
 func refuseCredentialBearingLegacyUpstreams(root map[string]any) error {
 	_, prepared := root["upstream_prepared_downgrade"]
-	withPassword, unparseable := 0, 0
-	if list, ok := root["upstream_proxies"].([]any); ok {
+	withPassword, unparseable, malformed := 0, 0, 0
+	if rawList, present := root["upstream_proxies"]; present {
+		list, ok := rawList.([]any)
+		if !ok {
+			malformed++
+		}
 		for _, item := range list {
-			raw := ""
-			switch v := item.(type) {
-			case string:
-				raw = v
-			case map[string]any:
-				raw, _ = v["url"].(string)
-			}
-			if raw == "" {
+			raw, ok := legacyUpstreamItemURL(item)
+			if !ok {
+				malformed++
 				continue
 			}
 			u, err := url.Parse(strings.TrimSpace(raw))
@@ -284,8 +293,23 @@ func refuseCredentialBearingLegacyUpstreams(root map[string]any) error {
 			}
 		}
 	}
-	if prepared || withPassword > 0 || unparseable > 0 {
-		return fmt.Errorf("%w (prepared_downgrade=%t, legacy_urls_with_password=%d, legacy_urls_unparseable=%d)", errUpstreamBackupPreparedDowngrade, prepared, withPassword, unparseable)
+	if prepared || withPassword > 0 || unparseable > 0 || malformed > 0 {
+		return fmt.Errorf("%w (prepared_downgrade=%t, legacy_urls_with_password=%d, legacy_urls_unparseable=%d, legacy_items_malformed=%d)", errUpstreamBackupPreparedDowngrade, prepared, withPassword, unparseable, malformed)
 	}
 	return nil
+}
+
+// legacyUpstreamItemURL returns the `url` of one persisted legacy upstream
+// item — an object whose `url` is a non-empty string — and false for every
+// other shape.
+func legacyUpstreamItemURL(item any) (string, bool) {
+	obj, ok := item.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	raw, ok := obj["url"].(string)
+	if !ok || raw == "" {
+		return "", false
+	}
+	return raw, true
 }
