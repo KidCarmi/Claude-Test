@@ -9,6 +9,7 @@ package main
 // unchanged, so the dependency is pinned without the shuffle.
 
 import (
+	"runtime"
 	"testing"
 )
 
@@ -34,4 +35,60 @@ func TestOrder_PolicyReorderWithForeignAccessRule(t *testing.T) {
 	t.Cleanup(func() { policyStore.Delete(extra.Priority) })
 
 	TestAPIPolicyReorder_Post_Success(t)
+}
+
+// PR-C7b (the same seeded run, once PR-C7's two were isolated): a
+// predecessor's best-effort admin-settings save (adminSettingsSave spawns a
+// goroutine every admin mutation makes) was still in flight when the legacy
+// LDAP sentinel test pinned and rewrote its fixture file, so the stale save
+// landed on the fixture with the flag already reset and the load read
+// `legacy_ldap_retired: false`. The fixture helper must drain pending saves
+// BEFORE it hands the settings path to the test: with one held open here, a
+// helper that drains cannot return until it is released.
+func TestOrder_LegacyLDAPFixtureDrainsPendingSaves(t *testing.T) {
+	release := make(chan struct{})
+	adminSettingsSaveWG.Add(1)
+	go func() {
+		defer adminSettingsSaveWG.Done()
+		<-release
+	}()
+	released := false
+	unblock := func() {
+		if !released {
+			released = true
+			close(release)
+		}
+	}
+	t.Cleanup(unblock)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		withLegacyLDAPAuthorityReset(t)
+	}()
+	for i := 0; i < 200000; i++ {
+		runtime.Gosched()
+	}
+	select {
+	case <-done:
+		t.Fatal("the LDAP fixture helper returned while a best-effort save was still pending; that save can land on the fixture file")
+	default:
+	}
+	unblock()
+	<-done
+}
+
+// PR-C7b: the R3 premise arms the process-global rejected-document latch.
+// upEnv resets it at ENTRY (PR-C2), which protects the next UPSTREAM test
+// only; a non-upstream successor's save carried the rejected sections
+// forward verbatim and its load logged `duplicate_authority` (the LDAP
+// sentinel test above). The latch must not outlive the test that armed it.
+func TestOrder_RejectedDocumentLatchDoesNotOutliveItsTest(t *testing.T) {
+	t.Run("r3", TestUpstreamV2C_R3_RejectedDocumentFreezesMutationsAndKeyMinting)
+	if _, _, ok := upstreamRetainedSections(); ok {
+		t.Fatal("the rejected-document latch armed by R3 is still set after R3 finished")
+	}
+	if st := getUpstreamState(); st.Degraded != nil {
+		t.Fatalf("the managed degradation surface armed by R3 is still set after R3 finished: %+v", st.Degraded)
+	}
 }
