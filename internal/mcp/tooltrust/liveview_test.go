@@ -108,21 +108,36 @@ func TestLiveView_EveryMutatorRepublishes(t *testing.T) {
 	}
 }
 
-// TestLiveView_SnapshotHoldsClonesNotStoredPointers pins the reason the snapshot clones. Mutators
-// edit records IN PLACE, so publishing the stored pointers would let a lock-free reader observe a
-// half-applied mutation.
+// TestLiveView_SnapshotHoldsClonesNotStoredPointers pins the reason the PUBLISHED SNAPSHOT clones,
+// which is a separate invariant from the one below and is no longer observable through
+// ActiveLiveApprovals — that now clones on the way out, so it would mask this.
+//
+// The lock-free reader walks the snapshot calling activeLiveAsOf, which reads Status and ExpiresAt,
+// BEFORE any outbound copy is made. If the snapshot aliased the stored records, those reads would
+// race an in-place mutation under the store lock (Reject sets a.Status on the live pointer) — a
+// reader could see a half-applied transition and admit against it. So the snapshot is inspected
+// directly here rather than through the accessor.
 func TestLiveView_SnapshotHoldsClonesNotStoredPointers(t *testing.T) {
 	s, now := liveViewStore(t)
-	snap := s.ActiveLiveApprovals(now)
-	if len(snap) != 1 {
-		t.Fatalf("premise: want one approval, got %d", len(snap))
+	if got := s.ActiveLiveApprovals(now); len(got) != 1 {
+		t.Fatalf("premise: want one active live approval, got %d", len(got))
+	}
+
+	view := s.liveView.Load()
+	if view == nil || len(*view) == 0 {
+		t.Fatal("premise: the published snapshot must be non-empty")
 	}
 	s.mu.Lock()
-	stored := s.byID[snap[0].ApprovalID]
+	stored := s.byID
 	s.mu.Unlock()
-	if stored == snap[0] {
-		t.Fatal("SECURITY: the lock-free view aliases the STORED record — an in-place mutation " +
-			"(Reject sets a.Status on the live pointer) would be observable half-applied")
+
+	for _, a := range *view {
+		if stored[a.ApprovalID] == a {
+			t.Fatalf("SECURITY: the published snapshot ALIASES the stored record %q — the "+
+				"lock-free filter reads Status and ExpiresAt off these pointers, so an in-place "+
+				"mutation under the store lock would race it and a reader could admit against a "+
+				"half-applied transition", a.ApprovalID)
+		}
 	}
 }
 
