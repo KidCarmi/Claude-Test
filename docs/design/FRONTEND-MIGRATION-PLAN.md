@@ -3439,6 +3439,34 @@ frozen program branch is untouched.
 > state at cleanup as well as at entry. No product code changed and no
 > accepted assertion changed.
 >
+> **PR-C8 — the root package's `-race` run overran the CI per-binary
+> budget.** `Gate · go test -race + coverage floors` on the PR-C7 head
+> ended in `panic: test timed out after 25m0s` (FAIL at 1502.7s, one test
+> 1s into its run — a budget overrun, not a hang); the run before it had
+> cleared the same budget by well under a minute. Measured per test
+> (`-race -json`, same box, both runs under the same background load):
+> `origin/main` alone is 1445s against the 1500s budget — 3.7% of
+> headroom, and the QA gate's main-push run of that suite already takes
+> 24m35s end to end — and this PR adds 58s of new root tests (445, the
+> RED matrices and harnesses of the program) plus ~20s on the OpenAPI
+> conformance slices for the larger contract, 1553s in total. This is
+> CI-01 (`docs/engineering/security-reviews/2026-08-25-mcp-overnight-hardening-run.md`)
+> two weeks on: the budget that was raised from 15m to 25m has been
+> consumed by `main` itself, and removing every test this PR adds would
+> leave a coin flip. The correction is the same decision with today's
+> numbers — the per-binary budget in `pr-fast-gate.yml` and `qa-gate.yml`
+> (which must move together) goes to 40m with the measurements recorded
+> beside the step; no test was shortened, skipped or weakened, and the
+> durable fix the record already names (split the root package) is
+> unchanged and remains an owner decision. Two related observations are
+> recorded, not changed: `security-release-gate.yml` still runs the same
+> suite under `-timeout=15m` on tags and the weekly cron, which `main`
+> exceeds today; and the root copy of `TestMatchDPIRegexWithTimeout_TimeoutReturnsTrue`
+> (`scanner_test.go`) keeps the racy 1 ns-timer shape the
+> `internal/scanner` test replaced with a blocking-fn seam, and failed
+> once here under three concurrent test runs (it has passed in every CI
+> run; it is not this PR's).
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
