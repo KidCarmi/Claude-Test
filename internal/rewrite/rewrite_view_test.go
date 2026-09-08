@@ -1,6 +1,7 @@
 package rewrite
 
 import (
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -60,42 +61,16 @@ func viewMatchesRules(rw *Rewriter) error {
 		}
 	}
 	if len(got) != len(want) {
-		return errCountf(len(got), len(want))
+		return fmt.Errorf("view holds %d rules, List() reports %d — a mutator did not republish",
+			len(got), len(want))
 	}
 	for i := range want {
 		if got[i].ID != want[i].ID || got[i].Host != want[i].Host {
-			return errRulef(i, got[i], want[i])
+			return fmt.Errorf("view rule %d = {id:%d host:%q}, want {id:%d host:%q} — "+
+				"a mutator did not republish", i, got[i].ID, got[i].Host, want[i].ID, want[i].Host)
 		}
 	}
 	return nil
-}
-
-type viewMismatch struct{ msg string }
-
-func (e *viewMismatch) Error() string { return e.msg }
-
-func errCountf(got, want int) error {
-	return &viewMismatch{msg: "view holds " + itoa(got) + " rules, List() reports " + itoa(want) +
-		" — a mutator did not republish"}
-}
-
-func errRulef(i int, got, want Rule) error {
-	return &viewMismatch{msg: "view rule " + itoa(i) + " = {id:" + itoa(got.ID) + " host:" + got.Host +
-		"}, want {id:" + itoa(want.ID) + " host:" + want.Host + "} — a mutator did not republish"}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
 }
 
 func TestRuleView_EveryMutatorRepublishes(t *testing.T) {
