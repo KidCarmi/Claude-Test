@@ -166,12 +166,22 @@ func normalizeHost(raw string) (string, error) {
 		if !isBracketedIPv6Literal(host) {
 			return "", errors.New("bracketed host must be an IPv6 literal")
 		}
-	case net.ParseIP(host) != nil:
-		if ip := net.ParseIP(host); ip.To4() == nil {
-			host = "[" + host + "]"
+	case strings.Contains(host, ":"):
+		// IPv6 URL SYNTAX decides, never net.IP.To4() (PR-C19 R10-B): an
+		// IPv4-mapped spelling such as `::ffff:192.0.2.1` parses as an IP
+		// whose To4() is non-nil, so a To4-keyed branch left the
+		// colon-bearing host unbracketed, Authority() produced a URL
+		// url.Parse refuses, and the pool rebuild silently omitted the
+		// persisted entry. A host carrying a colon is an IPv6 literal or
+		// nothing, and a bare literal is bracketed AS TYPED.
+		if !isIPv6Literal(host) {
+			return "", errors.New("host contains an invalid character")
 		}
+		host = "[" + host + "]"
+	case net.ParseIP(host) != nil:
+		// A full dotted-quad IPv4 literal, kept verbatim.
 	default:
-		if strings.ContainsAny(host, " /?#@:\\") {
+		if strings.ContainsAny(host, " /?#@\\") {
 			return "", errors.New("host contains an invalid character")
 		}
 		ascii, err := idna.Lookup.ToASCII(host)
@@ -202,8 +212,17 @@ func isBracketedIPv6Literal(host string) bool {
 	if strings.ContainsAny(inner, "[]") {
 		return false
 	}
-	ip := net.ParseIP(inner)
-	return ip != nil && ip.To4() == nil
+	return isIPv6Literal(inner)
+}
+
+// isIPv6Literal reports whether s is an IPv6 literal in URL syntax: it
+// carries a colon and net.ParseIP accepts it. IPv4-mapped and
+// IPv4-embedded spellings (`::ffff:192.0.2.1`, `64:ff9b::192.0.2.1`) are
+// IPv6 literals here even though net.IP.To4() is non-nil for the former —
+// the URL grammar brackets them, and that is what Authority() must emit
+// (PR-C19 R10-B). A dotted-quad (no colon) is never one.
+func isIPv6Literal(s string) bool {
+	return strings.Contains(s, ":") && net.ParseIP(s) != nil
 }
 
 // validateHostLabels refuses an IDNA host with an EMPTY label — a leading

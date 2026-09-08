@@ -296,7 +296,11 @@ fails to parse, or that parses without a host (a scheme-less `user:pw@host`
 spelling): the gate can only answer "does this URL carry a password?" for
 a URL it can parse, so an unreadable one fails the backup closed rather
 than being archived as password-free. Repair the entry (the legacy list
-carries `scheme://[user@]host:port`), then back up.
+carries `scheme://[user@]host:port`), then back up. A settings file that
+carries anything but whitespace after its single JSON object (a second
+value, trailing garbage) is refused the same way: only a sound settings
+file is archived, and nothing after the object is ever inspected or
+packed.
 
 **Restore** boots every formerly credentialed entry into the distinct
 state `requiresReplacement`: ineligible, never probed, never sent

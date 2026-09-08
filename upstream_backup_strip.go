@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 )
@@ -46,6 +47,17 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 	var root map[string]any
 	if err := dec.Decode(&root); err != nil {
 		return nil, 0, fmt.Errorf("admin_settings.json is not a JSON object: %w", err)
+	}
+	// PR-C19 R10-A: ONE settings object and nothing after it but
+	// whitespace. Decode reads a single value and never looks at the
+	// remaining bytes, so a credential-free leading object followed by a
+	// second value or trailing garbage carrying a plaintext legacy
+	// upstream URL was returned unchanged (the no-op path hands back the
+	// ORIGINAL body) and packed verbatim while the manifest asserted
+	// credentialsOmitted. A body with trailing data is not a sound
+	// settings file and is refused before any of it is inspected.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, 0, errors.New("admin_settings.json carries data after the settings object; a backup archives only a sound settings file")
 	}
 	// PR-C17 R8-A: a settings file in the prepared-downgrade state (after
 	// `--prepare-downgrade`, before the next boot re-migrates) carries NO v2

@@ -3646,6 +3646,27 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C19 — the tenth Codex round (one P1, one P2).** Both confirmed
+> and pinned before the correction (`upstream_codex_r10_red_test.go`).
+> (R10-A, P1) The backup sanitizer decoded ONE JSON value and never
+> looked at the bytes after it, so a settings body whose leading object
+> is credential-free followed by a second value or trailing garbage
+> carrying a plaintext legacy upstream URL was returned UNCHANGED (the
+> no-op path hands back the original body) and packed verbatim while the
+> manifest asserted `credentialsOmitted: true`. The sanitizer now requires
+> the decoder to reach EOF after the settings object (trailing whitespace
+> stays accepted) and refuses anything else before inspecting it; runbook
+> §8 updated. (R10-B, P2) `normalizeHost` decided "IPv6" by
+> `net.ParseIP(host).To4() == nil`, so an IPv4-mapped spelling
+> (`::ffff:192.0.2.1`, whose `To4()` is non-nil) was left unbracketed:
+> `Authority()` produced a URL `url.Parse` refuses and the pool rebuild
+> silently omitted the persisted entry, and the bracketed spelling was
+> refused by the same test. IPv6 URL SYNTAX now decides (`isIPv6Literal`:
+> a colon and a `net.ParseIP` parse), `To4()` never does, a bare literal
+> is bracketed as typed and the PR-C18 single-bracket-pair rule is kept;
+> the client already binds every colon-bearing host to its bracketed
+> form, so no frontend change was needed. Backend only.
+>
 > **PR-C18 — the ninth Codex round (one P1, one P2).** Both confirmed
 > and pinned before the correction (`upstream_codex_r9_red_test.go`).
 > (R9-A, P1) The PR-C17 backup refusal skipped a legacy `upstream_proxies`
