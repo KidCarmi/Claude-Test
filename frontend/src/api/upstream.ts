@@ -781,9 +781,24 @@ export interface CanonicalSpec {
 // appliance.
 const HOST_MAP_SENTINEL = ".culvert-host-map-sentinel";
 
+// Go's strings.ToLower applies the SIMPLE Unicode case mapping; JavaScript's
+// toLowerCase applies the FULL mapping, which differs unconditionally for
+// U+0130 (`İ` → `i̇`, two code points, vs `i`) and conditionally for a final
+// sigma (`Σ` → `ς` at the end of a word vs `σ` always). Both are mapped to
+// Go's result before the JavaScript lower-casing so the client agrees with
+// the appliance on every host (PR-C12 K7).
+function lowerAsGo(s: string): string {
+  return s
+    .replace(/\u0130/g, "i")
+    .replace(/\u03a3/g, "\u03c3")
+    .toLowerCase();
+}
+
 export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
   const scheme = spec.scheme.trim().toLowerCase();
-  let host = spec.host.trim().toLowerCase().replace(/\.+$/, "");
+  // The appliance strips exactly ONE trailing dot (`example.com..` is
+  // accepted and kept as `example.com.`) — never all of them (PR-C12 K7).
+  let host = lowerAsGo(spec.host.trim()).replace(/\.$/, "");
   if (host.includes(":")) {
     // An IPv6 literal: the appliance brackets a bare one and keeps the
     // literal AS TYPED (lower-cased, never compressed) — the URL parser
