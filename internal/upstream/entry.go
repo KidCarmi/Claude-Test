@@ -197,13 +197,30 @@ func validateHostLabels(host string) error {
 	if n := len(labels); n > 1 && labels[n-1] == "" {
 		labels = labels[:n-1] // the single trailing FQDN dot
 	}
+	// DNS length limits on the A-label form (RFC 1035 §2.3.4): the IDNA
+	// Lookup profile does not verify them, and an over-long label or name
+	// is a parent standard DNS cannot resolve (PR-C17 R8-B).
+	total := len(labels) - 1 // the dots between labels
 	for _, l := range labels {
 		if l == "" {
 			return errors.New("host contains an empty label")
 		}
+		if len(l) > maxDNSLabelOctets {
+			return errors.New("host contains a label longer than 63 octets")
+		}
+		total += len(l)
+	}
+	if total > maxDNSNameOctets {
+		return errors.New("host is longer than 253 octets")
 	}
 	return nil
 }
+
+// DNS length limits on the ASCII (A-label) form.
+const (
+	maxDNSLabelOctets = 63
+	maxDNSNameOctets  = 253
+)
 
 // SpecFromURL parses a legacy `scheme://[user[:pass]@]host[:port]` URL into
 // a normalized Spec plus the plaintext password it carried (empty when

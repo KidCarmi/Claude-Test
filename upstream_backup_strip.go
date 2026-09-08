@@ -25,7 +25,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -44,6 +46,18 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 	var root map[string]any
 	if err := dec.Decode(&root); err != nil {
 		return nil, 0, fmt.Errorf("admin_settings.json is not a JSON object: %w", err)
+	}
+	// PR-C17 R8-A: a settings file in the prepared-downgrade state (after
+	// `--prepare-downgrade`, before the next boot re-migrates) carries NO v2
+	// document and the UNSEALED passwords in the legacy `upstream_proxies`
+	// URLs by design — a pre-v2 file never booted on this binary can carry
+	// them too. An archive never carries material and the manifest asserts
+	// credentialsOmitted unconditionally, so such a body is REFUSED rather
+	// than packed verbatim: the operator boots this binary once (it
+	// re-migrates and seals the credentials) or completes the downgrade
+	// before taking a backup. Counts only — never a URL or a password.
+	if err := refuseCredentialBearingLegacyUpstreams(root); err != nil {
+		return nil, 0, err
 	}
 	doc, ok := root["upstream_proxies_v2"].(map[string]any)
 	if !ok {
@@ -100,4 +114,43 @@ func countUpstreamCredentialsRequiringReplacement(body []byte) int {
 		}
 	}
 	return n
+}
+
+// errUpstreamBackupPreparedDowngrade is the refusal for a settings file that
+// holds credential material in its legacy upstream list (see
+// refuseCredentialBearingLegacyUpstreams).
+var errUpstreamBackupPreparedDowngrade = errors.New("admin_settings.json carries upstream credential material in its legacy upstream_proxies list (prepared-downgrade state, or a pre-v2 file never booted on this binary); an archive never carries credential material — boot this binary once so the credentials are re-migrated and sealed, or complete the downgrade, then back up")
+
+// refuseCredentialBearingLegacyUpstreams refuses a settings body whose
+// legacy upstream_proxies list carries a password in any URL, or that
+// carries the prepared-downgrade marker (the mid-transition predecessor
+// shape). The message carries counts only.
+func refuseCredentialBearingLegacyUpstreams(root map[string]any) error {
+	_, prepared := root["upstream_prepared_downgrade"]
+	withPassword := 0
+	if list, ok := root["upstream_proxies"].([]any); ok {
+		for _, item := range list {
+			raw := ""
+			switch v := item.(type) {
+			case string:
+				raw = v
+			case map[string]any:
+				raw, _ = v["url"].(string)
+			}
+			if raw == "" {
+				continue
+			}
+			u, err := url.Parse(strings.TrimSpace(raw))
+			if err != nil || u.User == nil {
+				continue
+			}
+			if _, has := u.User.Password(); has {
+				withPassword++
+			}
+		}
+	}
+	if prepared || withPassword > 0 {
+		return fmt.Errorf("%w (prepared_downgrade=%t, legacy_urls_with_password=%d)", errUpstreamBackupPreparedDowngrade, prepared, withPassword)
+	}
+	return nil
 }
