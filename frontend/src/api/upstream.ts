@@ -773,8 +773,90 @@ function specWire(
 export interface CanonicalSpec {
   scheme: string;
   host: string;
+  /** The host at the Unicode level (see hostUnicodeKey) — the appliance's
+   *  IDNA tables cannot be reproduced exactly in the browser, so a returned
+   *  host is ALSO accepted when it decodes to the same letters. */
+  hostKey: string;
   port: number;
   username: string;
+}
+
+// ── Unicode-level host identity (PR-C13 K8) ─────────────────────────────
+// RFC 3492 punycode decoding of one label (the part after `xn--`).
+// Returns undefined for a malformed label — never a guess.
+function punycodeDecode(input: string): string | undefined {
+  const base = 36;
+  const tMin = 1;
+  const tMax = 26;
+  const skew = 38;
+  const damp = 700;
+  const out: number[] = [];
+  let n = 128;
+  let i = 0;
+  let bias = 72;
+  const delim = input.lastIndexOf("-");
+  const basicEnd = delim > 0 ? delim : 0;
+  for (let j = 0; j < basicEnd; j++) {
+    const c = input.charCodeAt(j);
+    if (c >= 0x80) return undefined;
+    out.push(c);
+  }
+  const digit = (c: number): number => {
+    if (c >= 48 && c <= 57) return c - 22;
+    if (c >= 65 && c <= 90) return c - 65;
+    if (c >= 97 && c <= 122) return c - 97;
+    return base;
+  };
+  const adapt = (d: number, numPoints: number, first: boolean): number => {
+    let delta = first ? Math.floor(d / damp) : d >> 1;
+    delta += Math.floor(delta / numPoints);
+    let k = 0;
+    while (delta > ((base - tMin) * tMax) >> 1) {
+      delta = Math.floor(delta / (base - tMin));
+      k += base;
+    }
+    return k + Math.floor(((base - tMin + 1) * delta) / (delta + skew));
+  };
+  let idx = basicEnd > 0 ? basicEnd + 1 : 0;
+  while (idx < input.length) {
+    const oldi = i;
+    let w = 1;
+    for (let k = base; ; k += base) {
+      if (idx >= input.length) return undefined;
+      const d = digit(input.charCodeAt(idx++));
+      if (d >= base) return undefined;
+      i += d * w;
+      const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+      if (d < t) break;
+      w *= base - t;
+    }
+    const numPoints = out.length + 1;
+    bias = adapt(i - oldi, numPoints, oldi === 0);
+    n += Math.floor(i / numPoints);
+    i %= numPoints;
+    if (n > 0x10ffff) return undefined;
+    out.splice(i, 0, n);
+    i++;
+  }
+  return String.fromCodePoint(...out);
+}
+
+// The Unicode form of an ASCII (A-label) host: every `xn--` label decoded,
+// NFC-normalised. A host with a malformed punycode label has NO key (an
+// empty string can never equal a typed host).
+export function hostUnicodeKey(host: string): string {
+  if (host === "" || host.startsWith("[")) return host;
+  const labels: string[] = [];
+  for (const label of host.split(".")) {
+    if (label.toLowerCase().startsWith("xn--")) {
+      const u = punycodeDecode(label.slice(4));
+      if (u === undefined || u === "") return "";
+      labels.push(u);
+    } else {
+      labels.push(label);
+    }
+  }
+  return labels.join(".").normalize("NFC");
 }
 // A trailing label appended ONLY while the browser maps a host through the
 // URL parser (see canonicalSpec); it is stripped again and never reaches the
@@ -799,6 +881,7 @@ export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
   // The appliance strips exactly ONE trailing dot (`example.com..` is
   // accepted and kept as `example.com.`) — never all of them (PR-C12 K7).
   let host = lowerAsGo(spec.host.trim()).replace(/\.$/, "");
+  let hostKey: string | undefined;
   if (host.includes(":")) {
     // An IPv6 literal: the appliance brackets a bare one and keeps the
     // literal AS TYPED (lower-cased, never compressed) — the URL parser
@@ -821,23 +904,42 @@ export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
         host = u.hostname.slice(0, -HOST_MAP_SENTINEL.length);
       }
     } catch {
-      /* keep the lowered host; the appliance would have refused it anyway */
+      // The browser refuses a host the appliance's IDNA tables may still
+      // accept (`ℵx.example` maps to `אx.example`, a label the browser's
+      // bidi check rejects, which the appliance returns as
+      // `xn--x-zhc.example`). The lowered host is kept, and the binding
+      // falls back to the Unicode-level key: UTS-46 is NFKC plus case
+      // folding for every mapped character seen so far, so the typed host
+      // is NFKC-mapped and lower-cased again (PR-C13 K8).
+      hostKey = lowerAsGo(host.normalize("NFKC"));
     }
   }
   const port = spec.port === 0 ? (scheme === "https" ? 443 : 80) : spec.port;
-  return { scheme, host, port, username: spec.username.trim() };
+  return {
+    scheme,
+    host,
+    hostKey: hostKey ?? hostUnicodeKey(host),
+    port,
+    username: spec.username.trim(),
+  };
 }
 
 function matchesSpec(
   e: { scheme: string; host: string; port: number; username: string },
   want: CanonicalSpec,
 ): boolean {
-  return (
-    e.scheme === want.scheme &&
-    e.host === want.host &&
-    e.port === want.port &&
-    e.username === want.username
-  );
+  if (
+    e.scheme !== want.scheme ||
+    e.port !== want.port ||
+    e.username !== want.username
+  ) {
+    return false;
+  }
+  if (e.host === want.host) return true;
+  // The appliance's ASCII form differs from the browser's: accept it only
+  // when it decodes to exactly the letters that were typed (PR-C13 K8).
+  const key = hostUnicodeKey(e.host);
+  return key !== "" && key === want.hostKey;
 }
 
 /** Wrap the read-model decoder with an ACTION-SPECIFIC evidence check: a
