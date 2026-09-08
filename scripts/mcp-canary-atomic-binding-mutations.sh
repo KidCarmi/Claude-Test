@@ -291,7 +291,7 @@ run_mutation M11 \
   'the pre-executor path counts the drift as evidence and never latches' \
   'TestPreAdmissionDrift_E2E_ServerIdentityDriftStopsTheActivation' \
   . "$ADM" \
-  's/\tglobalCanaryRuntime\.latchDriftUnderActivation\(capb, now, func\(\) \(bool, string\) \{\n\t\treturn mcpLiveTrustRevalidate\(obs\.Tenant, obs\.ServerID, obs\.ToolName, obs\.DecisionFP, now\)\n\t\}\)\n/\t_ = capb\n\t_ = now\n/'
+  's/\tglobalCanaryRuntime\.latchDriftUnderActivation\(capb, now, func\(\) \(bool, string\) \{.*?\n\t\}\)\n/\t_ = capb\n\t_ = now\n/s'
 
 run_mutation M12 \
   'the latch trusts the callers unlocked verdict instead of re-deriving under the lock' \
@@ -310,17 +310,6 @@ run_mutation M14 \
   'TestCanaryBreach_PreExecutorDriftCarriesItsTarget' \
   ./internal/mcp/runtime/ internal/mcp/runtime/execute.go \
   's/\t\t\tServerID:   toolServerID\(in\),/\t\t\tServerID:   "",/'
-
-# ── (7) §5: THE APPROVAL STORE STAYS OUT OF THE CRITICAL SECTION ───────────
-# tooltrust.Store.mu is held across persistLocked's atomic file write by every approval
-# mutation, so consulting the store under cr.mu puts a stuck disk in front of automatic
-# abort and demotion. This is a LIVENESS defect a lock-order audit cannot see.
-
-run_mutation M15 \
-  'the blocking approval lookup is moved back inside the activation critical section' \
-  'TestAtomicBinding_ApprovalLookupDoesNotHoldTheActivationLock' \
-  . mcp_live_gate.go \
-  's/\t\treturn live\.Eligible && approved, ""/\t\treturn live.Eligible \&\& approved \&\& g.approvalOK(live.Target, in.Now), ""/'
 
 # ── (8) TRUST IS EVALUATED WHOLLY INSIDE THE TRANSACTION ───────────────────
 # Round 22: hoisting the approval lookup out of the lock to satisfy §5 bought a worse
