@@ -3582,6 +3582,21 @@ frozen program branch is untouched.
 > that decodes to different letters, or carries a malformed punycode
 > label, stays unproven. Frontend only; `frontend/dist` regenerated.
 >
+> **PR-C14 — the sixth Codex round (one P2).** Confirmed against both
+> sides and pinned in `frontend/src/test/pr-c14-codex-red.test.tsx` (K9,
+> ten failing cases, four companions and one control) before the
+> correction. Go's `strings.TrimSpace` and JavaScript's `trim()` use
+> different whitespace sets: the appliance strips U+0085 NEXT LINE (and
+> U+00A0, U+2028, U+3000) from a username or host and KEEPS U+FEFF, while
+> `trim()` keeps U+0085 and strips U+FEFF, so a username pasted with a
+> NEXT LINE was returned as `svc` and the client's binding refused the
+> genuine success as UNPROVEN; the editor sent the untrimmed value for the
+> same reason. `trimAsGo` now trims exactly Go's set and is used by
+> `canonicalSpec` (scheme, host, username) and by the editor's
+> `draftToSpec` (host, username), so what is sent is what the appliance
+> keeps; a character neither side trims (U+200B) still binds only to
+> itself. Frontend only; `frontend/dist` regenerated.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
