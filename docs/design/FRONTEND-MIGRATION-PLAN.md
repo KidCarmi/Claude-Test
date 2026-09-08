@@ -3311,6 +3311,73 @@ UI leans on C2 semantics and must not cut over onto a known enforcement gap).
 > commits cleanly. Both shapes are proven at the Go layer and against the
 > real binary (policy-2d.spec.ts).
 
+#### Batch 2 PR correction round (PR #1340, append-only on `claude/culvert-frontend-batch2-pr`)
+
+The frozen Batch 2F head (`8e73a619`) was opened as a draft PR and the real
+CI matrix plus the repository's automated reviewer found what a root-run,
+single-order qualification could not. Every product correction below was
+preceded by a RED proof executed on the tree immediately before it; the
+frozen program branch is untouched.
+
+> **PR-C1 — the browser smoke depended on a writable `/data`.** The
+> appliance's persisted-state root was the fixed absolute `/data`; a CI
+> runner's unprivileged user cannot read or create it, so every
+> `/data`-backed mutation (admin settings, object stores, PAC profiles, CDR
+> state, drafts) answered `persist_failed`/503 while file-path-backed
+> stores kept working — 45 failed / 102 passed / 3 skipped, reproduced
+> verbatim on the PR head inside a private mount namespace with an empty
+> read-only tmpfs over `/data` (the exact CI premise: ENOENT on read, EROFS
+> on write). Correction: `CULVERT_DATA_DIR` (`data_dir.go`), a
+> startup-scoped, env-only override resolved once in `main()` before flag
+> parsing and any one-shot command (blank ⇒ `/data`, byte-identical;
+> otherwise an absolute, cleaned, non-root path, else FATAL; recorded
+> GUI-parity deferral of the HA-lease-endpoint class); the harness gives
+> every appliance instance its own root under the harness tmp dir, which
+> also retires the recorded "shared `/data` across instances and runs"
+> debt, and exports the AUTH root so the on-disk ciphertext needle checks
+> run everywhere instead of annotating a skip. **Qualification rule going
+> forward: the smoke is run at least once with `/data` unwritable** (the
+> `unshare -m` + read-only tmpfs shape) so a root-only premise can never
+> pass again.
+>
+> **PR-C2 — determinism gate.** Under `-shuffle -count=2` the
+> process-global "stored document rejected at load" latch armed by the R3
+> rejected-document test outlived its environment and handed a 409
+> `document_rejected` to the next upstream test. `upEnv` now resets the
+> latch and the degradation surface with the rest of the upstream process
+> state (`upstream_v2_env_isolation_red_test.go`).
+>
+> **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
+> the per-entry DELETE keyed their refusals on credential material only,
+> so an entry in the durable `requiresReplacement` state (Credential nil,
+> marker set) could be omitted or deleted without the exact-id Tier-3
+> clear; both now use the same `upstreamEntryProtected` predicate as the
+> import planner and name every protected entry. (P2)
+> `culvert --prepare-downgrade` audited into the in-memory ring of a
+> process that exits immediately; `runPrepareDowngradeCommand` opens the
+> `-audit-log` sink before the command and refuses to run when the
+> configured sink cannot be opened. Proofs in
+> `upstream_v2_codex_red_test.go`, the P2 one driving the real one-shot
+> dispatcher in a re-executed test binary.
+>
+> **PR-C3/C4 — hygiene.** The 50 diff-scoped lint findings and the three
+> staticcheck findings inherited from the program's earlier slices are
+> cleared (helpers extracted for the complexity findings; dead draft
+> helpers removed; test-only nolint directives carry their reason), and
+> the eleven CodeQL log-injection alerts on new code are closed with the
+> repository's `sanitizeLog` + `%q` convention.
+>
+> **PR-C6 — API contract.** oasdiff against `main` reports 36 breaking
+> changes, all the documented behaviour of the Batch 2 backend
+> corrections (JSON refusals instead of `text/plain`, 204 deletes, required
+> revision fences and identity parameters, closed security enumerations).
+> The contract takes the MAJOR bump the versioning policy requires
+> (1.2.0 → 2.0.0; the eleven operations this PR introduces are tagged
+> `x-culvert-introduced-version: 2.0.0`), the entry is recorded in
+> `CHANGELOG.md`, and the PR body carries the `Breaking-Change-Rationale:`,
+> `Migration-Instructions:` and `Version-Impact:` sections. The
+> `api-breaking-approved` label and the CODEOWNER approval are the owner's.
+
 ### FE-6 — Cluster, identity, certificates, settings, releases, support, MCP, decryption
 - **Objective**: FE-V27..V30, FE-V33, FE-V35, FE-V36 (settings decomposed per IA §5),
   FE-V37, FE-V04/05, FE-V07..V15.

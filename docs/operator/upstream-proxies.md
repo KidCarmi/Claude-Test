@@ -82,8 +82,12 @@ credential.
 **An authority change while a credential exists is refused** (409
 `credential_bound`). There is no combined rebind: clear the credential (T3),
 edit the entry, then set the credential again. Deleting an entry whose
-credential is `configured`, `unusable` or `mismatch` is refused too (409
-`credential_present`) — clearing is always an explicit, confirmed step.
+credential is `configured`, `unusable` or `mismatch` — or whose state is
+`requiresReplacement` (a restored or imported credentialed parent, see the
+portability section) — is refused too (409 `credential_present`): clearing
+is always an explicit, confirmed step, and the replacement marker is
+resolved only by that same Tier-3 clear or a Tier-2 replace, never by a
+delete.
 
 ### When the stored document is rejected
 
@@ -124,8 +128,10 @@ The legacy bulk endpoint survives as a **credential-free** adapter for
 scripts: a URL carrying any userinfo is refused (400 `userinfo_not_allowed`),
 an invalid entry refuses the whole list (400 `invalid_entry` — nothing is
 dropped), and the call is refused outright while any managed entry holds a
-credential (409 `credentialed_entries_present`). A credentialed entry can
-never be replaced or removed by omission. GET URLs never carry userinfo.
+credential or awaits credential replacement (`requiresReplacement`) (409
+`credentialed_entries_present`; `current.credentialed` names every such
+entry). A credentialed entry — or one carrying the replacement marker —
+can never be replaced or removed by omission. GET URLs never carry userinfo.
 
 The shipped admin panel (`static/index.html`) uses the per-entry endpoints;
 the adapter restrictions and the panel switch landed in the same commit.
@@ -307,9 +313,15 @@ only and atomically rewrites `admin_settings.json` (0600, fsync, rename)
 with full legacy URLs, removing `upstream_proxies_v2`; it refuses when
 the key is missing or unusable, when any credential is `mismatch`,
 `unusable` or `requiresReplacement` (fix those first), and when the file is
-already prepared. Output, log and audit carry counts only. The prepared
-file contains the passwords in cleartext by construction — that is the
-predecessor's format, and the reason the command is explicit and offline.
+already prepared. Output, log and audit carry counts only. The audit
+record (`upstream.prepare_downgrade`) is durable only when the one-shot is
+started with `-audit-log <path>` (the same flag the appliance runs with;
+the YAML `audit_log_file` is not consulted by one-shot commands): the
+command opens that log itself, refuses to run if the configured log cannot
+be opened (`audit_sink_unavailable`), and states `Audit: NOT persisted`
+when no audit log is configured. The prepared file contains the passwords
+in cleartext by construction — that is the predecessor's format, and the
+reason the command is explicit and offline.
 
 Booting the CURRENT binary on a prepared file re-migrates it once
 (`migration.reason: re-migrated_after_prepare`, credentials re-sealed).

@@ -1,8 +1,8 @@
 openapi: 3.0.4
 info:
   title: Culvert Admin API
-  version: 1.2.0
-  x-culvert-api-contract-version: 1.2.0
+  version: 2.0.0
+  x-culvert-api-contract-version: 2.0.0
   description: |
     Machine-readable contract for the Culvert admin/control-plane REST API served
     on the UI port (`-ui-port`, default 9090).
@@ -4425,7 +4425,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       responses:
         '200':
           description: Ordered rules + content revision.
@@ -5365,7 +5365,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       responses:
         '200':
           description: Profiles + content revision.
@@ -6658,7 +6658,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: non-idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: upstream.entry.create
       requestBody:
@@ -6713,7 +6713,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: upstream.entry.update
       requestBody:
@@ -6767,7 +6767,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: upstream.entry.delete
       parameters:
@@ -6824,7 +6824,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: high
       x-culvert-audit-event: upstream.credential.replace
       requestBody:
@@ -8757,7 +8757,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       parameters:
         - name: name
           in: path
@@ -11191,7 +11191,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       responses:
         '200':
           description: Categories + semantic revision.
@@ -12279,7 +12279,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: cdr.instance.enroll.recover
       requestBody:
@@ -12323,7 +12323,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       responses:
         '200':
           description: Receipts.
@@ -12351,7 +12351,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: cdr.instance.enroll.receipt.remove
       parameters:
