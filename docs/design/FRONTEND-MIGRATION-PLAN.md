@@ -3510,6 +3510,26 @@ frozen program branch is untouched.
 > exported for that test only; engine behaviour is byte-identical). No
 > Go handler changed; `frontend/dist` regenerated.
 >
+> **PR-C10 — the second Codex round (two P2s).** Both confirmed against
+> the code and pinned in `frontend/src/test/pr-c10-codex-red.test.tsx`
+> (K4–K5, nine failing cases and three controls) before the correction.
+> (K4) The appliance brackets a bare IPv6 literal and keeps the literal AS
+> TYPED (lower-cased, never compressed — `internal/upstream` `normalizeHost`),
+> while the client's canonical host went through the URL parser, which
+> throws on a bare literal and compresses a bracketed one, so a genuine
+> success on `2001:db8::1`, `2001:DB8::1`, `2001:0db8::1` or
+> `[2001:0db8::1]` was classified UNPROVEN; `canonicalSpec` now brackets
+> and lower-cases an IPv6 literal itself and never hands it to the URL
+> parser, and a different literal still stays unproven. (K5) A manual
+> probe and every mutation share one run owner (`begin()` aborts the
+> predecessor), but `canMutate` ignored `probing`, so New entry / Edit /
+> Delete entry / the credential ceremonies stayed live during a probe and
+> a confirmed mutation would abort the probe's request into an unproven
+> outcome while the appliance kept probing; `canMutate` now includes the
+> in-flight probe, the page test drives the real page with the probe
+> answer held open and proves the controls are disabled until it lands
+> and re-enabled after. Frontend only; `frontend/dist` regenerated.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
