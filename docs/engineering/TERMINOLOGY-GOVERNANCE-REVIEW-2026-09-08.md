@@ -298,3 +298,25 @@ disambiguation this program has recorded favorably in prior reviews. All fourtee
 findings were re-confirmed unchanged, two (T-39, T-21+T-32) by direct read rather than file-list absence
 alone given this window's size and the specific risk each carried of a fresh collision. No cosmetic or
 preference-driven renames were proposed.
+
+---
+
+## Addendum (same PR, post-open): fixing a real gap in the new merge-blocking gate itself
+
+`chatgpt-codex-connector[bot]`'s automated review on PR #1343 (the PR carrying this report) flagged that
+`docs_adr_numbering_test.go`'s original `splitLinesForADRTest` helper capped its scan at the first 8
+physical lines of each document. A document whose real `# ADR-NNNN` heading fell past that cap — e.g. a
+future RFC with a longer front-matter block than today's single-line status blockquote — would be silently
+treated as unnumbered and dropped out of the collision check, exactly the failure mode this gate exists to
+prevent (a second document could then claim the same number and the merge-blocking test would still pass).
+This is the same finding-verification discipline the charter asks of this program applied reflexively to
+its own same-PR output: verified against the actual helper (confirmed the 8-line cap existed and would
+reproduce the described gap on a hand-built fixture), then fixed. `splitLinesForADRTest` is replaced with
+`firstMarkdownHeading`, which scans the whole file for the first line starting with `#` with no line-count
+cap; `TestFirstMarkdownHeading_NoLineCountCap` pins a 21-line front-matter fixture that reproduces the
+exact gap the review described and would fail against the pre-fix helper. Re-verified against every current
+file in `docs/adr/` and `docs/support/rfc/` (unchanged pass/fail outcome — none of today's files were
+affected by the cap; this closes a latent gap for future documents, not a live miss).
+
+Verification: `go build ./...` clean, `gofmt -l docs_adr_numbering_test.go` clean, `go vet .` clean,
+`go test -run 'TestADRNumberingNoCollisions|TestFirstMarkdownHeading' -v .` — both tests pass.

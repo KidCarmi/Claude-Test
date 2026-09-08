@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -57,16 +58,21 @@ func TestADRNumberingNoCollisions(t *testing.T) {
 				t.Fatalf("reading %s: %v", path, err)
 			}
 			num := ""
-			for _, line := range splitLinesForADRTest(data) {
+			// The document's title is its first Markdown heading line, wherever it
+			// falls — an RFC's leading "> STATUS: ..." blockquote (and any blank
+			// lines around it) is skipped implicitly because it never starts with
+			// "#". Stopping at the FIRST heading (rather than scanning the whole
+			// file for any ADR-NNNN-shaped line) avoids a false match on a "Relates
+			// to: ADR-0016" body line further down; not capping the scan at a fixed
+			// line count (a prior version capped at 8 and a Codex review on the PR
+			// that introduced this test caught that a longer front-matter block
+			// would push the real heading past the cap and make the gate silently
+			// skip the file) means front matter of any length is still followed
+			// through to the real title.
+			if line := firstMarkdownHeading(data); line != "" {
 				if m := headerRe.FindStringSubmatch(line); m != nil {
 					num = m[1]
-					break
 				}
-				// Only the first non-empty line and the first Markdown heading are
-				// candidates; an RFC's leading "> STATUS: ..." blockquote line is
-				// skipped implicitly because it never matches headerRe, and we keep
-				// scanning until we find the real "# ADR-NNNN" heading or exhaust a
-				// generous prefix of the file.
 			}
 			if num == "" {
 				continue // not every docs/adr file self-titles "ADR-NNNN" in its header (e.g. ADR-FE-*)
@@ -96,20 +102,40 @@ func TestADRNumberingNoCollisions(t *testing.T) {
 	}
 }
 
-// splitLinesForADRTest scans only the first few lines of a doc — the header always
-// appears near the top (RFC-track files carry one leading status blockquote line first).
-func splitLinesForADRTest(data []byte) []string {
-	const maxLines = 8
-	lines := make([]string, 0, maxLines)
+// TestFirstMarkdownHeading_NoLineCountCap pins the fix for a Codex review finding on
+// the PR that introduced this file: an earlier version capped its scan at the first 8
+// physical lines, so a document with 8+ lines of front matter before its real heading
+// was silently treated as unnumbered and dropped out of the collision check entirely —
+// exactly the kind of gap that would let a fifth ADR-numbering collision (see T-16,
+// T-46, T-47, T-48) slip past a gate built specifically to catch it.
+func TestFirstMarkdownHeading_NoLineCountCap(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 20; i++ {
+		sb.WriteString("> front matter line that is not a heading\n")
+	}
+	sb.WriteString("# ADR-0099: heading pushed past any small fixed line cap\n")
+	sb.WriteString("\nbody text\n")
+
+	got := firstMarkdownHeading([]byte(sb.String()))
+	want := "# ADR-0099: heading pushed past any small fixed line cap"
+	if got != want {
+		t.Fatalf("firstMarkdownHeading with 21 lines of front matter = %q, want %q", got, want)
+	}
+}
+
+// firstMarkdownHeading returns the first line of data (trimmed) that starts with
+// "#", scanning the WHOLE file — no line-count cap, so front matter of any length
+// before the real title is followed through rather than silently truncated past.
+func firstMarkdownHeading(data []byte) string {
 	start := 0
-	for i := 0; i < len(data) && len(lines) < maxLines; i++ {
-		if data[i] == '\n' {
-			lines = append(lines, string(data[start:i]))
+	for i := 0; i <= len(data); i++ {
+		if i == len(data) || data[i] == '\n' {
+			line := strings.TrimSpace(string(data[start:i]))
+			if strings.HasPrefix(line, "#") {
+				return line
+			}
 			start = i + 1
 		}
 	}
-	if len(lines) < maxLines && start < len(data) {
-		lines = append(lines, string(data[start:]))
-	}
-	return lines
+	return ""
 }
