@@ -3418,6 +3418,27 @@ frozen program branch is untouched.
 > rewriter it mutated. No product code changed and no accepted assertion
 > changed.
 >
+> **PR-C7b — the same seed, one more.** With PR-C7's two isolated, the
+> seeded run reached `TestLegacyLDAP_RetirementSentinelDurableRoundTrip`
+> ("sentinel did not survive the admin_settings.json round trip"). Two
+> process-global leaks meet there: a predecessor's best-effort
+> admin-settings save (`adminSettingsSave` spawns a goroutine on every
+> admin mutation) was still in flight when the test pinned and rewrote its
+> fixture with the flag already reset, so the stale save landed on the
+> fixture and the load read `legacy_ldap_retired:false`; and the same load
+> logged `duplicate_authority`, because `upEnv` cleared the R3
+> rejected-document latch at ENTRY only (PR-C2), which protects the next
+> upstream test and nobody else — a non-upstream successor's save carried
+> the rejected sections forward verbatim. Both are pinned in
+> `test_order_isolation_red_test.go` (a held-open pending save that the
+> fixture helper must wait out; R3 as a subtest whose cleanup must clear
+> the latch and the degradation surface), and the corrections are isolation
+> only: the LDAP fixture helper drains `adminSettingsSaveWG` before it hands
+> the path to the test and the victim drains again before the rewrite (the
+> drain the upstream suites already use), and `upEnv` resets the latch and
+> state at cleanup as well as at entry. No product code changed and no
+> accepted assertion changed.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
