@@ -589,21 +589,29 @@ func TestAtomicBinding_G_PreExecutorDriftLatchesTheActiveGeneration(t *testing.T
 // inherited by an activation created afterwards.
 func TestAtomicBinding_H_PreExecutorDriftInThePublicationGapLatchesNothing(t *testing.T) {
 	r := newAtomicRig(t)
-	// Deliberately NOT armed: this is the publication gap.
+	g := r.arm(t, 4)
 
-	got := r.latchDrift(probeDrift("server_identity_drift"))
+	// The activation is demoted while the observation is in flight. This is the shape the gap
+	// check uniquely guards: demote leaves the GENERATION recorded and only clears active and the
+	// controllers, so the observation's generation still MATCHES — the equality check cannot
+	// refuse it, and only "there is no live activation" can.
+	if err := r.rt.demoteCanary(r.capb); err != nil {
+		t.Fatalf("demote: %v", err)
+	}
 
-	if got.Active || got.Generation != 0 || got.Latched {
-		t.Fatalf("SECURITY: a drift observed with no live activation reported %+v — it must "+
-			"latch nothing and name no generation", got)
+	got := r.latchDriftAs(g, probeDrift("server_identity_drift"))
+
+	if got.Active || got.Latched {
+		t.Fatalf("SECURITY: a drift observed with NO live activation reported %+v — ModeCanary "+
+			"with a demoted runtime is not an activation, and nothing may be latched there", got)
 	}
 
 	// Now an activation is published. It must be born healthy: it never saw that drift.
-	g := r.arm(t, 4)
+	g2 := r.arm(t, 4)
 	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
-		t.Fatalf("SECURITY: activation %d inherited a drift observed before it existed", g)
+		t.Fatalf("SECURITY: activation %d inherited a drift observed before it existed", g2)
 	}
-	if adm := r.admit(probeTrusted()); !adm.Granted() || adm.Generation != g {
+	if adm := r.admit(probeTrusted()); !adm.Granted() || adm.Generation != g2 {
 		t.Fatalf("a healthy request under the new activation was denied: %+v", adm)
 	}
 }
