@@ -320,7 +320,7 @@ run_mutation M16 \
   'the approval verdict is read before the lock and cached across it' \
   'TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction' \
   . mcp_live_gate.go \
-  's/\tadm := g\.admitUnderActivation\(in\.Now, canary\.ExecutionIdentity\{/\tpreHoist := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)\n\tapprovedHoist := preHoist.Eligible \&\& g.approvalOK(preHoist.Target, in.Now)\n\tadm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{/; s/\t\treturn live\.Eligible && g\.approvalOK\(live\.Target, in\.Now\), ""/\t\treturn live.Eligible \&\& approvedHoist, ""/'
+  's/\tadm := g\.admitUnderActivation\(in\.Now, canary\.ExecutionIdentity\{/\tpreHoist := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)\n\thoistOK, hoistCode := false, ""\n\tif preHoist.Eligible \{ hoistOK, hoistCode = g.approvalOK(preHoist.Target, in.Now) \}\n\tadm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{/; s/\t\treturn g\.approvalOK\(live\.Target, in\.Now\)/\t\treturn hoistOK, hoistCode/'
 
 run_mutation M18 \
   'the live-approval read takes the durable store lock again' \
