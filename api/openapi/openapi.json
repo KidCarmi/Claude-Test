@@ -5484,7 +5484,7 @@
           },
           "probe": {
             "additionalProperties": false,
-            "description": "The periodic health-probe configuration armed at startup (config.yaml upstream.health_interval).",
+            "description": "The periodic health-probe configuration armed at startup (config.yaml upstream.health_interval) and the node-local manual-run state.",
             "properties": {
               "configured": {
                 "type": "boolean"
@@ -5492,11 +5492,16 @@
               "interval": {
                 "description": "Go duration; \"0s\" when no periodic probe runs.",
                 "type": "string"
+              },
+              "manualInFlight": {
+                "description": "True while an admin-triggered manual probe run (POST /api/upstream/health, single-flight) is executing on this node. A client whose manual-run answer outran its deadline resolves the run against this flag and the entries' health instead of a deadline sized from a possibly stale entry count.",
+                "type": "boolean"
               }
             },
             "required": [
               "configured",
-              "interval"
+              "interval",
+              "manualInFlight"
             ],
             "type": "object"
           },

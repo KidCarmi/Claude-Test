@@ -178,9 +178,31 @@ func normalizeHost(raw string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("host is not a valid IDNA host name")
 		}
+		if err := validateHostLabels(ascii); err != nil {
+			return "", err
+		}
 		host = ascii
 	}
 	return host, nil
+}
+
+// validateHostLabels refuses an IDNA host with an EMPTY label — a leading
+// dot, consecutive dots, or more than the single trailing FQDN dot that
+// normalizeHost deliberately keeps — which the IDNA mapping passes through
+// unchanged; without it an invalid DNS name was persisted and published as
+// an eligible parent instead of the mutation receiving invalid_entry
+// (PR-C15 R7-A).
+func validateHostLabels(host string) error {
+	labels := strings.Split(host, ".")
+	if n := len(labels); n > 1 && labels[n-1] == "" {
+		labels = labels[:n-1] // the single trailing FQDN dot
+	}
+	for _, l := range labels {
+		if l == "" {
+			return errors.New("host contains an empty label")
+		}
+	}
+	return nil
 }
 
 // SpecFromURL parses a legacy `scheme://[user[:pass]@]host[:port]` URL into

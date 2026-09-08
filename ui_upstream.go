@@ -122,7 +122,7 @@ func upstreamView() map[string]any {
 			"plainHttp": "chained", "connect": "direct", "websocket": "direct", "socks5": "direct",
 			"summary": "plain_http_only",
 		},
-		"probe":                 map[string]any{"configured": probeConfigured, "interval": probeInterval.String()},
+		"probe":                 map[string]any{"configured": probeConfigured, "interval": probeInterval.String(), "manualInFlight": upstreamPool.ManualProbeInFlight()},
 		"revision":              doc.Revision,
 		"entries":               list,
 		"proxies":               list, // legacy field: same credential-free rows

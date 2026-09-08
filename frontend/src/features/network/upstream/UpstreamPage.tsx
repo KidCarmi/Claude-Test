@@ -150,6 +150,47 @@ function plural(n: number, one: string, many: string): string {
   return `${String(n)} ${n === 1 ? one : many}`;
 }
 
+/** Poll cadence and ceiling while a timed-out manual probe is resolved
+ * against the appliance (PR-C15 K11). The ceiling is a sanity bound far
+ * above any real run; the appliance's own per-entry bound is what ends a
+ * run. */
+const PROBE_RESOLVE_POLL_MS = 1_000;
+const PROBE_RESOLVE_MAX_MS = 600_000;
+
+/** The counts-only summary of a manual run read back from the read model:
+ * an eligible entry counts as probed when its health stamp CHANGED since
+ * `before` and carries the manual source. Returns null when nothing
+ * advanced (the run cannot be proven) or when there is no `before`. */
+function probeAdvanced(
+  before: UpstreamConfig | undefined,
+  now: UpstreamConfig,
+): UpstreamProbeSummary | null {
+  if (before === undefined) return null;
+  const prev = new Map(before.entries.map((e) => [e.id, e.health]));
+  let probed = 0;
+  let healthy = 0;
+  for (const e of now.entries) {
+    const h = e.health;
+    const p = prev.get(e.id);
+    const changed =
+      h.source === "manual" &&
+      (p === undefined ||
+        p.lastProbeAt !== h.lastProbeAt ||
+        p.source !== h.source ||
+        p.status !== h.status);
+    if (!changed) continue;
+    probed += 1;
+    if (h.status === "healthy") healthy += 1;
+  }
+  if (probed === 0) return null;
+  return {
+    probed,
+    healthy,
+    unhealthy: probed - healthy,
+    skipped: now.entries.length - probed,
+  };
+}
+
 export function UpstreamPage(): JSX.Element {
   const { state } = useAuth();
   const role = state.role ?? "viewer";
@@ -373,16 +414,72 @@ export function UpstreamPage(): JSX.Element {
     }
   };
 
+  /** A manual probe whose ANSWER outran the client deadline (PR-C15 K11).
+   * The appliance snapshots and probes the CURRENT entries sequentially, so
+   * a deadline sized from this page's entry count is not an upper bound
+   * (another admin may have added entries since the last read). The run is
+   * resolved against the appliance instead of being guessed: the read
+   * model is polled until no manual run is in flight, and the run counts
+   * as completed only when at least one eligible entry's health ADVANCED
+   * (a POST that never reached the appliance leaves nothing in flight and
+   * nothing advanced — that stays unproven, fail-closed). */
+  const resolveProbeAgainstAppliance = async (
+    before: UpstreamConfig | undefined,
+    signal: AbortSignal,
+    err: unknown,
+  ): Promise<void> => {
+    const started = Date.now();
+    for (;;) {
+      if (signal.aborted) return;
+      let now: UpstreamConfig;
+      try {
+        now = await getUpstream(signal);
+      } catch (e) {
+        markUnproven("manual probe", e);
+        return;
+      }
+      if (now.probe.manualInFlight === undefined) {
+        markUnproven("manual probe", err);
+        return;
+      }
+      if (!now.probe.manualInFlight) {
+        const advanced = probeAdvanced(before, now);
+        if (advanced === null) {
+          markUnproven("manual probe", err);
+          return;
+        }
+        setSummary(advanced);
+        setNotice(
+          "Probe run completed on the appliance; its answer outran the client deadline, so the results were read back from the read model.",
+        );
+        page.refreshToResolve();
+        return;
+      }
+      if (Date.now() - started > PROBE_RESOLVE_MAX_MS) {
+        markUnproven("manual probe", err);
+        return;
+      }
+      await new Promise<void>((r) => {
+        setTimeout(r, PROBE_RESOLVE_POLL_MS);
+      });
+    }
+  };
+
   const runProbe = async (): Promise<void> => {
     clearOutcome();
     setProbing(true);
     const signal = page.owner.begin();
+    const before = cfg;
     try {
       const res = await runUpstreamProbe(signal, cfg?.entries.length ?? 0);
       setSummary(res.summary ?? null);
       page.refreshToResolve();
     } catch (err) {
-      fail(err, "manual probe", "document revision");
+      if (err instanceof ApiError && err.kind === "timeout") {
+        await resolveProbeAgainstAppliance(before, signal, err);
+      } else {
+        fail(err, "manual probe", "document revision");
+      }
     } finally {
       page.owner.settle(signal);
       setProbing(false);

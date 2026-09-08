@@ -1324,12 +1324,13 @@ components:
             summary: { type: string, enum: [plain_http_only] }
         probe:
           type: object
-          description: The periodic health-probe configuration armed at startup (config.yaml upstream.health_interval).
-          required: [configured, interval]
+          description: The periodic health-probe configuration armed at startup (config.yaml upstream.health_interval) and the node-local manual-run state.
+          required: [configured, interval, manualInFlight]
           additionalProperties: false
           properties:
             configured: { type: boolean }
             interval: { type: string, description: 'Go duration; "0s" when no periodic probe runs.' }
+            manualInFlight: { type: boolean, description: 'True while an admin-triggered manual probe run (POST /api/upstream/health, single-flight) is executing on this node. A client whose manual-run answer outran its deadline resolves the run against this flag and the entries'' health instead of a deadline sized from a possibly stale entry count.' }
         revision: { type: integer, format: int64 }
         entries: { type: array, items: { $ref: '#/components/schemas/UpstreamEntry' }, nullable: true }
         proxies: { type: array, items: { $ref: '#/components/schemas/UpstreamEntry' }, nullable: true, description: 'Legacy alias of `entries`.' }

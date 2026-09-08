@@ -301,6 +301,17 @@ func (p *Pool) BeginManualProbe(now time.Time) (ok bool, code string, retryAfter
 	return true, "", 0
 }
 
+// ManualProbeInFlight reports whether an admitted manual probe run is
+// executing. The read model exposes it so a client whose POST answer
+// outran its deadline can resolve the run against the appliance (no run
+// in flight + the entries' health advanced) instead of sizing a deadline
+// from a possibly stale entry count (PR-C15 R7-B).
+func (p *Pool) ManualProbeInFlight() bool {
+	p.manualMu.Lock()
+	defer p.manualMu.Unlock()
+	return p.manualInflight
+}
+
 // EndManualProbe releases the single-flight slot of an admitted run.
 func (p *Pool) EndManualProbe() {
 	p.manualMu.Lock()

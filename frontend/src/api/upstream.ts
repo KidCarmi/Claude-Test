@@ -186,6 +186,9 @@ export interface UpstreamCoverage {
 export interface UpstreamProbeConfig {
   configured: boolean;
   interval: string;
+  /** True while a manual probe run is executing on the appliance (PR-C15
+   *  K11); absent only on an appliance that predates the field. */
+  manualInFlight?: boolean;
 }
 
 export interface UpstreamDirectFallback {
@@ -460,9 +463,16 @@ export const decodeUpstreamConfig: Decoder<UpstreamConfig> = (
     coverage: field(o, "coverage", decodeCoverage, path),
     probe: (() => {
       const p = readRecord(o["probe"], `${path}.probe`);
+      const manualInFlight = opt(
+        p,
+        "manualInFlight",
+        readBoolean,
+        `${path}.probe`,
+      );
       return {
         configured: field(p, "configured", readBoolean, `${path}.probe`),
         interval: field(p, "interval", readString, `${path}.probe`),
+        ...(manualInFlight !== undefined ? { manualInFlight } : {}),
       };
     })(),
     revision: field(o, "revision", readNumber, path),
