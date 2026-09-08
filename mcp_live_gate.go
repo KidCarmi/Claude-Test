@@ -52,7 +52,7 @@ type mcpLiveSideEffectGate struct {
 	// the activation lock. It can only ever produce a request-scoped verdict — it never reports
 	// drift and never latches anything, which is exactly why it does not need to be attributed to
 	// an activation generation.
-	approvalOK func(tgt canary.LiveTarget, now time.Time) bool
+	approvalOK func(tgt canary.LiveTarget, now time.Time) (satisfied bool, driftCode string)
 	// admitUnderActivation is THE atomic activation-bound admission transaction: it verifies an
 	// armed activation, captures its exact generation, evaluates the trust probe, latches an
 	// authoritative drift against that generation, and reserves the budget — all under one
@@ -156,7 +156,10 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		if live.DriftCode != "" {
 			return false, live.DriftCode
 		}
-		return live.Eligible && g.approvalOK(live.Target, in.Now), ""
+		if !live.Eligible {
+			return false, ""
+		}
+		return g.approvalOK(live.Target, in.Now)
 	})
 	// The denial class is read from an EXPLICIT field, never inferred from which other field is
 	// zero: an already-aborted Canary and an untrusted request both leave Trusted false, and
@@ -299,21 +302,50 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 	}
 }
 
-// mcpLiveApprovalSatisfied is the BLOCKING half: it consults the durable approval store, so it must
-// never be called while the activation lock is held (see mcpLiveTrustPrecheck). It can only ever
-// return a request-scoped verdict — it never reports drift and never latches anything.
-func mcpLiveApprovalSatisfied(tgt canary.LiveTarget, now time.Time) bool {
+// mcpLiveApprovalSatisfied answers the APPROVAL half of live-execution trust, and reports the one
+// condition in it that is an authoritative whole-Canary drift rather than an ordinary denial.
+//
+// WHY THE DRIFT VERDICT LIVES HERE. A rug-pull landing before a request's policy resolution is
+// refused upstream of this gate, and every request AFTER it resolves cleanly against the NEW
+// fingerprint — so the comparison in mcpLiveTrustPrecheck sees F2 == F2, reports no drift, and the
+// request is denied merely for lacking an approval. Read that way an authoritative breach is
+// indistinguishable from ordinary unauthorized traffic and stops nothing (Codex rounds 20 and 23).
+//
+// The evidence is right here, though: an approval that is ACTIVE, live-purpose and valid in every
+// respect EXCEPT that it pins a different fingerprint for this exact (tenant, server, tool) is
+// precisely the taxonomy's rug-pull — the executed tool is not the reviewed tool. Detecting it at
+// this point puts the whole-Canary latch inside the ATOMIC admission transaction, which already
+// owns the activation lock and charges an exact generation. It is activation-bound BY
+// CONSTRUCTION, needing no generation carried from elsewhere, no scope lookup, and no argument
+// about which activation an observation belongs to.
+//
+// Anything else — no approval at all, expired, revoked, wrong tenant, never granted — stays
+// REQUEST-SCOPED: a Canary correctly refusing an unauthorized request is a Canary working.
+//
+// The store read is LOCK-FREE (tooltrust publishes a copy-on-write snapshot through an atomic
+// pointer), which is what makes it legal inside the critical section at all — see §5.
+func mcpLiveApprovalSatisfied(tgt canary.LiveTarget, now time.Time) (satisfied bool, driftCode string) {
 	if mcpToolTrust == nil {
-		return false
+		return false, ""
 	}
+	reviewedElsewhere := false
 	for _, a := range mcpToolTrust.activeLiveApprovals(now) {
 		if canary.SatisfiesLiveExecution(a, tgt, now) == canary.TrustOK {
-			return true
+			return true, ""
+		}
+		// Same reviewed tool, DIFFERENT reviewed fingerprint. Evaluated over the same approval set
+		// at the same instant as the branch above, so it can never contradict it.
+		if a.Tenant == tgt.Tenant && a.ServerID == tgt.ServerID && a.ToolName == tgt.ToolName &&
+			a.Fingerprint != tgt.Fingerprint {
+			reviewedElsewhere = true
 		}
 	}
-	// No satisfying approval: request-scoped. The target still matches what was reviewed; this
+	if reviewedElsewhere {
+		return false, "tool_fingerprint_drift"
+	}
+	// No satisfying approval and nothing saying the reviewed target moved: request-scoped. This
 	// request simply is not authorized (expired, revoked, never granted).
-	return false
+	return false, ""
 }
 
 // mcpLiveGateDenials counts live side-effect gate denials by bounded reason code, for the

@@ -4,7 +4,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KidCarmi/Culvert/internal/mcp/catalog"
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
+	"github.com/KidCarmi/Culvert/internal/mcp/registry"
 )
 
 // Codex round-4 P1 fixes: the runtime live-trust revalidation must bind to the DECISION's fingerprint
@@ -20,7 +22,10 @@ func liveTrustVerdict(tenant, serverID, toolName, decisionFP string, now time.Ti
 	if live.DriftCode != "" {
 		return false, live.DriftCode
 	}
-	return live.Eligible && mcpLiveApprovalSatisfied(live.Target, now), ""
+	if !live.Eligible {
+		return false, ""
+	}
+	return mcpLiveApprovalSatisfied(live.Target, now)
 }
 
 // P1a: live-trust revalidation binds trust to the decision fingerprint. A valid live approval for the
@@ -98,5 +103,96 @@ func TestLiveTrustRevalidate_RejectsUnusableServer(t *testing.T) {
 
 	if ok, _ := liveTrustVerdict(ttTenant, sid, tool, fpHex, now); ok {
 		t.Fatal("P1b: a request against a server that is no longer usable must be denied at the boundary")
+	}
+}
+
+// TestLiveTrustRevalidate_RugPullReportsDriftNotMissingApproval drives the round-20/23 scenario
+// through the REAL approval store: a live approval is granted for the reviewed fingerprint, then
+// the tool is republished with a DIFFERENT one. Every later request is decided against the new
+// fingerprint, so the precheck sees no drift — the only evidence that the reviewed tool moved is
+// the approval still pinned to the old one, and it must be classified as an authoritative
+// whole-Canary drift rather than an ordinary missing-approval denial.
+func TestLiveTrustRevalidate_RugPullReportsDriftNotMissingApproval(t *testing.T) {
+	resetInventory(t)
+	resetExecDeps(t)
+	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
+	_, fn := liveFakeClock()
+	composeToolTrust(t, fn)
+	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+	now := mcpToolTrust.now()
+
+	if ok, code := liveTrustVerdict(ttTenant, sid, tool, fpHex, now); !ok || code != "" {
+		t.Fatalf("premise: the approved target must revalidate OK, got ok=%v code=%q", ok, code)
+	}
+
+	// The rug-pull: the SAME tool, republished with a different schema, so its composite
+	// fingerprint changes. The approval is untouched and still names the reviewed fingerprint.
+	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + ttTenant + `","servers":[
+	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"id","enabled":true,
+	   "tools":[{"name":"` + tool + `","input_schema":{"type":"object","properties":{"rug":{"type":"string"}}}}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("decode rug-pulled inventory: %v", err)
+	}
+	reg2, cat2, err := seedInventory(doc, limits.DefaultCatalog())
+	if err != nil {
+		t.Fatalf("seed rug-pulled inventory: %v", err)
+	}
+	publishMCPInventory(mcpInvLoaded, "", reg2, cat2)
+
+	rec, ok := cat2.Current().Get(catalog.ToolKey{Server: registry.ServerID(sid), Name: tool})
+	if !ok {
+		t.Fatal("the rug-pulled tool is not in the catalog")
+	}
+	sum := rec.Fingerprint.Sum()
+	newFP := hexOf(sum[:])
+	if newFP == fpHex {
+		t.Fatal("premise: the republished tool must carry a DIFFERENT fingerprint")
+	}
+
+	// A request decided against the NEW fingerprint: the precheck cannot see drift (F2 == F2).
+	gotOK, gotCode := liveTrustVerdict(ttTenant, sid, tool, newFP, now)
+	if gotOK {
+		t.Fatal("a rug-pulled target must not be trusted")
+	}
+	if gotCode != "tool_fingerprint_drift" {
+		t.Fatalf("drift code = %q, want tool_fingerprint_drift — the approval pinned to the "+
+			"superseded fingerprint is the ONLY evidence the reviewed tool moved, and reading it "+
+			"as an ordinary missing approval lets a rug-pull stop nothing", gotCode)
+	}
+}
+
+// TestLiveTrustRevalidate_UnapprovedIsNotDrift is the control for the rug-pull classification, and
+// it drives the REAL approval store rather than a stub: a gate that only ever sees a stubbed
+// verdict cannot notice the classifier becoming indiscriminate.
+//
+// Without this, "report drift whenever the approval check fails" would satisfy the rug-pull test
+// while turning every unauthorized request into a kill switch for the whole experiment — the
+// direction a safety control must never err in.
+func TestLiveTrustRevalidate_UnapprovedIsNotDrift(t *testing.T) {
+	resetInventory(t)
+	resetExecDeps(t)
+	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
+	_, fn := liveFakeClock()
+	composeToolTrust(t, fn)
+	grant := requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+	now := mcpToolTrust.now()
+
+	if ok, code := liveTrustVerdict(ttTenant, sid, tool, fpHex, now); !ok || code != "" {
+		t.Fatalf("premise: the approved target must revalidate OK, got ok=%v code=%q", ok, code)
+	}
+
+	// Revoked: the tool is unchanged, so nothing says the reviewed target moved. This is an
+	// ordinary unauthorized request.
+	if _, err := mcpToolTrust.Revoke(grant.ApprovalID, "admin2", ttTenant, "no longer needed"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	ok, code := liveTrustVerdict(ttTenant, sid, tool, fpHex, now)
+	if ok {
+		t.Fatal("a revoked approval must not authorize live execution")
+	}
+	if code != "" {
+		t.Fatalf("drift code = %q, want empty — a revoked or missing approval is REQUEST-SCOPED, "+
+			"and classifying it as drift makes every unauthorized caller able to stop the Canary", code)
 	}
 }

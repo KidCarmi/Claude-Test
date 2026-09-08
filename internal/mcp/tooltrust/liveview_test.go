@@ -126,6 +126,37 @@ func TestLiveView_SnapshotHoldsClonesNotStoredPointers(t *testing.T) {
 	}
 }
 
+// TestLiveView_ReturnedRecordsAreCallerOwned pins that a caller mutating a returned approval
+// cannot affect any later read. The snapshot's entries are already copies of the stored records, so
+// the store itself is safe either way — but handing out the SNAPSHOT's pointers would let one
+// caller's mutation change the target or status every other reader sees, for every admission and
+// preflight, until the next publication. The pre-snapshot implementation cloned per call; this
+// keeps that contract (Codex round 23).
+func TestLiveView_ReturnedRecordsAreCallerOwned(t *testing.T) {
+	s, now := liveViewStore(t)
+	first := s.ActiveLiveApprovals(now)
+	if len(first) != 1 {
+		t.Fatalf("premise: want one active live approval, got %d", len(first))
+	}
+	original := first[0].ToolName
+
+	first[0].ToolName = "mutated-by-a-caller"
+	first[0].Status = StatusRevoked
+
+	second := s.ActiveLiveApprovals(now)
+	if len(second) != 1 {
+		t.Fatalf("SECURITY: a caller's mutation removed an approval from every later read (%d "+
+			"remain) — the view is handing out shared records", len(second))
+	}
+	if second[0].ToolName != original {
+		t.Fatalf("SECURITY: a caller's mutation changed the tool a later read authorizes against "+
+			"(%q, want %q) — the view is handing out shared records", second[0].ToolName, original)
+	}
+	if second[0] == first[0] {
+		t.Fatal("SECURITY: two reads returned the SAME record pointer")
+	}
+}
+
 // TestLiveView_PersistFailureDoesNotPublish pins durable-before-effect: a mutation whose durable
 // write failed is reverted in memory, and must not be visible through the lock-free view either.
 func TestLiveView_PersistFailureDoesNotPublish(t *testing.T) {

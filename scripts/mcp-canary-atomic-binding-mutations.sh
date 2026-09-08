@@ -370,6 +370,30 @@ run_mutation M24 \
   ./internal/mcp/runtime/ internal/mcp/runtime/execute.go \
   's/\t\t\tGeneration: genAtResolve,/\t\t\tGeneration: 0,/'
 
+# ── (10) THE RUG-PULL LATCHES INSIDE THE TRANSACTION ───────────────────────
+# Rounds 20 and 23: after a rug-pull the catalog settles at F2, so every later request is
+# decided against F2 and the fingerprint comparison sees no drift — the breach read as
+# ordinary unauthorized traffic and stopped nothing. The approval still pinned to F1 is the
+# evidence, and it is available where the transaction already owns the activation lock.
+
+run_mutation M25 \
+  'the rug-pull reason is dropped, so the breach reads as a missing approval' \
+  'TestLiveTrustRevalidate_RugPullReportsDriftNotMissingApproval' \
+  . mcp_live_gate.go \
+  's/\tif reviewedElsewhere \{\n\t\treturn false, "tool_fingerprint_drift"\n\t\}\n/\t_ = reviewedElsewhere\n/'
+
+run_mutation M26 \
+  'EVERY approval failure is classified as drift (the control)' \
+  'TestLiveTrustRevalidate_UnapprovedIsNotDrift' \
+  . mcp_live_gate.go \
+  's/\tif reviewedElsewhere \{/\tif reviewedElsewhere || true \{/'
+
+run_mutation M27 \
+  'the lock-free view hands out its shared records instead of copies' \
+  'TestLiveView_ReturnedRecordsAreCallerOwned' \
+  ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
+  's/\t\t\tout = append\(out, a\.clone\(\)\)/\t\t\tout = append(out, a)/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

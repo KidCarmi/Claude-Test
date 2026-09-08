@@ -702,17 +702,17 @@ func TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction(t *testing.T) {
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckEligible,
-		approvalOK: func(canary.LiveTarget, time.Time) bool {
+		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
 			// The store answers DIFFERENTLY either side of the lock, which is the whole point:
 			// a constant answer cannot tell a cached read from a live one. sync.Mutex is not
 			// reentrant, so on this single-threaded path a successful TryLock means we are NOT
 			// inside the transaction — i.e. this is the hoisted, pre-lock read.
 			if cr.mu.TryLock() {
 				cr.mu.Unlock()
-				return true // the stale pre-revocation answer
+				return true, "" // the stale pre-revocation answer
 			}
 			askedInsideLock = true
-			return false // the revocation the transaction must observe
+			return false, "" // the revocation the transaction must observe
 		},
 		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 			return r.rt.admitLiveExecution(r.capb, now, ident, trust)
@@ -742,5 +742,102 @@ func TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction(t *testing.T) {
 	}
 	if got := r.remaining(); got != 4 {
 		t.Fatalf("budget remaining = %d, want 4 — a trust-refused request reserved anyway", got)
+	}
+}
+
+// ── The rug-pull latches inside the transaction ──────────────────────────────
+
+// TestAtomicBinding_RugPullLatchesAtAdmission is the gate for the round-20/23 hole, and it is the
+// reason the pre-executor path no longer needs an activation binding of its own.
+//
+// After a rug-pull the catalog settles at F2. Every later request is DECIDED against F2, so the
+// fingerprint comparison in the precheck sees F2 == F2 and reports no drift — those requests were
+// being denied merely for lacking an approval, which is indistinguishable from ordinary
+// unauthorized traffic. The approval pinned to F1 is the evidence that the reviewed tool moved, and
+// it is available exactly where the transaction already holds the activation lock.
+func TestAtomicBinding_RugPullLatchesAtAdmission(t *testing.T) {
+	r := newAtomicRig(t)
+	g := r.arm(t, 4)
+
+	// The approval store answers as it does after a rug-pull: nothing satisfies this target, but an
+	// active approval exists for the same tool pinned to the REVIEWED (now superseded) fingerprint.
+	gate := &mcpLiveSideEffectGate{
+		capb:          r.capb,
+		admit:         func() (func(), bool) { return func() {}, true },
+		readFirst:     func(policy.OperationClass) bool { return true },
+		trustPrecheck: stubTrustPrecheckEligible,
+		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
+			return false, "tool_fingerprint_drift"
+		},
+		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, ident, trust)
+		},
+		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
+		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },
+		note:              noteMCPLiveGateDenied,
+	}
+
+	dec := gate.AdmitSideEffect(execution.LiveGateInput{
+		Capability: 0, Operation: policy.OpRead,
+		Tenant: "t1", Principal: "p1", ServerID: "s1", ToolName: "x",
+		Fingerprint: "fp", Now: canaryRuntimeTestNow,
+	})
+	if dec.Release != nil {
+		dec.Release()
+	}
+	if dec.Admit {
+		t.Fatal("a rug-pulled target must not be admitted")
+	}
+	if r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
+		t.Fatalf("SECURITY: activation %d is STILL execution-eligible after an authoritative "+
+			"rug-pull reached admission. The breach is declared whole-Canary but stops nothing, "+
+			"and no later request will latch it either — they all resolve against the new "+
+			"fingerprint and read as ordinary unauthorized traffic (Codex rounds 20 and 23)", g)
+	}
+	// Latched against the activation that was live, with no budget spent.
+	if adm := r.admit(probeTrusted()); adm.Denial != canaryAdmitAborted {
+		t.Fatalf("a request after the latch was denied %v, want canaryAdmitAborted", adm.Denial)
+	}
+	if got := r.remaining(); got != 4 {
+		t.Fatalf("budget remaining = %d, want 4 — a drift-refused request reserved anyway", got)
+	}
+}
+
+// TestAtomicBinding_MissingApprovalIsNotDrift is the control. Without it, "latch whenever the
+// approval check fails" would pass the gate above while stopping the experiment for every
+// unauthorized request — a Canary correctly refusing one is a Canary working, not a breach.
+func TestAtomicBinding_MissingApprovalIsNotDrift(t *testing.T) {
+	r := newAtomicRig(t)
+	r.arm(t, 4)
+
+	gate := &mcpLiveSideEffectGate{
+		capb:          r.capb,
+		admit:         func() (func(), bool) { return func() {}, true },
+		readFirst:     func(policy.OperationClass) bool { return true },
+		trustPrecheck: stubTrustPrecheckEligible,
+		approvalOK:    func(canary.LiveTarget, time.Time) (bool, string) { return false, "" },
+		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, ident, trust)
+		},
+		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
+		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },
+		note:              noteMCPLiveGateDenied,
+	}
+
+	dec := gate.AdmitSideEffect(execution.LiveGateInput{
+		Capability: 0, Operation: policy.OpRead,
+		Tenant: "t1", Principal: "p1", ServerID: "s1", ToolName: "x",
+		Fingerprint: "fp", Now: canaryRuntimeTestNow,
+	})
+	if dec.Release != nil {
+		dec.Release()
+	}
+	if dec.Admit {
+		t.Fatal("an unapproved request must not be admitted")
+	}
+	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
+		t.Fatal("SECURITY: an ordinary unauthorized request STOPPED the Canary — a missing " +
+			"approval is request-scoped, and treating it as a breach makes every unauthorized " +
+			"caller a kill switch")
 	}
 }

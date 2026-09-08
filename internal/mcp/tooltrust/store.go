@@ -863,7 +863,12 @@ func (s *Store) ActiveLiveApprovals(now time.Time) []*ToolApproval {
 	var out []*ToolApproval
 	for _, a := range *view {
 		if a.activeLiveAsOf(now) {
-			out = append(out, a)
+			// Cloned AGAIN on the way out. The snapshot's entries are already copies of the stored
+			// records, so a caller mutating one cannot corrupt the store — but it would corrupt the
+			// SHARED snapshot every other reader sees until the next publication, which the
+			// pre-snapshot implementation (a fresh clone per call) never allowed. Returning
+			// caller-owned records keeps that contract exactly (Codex round 23).
+			out = append(out, a.clone())
 		}
 	}
 	return out
