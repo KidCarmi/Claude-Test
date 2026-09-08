@@ -125,9 +125,19 @@ var errUpstreamBackupPreparedDowngrade = errors.New("admin_settings.json carries
 // legacy upstream_proxies list carries a password in any URL, or that
 // carries the prepared-downgrade marker (the mid-transition predecessor
 // shape). The message carries counts only.
+//
+// PR-C18 R9-A: a legacy URL the sanitizer cannot READ is refused too. The
+// only question this gate answers is "does this URL carry a password?",
+// and an unparseable URL (a malformed escape in the password itself, a
+// scheme-less `user:pw@host` spelling that parses as an OPAQUE URL with no
+// host) cannot answer it — treating a parse failure as "no password" let
+// the material through verbatim while the manifest asserted
+// credentialsOmitted. Fail CLOSED: every URL in the list must parse to an
+// absolute URL with a host, and none may carry a password; anything else
+// is counted as unparseable and refuses the archive.
 func refuseCredentialBearingLegacyUpstreams(root map[string]any) error {
 	_, prepared := root["upstream_prepared_downgrade"]
-	withPassword := 0
+	withPassword, unparseable := 0, 0
 	if list, ok := root["upstream_proxies"].([]any); ok {
 		for _, item := range list {
 			raw := ""
@@ -141,16 +151,18 @@ func refuseCredentialBearingLegacyUpstreams(root map[string]any) error {
 				continue
 			}
 			u, err := url.Parse(strings.TrimSpace(raw))
-			if err != nil || u.User == nil {
-				continue
-			}
-			if _, has := u.User.Password(); has {
-				withPassword++
+			switch {
+			case err != nil, u.Opaque != "", u.Host == "":
+				unparseable++
+			case u.User != nil:
+				if _, has := u.User.Password(); has {
+					withPassword++
+				}
 			}
 		}
 	}
-	if prepared || withPassword > 0 {
-		return fmt.Errorf("%w (prepared_downgrade=%t, legacy_urls_with_password=%d)", errUpstreamBackupPreparedDowngrade, prepared, withPassword)
+	if prepared || withPassword > 0 || unparseable > 0 {
+		return fmt.Errorf("%w (prepared_downgrade=%t, legacy_urls_with_password=%d, legacy_urls_unparseable=%d)", errUpstreamBackupPreparedDowngrade, prepared, withPassword, unparseable)
 	}
 	return nil
 }

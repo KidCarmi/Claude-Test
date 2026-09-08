@@ -3646,6 +3646,27 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C18 — the ninth Codex round (one P1, one P2).** Both confirmed
+> and pinned before the correction (`upstream_codex_r9_red_test.go`).
+> (R9-A, P1) The PR-C17 backup refusal skipped a legacy `upstream_proxies`
+> URL that `url.Parse` could not parse (a malformed escape in the
+> password) or that parsed as an opaque, host-less scheme-less
+> `user:pw@host` spelling, treating a parse failure as "no password" —
+> so exactly the material the gate exists to keep out of an archive was
+> packed verbatim under `credentialsOmitted: true`. The gate now fails
+> CLOSED: every legacy URL must parse to an absolute URL with a host, and
+> an unreadable one is counted as unparseable and refuses the archive
+> (counts only; runbook §8 updated). (R9-B, P2) `normalizeHost` stripped
+> EVERY outer bracket with `strings.Trim(host, "[]")` before parsing the
+> IPv6 literal, so `[[::1]]` and a mismatched pair (`[[2001:db8::1]`,
+> `[2001:db8::1]]`) passed normalization and were persisted; the pool
+> rebuild cannot parse the resulting authority and silently omitted the
+> entry, so an update could remove a working parent from the effective
+> pool. Exactly one bracket pair is now required — a host that starts or
+> ends with a bracket must be `[` + an IPv6 literal without brackets +
+> `]` — and every other bracket shape is `invalid_entry` before it can
+> reach the store. Backend only.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,

@@ -162,8 +162,8 @@ func normalizeHost(raw string) (string, error) {
 	}
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
 	switch {
-	case strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]"):
-		if ip := net.ParseIP(strings.Trim(host, "[]")); ip == nil || ip.To4() != nil {
+	case strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]"):
+		if !isBracketedIPv6Literal(host) {
 			return "", errors.New("bracketed host must be an IPv6 literal")
 		}
 	case net.ParseIP(host) != nil:
@@ -184,6 +184,26 @@ func normalizeHost(raw string) (string, error) {
 		host = ascii
 	}
 	return host, nil
+}
+
+// isBracketedIPv6Literal reports whether host is exactly ONE bracket pair
+// around an IPv6 literal: `[` + a literal that itself carries no bracket +
+// `]`. PR-C18 R9-B: `strings.Trim(host, "[]")` stripped every outer
+// bracket, so `[[::1]]` and a mismatched pair passed normalization and
+// were persisted; the pool rebuild cannot parse the resulting authority
+// and silently omits the entry, so an update could remove a working parent
+// from the effective pool. Every other bracket shape is refused before it
+// can reach the store.
+func isBracketedIPv6Literal(host string) bool {
+	if len(host) < 2 || host[0] != '[' || host[len(host)-1] != ']' {
+		return false
+	}
+	inner := host[1 : len(host)-1]
+	if strings.ContainsAny(inner, "[]") {
+		return false
+	}
+	ip := net.ParseIP(inner)
+	return ip != nil && ip.To4() == nil
 }
 
 // validateHostLabels refuses an IDNA host with an EMPTY label — a leading

@@ -291,6 +291,12 @@ never booted on this binary. An archive never carries material and the
 manifest's `credentialsOmitted: true` must be true of every archive that
 is produced, so the backup fails with a counts-only error naming the
 state; boot this binary once, or complete the downgrade, then back up.
+The same refusal covers a legacy URL the sanitizer cannot read — one that
+fails to parse, or that parses without a host (a scheme-less `user:pw@host`
+spelling): the gate can only answer "does this URL carry a password?" for
+a URL it can parse, so an unreadable one fails the backup closed rather
+than being archived as password-free. Repair the entry (the legacy list
+carries `scheme://[user@]host:port`), then back up.
 
 **Restore** boots every formerly credentialed entry into the distinct
 state `requiresReplacement`: ineligible, never probed, never sent

@@ -24,20 +24,20 @@ import (
 //         a working parent from the effective pool. Exactly one bracket
 //         pair is required.
 
-const r9Secret = "secret-R9-canary"
+const r9Canary = "secret-R9-canary"
 
 func TestUpstreamR9_BackupStripRefusesUnparseableLegacyURL(t *testing.T) {
 	for _, raw := range []string{
-		"http://svc:" + r9Secret + "%zz@parent-a.example:3128", // malformed escape: url.Parse fails
-		"svc:" + r9Secret + "@parent-a.example:3128",           // scheme-less: parses as an opaque URL
+		"http://svc:" + r9Canary + "%zz@parent-a.example:3128", // malformed escape: url.Parse fails
+		"svc:" + r9Canary + "@parent-a.example:3128",           // scheme-less: parses as an opaque URL
 	} {
 		body := []byte(`{"upstream_proxies": [{"url": "` + raw + `"}], "upstream_proxies_saved": true}`)
 		out, _, err := stripUpstreamCredentialsFromSettings(body)
 		if err == nil {
-			t.Errorf("legacy URL %q was accepted for archiving", strings.ReplaceAll(raw, r9Secret, "<secret>"))
+			t.Errorf("legacy URL %q was accepted for archiving", strings.ReplaceAll(raw, r9Canary, "<secret>"))
 		}
-		if bytes.Contains(out, []byte(r9Secret)) {
-			t.Errorf("the password survived into the archive body for %q", strings.ReplaceAll(raw, r9Secret, "<secret>"))
+		if bytes.Contains(out, []byte(r9Canary)) {
+			t.Errorf("the password survived into the archive body for %q", strings.ReplaceAll(raw, r9Canary, "<secret>"))
 		}
 	}
 }
