@@ -10,24 +10,37 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/KidCarmi/Culvert/internal/configver"
 	"github.com/KidCarmi/Culvert/internal/pac"
 )
 
+// resetPACPublishGlobals isolates the PAC stores AND the config-version
+// store for one test. A publish is complete only once its config-version
+// capture lands, so the store must live under the test's temp dir: on the
+// process default (<dataDir>/config_versions) a runner without a writable
+// /data fails every capture, the first publish stays pending_reconciliation
+// and the next one is refused with 409 operation_pending (PR-C1c; pinned by
+// pac_publish_env_red_test.go).
 func resetPACPublishGlobals(t *testing.T) {
 	t.Helper()
 	oc := pacStore.Snapshot()
 	op := pacProfiles.Snapshot()
 	ol := pacLifecycle.Snapshot()
+	ov := configVersions
 	t.Cleanup(func() {
 		pacStore.Restore(oc)
 		pacProfiles.Restore(op)
 		pacLifecycle.Restore(ol)
+		configVersions = ov
 	})
+	configVersions = configver.New(filepath.Join(t.TempDir(), "config_versions"), 0)
+	configVersions.Init()
 }
 
 func seedPublishProfile(t *testing.T) {
