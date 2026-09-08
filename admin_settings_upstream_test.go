@@ -274,7 +274,7 @@ func TestAdminSettings_LegacyMigrationParseFailureIsDegradedNotDestructive(t *te
 	t.Cleanup(func() { dataDir = prevData })
 	upstreamPool.Configure(nil, 5, time.Minute)
 
-	legacy := `{"upstream_proxies_saved":true,"upstream_proxies":[{"url":"http://svc:secret@parent-a.test:3128"},{"url":"://not a url"}]}`
+	legacy := `{"upstream_proxies_saved":true,"upstream_proxies":[{"url":"http://svc:secret@parent-a.test:3128"},{"url":"://not a url"}]}` //nolint:gosec // G101: fixture credential in a test URL, not a secret
 	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}

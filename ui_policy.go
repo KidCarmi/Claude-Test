@@ -541,74 +541,7 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 		// Prefer stable-ID addressing (rename-safe) when ?id= is supplied; fall
 		// back to name for legacy clients. Mirrors the policy ?id= path (#695).
 		if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
-			before := globalCategoryGroups.GetByID(id)
-			if before == nil {
-				http.Error(w, "group not found", http.StatusNotFound)
-				return
-			}
-			// Rename (references-by-id S2): UpdateByID keeps the current name, so a
-			// name change must be applied explicitly via Rename (re-keys the store)
-			// and cascaded onto referencing rules. Rules link by the group ID, so
-			// matching survives regardless; the cascade keeps the denormalized name
-			// honest for display/export/DP-sync.
-			newName := strings.TrimSpace(body.Name)
-			renamed := newName != "" && !strings.EqualFold(newName, before.Name)
-			// Phase 1 — the OBJECT domain, durable-or-nothing (2D-A.0): content
-			// update + rename apply and persist in one serialized critical section
-			// under the optional ?ifVersion= fence. Validation rejects before any
-			// state changes; a persist failure rolls everything back (500); a name
-			// collision is refused under the store lock (409, no TOCTOU).
-			err := globalCategoryGroups.MutateDurable(parseIfVersion(r), func() error {
-				if uerr := globalCategoryGroups.UpdateByID(id, body.Categories); uerr != nil {
-					return uerr
-				}
-				if renamed {
-					if _, rerr := globalCategoryGroups.Rename(id, newName); rerr != nil {
-						return rerr
-					}
-				}
-				return nil
-			})
-			if writeObjectMutationError(w, err) {
-				return
-			}
-			detail := fmt.Sprintf("%d categories", len(body.Categories))
-			// Phase 2/3 — the rename cascade onto RUNNING policy and the open
-			// draft candidate (composed cross-store operation, §6/§7): each is a
-			// real policy mutation that must survive a restart, so both persists
-			// are error-aware. A failure after the durable object rename keeps the
-			// (correct) in-memory cascade, is surfaced as a truthful 500 — never a
-			// 2xx with a known-failed durable domain — and converges at the next
-			// restart via reconcileObjectRefNames (the object store owns name truth).
-			var cascadeErr error
-			if renamed {
-				if n := policyStore.CascadeDestCategoryGroupRename(id, before.Name, newName); n > 0 {
-					if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
-						cascadeErr = fmt.Errorf("running policy: %w", perr)
-					}
-				}
-				if derr := policyDraft.cascadeDestCategoryGroupRename(id, before.Name, newName); derr != nil {
-					if cascadeErr != nil {
-						cascadeErr = fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
-					} else {
-						cascadeErr = fmt.Errorf("draft candidate: %w", derr)
-					}
-				}
-				detail += ", renamed from " + sanitizeLog(before.Name)
-			}
-			auditName := before.Name
-			if renamed {
-				auditName = newName
-			}
-			if cascadeErr != nil {
-				auditEventDiffID(r, "category-group.update", auditName, id,
-					detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error(), nil, nil)
-				writeRenameCascadePersistFailure(w, "category group", cascadeErr)
-				return
-			}
-			auditEventDiffID(r, "category-group.update", auditName, id, detail, nil, nil)
-			saveConfigVersion(sessionAdmin(r), "category-group.update")
-			jsonOK(w, map[string]any{"ok": true, "version": globalCategoryGroups.Version()})
+			apiCategoryGroupUpdateByID(w, r, id, body.Name, body.Categories)
 			return
 		}
 		if err := globalCategoryGroups.MutateDurable(nil, func() error {
@@ -676,6 +609,92 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// apiCategoryGroupUpdateByID is the stable-ID PUT branch of apiCategoryGroups
+// (rename-safe addressing, mirrors the policy ?id= path, #695): the durable
+// content update + rename in one fenced critical section, then the rename
+// cascade onto running policy and the open draft candidate. The caller holds
+// the reference-integrity write gate.
+func apiCategoryGroupUpdateByID(w http.ResponseWriter, r *http.Request, id, name string, categories []string) {
+	before := globalCategoryGroups.GetByID(id)
+	if before == nil {
+		http.Error(w, "group not found", http.StatusNotFound)
+		return
+	}
+	// Rename (references-by-id S2): UpdateByID keeps the current name, so a
+	// name change must be applied explicitly via Rename (re-keys the store)
+	// and cascaded onto referencing rules. Rules link by the group ID, so
+	// matching survives regardless; the cascade keeps the denormalized name
+	// honest for display/export/DP-sync.
+	newName := strings.TrimSpace(name)
+	renamed := newName != "" && !strings.EqualFold(newName, before.Name)
+	// Phase 1 — the OBJECT domain, durable-or-nothing (2D-A.0): content
+	// update + rename apply and persist in one serialized critical section
+	// under the optional ?ifVersion= fence. Validation rejects before any
+	// state changes; a persist failure rolls everything back (500); a name
+	// collision is refused under the store lock (409, no TOCTOU).
+	err := globalCategoryGroups.MutateDurable(parseIfVersion(r), func() error {
+		if uerr := globalCategoryGroups.UpdateByID(id, categories); uerr != nil {
+			return uerr
+		}
+		if renamed {
+			if _, rerr := globalCategoryGroups.Rename(id, newName); rerr != nil {
+				return rerr
+			}
+		}
+		return nil
+	})
+	if writeObjectMutationError(w, err) {
+		return
+	}
+	detail := fmt.Sprintf("%d categories", len(categories))
+	// Phase 2/3 — the rename cascade onto RUNNING policy and the open
+	// draft candidate (composed cross-store operation, §6/§7): each is a
+	// real policy mutation that must survive a restart, so both persists
+	// are error-aware. A failure after the durable object rename keeps the
+	// (correct) in-memory cascade, is surfaced as a truthful 500 — never a
+	// 2xx with a known-failed durable domain — and converges at the next
+	// restart via reconcileObjectRefNames (the object store owns name truth).
+	var cascadeErr error
+	if renamed {
+		cascadeErr = cascadeCategoryGroupRenameDurable(id, before.Name, newName)
+		detail += ", renamed from " + sanitizeLog(before.Name)
+	}
+	auditName := before.Name
+	if renamed {
+		auditName = newName
+	}
+	if cascadeErr != nil {
+		auditEventDiffID(r, "category-group.update", auditName, id,
+			detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error(), nil, nil)
+		writeRenameCascadePersistFailure(w, "category group", cascadeErr)
+		return
+	}
+	auditEventDiffID(r, "category-group.update", auditName, id, detail, nil, nil)
+	saveConfigVersion(sessionAdmin(r), "category-group.update")
+	jsonOK(w, map[string]any{"ok": true, "version": globalCategoryGroups.Version()})
+}
+
+// cascadeCategoryGroupRenameDurable cascades a category-group rename onto
+// RUNNING policy and the open draft candidate and reports the first persist
+// failure of either domain (both are attempted; the errors are joined). The
+// in-memory cascade is kept on failure — the caller surfaces a truthful 500
+// and reconcileObjectRefNames converges at the next restart.
+func cascadeCategoryGroupRenameDurable(id, oldName, newName string) error {
+	var cascadeErr error
+	if n := policyStore.CascadeDestCategoryGroupRename(id, oldName, newName); n > 0 {
+		if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
+			cascadeErr = fmt.Errorf("running policy: %w", perr)
+		}
+	}
+	if derr := policyDraft.cascadeDestCategoryGroupRename(id, oldName, newName); derr != nil {
+		if cascadeErr != nil {
+			return fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
+		}
+		return fmt.Errorf("draft candidate: %w", derr)
+	}
+	return cascadeErr
 }
 
 // apiDecryptionProfiles is the CRUD handler for named SSL-decryption profiles

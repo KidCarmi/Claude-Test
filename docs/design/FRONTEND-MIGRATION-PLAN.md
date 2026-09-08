@@ -3366,6 +3366,26 @@ frozen program branch is untouched.
 > never sit under the process data root and must be writable), and the
 > root suite is now also qualified under `-race` with `/data` unwritable.
 >
+> **PR-C3b — advisory reviewdog findings on the corrected head.** The
+> `Code Review` workflow's inline golangci pass (advisory, `diff_context`
+> filter — it reports a finding whose line sits near a changed line, where
+> the blocking Fast-Gate run reports only findings ON changed lines) posted
+> nine findings on the corrected head: cyclomatic complexity 20 on
+> `apiCDRRevokeRPC`, cognitive complexity 33 on `apiFileblockProfiles` and
+> 35 on `diffRewriteRules`, nested-block complexity 20 on the category-group
+> stable-ID PUT branch and 5 on the no-persistence branch of
+> `saveAdminSettingsWithOverrides`, a shadowed `copy` builtin in the CDR
+> store, and three gosec G101 hits on fixture URLs in tests. Correction:
+> pure helper extraction with no behaviour change — the handler role gates
+> stay in the method switch so the C1.5 AST parity keeps seeing them
+> (`apiCategoryGroupUpdateByID` + `cascadeCategoryGroupRenameDurable`,
+> `apiFileblockProfileUpdate` + `apiFileblockProfileDelete`,
+> `cdrRevokeTargets` / `cdrRevokeGenerations` / `cdrPruneRevokedInstance`,
+> `rewriteRuleStableIDs` / `diffRewriteRulesLegacy` / `rewriteRulesReordered`,
+> `applyAdminSettingsOverridesUnpersisted`), the rename, and reasoned
+> `//nolint:gosec` on the three test fixtures (the repository's lint
+> suppression convention). No accepted RED assertion changed.
+>
 > **PR-C2 — determinism gate.** Under `-shuffle -count=2` the
 > process-global "stored document rejected at load" latch armed by the R3
 > rejected-document test outlived its environment and handed a 409

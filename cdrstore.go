@@ -217,15 +217,15 @@ func (r *CDRInstanceRegistry) Add(inst CDREnrolledInstance) (CDREnrolledInstance
 	// write reverts the in-memory append so memory never claims an
 	// instance the next boot will not load (2E-C commit boundary).
 	prev := r.instances
-	copy := inst
-	normalizeLineageLocked(&copy)
-	r.instances = append(append([]*CDREnrolledInstance(nil), prev...), &copy)
+	entry := inst
+	normalizeLineageLocked(&entry)
+	r.instances = append(append([]*CDREnrolledInstance(nil), prev...), &entry)
 	if err := r.saveLocked(); err != nil {
 		r.instances = prev
 		return CDREnrolledInstance{}, err
 	}
 	r.bumpVersion()
-	return copy, nil
+	return entry, nil
 }
 
 // RemoveByName removes an instance; returns false if no match.

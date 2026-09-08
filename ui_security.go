@@ -634,91 +634,107 @@ func apiFileblockProfiles(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		id := strings.TrimSpace(r.URL.Query().Get("id"))
-		if id == "" {
-			http.Error(w, "missing id param", http.StatusBadRequest)
-			return
-		}
-		var body struct {
-			Name       string   `json:"name"`
-			Extensions []string `json:"extensions"`
-		}
-		if err := decodeJSON(r, &body); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		// Rename detection BEFORE the durable update, by stable ID (2D-C §8): a
-		// true rename keeps the object ID and every referencing rule's identity;
-		// only the display name changes and cascades.
-		beforeName, existed := globalProfileStore.NameByID(id)
-		newName := strings.TrimSpace(body.Name)
-		renamed := existed && newName != "" && !strings.EqualFold(beforeName, newName)
-		if err := globalProfileStore.UpdateFenced(
-			strings.TrimSpace(r.URL.Query().Get("ifRevision")), id, body.Name, body.Extensions); writeFileProfileMutationError(w, r, err, http.StatusNotFound) {
-			return
-		}
-		detail := fmt.Sprintf("%d extensions", len(body.Extensions))
-		// Rename cascade onto RUNNING policy and the open draft candidate —
-		// same composed cross-store operation as the category-group /
-		// decryption-profile renames (2D-A §6/§7): each is a real policy
-		// mutation that must survive a restart, so both persists are
-		// error-aware; a failure after the durable object rename keeps the
-		// (correct) in-memory cascade, is surfaced as a truthful 500 — never a
-		// 2xx over a known-failed durable domain — and converges at the next
-		// restart via reconcileObjectRefNames.
-		var cascadeErr error
-		if renamed {
-			cascadeErr = cascadeFileProfileRenameDurable(id, beforeName, newName)
-			detail += ", renamed from " + sanitizeLog(beforeName)
-		}
-		if cascadeErr != nil {
-			auditEvent(r, "fileprofile.update", newName,
-				detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error())
-			writeRenameCascadePersistFailure(w, "file profile", cascadeErr)
-			return
-		}
-		auditEvent(r, "fileprofile.update", body.Name, detail)
-		jsonOK(w, map[string]any{"ok": true, "revision": globalProfileStore.Revision()})
+		apiFileblockProfileUpdate(w, r)
 
 	case http.MethodDelete:
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		id := strings.TrimSpace(r.URL.Query().Get("id"))
-		if id == "" {
-			http.Error(w, "missing id param", http.StatusBadRequest)
-			return
-		}
-		// Blocker B: reference scan + delete as one atomic decision under the
-		// exclusive side of the reference-integrity gate.
-		refScanDeleteLock()
-		defer refScanDeleteUnlock()
-		// The DELETE addresses a profile by id, but rules reference it by
-		// NAME. Resolve the name under the store lock (NameByID copies it —
-		// reading GetByID().Name outside the lock races a concurrent rename).
-		// A bad/stale id falls through to Delete's own 404 (never a spurious
-		// 409). Then block via the shared walk if any rule still references
-		// the profile — deleting a referenced profile was fail-open for the
-		// file-control dimension.
-		// NOTE: this closes DELETE only. A profile RENAME still dangles every
-		// rule holding the old name (profiles are id-keyed with a mutable
-		// name) — an open fail-open the object-ID work (P3) closes; see
-		// roadmap/POLICY-REFS-PLAN.md.
-		if profName, ok := globalProfileStore.NameByID(id); ok {
-			if deleteBlockedByReferences(w, r, "file-profile", profName, "fileprofile.delete.blocked") {
-				return
-			}
-		}
-		if err := globalProfileStore.DeleteFenced(
-			strings.TrimSpace(r.URL.Query().Get("ifRevision")), id); writeFileProfileMutationError(w, r, err, http.StatusNotFound) {
-			return
-		}
-		auditEvent(r, "fileprofile.delete", id, "")
-		w.WriteHeader(http.StatusNoContent)
+		apiFileblockProfileDelete(w, r)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// apiFileblockProfileDelete is the DELETE branch of apiFileblockProfiles (the
+// caller has already enforced the operator role): the reference scan and the
+// fenced durable delete as one atomic decision under the exclusive side of
+// the reference-integrity gate.
+func apiFileblockProfileDelete(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		http.Error(w, "missing id param", http.StatusBadRequest)
+		return
+	}
+	// Blocker B: reference scan + delete as one atomic decision under the
+	// exclusive side of the reference-integrity gate.
+	refScanDeleteLock()
+	defer refScanDeleteUnlock()
+	// The DELETE addresses a profile by id, but rules reference it by
+	// NAME. Resolve the name under the store lock (NameByID copies it —
+	// reading GetByID().Name outside the lock races a concurrent rename).
+	// A bad/stale id falls through to Delete's own 404 (never a spurious
+	// 409). Then block via the shared walk if any rule still references
+	// the profile — deleting a referenced profile was fail-open for the
+	// file-control dimension.
+	// NOTE: this closes DELETE only. A profile RENAME still dangles every
+	// rule holding the old name (profiles are id-keyed with a mutable
+	// name) — an open fail-open the object-ID work (P3) closes; see
+	// roadmap/POLICY-REFS-PLAN.md.
+	if profName, ok := globalProfileStore.NameByID(id); ok {
+		if deleteBlockedByReferences(w, r, "file-profile", profName, "fileprofile.delete.blocked") {
+			return
+		}
+	}
+	if err := globalProfileStore.DeleteFenced(
+		strings.TrimSpace(r.URL.Query().Get("ifRevision")), id); writeFileProfileMutationError(w, r, err, http.StatusNotFound) {
+		return
+	}
+	auditEvent(r, "fileprofile.delete", id, "")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// apiFileblockProfileUpdate is the PUT branch of apiFileblockProfiles (the
+// caller has already enforced the operator role): the
+// fenced durable update by stable id, rename detection BEFORE the update, and
+// the rename cascade onto running policy and the open draft candidate.
+func apiFileblockProfileUpdate(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		http.Error(w, "missing id param", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Name       string   `json:"name"`
+		Extensions []string `json:"extensions"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	// Rename detection BEFORE the durable update, by stable ID (2D-C §8): a
+	// true rename keeps the object ID and every referencing rule's identity;
+	// only the display name changes and cascades.
+	beforeName, existed := globalProfileStore.NameByID(id)
+	newName := strings.TrimSpace(body.Name)
+	renamed := existed && newName != "" && !strings.EqualFold(beforeName, newName)
+	if err := globalProfileStore.UpdateFenced(
+		strings.TrimSpace(r.URL.Query().Get("ifRevision")), id, body.Name, body.Extensions); writeFileProfileMutationError(w, r, err, http.StatusNotFound) {
+		return
+	}
+	detail := fmt.Sprintf("%d extensions", len(body.Extensions))
+	// Rename cascade onto RUNNING policy and the open draft candidate —
+	// same composed cross-store operation as the category-group /
+	// decryption-profile renames (2D-A §6/§7): each is a real policy
+	// mutation that must survive a restart, so both persists are
+	// error-aware; a failure after the durable object rename keeps the
+	// (correct) in-memory cascade, is surfaced as a truthful 500 — never a
+	// 2xx over a known-failed durable domain — and converges at the next
+	// restart via reconcileObjectRefNames.
+	var cascadeErr error
+	if renamed {
+		cascadeErr = cascadeFileProfileRenameDurable(id, beforeName, newName)
+		detail += ", renamed from " + sanitizeLog(beforeName)
+	}
+	if cascadeErr != nil {
+		auditEvent(r, "fileprofile.update", newName,
+			detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error())
+		writeRenameCascadePersistFailure(w, "file profile", cascadeErr)
+		return
+	}
+	auditEvent(r, "fileprofile.update", body.Name, detail)
+	jsonOK(w, map[string]any{"ok": true, "revision": globalProfileStore.Revision()})
 }
 
 func apiSecScanStatus(w http.ResponseWriter, r *http.Request) {

@@ -952,19 +952,7 @@ func saveAdminSettingsWithOverrides(ov adminSaveOverrides) error {
 		// No persistence configured: the (empty) write trivially succeeds, so a
 		// persist-before-apply target still applies — the caller was promised
 		// "returns nil ⇒ the target is live".
-		if rewriteApply {
-			rewriter.SetRules(rewriteTarget)
-		}
-		if upstreamApply {
-			if err := upstreamPool.SetDocument(upstreamDoc); err != nil {
-				return err
-			}
-			applyUpstreamProxy()
-		}
-		if ov.applyOnSuccess != nil {
-			ov.applyOnSuccess()
-		}
-		return nil
+		return applyAdminSettingsOverridesUnpersisted(ov, rewriteApply, rewriteTarget, upstreamApply, upstreamDoc)
 	}
 
 	s := AdminSettings{
@@ -1115,6 +1103,26 @@ func saveAdminSettingsWithOverrides(ov adminSaveOverrides) error {
 		if err := upstreamPool.SetDocument(upstreamDoc); err != nil {
 			// Validated above under the same lock; unreachable in practice.
 			logger.Printf("AdminSettings: upstream document publication refused after a durable write: %v", err)
+			return err
+		}
+		applyUpstreamProxy()
+	}
+	if ov.applyOnSuccess != nil {
+		ov.applyOnSuccess()
+	}
+	return nil
+}
+
+// applyAdminSettingsOverridesUnpersisted is the no-persistence-path half of
+// saveAdminSettingsWithOverrides: with no settings file configured the
+// (empty) write trivially succeeds, so every persist-before-apply target is
+// applied in the same order the persisted path applies it.
+func applyAdminSettingsOverridesUnpersisted(ov adminSaveOverrides, rewriteApply bool, rewriteTarget []RewriteRule, upstreamApply bool, upstreamDoc upstream.Document) error {
+	if rewriteApply {
+		rewriter.SetRules(rewriteTarget)
+	}
+	if upstreamApply {
+		if err := upstreamPool.SetDocument(upstreamDoc); err != nil {
 			return err
 		}
 		applyUpstreamProxy()

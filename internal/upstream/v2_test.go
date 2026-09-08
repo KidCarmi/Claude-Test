@@ -330,7 +330,7 @@ func TestV2C_TransplantedCredentialIsMismatch(t *testing.T) {
 // with the password, never in the document, list, entries or legacy URLs.
 func TestV2C_YAMLInlineCredentialRetainedInMemoryOnly(t *testing.T) {
 	pool := &Pool{}
-	if err := pool.Configure([]Entry{{URL: "http://svc:inline-pw@parent.test:3128"}}, 5, time.Minute); err != nil {
+	if err := pool.Configure([]Entry{{URL: "http://svc:inline-pw@parent.test:3128"}}, 5, time.Minute); err != nil { //nolint:gosec // G101: fixture credential in a test URL, not a secret
 		t.Fatalf("Configure: %v", err)
 	}
 	list := pool.List()
