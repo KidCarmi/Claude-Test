@@ -31,6 +31,7 @@ cleanup() {
   [ -n "${AUTH_PID:-}" ] && kill "$AUTH_PID" 2>/dev/null || true
   [ -n "${FRESH_PID:-}" ] && kill "$FRESH_PID" 2>/dev/null || true
   [ -n "${FAIL_PID:-}" ] && kill "$FAIL_PID" 2>/dev/null || true
+  [ -n "${YAMLUP_PID:-}" ] && kill "$YAMLUP_PID" 2>/dev/null || true
   wait 2>/dev/null || true
   rm -rf "$WORK" 2>/dev/null || true
 }
