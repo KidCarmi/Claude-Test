@@ -3549,6 +3549,21 @@ frozen program branch is untouched.
 > different numeric host still stays unproven. Frontend only;
 > `frontend/dist` regenerated.
 >
+> **PR-C12 — the fourth Codex round (one P2).** Confirmed against both
+> sides and pinned in `frontend/src/test/pr-c12-codex-red.test.tsx` (K7,
+> eight failing cases, four companions and one control) before the
+> correction. The appliance lower-cases with Go's SIMPLE Unicode case
+> mapping (`strings.ToLower`: U+0130 `İ` → `i`, `Σ` → `σ` always) and
+> strips exactly ONE trailing dot before the IDNA mapping, so `İ.example`
+> is returned as `i.example` and `example.com..` as `example.com.`; the
+> client used JavaScript's FULL mapping (`İ` → `i̇`, which the IDNA mapping
+> turns into `xn--i-9bb`) and stripped every trailing dot, so a genuine
+> create/update success on such a host was classified UNPROVEN.
+> `canonicalSpec` now maps the two full-mapping specials to Go's result
+> before lower-casing (`lowerAsGo`) and strips a single trailing dot; an
+> answer keeping a dot the appliance would have stripped still stays
+> unproven. Frontend only; `frontend/dist` regenerated.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
