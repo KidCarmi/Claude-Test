@@ -392,7 +392,7 @@ run_mutation M27 \
   'the lock-free view hands out its shared records instead of copies' \
   'TestLiveView_ReturnedRecordsAreCallerOwned' \
   ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
-  's/\t\t\tout = append\(out, a\.clone\(\)\)/\t\t\tout = append(out, a)/'
+  's/caller-owned records keeps that contract exactly \(Codex round 23\)\.\n\t\t\tout = append\(out, a\.clone\(\)\)/caller-owned records keeps that contract exactly (Codex round 23).\n\t\t\tout = append(out, a)/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
