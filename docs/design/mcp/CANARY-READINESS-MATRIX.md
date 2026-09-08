@@ -124,14 +124,23 @@ scope_escape, tool_fingerprint_drift, server_identity_drift, outcome_evidence_lo
 credential_safety_failure, budget_exhausted, elevated_error_rate, latency_pathology,
 unexpected_upstream_response, independent_witness_mismatch, window_expired.
 
-**AUTOMATIC (review §16, blocker 7 REOPENED then CLOSED — see the ledger).** The whole-Canary
-latch for `tool_fingerprint_drift` / `server_identity_drift` is taken by the ATOMIC
-activation-bound admission transaction (`admitLiveExecution`), which evaluates live trust and
-latches under one acquisition of the activation lock and charges an exact, non-zero generation. The
-pre-executor drift refusal is fail-closed and records bounded evidence, but does NOT latch: it
-happens before any reservation, so nothing binds it to an activation, and an unattributable
-observation must never stop an experiment that may not have seen the drift. Every code above has a
-wired trip path onto the
+**AUTOMATIC (review §16, blocker 7 REOPENED; closure pending a clean review round — see the
+ledger).** The whole-Canary latch for `tool_fingerprint_drift` / `server_identity_drift` is taken
+in TWO places, and both are activation-bound under one acquisition of the activation lock, charging
+an exact non-zero generation:
+
+- the ATOMIC admission transaction (`admitLiveExecution`), which evaluates live trust in full —
+  including the approval, so a revocation racing the lock cannot be missed — and latches an
+  authoritative drift before reserving budget; and
+- the PRE-EXECUTOR refusal, which happens before any reservation. It is fail-closed and records
+  bounded evidence as before, and it also reports the drift WITH its target so the root can
+  re-derive it live inside the critical section. It latches only when the activation in force is
+  still the one the request resolved under (generations are monotonic, so a mismatch means an
+  activation intervened) and never during the publication gap. Leaving this path evidence-only was
+  tried and was wrong: after a rug-pull no later request presents as drift, so the breach condition
+  stopped nothing at all.
+
+Every code above has a wired trip path onto the
 ONE `canary.AbortController`; the latch revokes EXECUTION AUTHORITY (no new reservation, and an
 already-admitted request fails the final live revalidation before `Upstream.Call`). Two of them —
 `window_expired` and `budget_exhausted` — stop the experiment with NO further request arriving:
