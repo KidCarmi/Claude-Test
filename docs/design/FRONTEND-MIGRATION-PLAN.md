@@ -3646,6 +3646,23 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C24 — a newly published dependency advisory in the generator
+> workspace.** `Gate · frontend / Frontend · verify + determinism` failed on
+> the PR-C23 head at the last verify step — `npm audit --audit-level=high`
+> in `frontend/tools/openapi-gen` — because GHSA-2883-xcg3-v3hh (js-yaml
+> `4.0.0`–`4.3.1`, CPU exhaustion on empty merge sources) was published
+> between two runs of the same gate on the same generator lockfile, which
+> has been unchanged since the workspace was created and is identical on
+> `main`. `openapi-typescript@7.13.0` requires `@redocly/openapi-core
+> ^1.34.6`, whose latest `1.34.19` pins `js-yaml` to exactly `4.3.1`, so no
+> in-range update exists and `npm audit fix` is a no-op; the workspace now
+> carries an npm `overrides` entry pinning `js-yaml` to the patched `4.3.2`
+> (lockfile regenerated with `--package-lock-only`, integrity recorded).
+> The generator's YAML parsing is the only consumer; the canonical
+> `npm run verify` proves the regenerated `src/api/types.gen.ts` and
+> `frontend/dist` are byte-identical (drift gates pass) and both audits are
+> clean. Frontend workspace only; no product code changed.
+>
 > **PR-C23 — the fourteenth Codex round (one P1, one P2).** Both
 > confirmed and pinned before the correction
 > (`upstream_codex_r14_red_test.go`). (R14-A, P1) The sanitizer asserted
