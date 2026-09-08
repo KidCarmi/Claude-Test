@@ -18,6 +18,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -109,5 +110,60 @@ func TestReadTarball_AcceptsEntryUnderTheBound(t *testing.T) {
 	}
 	if len(files["data/blocklist.txt"]) != size {
 		t.Fatalf("got %d bytes back, want %d", len(files["data/blocklist.txt"]), size)
+	}
+}
+
+// writeSplitDecompressionBombTarball builds a tar.gz with entryCount distinct
+// data/* entries, each declaring entrySize bytes — every entry individually
+// under maxRestoreEntryBytes, but summing well past it. Proves the per-entry
+// bound alone (Codex review, PR #1344: a hostile archive can split its
+// payload across many uniquely named entries each at or under the per-entry
+// cap) is not sufficient.
+func writeSplitDecompressionBombTarball(t *testing.T, destPath string, entryCount int, entrySize int64) {
+	t.Helper()
+	out, err := os.Create(destPath) // #nosec G304 -- test temp path
+	if err != nil {
+		t.Fatalf("create dest: %v", err)
+	}
+	defer func() { _ = out.Close() }()
+	gz := gzip.NewWriter(out)
+	tw := tar.NewWriter(gz)
+
+	for i := 0; i < entryCount; i++ {
+		hdr := &tar.Header{
+			Name:     fmt.Sprintf("data/part-%d.txt", i),
+			Mode:     0o600,
+			Size:     entrySize,
+			Typeflag: tar.TypeReg,
+			ModTime:  time.Now().UTC(),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write header %d: %v", i, err)
+		}
+		if _, err := io.CopyN(tw, zeroReader{}, entrySize); err != nil {
+			t.Fatalf("write bomb body %d: %v", i, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar writer: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+}
+
+// TestReadTarball_RejectsOversizedAggregate proves readTarball also bounds
+// the SUM of declared entry sizes, not just each entry individually. Each of
+// 4 entries here declares 200 MiB — comfortably under the 256 MiB per-entry
+// bound on its own — but the 800 MiB total exceeds the 512 MiB aggregate
+// bound, which a per-entry-only check would never catch.
+func TestReadTarball_RejectsOversizedAggregate(t *testing.T) {
+	const entrySize = 200 << 20 // 200 MiB per entry, under the per-entry cap
+	const entryCount = 4        // 800 MiB total, over the aggregate cap
+	path := filepath.Join(t.TempDir(), "split-bomb.tar.gz")
+	writeSplitDecompressionBombTarball(t, path, entryCount, entrySize)
+
+	if _, _, err := readTarball(path, ""); err == nil {
+		t.Fatalf("readTarball accepted %d entries of %d bytes each (all individually under the per-entry bound) — aggregate decompression bomb not bounded", entryCount, entrySize)
 	}
 }
