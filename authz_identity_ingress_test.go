@@ -62,6 +62,17 @@ func assertNoIdentityAttribution(t *testing.T, destHost string) {
 	}
 }
 
+// assertNoIdentityAttributionSince is the snapshot-scoped form: `prev` is the
+// ring as read immediately BEFORE the request under test, so only entries
+// this test's request produced are judged. PR-C16 RED: on the untouched tree
+// it still judges the WHOLE ring (a stale entry from an earlier test whose
+// backend sat on the same recycled ephemeral port fails the assertion).
+func assertNoIdentityAttributionSince(t *testing.T, destHost string, prev []LogEntry) {
+	t.Helper()
+	_ = prev
+	assertNoIdentityAttribution(t, destHost)
+}
+
 // TestIdentityIngress_ExemptSpoofDenied: default-Exempt (open) posture with a
 // SourceIdentity-scoped allow rule. The unauthenticated request reaches
 // Stage-2 with an EMPTY identity; a spoofed X-User-Identity: alice must not

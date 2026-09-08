@@ -9,6 +9,9 @@ package main
 // unchanged, so the dependency is pinned without the shuffle.
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"testing"
 )
@@ -91,4 +94,49 @@ func TestOrder_RejectedDocumentLatchDoesNotOutliveItsTest(t *testing.T) {
 	if st := getUpstreamState(); st.Degraded != nil {
 		t.Fatalf("the managed degradation surface armed by R3 is still set after R3 finished: %+v", st.Degraded)
 	}
+}
+
+// PR-C16 RED — the CI-shaped seeded shuffle (`-shuffle=1788873409540952482
+// ./... -count=2`, read-only /data) failed TestIdentityIngress_NoBackendSpoofDenied
+// with "log entry for 127.0.0.1:43439 attributed to identity \"alice\"" while
+// the test's OWN request was logged with an EMPTY identity: the assertion
+// judged every ring entry whose host matched the backend's ephemeral port,
+// and an earlier test that authenticated alice against a backend on the
+// same recycled port had left its entry in the ring. Reproduced
+// deterministically: a stale alice entry for the backend's host is recorded
+// before the spoofed request, and the snapshot-scoped assertion must judge
+// only what THIS request produced.
+func TestOrder_IdentityIngressAttributionIsScopedToOwnRequest(t *testing.T) {
+	backend, cb := startCountingBackend(t)
+	setupProxyTest(t)
+
+	origReg := idpRegistry
+	idpRegistry = &IdPRegistry{}
+	t.Cleanup(func() { idpRegistry = origReg })
+
+	policyStore.Add(PolicyRule{
+		Priority: 1, Name: "alice-allow", DestFQDN: "*", SourceIdentity: "alice", Action: ActionAllow,
+	})
+	u, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("parse backend url: %v", err)
+	}
+	// The stale entry: an earlier test's authenticated request to a backend
+	// that sat on the same ephemeral port.
+	recordRequest("127.0.0.1", "GET", u.Host, "OK", "alice-allow", "allow", "alice", "")
+
+	srv := httptest.NewServer(http.HandlerFunc(handleRequest))
+	t.Cleanup(srv.Close)
+	proxyURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse proxy url: %v", err)
+	}
+	prev := logGet()
+	if got := spoofedGet(t, proxyURL, backend.URL+"/", "alice"); got != http.StatusForbidden {
+		t.Fatalf("spoofed request: status %d, want 403", got)
+	}
+	if cb.hitCount() != 0 {
+		t.Fatalf("spoofed request reached upstream %d times, want 0", cb.hitCount())
+	}
+	assertNoIdentityAttributionSince(t, u.Host, prev)
 }
