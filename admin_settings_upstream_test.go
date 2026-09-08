@@ -144,7 +144,7 @@ func TestAdminSettings_UpstreamRoundTrip(t *testing.T) {
 	// is the credentialed one, and it must unseal to the original password.
 	var got string
 	for i := 0; i < 2; i++ {
-		u, err := upstreamPool.ProxyFunc()(httptest.NewRequest("GET", "http://origin.example/", http.NoBody))
+		u, err := upstreamPool.ProxyFunc()(httptest.NewRequestWithContext(t.Context(), "GET", "http://origin.example/", http.NoBody))
 		if err != nil || u == nil {
 			t.Fatalf("ProxyFunc after restore: %v %v", u, err)
 		}
@@ -248,7 +248,7 @@ func TestAdminSettings_LegacyMigrationSealsUserinfo(t *testing.T) {
 	}
 	var got string
 	for i := 0; i < 2; i++ {
-		u, err := upstreamPool.ProxyFunc()(httptest.NewRequest("GET", "http://origin.example/", http.NoBody))
+		u, err := upstreamPool.ProxyFunc()(httptest.NewRequestWithContext(t.Context(), "GET", "http://origin.example/", http.NoBody))
 		if err != nil || u == nil {
 			t.Fatalf("ProxyFunc after migration: %v %v", u, err)
 		}
