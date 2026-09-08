@@ -3646,6 +3646,20 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C26 — the sixteenth Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r16_red_test.go`). (R16-A, P1)
+> The PR-C25 v2-document verification ran only AFTER at least one
+> credential object had been stripped, so a v2 document carrying
+> misplaced sealed fields with no recognized `credential` object — a
+> document-level `ciphertext` or `keyId`, an entry-level `authorityHash`
+> or `ciphertext`, a nested object inside the document — returned the
+> ORIGINAL bytes at the zero-strip branch before the verifier ran, and
+> the material was archived under `credentialsOmitted: true`. The
+> verification now runs whenever a v2 document is present, before the
+> zero-strip return; a sound document with no credential and the sealed
+> names outside the document stay ordinary (pinned as controls). Backend
+> only.
+>
 > **PR-C25 — the fifteenth Codex round (one P2).** Confirmed and pinned
 > before the correction (`upstream_codex_r15_red_test.go`). (R15-A, P2)
 > After stripping a v2 credential the sanitizer scanned the WHOLE

@@ -93,9 +93,6 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 	if err != nil {
 		return nil, 0, err
 	}
-	if stripped == 0 {
-		return body, 0, nil
-	}
 	// PR-C25 R15-A: the post-strip check verifies removal WITHIN the v2
 	// document, never by forbidding the sealed-record key names throughout
 	// the sanitized settings — an operator-controlled map (`otlp_headers`)
@@ -103,9 +100,21 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 	// as a name, and refusing a sound backup after the credential had been
 	// removed was the defect. The v2 document is upstream-owned in full, so
 	// any of these names surviving anywhere inside it is material the
-	// strip cannot account for and still refuses the archive.
-	if err := verifyV2CredentialsRemoved(root["upstream_proxies_v2"]); err != nil {
-		return nil, 0, err
+	// strip cannot account for and refuses the archive.
+	//
+	// PR-C26 R16-A: the verification runs whenever a v2 document is PRESENT,
+	// whether or not a credential object was stripped — it used to run only
+	// after a strip, so a document carrying misplaced sealed fields with no
+	// recognized `credential` object (a document-level `ciphertext`, an
+	// entry-level `keyId`) returned the ORIGINAL bytes at the zero-strip
+	// branch before the verifier ever ran.
+	if doc, present := root["upstream_proxies_v2"]; present {
+		if err := verifyV2CredentialsRemoved(doc); err != nil {
+			return nil, 0, err
+		}
+	}
+	if stripped == 0 {
+		return body, 0, nil
 	}
 	out, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
@@ -115,7 +124,9 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 }
 
 // verifyV2CredentialsRemoved re-serializes the v2 document alone and refuses
-// it if any sealed-record key name survives inside it after the strip.
+// it if any sealed-record key name is present inside it after the strip —
+// which, for a document that carried no credential object, means anywhere
+// the strip could not reach (PR-C26 R16-A).
 func verifyV2CredentialsRemoved(doc any) error {
 	sub, err := json.Marshal(doc)
 	if err != nil {
