@@ -291,7 +291,7 @@ run_mutation M11 \
   'the pre-executor path counts the drift as evidence and never latches' \
   'TestPreAdmissionDrift_E2E_ServerIdentityDriftStopsTheActivation' \
   . "$ADM" \
-  's/\tglobalCanaryRuntime\.latchDriftUnderActivation\(capb, now, func\(\) \(bool, string\) \{.*?\n\t\}\)\n/\t_ = capb\n\t_ = now\n/s'
+  's/\tglobalCanaryRuntime\.latchDriftUnderActivation\(.*?\n\t\}\)\n/\t_ = capb\n\t_ = now\n/s'
 
 run_mutation M12 \
   'the latch trusts the callers unlocked verdict instead of re-deriving under the lock' \
