@@ -3617,6 +3617,20 @@ frozen program branch is untouched.
 > source; nothing in flight and nothing advanced stays unproven,
 > fail-closed. Backend + frontend; `frontend/dist` regenerated.
 >
+> **PR-C16 — the CI-shaped seeded shuffle on the PR-C15 head.** The
+> `-shuffle=1788873409540952482 ./... -count=2` run under a read-only
+> `/data` failed `TestIdentityIngress_NoBackendSpoofDenied` on a request-log
+> entry attributed to `alice` while the test's own request was logged with
+> an empty identity: the assertion judged every ring entry whose host
+> matched the backend's ephemeral port, and an earlier test that
+> authenticated alice against a backend on the same recycled port had left
+> its entry in the process-global ring. Reproduced deterministically
+> without the shuffle (`TestOrder_IdentityIngressAttributionIsScopedToOwnRequest`,
+> RED-before) and corrected in the fixture only: `logEntriesSince(prev)`
+> yields the entries recorded after a ring snapshot, and the three ingress
+> tests judge only what their own request produced (the positive
+> attribution test included). No assertion weakened; test-only.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
