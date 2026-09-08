@@ -42,6 +42,17 @@ var upstreamSettingsCredentialKeys = []string{`"ciphertext"`, `"keyId"`, `"autho
 // A body that is not a JSON object is an error (a corrupt settings file
 // must not be archived as if it were sound).
 func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripped int, err error) {
+	// PR-C20 R11-A: a repeated key is refused BEFORE the body is decoded
+	// into a map. encoding/json keeps only the LAST value of a repeated
+	// key, so a settings object that repeats `upstream_proxies` (a
+	// credential-bearing list first, an empty list last), a repeated
+	// nested `url`, or a repeated `upstream_proxies_v2` document had the
+	// credential gate inspect only the surviving value while the no-op
+	// path handed back the ORIGINAL bytes, secret included. A sound
+	// settings file never repeats a key at any nesting level.
+	if err := rejectDuplicateJSONKeys(body); err != nil {
+		return nil, 0, err
+	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	var root map[string]any
@@ -103,6 +114,106 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 		}
 	}
 	return out, stripped, nil
+}
+
+// errUpstreamSettingsDuplicateKey is the refusal for a settings body that
+// repeats a key inside one JSON object (see rejectDuplicateJSONKeys).
+var errUpstreamSettingsDuplicateKey = errors.New("admin_settings.json repeats a key inside one JSON object; a backup archives only a sound settings file")
+
+// rejectDuplicateJSONKeys walks the raw token stream of body and refuses
+// any JSON object that carries the same key twice, at every nesting level
+// (an object inside an array inside an object included). It reports
+// nothing about VALUES — the same key in two different objects is normal —
+// and never decodes into a map, which is exactly the representation that
+// discards the earlier value. Syntax errors are left to the decoder that
+// follows; only a duplicate is refused here.
+func rejectDuplicateJSONKeys(body []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var w jsonKeyWalker
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil // io.EOF, or a syntax error the decoder that follows reports
+		}
+		if dup := w.step(tok); dup {
+			return errUpstreamSettingsDuplicateKey
+		}
+	}
+}
+
+// jsonObjectFrame is one open JSON container on the walker's stack: for an
+// object, the keys seen so far and whether the next token is a key.
+type jsonObjectFrame struct {
+	object    bool
+	keys      map[string]struct{}
+	expectKey bool
+}
+
+// jsonKeyWalker tracks the open containers of a token stream and reports a
+// key repeated inside one object.
+type jsonKeyWalker struct {
+	stack []*jsonObjectFrame
+}
+
+// step consumes one token and reports true when it is a duplicate key.
+func (w *jsonKeyWalker) step(tok json.Token) bool {
+	if top := w.top(); top != nil && top.object && top.expectKey {
+		return w.stepKeyPosition(top, tok)
+	}
+	if top := w.top(); top != nil && top.object {
+		top.expectKey = true // the value has been consumed, or begins below
+	}
+	w.stepDelim(tok)
+	return false
+}
+
+// stepKeyPosition handles a token where an object expects a key: the closing
+// brace, or the key itself (a duplicate reports true).
+func (w *jsonKeyWalker) stepKeyPosition(top *jsonObjectFrame, tok json.Token) bool {
+	if d, ok := tok.(json.Delim); ok && d == '}' {
+		w.pop()
+		return false
+	}
+	key, ok := tok.(string)
+	if !ok {
+		return false // not a key where one is required: a syntax error
+	}
+	if _, dup := top.keys[key]; dup {
+		return true
+	}
+	top.keys[key] = struct{}{}
+	top.expectKey = false
+	return false
+}
+
+// stepDelim opens or closes a container for a delimiter token.
+func (w *jsonKeyWalker) stepDelim(tok json.Token) {
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return
+	}
+	switch d {
+	case '{':
+		w.stack = append(w.stack, &jsonObjectFrame{object: true, keys: map[string]struct{}{}, expectKey: true})
+	case '[':
+		w.stack = append(w.stack, &jsonObjectFrame{})
+	case '}', ']':
+		w.pop()
+	}
+}
+
+func (w *jsonKeyWalker) top() *jsonObjectFrame {
+	if len(w.stack) == 0 {
+		return nil
+	}
+	return w.stack[len(w.stack)-1]
+}
+
+func (w *jsonKeyWalker) pop() {
+	if len(w.stack) > 0 {
+		w.stack = w.stack[:len(w.stack)-1]
+	}
 }
 
 // countUpstreamCredentialsRequiringReplacement counts the entries an

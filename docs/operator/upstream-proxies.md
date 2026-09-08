@@ -298,9 +298,11 @@ a URL it can parse, so an unreadable one fails the backup closed rather
 than being archived as password-free. Repair the entry (the legacy list
 carries `scheme://[user@]host:port`), then back up. A settings file that
 carries anything but whitespace after its single JSON object (a second
-value, trailing garbage) is refused the same way: only a sound settings
-file is archived, and nothing after the object is ever inspected or
-packed.
+value, trailing garbage) is refused the same way, and so is a settings
+object that repeats a key at any nesting level (a JSON decoder keeps only
+the last value of a repeated key, so the gate could otherwise be shown a
+value the archive would not carry): only a sound settings file is
+archived, and nothing the gate did not inspect is ever packed.
 
 **Restore** boots every formerly credentialed entry into the distinct
 state `requiresReplacement`: ineligible, never probed, never sent

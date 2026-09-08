@@ -3646,6 +3646,21 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C20 — the eleventh Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r11_red_test.go`). (R11-A, P1)
+> The backup sanitizer decoded the settings object into a map, and
+> `encoding/json` keeps only the LAST value of a repeated key, so a
+> settings object repeating `upstream_proxies` (a credential-bearing list
+> first, an empty list last), a repeated nested `url`, or a repeated
+> `upstream_proxies_v2` document had the credential gate inspect only the
+> surviving value while the no-op path handed back the ORIGINAL bytes,
+> secret included, under `credentialsOmitted: true`. The sanitizer now
+> walks the raw token stream first (`rejectDuplicateJSONKeys`) and refuses
+> any object that repeats a key at any nesting level — never decoding
+> into the representation that discards the earlier value — before the
+> PR-C19 EOF check and the map decode; the same key in different objects
+> stays ordinary (pinned as a control). Runbook §8 updated. Backend only.
+>
 > **PR-C19 — the tenth Codex round (one P1, one P2).** Both confirmed
 > and pinned before the correction (`upstream_codex_r10_red_test.go`).
 > (R10-A, P1) The backup sanitizer decoded ONE JSON value and never
