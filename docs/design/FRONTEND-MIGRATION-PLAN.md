@@ -413,7 +413,7 @@ UI leans on C2 semantics and must not cut over onto a known enforcement gap).
 > | **2C** | Authentication Policy (Stage-1 rules + default-auth-outcome T3 ceremony) + Policy Learning (advisory panel, accept-to-draft, reject) | pending |
 > | **2D** | Objects & Taxonomy: URL categories (+hosts, lookup, feed status), SaaS feed settings/overrides/refresh, category groups (+rename), decryption profiles (+rename, cert-enum lockstep), file profiles, rewrite. **Internal review decomposition (2026-08-28, checkpoint boundaries only — product scope unchanged): 2D-A** Category Groups + Decryption Profiles (shipped — see the 2D-A record below); **2D-B** URL Categories + SaaS feed/settings/overrides/status/refresh; **2D-C** File Profiles + Rewrite Rules. Two already-discovered later gates, recorded here and deliberately NOT solved in 2D-A: **(2D-B)** the URL-category PUT path needs the same 10,000-host cap the POST path enforces, and taxonomy writes need truthful durability (the urlcat store's Save is still best-effort); **(2D-C)** File Profiles are ID-bearing objects but Policy references them by NAME (`FileProfile`), and Rewrite Rule IDs are process-local integers, not durable identities — both need their reference/identity model settled before a v2 write surface. | 2D-A shipped |
 > | **2E** | Scanning / Content Security / Decryption / CDR: blocklist (+feeds/exceptions/mode T3), Content & Scanning (YARA/DPI/exclusions/threat feeds/cache/saturation), decryption exclusions + tunables + health (pulled forward from FE-6 for cohesion with 2D profiles), CDR | pending |
-> | **2F** | Network: PAC (profiles/pools/lifecycle/simulator/analyze/posture/exceptions + server-named DIRECT-bypass T3 ceremony) + Upstream (write-only credentials, direct-fallback banner) | **2F-0 entry gate shipped — contract approved (see the 2F-0 record below)** |
+> | **2F** | Network: PAC (profiles/pools/lifecycle/simulator/analyze/posture/exceptions + server-named DIRECT-bypass T3 ceremony) + Upstream (write-only credentials, direct-fallback banner) | **2F-A … 2F-F shipped and frozen (2F-F at `77acdd67`); 2F-G closure this round — see the 2F-G record below** |
 >
 > FE-6/FE-7/FE-8 remain outside Batch 2. ADR-FE-001 and ADR-FE-002 remain
 > authoritative; no new ADR. Parity rows are updated only for capabilities a
@@ -1160,6 +1160,150 @@ UI leans on C2 semantics and must not cut over onto a known enforcement gap).
 > the acknowledgement ceremony is an API + new-frontend (2F-E) contract —
 > recorded, not a regression. Contract artifacts regenerated (`openapi.yaml` →
 > bundle + `types.gen.ts`); route count unchanged (241).
+>
+> **2F-G IMPLEMENTATION RECORD (this branch, 2026-09-08 — the closure
+> slice of Batch 2F; not a feature-expansion slice).** Baseline: the frozen
+> 2F-F head `77acdd67` (accepted by external review). **Entry gate:**
+> `origin/main` re-fetched before any change = `1b3d0e6a`, already an
+> ancestor — no entry merge. Append-only chain: `fe8bd067` (RED matrix on
+> the exact baseline) → `92b51b06` (RED harness typecheck correction, verdicts
+> unchanged) → `844c78f4` (product correction) → `938bfeaf` (dist) →
+> `edae409e` (closure journeys + harness) → this record + the parity /
+> contract / runbook corrections. No Go, OpenAPI, generated-type, route or
+> inventory artifact changed (no authoritative source changed), so none was
+> regenerated.
+>
+> **A. CDR recovery-marker correction (the defect recorded in the 2F-E
+> correction record).** `readEnrollRecovery(subject)` compared an EMPTY
+> subject as a foreign identity: a render before the authenticated subject
+> was known read the marker with `""`, classified it foreign and DELETED it —
+> a recoverable enrollment destroyed by a transient state. RED matrix
+> `frontend/src/test/cdr-2fg-red.test.tsx`, executed on `77acdd67` before
+> the correction (a deferred `/api/auth/status` answer is the
+> channel-controlled "subject not yet known" window; no timing): G1
+> unresolved read must neither classify nor delete — FAILED (marker gone);
+> G2 marker survives the unresolved first render and surfaces once the owner
+> is authoritative — FAILED; G3 control, a confirmed mismatch clears and
+> never surfaces — passed; G4 nothing dispatched while unresolved, ceremony
+> opens on resolution — FAILED (the ceremony was armed against an unknown
+> identity); G5 a real logout through the auth machine clears the surfaced
+> marker — FAILED on the baseline only because the marker was already gone
+> (the clear itself is 2E-C behaviour); G6 control, the unresolved render
+> triggers no recovery call and claims no outcome — passed. Correction
+> (`enrollRecovery.ts` + `CDRInstancesTab.tsx`): an empty or blank subject
+> is NOT an identity — the read reports `unresolved` BEFORE touching storage
+> (nothing classified, nothing deleted); the tab keeps the enrollment
+> ceremony closed (`canEnroll` requires `none`), shows neither the recovery
+> surface nor a store error while unresolved, and re-reads when the subject
+> becomes authoritative — a matching owner surfaces the marker, a confirmed
+> mismatch discards it, logout / the auth boundary clear it exactly as
+> before. The write path was already fail-closed (the grammar refuses an
+> empty subject, so no dispatch without an identity); marker contents are
+> unchanged (non-secret, ownership-bound). G1–G6 green; the accepted 2E-C
+> recovery suites are untouched and green (63 files / 710 unit tests). The
+> accepted CDR trust-lifecycle backend is not touched. **Reachability
+> disclosure:** through the shipped `AuthGate` the authenticated shell
+> renders only in the `authenticated` phase, whose identity decoder refuses
+> an empty user, so the empty-subject render is prevented by ordering today;
+> the component contract no longer depends on that ordering.
+>
+> **B. Final journey closure (`frontend/e2e/network-2fg.spec.ts`, nine
+> journeys, real appliances, 9/9).** Inventory first: the accepted PAC
+> (`pac-2fe*`), Upstream (`upstream-2ff*`, `upstream-2fd`) and CDR
+> (`cdr-2ec`) specs already prove publish / refusal / recovery / reload
+> continuity, viewer posture, create/edit, T2 replace, T3 clear, probe
+> behaviour, UNPROVEN handling and the Upstream/CDR leak sweeps — none of
+> those assertions is duplicated or changed. Added only what was missing:
+> N1 sidebar navigation to both surfaces (`expectNavLinkReachable`), the
+> routes served as the SPA document, unauthenticated deep links returning to
+> the intended route after sign-in (admin for Upstream, the viewer floor for
+> PAC); N2 admin-only made server-authoritative — an OPERATOR sees zero
+> mutation controls on PAC and Upstream and issues no non-GET request, and
+> nine operator and viewer mutation shapes (upstream create / update / delete
+> / credential / manual probe; PAC profile create / publish / delete /
+> exception governance) are refused 403 with the document revision, entry
+> revision, credential state, profile collection etag and active revision
+> unchanged; N3 YAML read-only posture on a FOURTH, config.yaml-seeded
+> appliance (`YAMLUP`, `scripts/e2e-smoke.sh`; one parent under the
+> `.invalid` TLD so its periodic probe fails deterministically and nothing is
+> dialled — a separate instance because a config.yaml parent chains every
+> allowed plain-HTTP request of the appliance carrying it, which would change
+> the data-plane premise of every other journey): the row is labelled
+> `config.yaml` / read-only with zero controls and "edit the YAML and
+> reload", survives a reload, and PUT / DELETE / credential replace are
+> refused `409 yaml_owned` with the entry unchanged; N4 CDR marker survival —
+> a lost enrollment answer (aborted in the browser; the appliance never
+> receives it and lists no such instance) leaves the non-secret,
+> ownership-bound marker, which survives a FULL reload (the app boots with an
+> unresolved subject until the status read lands) and SPA navigation,
+> surfaces "Resolve enrollment" naming the operation for its owner, never
+> carries the token in storage or the DOM, keeps the ceremony closed, and is
+> cleared by Sign out with nothing but the theme key left; N5 PAC marker at
+> the auth boundary — a publish that never left the browser latches the
+> marker and disables Publish, Sign out clears it, a re-login finds no marker,
+> Publish open and the lifecycle unmoved (`activeRevision`/`activeN` equal to
+> the captured baseline); N6 a raw 500 body carrying a canary never reaches
+> the DOM, URL or storage, the outcome stays unresolved (marker kept, Publish
+> disabled), no "Published" claim, lifecycle unmoved; N7 node-local labels on
+> the PAC lifecycle ("Publish history (node-local)"), the DIRECT exceptions
+> tab ("Node-local governance records") and Upstream health after a manual
+> probe ("Manual probe complete (node-local)", source `manual`) stay after
+> `page.reload()` and after the in-page Refresh, and Upstream leaves nothing
+> in browser storage. **Harness corrections found by the real-binary runs
+> (recorded):** the two journeys that end in a real Sign out authenticate
+> explicitly under an empty storage state — a sign-out revokes the server
+> session behind the suite-wide admin storage state, which the first run
+> exposed as three later journeys landing on the sign-in page; and the
+> lifecycle comparison reads a captured baseline (`activeRevision` of a
+> freshly created profile is 1, `activeN` 0) instead of assuming zero. No
+> retry, timeout, skip or weakened assertion. **Restart disclosure:** the
+> browser suite proves label and verdict continuity across reload and
+> in-page Refresh; an appliance RESTART is not exercised from the browser
+> (the harness starts each instance once) — restart continuity of the
+> upstream document, credentials and probe state is proven by the Go
+> integration / portability harnesses (54/54, 38/38) that run in the same
+> qualification.
+>
+> **C. Parity and documentation closure.** `FRONTEND-FEATURE-PARITY.md`
+> FE-V31 / FE-V32: the Role cells said `operator` — a documentation error
+> against the backend truth (every PAC and Upstream mutation, including the
+> manual probe, is `RoleAdmin` in `ui_routes_meta.go`); both rows now read
+> "viewer (mutations admin-only)", carry the MIGRATED annotation every other
+> Batch-2 row carries, list the v2 upstream entry routes and the PAC
+> lifecycle / analyze / `/pac/` routes, and state the current T3 form (the
+> server-bound `<profileId>:<candidateSpecDigest[0:8]>` challenge; the
+> pre-2F "word = profile id" is no longer accepted); the stale "§7 accounting
+> table" pointer (also in `FRONTEND-CURRENT-STATE.md`) now names the real pin
+> (243 routes, `ui_routes_meta_test.go`) and the generated inventory
+> (`api/route-classification.yaml`). `FRONTEND-SECURITY-CONTRACT.md`: D1's
+> Tier-3 count corrected (10 since 2F-C) and a D15 row records the 2F
+> enforcement posture (fenced, admin-only, UNPROVEN discipline, node-local
+> key, non-secret ownership-bound markers never classified against an
+> unresolved subject). Node-local labelling verified consistent: the UI
+> labels the PAC draft / history / exception governance and the Upstream
+> entries / credentials / probe verdicts / effective mode node-local with one
+> meaning (this appliance only, never cluster-synced, never on
+> config-version rollback); `docs/operator/pac-traffic-steering.md` gains the
+> `/app/network/pac` paragraph it lacked (admin-only mutations, the same
+> node-local meaning, backup-surface note, pools and the ACTIVE spec as the
+> cluster-synced part) and `docs/operator/upstream-proxies.md` §4 gains the
+> node-local statement the UI already made (entries, credentials, health,
+> effective mode; manual probe `(node-local)` / `scope=node-local`; labels
+> and verdicts re-read from the appliance, never from browser storage). The
+> repository contract pointer (`CLAUDE.md`, frontend line) records the
+> unresolved-subject rule, the admin-only parity correction and the closure
+> spec + fourth appliance. UI strings unchanged (three parallel node-local
+> phrasings share the same meaning; the PAC page subtitle scopes "node-local"
+> to the lifecycle while the Legacy PAC tab correctly carries no node-local
+> claim — recorded, not reworded, to keep the accepted `/node-local/i`
+> assertions stable).
+>
+> **Scope exclusions honoured:** no PX-1 chaining expansion, no YAML
+> adoption, no breaker / probe-interval UI, no secret-inclusive backups, no
+> scheme-grammar change, no CDR backend change, and neither the inherited
+> 50-finding PR-base lint inventory nor the inherited main-side `funlen`
+> finding (both stay with the dedicated pre-PR hygiene gate). Qualification
+> of the candidate head is reported in the 2F-G candidate report.
 >
 > **2F-F CORRECTION RECORD (this branch, 2026-09-07; external review of
 > `d391b12f` REJECTED — one append-only round).** The rejected candidate

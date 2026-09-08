@@ -136,6 +136,17 @@ to render an entry that carries credential material.
 
 ## 4. Health, eligibility, and the effective mode
 
+**Node-local facts.** Entries, sealed credentials, probe verdicts (health)
+and the effective mode are node-local: they live on this appliance only,
+are never cluster-synced (CP→DP) and never on config-version rollback. The
+sealed document is on the backup surface with every credential stripped
+(§8); the node-local key file is never archived. The `/app/network/upstream`
+page labels the same facts node-local, and a manual probe reports
+"(node-local)" on its completion notice and `scope=node-local` in its audit
+entry — refresh or reload the page and the labels and the last probe
+verdict (source `manual`, timestamp) are re-read from the appliance, never
+from browser storage (the page persists nothing).
+
 Probes are tri-state and classified by a bounded reason:
 
 | probe outcome | status / reason |

@@ -152,6 +152,19 @@ byte-identical output. Custom profiles are managed in the PAC panel's
 Steering Profiles section (`/api/pac/profiles`, admin-only mutations) and
 persist in `<dataDir>/pac_profiles.json` (on the backup surface).
 
+The new admin frontend (`CULVERT_EXPERIMENTAL_UI`, `/app/network/pac`)
+manages the same profiles, pools, lifecycle (draft → publish → history →
+rollback) and DIRECT-exception governance through the same endpoints. Every
+mutation there is **admin-only** (operators and viewers read; the appliance
+refuses lower roles with 403 before any handler runs). The page labels the
+draft, the publish history and the exception governance **node-local**
+with exactly the meaning this runbook gives the term: on this appliance
+only, never cluster-synced (CP→DP), never on config-version rollback, and
+included in `culvert backup` (restore the lifecycle / governance files on a
+promoted node — see the HA / failover note under "Draft → Publish → Rollback
+lifecycle" and "DIRECT exception governance"). Pools and the ACTIVE profile
+spec are the cluster-synced part, and the page says so on the Pools tab.
+
 Each profile carries:
 
 - a **proxy pool** reference — an ordered failover chain of 1–3 endpoints,
