@@ -863,6 +863,17 @@ export function hostUnicodeKey(host: string): string {
 // appliance.
 const HOST_MAP_SENTINEL = ".culvert-host-map-sentinel";
 
+// Go's strings.TrimSpace strips Unicode White_Space — '\t' '\n' '\v' '\f'
+// '\r' ' ' U+0085 U+00A0 and the Zs/Zl/Zp separators — while JavaScript's
+// trim() strips its own WhiteSpace + LineTerminator set, which KEEPS U+0085
+// and additionally strips U+FEFF. The appliance trims every spec field with
+// Go's set, so the client trims with the same set (PR-C14 K9).
+const GO_SPACE =
+  /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g;
+export function trimAsGo(s: string): string {
+  return s.replace(GO_SPACE, "");
+}
+
 // Go's strings.ToLower applies the SIMPLE Unicode case mapping; JavaScript's
 // toLowerCase applies the FULL mapping, which differs unconditionally for
 // U+0130 (`İ` → `i̇`, two code points, vs `i`) and conditionally for a final
@@ -877,10 +888,10 @@ function lowerAsGo(s: string): string {
 }
 
 export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
-  const scheme = spec.scheme.trim().toLowerCase();
+  const scheme = trimAsGo(spec.scheme).toLowerCase();
   // The appliance strips exactly ONE trailing dot (`example.com..` is
   // accepted and kept as `example.com.`) — never all of them (PR-C12 K7).
-  let host = lowerAsGo(spec.host.trim()).replace(/\.$/, "");
+  let host = lowerAsGo(trimAsGo(spec.host)).replace(/\.$/, "");
   let hostKey: string | undefined;
   if (host.includes(":")) {
     // An IPv6 literal: the appliance brackets a bare one and keeps the
@@ -920,7 +931,7 @@ export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
     host,
     hostKey: hostKey ?? hostUnicodeKey(host),
     port,
-    username: spec.username.trim(),
+    username: trimAsGo(spec.username),
   };
 }
 

@@ -19,7 +19,7 @@ import {
   type ConfirmResult,
 } from "../../../design-system/dialog";
 import type { UpstreamEntry, UpstreamEntrySpec } from "../../../api/upstream";
-import { UPSTREAM_SCHEMES } from "../../../api/upstream";
+import { UPSTREAM_SCHEMES, trimAsGo } from "../../../api/upstream";
 import styles from "../../policy/policy.module.css";
 
 export interface EntryDraft {
@@ -42,7 +42,7 @@ export function draftFrom(e: UpstreamEntry | null): EntryDraft {
 
 /** Local shape check only — the appliance validates (400 invalid_entry). */
 export function draftToSpec(d: EntryDraft): UpstreamEntrySpec | string {
-  const host = d.host.trim();
+  const host = trimAsGo(d.host);
   if (host === "") return "Host is required.";
   const portText = d.port.trim();
   let port = 0;
@@ -51,7 +51,7 @@ export function draftToSpec(d: EntryDraft): UpstreamEntrySpec | string {
     if (!Number.isInteger(port) || port < 0 || port > 65535)
       return "Port must be 1–65535 (or empty for the scheme default).";
   }
-  return { scheme: d.scheme, host, port, username: d.username.trim() };
+  return { scheme: d.scheme, host, port, username: trimAsGo(d.username) };
 }
 
 export function authorityOf(spec: UpstreamEntrySpec): string {
