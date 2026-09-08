@@ -853,36 +853,9 @@ func (ps *PolicyStore) RefreshObjectRefNames(groupNames, profileNames, fileProfi
 	next := append([]*PolicyRule(nil), ps.rules...)
 	n := 0
 	for i, rule := range next {
-		newGroup, hasGroup := "", false
-		if rule.DestCategoryGroupID != "" {
-			if cur, ok := groupNames[rule.DestCategoryGroupID]; ok && rule.DestCategoryGroup != cur {
-				newGroup, hasGroup = cur, true
-			}
-		}
-		newProfile, hasProfile := "", false
-		if rule.DecryptionProfileID != "" {
-			if cur, ok := profileNames[rule.DecryptionProfileID]; ok && rule.DecryptionProfile != cur {
-				newProfile, hasProfile = cur, true
-			}
-		}
-		newFileProfile, hasFileProfile := "", false
-		if rule.FileProfileID != "" {
-			if cur, ok := fileProfileNames[rule.FileProfileID]; ok && string(rule.FileProfile) != cur {
-				newFileProfile, hasFileProfile = cur, true
-			}
-		}
-		if !hasGroup && !hasProfile && !hasFileProfile {
+		nr, changed := refreshedObjectRefNames(rule, groupNames, profileNames, fileProfileNames)
+		if !changed {
 			continue
-		}
-		nr := *rule
-		if hasGroup {
-			nr.DestCategoryGroup = newGroup
-		}
-		if hasProfile {
-			nr.DecryptionProfile = newProfile
-		}
-		if hasFileProfile {
-			nr.FileProfile = FileProfileName(newFileProfile)
 		}
 		next[i] = &nr
 		n++
@@ -893,6 +866,30 @@ func (ps *PolicyStore) RefreshObjectRefNames(groupNames, profileNames, fileProfi
 		ps.bumpVersion()
 	}
 	return n
+}
+
+// refreshedObjectRefNames returns a copy of rule with every cached object
+// display name refreshed from the ID→name maps, and whether anything
+// changed. A dangling ID (absent from its map) is left alone.
+func refreshedObjectRefNames(rule *PolicyRule, groupNames, profileNames, fileProfileNames map[string]string) (PolicyRule, bool) {
+	nr := *rule
+	changed := false
+	if rule.DestCategoryGroupID != "" {
+		if cur, ok := groupNames[rule.DestCategoryGroupID]; ok && rule.DestCategoryGroup != cur {
+			nr.DestCategoryGroup, changed = cur, true
+		}
+	}
+	if rule.DecryptionProfileID != "" {
+		if cur, ok := profileNames[rule.DecryptionProfileID]; ok && rule.DecryptionProfile != cur {
+			nr.DecryptionProfile, changed = cur, true
+		}
+	}
+	if rule.FileProfileID != "" {
+		if cur, ok := fileProfileNames[rule.FileProfileID]; ok && string(rule.FileProfile) != cur {
+			nr.FileProfile, changed = FileProfileName(cur), true
+		}
+	}
+	return nr, changed
 }
 
 // DeleteByID removes the rule with the given stable ULID. Rename/reorder-safe
@@ -1820,19 +1817,11 @@ func (r *PolicyRule) FileProfileBlocked(urlPath string) bool {
 	if !r.FileFiltering || r.FileProfile == FileProfileNone {
 		return false
 	}
-	var exts []string
 	if r.FileProfileID != "" {
-		p := globalProfileStore.GetByID(r.FileProfileID)
-		if p == nil {
-			// Dangling authoritative ID — fail CLOSED for file transactions.
-			if pathFileExt(urlPath) == "" {
-				return false // no profile could ever block an extension-less path
-			}
-			noteFileProfileUnresolvedBlock(r.FileProfileID, string(r.FileProfile))
-			return true
-		}
-		exts = p.Extensions
-	} else if p := globalProfileStore.GetByName(string(r.FileProfile)); p != nil {
+		return r.fileProfileBlockedByID(urlPath)
+	}
+	var exts []string
+	if p := globalProfileStore.GetByName(string(r.FileProfile)); p != nil {
 		exts = p.Extensions
 	} else if legacyExts, ok := fileProfileExts[r.FileProfile]; ok {
 		exts = legacyExts
@@ -1840,6 +1829,21 @@ func (r *PolicyRule) FileProfileBlocked(urlPath string) bool {
 		return false
 	}
 	return matchFileExt(urlPath, exts)
+}
+
+// fileProfileBlockedByID is the authoritative-ID arm of FileProfileBlocked:
+// the profile is resolved by ID only (never by name — the anti-rebinding
+// doctrine), and a dangling ID fails CLOSED for file transactions.
+func (r *PolicyRule) fileProfileBlockedByID(urlPath string) bool {
+	p := globalProfileStore.GetByID(r.FileProfileID)
+	if p != nil {
+		return matchFileExt(urlPath, p.Extensions)
+	}
+	if pathFileExt(urlPath) == "" {
+		return false // no profile could ever block an extension-less path
+	}
+	noteFileProfileUnresolvedBlock(r.FileProfileID, string(r.FileProfile))
+	return true
 }
 
 // statFileProfileUnresolvedBlocked counts file transactions blocked because a

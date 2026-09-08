@@ -38,7 +38,7 @@ func testRevOf(o Overrides) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func newDurableOverrideStore(t *testing.T) (*Store, string) {
+func newDurableOverrideStore(t *testing.T) (store *Store, filePath string) {
 	t.Helper()
 	s := New()
 	path := filepath.Join(t.TempDir(), "overrides.json")

@@ -275,14 +275,14 @@ func tl2ConcurrentSameOperation(t *testing.T, nameA, epA, nameB, epB string) {
 		t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	}
 	dispatched, entered, release := tl2GatedEnroll(t)
-	codes := make([]int, 2)
+	statusCodes := make([]int, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		w := httptest.NewRecorder()
 		apiCDREnroll(w, newAdminRequest(http.MethodPost, "/api/cdr/instances/enroll", tl2EnrollBody(nameA, epA, tl2Op)))
-		codes[0] = w.Code
+		statusCodes[0] = w.Code
 	}()
 	<-entered // A's receipt exists and its RPC is in flight
 	// B runs to COMPLETION while A is still inside the RPC (deterministic:
@@ -295,7 +295,7 @@ func tl2ConcurrentSameOperation(t *testing.T, nameA, epA, nameB, epB string) {
 		defer wgB.Done()
 		w := httptest.NewRecorder()
 		apiCDREnroll(w, newAdminRequest(http.MethodPost, "/api/cdr/instances/enroll", tl2EnrollBody(nameB, epB, tl2Op)))
-		codes[1] = w.Code
+		statusCodes[1] = w.Code
 	}()
 	wgB.Wait()
 	close(release)
@@ -303,8 +303,8 @@ func tl2ConcurrentSameOperation(t *testing.T, nameA, epA, nameB, epB string) {
 	if n := atomic.LoadInt32(dispatched); n != 1 {
 		t.Errorf("operation %s was dispatched %d times, want exactly 1", tl2Op, n)
 	}
-	if codes[0] != http.StatusOK || codes[1] != http.StatusConflict {
-		t.Errorf("codes = %v, want [200 409]", codes)
+	if statusCodes[0] != http.StatusOK || statusCodes[1] != http.StatusConflict {
+		t.Errorf("statusCodes = %v, want [200 409]", statusCodes)
 	}
 	if rc, ok := cdrEnrollReceipts.Get(tl2Op); !ok || rc.Name != nameA || rc.Endpoint != epA {
 		t.Errorf("the binding was rewritten: %+v", rc)
@@ -379,8 +379,10 @@ func TestCDR2ECTL2_ReceiptFile_CorruptAtStartup_IsDegradedAndFailClosed(t *testi
 	valid := func(op, name string) map[string]any {
 		return map[string]any{"operationId": op, "name": name, "endpoint": "e:1", "serverFingerprint": strings.Repeat("ab", 32), "state": "stored", "actor": "a", "startedAt": "2026-09-01T00:00:00Z", "updatedAt": "2026-09-01T00:00:00Z"}
 	}
-	recs = append(recs, valid(tl2Op, "dup-a"), valid(tl2Op, "dup-b")) // duplicate id
-	recs = append(recs, valid("bad id!", "grammar"))                  // invalid grammar
+	recs = append(recs,
+		valid(tl2Op, "dup-a"), valid(tl2Op, "dup-b"), // duplicate id
+		valid("bad id!", "grammar"), // invalid grammar
+	)
 	r := valid("tl2-badstate-0123456789abcdef", "state")
 	r["state"] = "teleported"
 	recs = append(recs, r) // invalid state

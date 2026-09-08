@@ -191,6 +191,8 @@ func TestCDR2ECTLG_Revoke_CoversWholeLineage_ProgressIsDurable(t *testing.T) {
 
 // Crash/restart at each renewal commit boundary: the durable lineage +
 // on-disk state let reconcileCredentialLineage finish or abandon safely.
+//
+//nolint:gocognit // linear proof script: every step is part of the specification
 func TestCDR2ECTLG_Renewal_CrashBoundariesReconcileAtRestart(t *testing.T) {
 	type boundary struct {
 		label     string
@@ -277,6 +279,8 @@ func TestCDR2ECTLG_Renewal_CrashBoundariesReconcileAtRestart(t *testing.T) {
 // A renewal whose RPC response was lost is resolved by the poller through
 // EnrollStatus: ISSUED ⇒ orphaned (fingerprint recorded, audited),
 // NOT_ISSUED ⇒ dropped. Until resolved, no second renewal is staged.
+//
+//nolint:gocognit // linear proof script: every step is part of the specification
 func TestCDR2ECTLG_Renewal_LostResponseIsReconciledByPoller(t *testing.T) {
 	for _, tc := range []struct {
 		label   string
@@ -446,7 +450,7 @@ func TestCDR2ECTLG_Enroll_LostResponse_ReceiptDispatchedBeforeRPC(t *testing.T) 
 func TestCDR2ECTLG_Enroll_ReceiptStorageFailure_SendsNothing(t *testing.T) {
 	resetCDRState(t)
 	redirectSentinelToTempDir(t)
-	if err := cdrEnrollReceipts.Load(filepath.Join("/proc/culvert-nonexistent", "receipts.json")); err != nil {
+	if err := cdrEnrollReceipts.Load(filepath.Join(string(filepath.Separator), "proc", "culvert-nonexistent", "receipts.json")); err != nil {
 		t.Fatal(err)
 	}
 	dispatched := 0
@@ -528,6 +532,7 @@ func TestCDR2ECTLG_Enroll_HandlerLocalPersistFailure_NamesTheIssuedFingerprint(t
 	}
 }
 
+//nolint:gocognit // linear proof script: every step is part of the specification
 func TestCDR2ECTLG_Recover_ClassifiesEveryOutcome(t *testing.T) {
 	const op = "tlg-recover-0123456789abcdef"
 	issuedFP := "sha256:" + strings.Repeat("ef", 32)

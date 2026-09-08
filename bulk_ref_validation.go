@@ -116,57 +116,68 @@ type bulkCandidate struct {
 func postApplyCategoryClosure(cands []CategoryEntry, ov CategoryOverrides) func(string) bool {
 	view := saasEffectiveView.Current()
 	var names map[string]struct{}
-	build := func() map[string]struct{} {
-		out := make(map[string]struct{}, len(cands))
-		if view == nil {
-			for i := range cands {
-				out[strings.ToLower(cands[i].Name)] = struct{}{}
-			}
-			return out
-		}
-		// Admin tier: candidate BuiltIn=false names only.
-		for i := range cands {
-			if !cands[i].BuiltIn {
-				out[strings.ToLower(cands[i].Name)] = struct{}{}
-			}
-		}
-		// View tier: candidate overrides composed over the RAW base.
-		var baseMembers map[string][]string
-		if view.Source == sourceEmbedded {
-			baseMembers = candidateBuiltInMemberships(cands)
-		} else {
-			base := view.baseClasses()
-			baseMembers = make(map[string][]string, len(base))
-			for h, c := range base {
-				baseMembers[h] = []string{c}
-			}
-		}
-		for _, cats := range catoverride.ComposeMembership(baseMembers, ov) {
-			for _, c := range cats {
-				out[strings.ToLower(c)] = struct{}{}
-			}
-		}
-		return out
-	}
 	return func(name string) bool {
 		if name == "" {
 			return true
 		}
 		if names == nil {
-			names = build()
+			names = candidateCategoryNames(cands, ov, view)
 		}
 		if _, ok := names[strings.ToLower(name)]; ok {
 			return true
 		}
-		if communityDB != nil {
-			for _, c := range feedsync.MappedCategories() {
-				if strings.EqualFold(c, name) {
-					return true
-				}
-			}
+		return communityCategoryKnown(name)
+	}
+}
+
+// candidateCategoryNames is the lazily-built authority set behind
+// postApplyCategoryClosure: with no live view every candidate name counts;
+// otherwise the admin tier (candidate BuiltIn=false names) plus the view
+// tier — the candidate overrides composed over the RAW base (never over the
+// already-composed live entries, which would double-apply them).
+func candidateCategoryNames(cands []CategoryEntry, ov CategoryOverrides, view *effectiveCategoryView) map[string]struct{} {
+	out := make(map[string]struct{}, len(cands))
+	if view == nil {
+		for i := range cands {
+			out[strings.ToLower(cands[i].Name)] = struct{}{}
 		}
+		return out
+	}
+	for i := range cands {
+		if !cands[i].BuiltIn {
+			out[strings.ToLower(cands[i].Name)] = struct{}{}
+		}
+	}
+	var baseMembers map[string][]string
+	if view.Source == sourceEmbedded {
+		baseMembers = candidateBuiltInMemberships(cands)
+	} else {
+		base := view.baseClasses()
+		baseMembers = make(map[string][]string, len(base))
+		for h, c := range base {
+			baseMembers[h] = []string{c}
+		}
+	}
+	for _, cats := range catoverride.ComposeMembership(baseMembers, ov) {
+		for _, c := range cats {
+			out[strings.ToLower(c)] = struct{}{}
+		}
+	}
+	return out
+}
+
+// communityCategoryKnown reports whether the Layer-2 community feed maps
+// name (case-insensitive); false when no community store is loaded.
+func communityCategoryKnown(name string) bool {
+	if communityDB == nil {
 		return false
 	}
+	for _, c := range feedsync.MappedCategories() {
+		if strings.EqualFold(c, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // candidateBuiltInMemberships derives the embedded-baseline membership map
@@ -246,15 +257,8 @@ func canonicalizeCandidateRuleRefs(r *PolicyRule, groups []CategoryGroup, profil
 // never truncate, never silently drop a rule).
 func validateBulkCandidateRefs(c bulkCandidate) error {
 	if c.CheckCategories {
-		for i := range c.Groups {
-			for _, m := range c.Groups[i].Categories {
-				if strings.TrimSpace(m) == "" {
-					continue
-				}
-				if !c.CategoryOK(m) {
-					return &bulkRefViolation{Owner: fmt.Sprintf("category group %q", c.Groups[i].Name), Type: "category", Name: m}
-				}
-			}
+		if err := validateBulkGroupCategories(c); err != nil {
+			return err
 		}
 	}
 	groupNames := make(map[string]struct{}, len(c.Groups))
@@ -273,35 +277,69 @@ func validateBulkCandidateRefs(c bulkCandidate) error {
 			profIDs[c.Profiles[i].ID] = struct{}{}
 		}
 	}
+	ids := bulkObjectIdentities{groupNames: groupNames, groupIDs: groupIDs, profNames: profNames, profIDs: profIDs}
 	for i := range c.Rules {
-		r := &c.Rules[i]
-		owner := fmt.Sprintf("policy rule %q", r.Name)
-		if c.CheckRuleGroups && r.DestCategoryGroup != "" {
-			if _, byName := groupNames[strings.ToLower(r.DestCategoryGroup)]; !byName {
-				if _, byID := groupIDs[r.DestCategoryGroupID]; !byID || r.DestCategoryGroupID == "" {
-					return &bulkRefViolation{Owner: owner, Type: "category-group", Name: r.DestCategoryGroup}
-				}
-			}
+		if err := validateBulkRuleRefs(c, &c.Rules[i], ids); err != nil {
+			return err
 		}
-		if c.CheckRuleProfiles && r.DecryptionProfile != "" {
-			if _, byName := profNames[strings.ToLower(r.DecryptionProfile)]; !byName {
-				if _, byID := profIDs[r.DecryptionProfileID]; !byID || r.DecryptionProfileID == "" {
-					return &bulkRefViolation{Owner: owner, Type: "decryption-profile", Name: r.DecryptionProfile}
-				}
+	}
+	return nil
+}
+
+// bulkObjectIdentities is the candidate object identity index a rule edge is
+// judged against: lowercase names and non-empty IDs of the candidate groups
+// and decryption profiles.
+type bulkObjectIdentities struct {
+	groupNames, groupIDs, profNames, profIDs map[string]struct{}
+}
+
+// validateBulkGroupCategories judges every category membership of every
+// candidate group (blank members are ignored).
+func validateBulkGroupCategories(c bulkCandidate) error {
+	for i := range c.Groups {
+		for _, m := range c.Groups[i].Categories {
+			if strings.TrimSpace(m) == "" {
+				continue
 			}
-		}
-		if c.CheckCategories && r.DestCategory != CategoryAny && r.DestCategory != "" {
-			if !c.CategoryOK(string(r.DestCategory)) {
-				return &bulkRefViolation{Owner: owner, Type: "category", Name: string(r.DestCategory)}
-			}
-		}
-		if c.CheckRuleFileProfiles && r.FileProfile != "" && r.FileProfile != FileProfileNone {
-			if !fileProfileRefResolves(r, c.FileProfiles) {
-				return &bulkRefViolation{Owner: owner, Type: "file-profile", Name: string(r.FileProfile)}
+			if !c.CategoryOK(m) {
+				return &bulkRefViolation{Owner: fmt.Sprintf("category group %q", c.Groups[i].Name), Type: "category", Name: m}
 			}
 		}
 	}
 	return nil
+}
+
+// validateBulkRuleRefs judges one candidate rule's enabled edges: category
+// group (by name, else by a non-empty ID), decryption profile (same), plain
+// category, and file profile (the enforcement-mirroring resolver).
+func validateBulkRuleRefs(c bulkCandidate, r *PolicyRule, ids bulkObjectIdentities) error {
+	owner := fmt.Sprintf("policy rule %q", r.Name)
+	if c.CheckRuleGroups && r.DestCategoryGroup != "" && !bulkRefByNameOrID(ids.groupNames, ids.groupIDs, r.DestCategoryGroup, r.DestCategoryGroupID) {
+		return &bulkRefViolation{Owner: owner, Type: "category-group", Name: r.DestCategoryGroup}
+	}
+	if c.CheckRuleProfiles && r.DecryptionProfile != "" && !bulkRefByNameOrID(ids.profNames, ids.profIDs, r.DecryptionProfile, r.DecryptionProfileID) {
+		return &bulkRefViolation{Owner: owner, Type: "decryption-profile", Name: r.DecryptionProfile}
+	}
+	if c.CheckCategories && r.DestCategory != CategoryAny && r.DestCategory != "" && !c.CategoryOK(string(r.DestCategory)) {
+		return &bulkRefViolation{Owner: owner, Type: "category", Name: string(r.DestCategory)}
+	}
+	if c.CheckRuleFileProfiles && r.FileProfile != "" && r.FileProfile != FileProfileNone && !fileProfileRefResolves(r, c.FileProfiles) {
+		return &bulkRefViolation{Owner: owner, Type: "file-profile", Name: string(r.FileProfile)}
+	}
+	return nil
+}
+
+// bulkRefByNameOrID resolves an object reference by lowercase name, else by
+// a NON-EMPTY id present in the candidate set.
+func bulkRefByNameOrID(names, ids map[string]struct{}, name, id string) bool {
+	if _, byName := names[strings.ToLower(name)]; byName {
+		return true
+	}
+	if id == "" {
+		return false
+	}
+	_, byID := ids[id]
+	return byID
 }
 
 // fileProfileRefResolves judges one rule's file-profile reference against the

@@ -304,7 +304,7 @@ func (s *FileProfileStore) Revision() string {
 // doctrine, 2D-A/2D-B): a management GET must never pair rows from one state
 // with another state's fence token. The returned pointers are immutable
 // published values (see the store contract).
-func (s *FileProfileStore) SnapshotWithRevision() ([]*FileExtProfile, string) {
+func (s *FileProfileStore) SnapshotWithRevision() (profiles []*FileExtProfile, revision string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*FileExtProfile, len(s.profiles))
@@ -338,9 +338,9 @@ func fingerprintProfiles(profiles []*FileExtProfile) string {
 	}
 	sort.Strings(rows)
 	h := sha256.New()
-	fmt.Fprintf(h, "fpv2\x00%d:", len(rows))
+	_, _ = fmt.Fprintf(h, "fpv2\x00%d:", len(rows)) // hash.Hash never errors
 	for _, r := range rows {
-		fmt.Fprintf(h, "%d:%s", len(r), r)
+		_, _ = fmt.Fprintf(h, "%d:%s", len(r), r)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

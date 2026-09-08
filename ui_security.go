@@ -668,18 +668,7 @@ func apiFileblockProfiles(w http.ResponseWriter, r *http.Request) {
 		// restart via reconcileObjectRefNames.
 		var cascadeErr error
 		if renamed {
-			if n := policyStore.CascadeFileProfileRename(id, beforeName, newName); n > 0 {
-				if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
-					cascadeErr = fmt.Errorf("running policy: %w", perr)
-				}
-			}
-			if derr := policyDraft.cascadeFileProfileRename(id, beforeName, newName); derr != nil {
-				if cascadeErr != nil {
-					cascadeErr = fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
-				} else {
-					cascadeErr = fmt.Errorf("draft candidate: %w", derr)
-				}
-			}
+			cascadeErr = cascadeFileProfileRenameDurable(id, beforeName, newName)
 			detail += ", renamed from " + sanitizeLog(beforeName)
 		}
 		if cascadeErr != nil {
@@ -1912,4 +1901,24 @@ func registerSecurityRoutes(mux *http.ServeMux) {
 
 	// ── GeoIP status ────────────────────────────────────────────────────
 	mux.HandleFunc("/api/geoip", apiGeoIPConfig)
+}
+
+// cascadeFileProfileRenameDurable cascades a file-profile rename onto the
+// RUNNING policy and the open draft candidate and reports the first
+// persistence failure of either domain (the in-memory cascade is kept; the
+// caller surfaces a truthful 500 and the next restart converges).
+func cascadeFileProfileRenameDurable(id, beforeName, newName string) error {
+	var cascadeErr error
+	if n := policyStore.CascadeFileProfileRename(id, beforeName, newName); n > 0 {
+		if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
+			cascadeErr = fmt.Errorf("running policy: %w", perr)
+		}
+	}
+	if derr := policyDraft.cascadeFileProfileRename(id, beforeName, newName); derr != nil {
+		if cascadeErr != nil {
+			return fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
+		}
+		return fmt.Errorf("draft candidate: %w", derr)
+	}
+	return cascadeErr
 }

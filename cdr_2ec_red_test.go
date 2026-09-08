@@ -285,7 +285,7 @@ func TestCDR2EC_DuplicatePolicyNameRefused(t *testing.T) {
 // ─── Control: distinct names keep working (green at predecessor AND after) ──
 
 // TestCDR2EC_Control_DistinctPolicyNamesStillAdd guards the R5 correction
-// against overblocking: two rules with different names must both land, and
+// against over-blocking: two rules with different names must both land, and
 // deleting one by name must remove exactly that one.
 func TestCDR2EC_Control_DistinctPolicyNamesStillAdd(t *testing.T) {
 	resetCDRState(t)

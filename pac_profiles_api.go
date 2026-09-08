@@ -132,7 +132,7 @@ func pacApplyProfilesMutation(w http.ResponseWriter, r *http.Request, action, ob
 		return false
 	}
 	if err := pacSettlePendingBeforeWrite(before, candidate); err != nil {
-		logger.Printf("PAC: %s of %q refused: %v", sanitizeLog(action), sanitizeLog(object), err)
+		logger.Printf("PAC: %q of %q refused: %q", sanitizeLog(action), sanitizeLog(object), sanitizeLog(err.Error()))
 		writePACFenceRefusal(w, http.StatusServiceUnavailable, "lifecycle_unsettled",
 			"the profile has an unresolved lifecycle operation whose outcome could not be recorded durably; nothing was changed — retry once the node-local history is writable",
 			map[string]any{"detail": err.Error()})

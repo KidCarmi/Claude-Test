@@ -137,7 +137,7 @@ func rotateTrafficPseudonymKey() error {
 // mintTrafficPseudonymKeyPair mints a fresh (key, generation-id) pair WITHOUT
 // publishing it — the persist-before-apply redaction PUT builds its durable
 // target from this and publishes only after the write lands (2E-B §B/§C).
-func mintTrafficPseudonymKeyPair() ([]byte, string, error) {
+func mintTrafficPseudonymKeyPair() (key []byte, keyID string, err error) {
 	k := make([]byte, trafficKeyLen)
 	if _, err := rand.Read(k); err != nil {
 		return nil, "", err

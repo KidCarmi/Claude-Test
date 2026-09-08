@@ -1193,23 +1193,7 @@ func apiConfigImport(w http.ResponseWriter, r *http.Request) {
 		if replaceMode {
 			target = append([]RewriteRule(nil), b.RewriteRules...)
 		} else {
-			target = rewriter.List()
-			for _, in := range b.RewriteRules {
-				replaced := false
-				if in.StableID != "" {
-					for j := range target {
-						if target[j].StableID == in.StableID {
-							target[j] = in
-							replaced = true
-							break
-						}
-					}
-				}
-				if !replaced {
-					in.StableID = "" // appended rule: server-generated identity
-					target = append(target, in)
-				}
-			}
+			target = mergeImportedRewriteRules(rewriter.List(), b.RewriteRules)
 		}
 		if err := installRewriteRulesDurable(target); err != nil {
 			logger.Printf("ConfigImport: rewrite slice not applied (persist failed): %v", err)
@@ -1315,7 +1299,7 @@ func apiConfigImport(w http.ResponseWriter, r *http.Request) {
 		cur := pacProfiles.Get()
 		cand := importPACProfilesCandidate(cur, &b, replaceMode)
 		if err := pacSettlePendingBeforeWrite(cur, cand); err != nil {
-			logger.Printf("ConfigImport: PAC profiles slice not applied: %v", err)
+			logger.Printf("ConfigImport: PAC profiles slice not applied: %q", sanitizeLog(err.Error()))
 			pacProfilesNotApplied = err.Error()
 		} else {
 			_ = pacProfiles.Set(cand)
@@ -2281,4 +2265,29 @@ func registerSettingsRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/metrics-config", apiMetricsConfig) //
 	mux.HandleFunc("/api/otlp", apiOTLPConfig)              //
 	mux.HandleFunc("/api/connlimit", apiConnLimit)          // GET status / POST update
+}
+
+// mergeImportedRewriteRules is the merge-mode rewrite import: an incoming rule
+// whose stableId matches a live rule REPLACES it in place (idempotent
+// re-import); everything else is appended in order with server-generated
+// identity (its client-supplied stableId is discarded).
+func mergeImportedRewriteRules(live, incoming []RewriteRule) []RewriteRule {
+	target := live
+	for _, in := range incoming {
+		replaced := false
+		if in.StableID != "" {
+			for j := range target {
+				if target[j].StableID == in.StableID {
+					target[j] = in
+					replaced = true
+					break
+				}
+			}
+		}
+		if !replaced {
+			in.StableID = "" // appended rule: server-generated identity
+			target = append(target, in)
+		}
+	}
+	return target
 }

@@ -136,7 +136,8 @@ func computeReceiptIntegrity(items []CDREnrollReceipt) CDREnrollReceiptIntegrity
 		out.Issues = append(out.Issues, CDREnrollReceiptIntegrityIssue{Kind: kind, OperationID: op, Positions: pos})
 	}
 	byID := map[string][]int{}
-	for i, it := range items {
+	for i := range items {
+		it := &items[i]
 		if !cdrOperationIDRE.MatchString(it.OperationID) {
 			add("invalid_operation_id", "", i)
 		} else {
@@ -258,9 +259,7 @@ func (s *cdrEnrollReceiptStore) Create(r CDREnrollReceipt) error {
 	if r.StartedAt.IsZero() {
 		r.StartedAt = r.UpdatedAt
 	}
-	if !cdrOperationIDRE.MatchString(r.OperationID) || !cdrReceiptStateValid(r.State) ||
-		strings.TrimSpace(r.Name) == "" || strings.TrimSpace(r.Endpoint) == "" ||
-		strings.TrimSpace(r.ServerFingerprint) == "" || strings.TrimSpace(r.Actor) == "" {
+	if !r.wellFormed() {
 		return errCDRReceiptInvalid
 	}
 	s.mu.Lock()
@@ -268,25 +267,15 @@ func (s *cdrEnrollReceiptStore) Create(r CDREnrollReceipt) error {
 	if s.degradedLocked() {
 		return errCDRReceiptsDegraded
 	}
-	for _, it := range s.items {
-		if it.OperationID == r.OperationID {
+	for i := range s.items {
+		if s.items[i].OperationID == r.OperationID {
 			return errCDRReceiptExists
 		}
 	}
 	prev := s.items
-	next := append(append([]CDREnrollReceipt(nil), prev...), r)
-	for len(next) > cdrMaxEnrollReceipts {
-		pruned := false
-		for i, it := range next {
-			if it.terminal() && it.OperationID != r.OperationID {
-				next = append(next[:i:i], next[i+1:]...)
-				pruned = true
-				break
-			}
-		}
-		if !pruned {
-			return errCDRReceiptsFull
-		}
+	next, ok := cdrReceiptsWithinCapacity(append(append([]CDREnrollReceipt(nil), prev...), r), r.OperationID)
+	if !ok {
+		return errCDRReceiptsFull
 	}
 	s.items = next
 	if err := s.saveLocked(); err != nil {
@@ -294,6 +283,34 @@ func (s *cdrEnrollReceiptStore) Create(r CDREnrollReceipt) error {
 		return err
 	}
 	return nil
+}
+
+// wellFormed is the create-time validity of a receipt: a grammatical
+// operation id, a known state, and every identity field present.
+func (r *CDREnrollReceipt) wellFormed() bool {
+	return cdrOperationIDRE.MatchString(r.OperationID) && cdrReceiptStateValid(r.State) &&
+		strings.TrimSpace(r.Name) != "" && strings.TrimSpace(r.Endpoint) != "" &&
+		strings.TrimSpace(r.ServerFingerprint) != "" && strings.TrimSpace(r.Actor) != ""
+}
+
+// cdrReceiptsWithinCapacity prunes the OLDEST terminal receipts (never the
+// one being created, keepID) until the list fits the cap; false when only
+// unresolved receipts remain and nothing may be evicted.
+func cdrReceiptsWithinCapacity(next []CDREnrollReceipt, keepID string) ([]CDREnrollReceipt, bool) {
+	for len(next) > cdrMaxEnrollReceipts {
+		pruned := false
+		for i := range next {
+			if next[i].terminal() && next[i].OperationID != keepID {
+				next = append(next[:i:i], next[i+1:]...)
+				pruned = true
+				break
+			}
+		}
+		if !pruned {
+			return next, false
+		}
+	}
+	return next, true
 }
 
 // Put is the pre-R12 name for Create and carries EXACTLY its create-if-
@@ -340,9 +357,9 @@ func (s *cdrEnrollReceiptStore) Update(operationID string, fn func(r *CDREnrollR
 func (s *cdrEnrollReceiptStore) Get(operationID string) (CDREnrollReceipt, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, it := range s.items {
-		if it.OperationID == operationID {
-			return it, true
+	for i := range s.items {
+		if s.items[i].OperationID == operationID {
+			return s.items[i], true
 		}
 	}
 	return CDREnrollReceipt{}, false
@@ -419,12 +436,14 @@ func (s *cdrEnrollReceiptStore) removeAtLocked(idx int) (bool, error) {
 // the operation ids whose transition could NOT be persisted (R12.11).
 func markReceiptFingerprintRevoked(fp string) []string {
 	var failed []string
-	for _, it := range cdrEnrollReceipts.List() {
+	list := cdrEnrollReceipts.List()
+	for i := range list {
+		it := &list[i]
 		if it.Fingerprint != fp || it.State == cdrReceiptRevoked {
 			continue
 		}
 		if err := cdrEnrollReceipts.Update(it.OperationID, func(r *CDREnrollReceipt) { r.State = cdrReceiptRevoked }); err != nil {
-			logger.Printf("CDR: enrollment receipt %s: record revocation: %v", it.OperationID, err)
+			logger.Printf("CDR: enrollment receipt %q: record revocation: %q", sanitizeLog(it.OperationID), sanitizeLog(err.Error()))
 			failed = append(failed, it.OperationID)
 		}
 	}
@@ -475,7 +494,9 @@ const (
 // cdrRegistryHoldsFingerprint reports whether any enrolled instance's
 // lineage (or legacy record) names fp.
 func cdrRegistryHoldsFingerprint(fp string) (string, bool) {
-	for _, inst := range cdrInstances.SnapshotView() {
+	insts := cdrInstances.SnapshotView()
+	for i := range insts {
+		inst := &insts[i]
 		if inst.ClientCertFingerprint == fp {
 			return inst.Name, true
 		}
@@ -563,24 +584,8 @@ func apiCDREnrollRecover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	receipt, hasReceipt := cdrEnrollReceipts.Get(opID)
-	endpoint := strings.TrimSpace(req.Endpoint)
-	serverFP := strings.TrimSpace(req.ServerFingerprint)
-	if hasReceipt {
-		// R12.5/6: the bound endpoint + pin are authoritative; a caller
-		// value that conflicts is refused BEFORE any network activity.
-		if endpoint != "" && endpoint != receipt.Endpoint {
-			http.Error(w, fmt.Sprintf("operation %s is bound to endpoint %s; the supplied endpoint conflicts and is refused", opID, receipt.Endpoint), http.StatusConflict)
-			return
-		}
-		if serverFP != "" && normaliseFingerprint(serverFP) != normaliseFingerprint(receipt.ServerFingerprint) {
-			http.Error(w, fmt.Sprintf("operation %s is bound to a different server fingerprint; the supplied pin conflicts and is refused", opID), http.StatusConflict)
-			return
-		}
-		endpoint = receipt.Endpoint
-		serverFP = receipt.ServerFingerprint
-	}
-	if endpoint == "" || serverFP == "" {
-		http.Error(w, "no receipt for that operation; endpoint and serverFingerprint are required to resolve it", http.StatusBadRequest)
+	endpoint, serverFP, ok := cdrRecoverBinding(w, req, opID, receipt, hasReceipt)
+	if !ok {
 		return
 	}
 
@@ -603,46 +608,11 @@ func apiCDREnrollRecover(w http.ResponseWriter, r *http.Request) {
 		if err := cdrEnrollReceipts.Update(opID, fn); err != nil {
 			out["receiptUpdated"] = false
 			out["receiptError"] = sanitizeLog(err.Error())
-			logger.Printf("CDR: enrollment receipt %s: transition failed (previous durable state kept): %v", opID, err)
+			logger.Printf("CDR: enrollment receipt %q: transition failed (previous durable state kept): %q", sanitizeLog(opID), sanitizeLog(err.Error()))
 		}
 	}
 	st, err := cdrEnrollStatusRPC(ctx, endpoint, serverFP, opID)
-	classification := cdrRecoverAmbiguous
-	switch {
-	case err != nil:
-		out["retryable"] = true
-		out["error"] = sanitizeLog(err.Error())
-	case st.GetOutcome() == pb.EnrollOutcome_ENROLL_NOT_ISSUED:
-		classification = cdrRecoverNotIssued
-		if hasReceipt && !receipt.terminal() {
-			transition(func(rc *CDREnrollReceipt) { rc.State = cdrReceiptNotIssued })
-		}
-	case st.GetOutcome() == pb.EnrollOutcome_ENROLL_ISSUED:
-		fp := st.GetClientCertFingerprint()
-		out["fingerprint"] = fp
-		out["revoked"] = st.GetRevoked()
-		if name, held := cdrRegistryHoldsFingerprint(fp); held {
-			classification = cdrRecoverLanded
-			out["name"] = name
-			if hasReceipt && receipt.State == cdrReceiptDispatched {
-				transition(func(rc *CDREnrollReceipt) { rc.State = cdrReceiptStored; rc.Fingerprint = fp })
-			}
-		} else {
-			classification = cdrRecoverNotStored
-			out["revocation"] = cdrOrphanRevocationPath(fp)
-			if hasReceipt && !receipt.terminal() {
-				state := cdrReceiptIssuedNotStored
-				if st.GetRevoked() {
-					state = cdrReceiptRevoked
-				}
-				transition(func(rc *CDREnrollReceipt) { rc.State = state; rc.Fingerprint = fp })
-			}
-		}
-	default:
-		// A v0.2 server answers UNSPECIFIED — it cannot resolve operations.
-		out["retryable"] = false
-		out["error"] = "the Sluice server does not support operation resolution (v0.2); resolve it on the Sluice host (sluice node list)"
-	}
+	classification := cdrRecoverClassify(err, st.GetOutcome(), st.GetClientCertFingerprint(), st.GetRevoked(), receipt, hasReceipt, out, transition)
 	out["classification"] = classification
 	if rc, ok := cdrEnrollReceipts.Get(opID); ok {
 		out["receiptState"] = rc.State
@@ -650,6 +620,85 @@ func apiCDREnrollRecover(w http.ResponseWriter, r *http.Request) {
 	auditEvent(r, "cdr.instance.enroll.recover", opID,
 		fmt.Sprintf("classification=%s fingerprint=%v receiptUpdated=%v", classification, out["fingerprint"], out["receiptUpdated"]))
 	jsonOK(w, out)
+}
+
+// cdrRecoverBinding resolves the endpoint + server pin a recovery resolves
+// against (R12.5/6): with a receipt, the BOUND values are authoritative and
+// a caller value that conflicts is refused (409) BEFORE any network
+// activity; without one, both must be supplied (400). ok=false means the
+// refusal has been written.
+func cdrRecoverBinding(w http.ResponseWriter, req cdrRecoverRequest, opID string, receipt CDREnrollReceipt, hasReceipt bool) (endpoint, serverFP string, ok bool) {
+	endpoint = strings.TrimSpace(req.Endpoint)
+	serverFP = strings.TrimSpace(req.ServerFingerprint)
+	if hasReceipt {
+		if endpoint != "" && endpoint != receipt.Endpoint {
+			http.Error(w, fmt.Sprintf("operation %s is bound to endpoint %s; the supplied endpoint conflicts and is refused", opID, receipt.Endpoint), http.StatusConflict)
+			return "", "", false
+		}
+		if serverFP != "" && normaliseFingerprint(serverFP) != normaliseFingerprint(receipt.ServerFingerprint) {
+			http.Error(w, fmt.Sprintf("operation %s is bound to a different server fingerprint; the supplied pin conflicts and is refused", opID), http.StatusConflict)
+			return "", "", false
+		}
+		endpoint = receipt.Endpoint
+		serverFP = receipt.ServerFingerprint
+	}
+	if endpoint == "" || serverFP == "" {
+		http.Error(w, "no receipt for that operation; endpoint and serverFingerprint are required to resolve it", http.StatusBadRequest)
+		return "", "", false
+	}
+	return endpoint, serverFP, true
+}
+
+// cdrRecoverClassify turns the EnrollStatus answer into a classification and
+// the matching receipt transition: a transport error is retryable and
+// AMBIGUOUS; NOT_ISSUED moves an unresolved receipt to not_issued; ISSUED is
+// resolved against the local registry (cdrRecoverIssued); an UNSPECIFIED
+// answer is a v0.2 server that cannot resolve operations.
+func cdrRecoverClassify(err error, outcome pb.EnrollOutcome, fp string, revoked bool, receipt CDREnrollReceipt, hasReceipt bool, out map[string]any, transition func(func(rc *CDREnrollReceipt))) string {
+	switch {
+	case err != nil:
+		out["retryable"] = true
+		out["error"] = sanitizeLog(err.Error())
+		return cdrRecoverAmbiguous
+	case outcome == pb.EnrollOutcome_ENROLL_NOT_ISSUED:
+		if hasReceipt && !receipt.terminal() {
+			transition(func(rc *CDREnrollReceipt) { rc.State = cdrReceiptNotIssued })
+		}
+		return cdrRecoverNotIssued
+	case outcome == pb.EnrollOutcome_ENROLL_ISSUED:
+		return cdrRecoverIssued(fp, revoked, receipt, hasReceipt, out, transition)
+	default:
+		// A v0.2 server answers UNSPECIFIED — it cannot resolve operations.
+		out["retryable"] = false
+		out["error"] = "the Sluice server does not support operation resolution (v0.2); resolve it on the Sluice host (sluice node list)"
+		return cdrRecoverAmbiguous
+	}
+}
+
+// cdrRecoverIssued classifies an ISSUED outcome against the local registry:
+// a fingerprint the registry holds LANDED (a dispatched receipt is moved to
+// stored); one it does not hold is ISSUED_BUT_NOT_STORED — the orphan
+// revocation path is reported and an unresolved receipt is moved to
+// issued_not_stored (or revoked, when the server already revoked it).
+func cdrRecoverIssued(fp string, revoked bool, receipt CDREnrollReceipt, hasReceipt bool, out map[string]any, transition func(func(rc *CDREnrollReceipt))) string {
+	out["fingerprint"] = fp
+	out["revoked"] = revoked
+	if name, held := cdrRegistryHoldsFingerprint(fp); held {
+		out["name"] = name
+		if hasReceipt && receipt.State == cdrReceiptDispatched {
+			transition(func(rc *CDREnrollReceipt) { rc.State = cdrReceiptStored; rc.Fingerprint = fp })
+		}
+		return cdrRecoverLanded
+	}
+	out["revocation"] = cdrOrphanRevocationPath(fp)
+	if hasReceipt && !receipt.terminal() {
+		state := cdrReceiptIssuedNotStored
+		if revoked {
+			state = cdrReceiptRevoked
+		}
+		transition(func(rc *CDREnrollReceipt) { rc.State = state; rc.Fingerprint = fp })
+	}
+	return cdrRecoverNotStored
 }
 
 // apiCDREnrollReceipts lists (viewer) or removes (admin) recovery receipts.
@@ -664,8 +713,8 @@ func apiCDREnrollReceipts(w http.ResponseWriter, r *http.Request) {
 		}
 		list := cdrEnrollReceipts.List()
 		unresolved := 0
-		for _, it := range list {
-			if !it.terminal() {
+		for i := range list {
+			if !list[i].terminal() {
 				unresolved++
 			}
 		}

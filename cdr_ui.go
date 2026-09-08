@@ -461,7 +461,7 @@ func apiCDREnroll(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	resp, err := cdrEnrollRPC(ctx, req.Endpoint, req.ServerFingerprint, req.Token, req.OperationID)
 	if err != nil {
-		logger.Printf("CDR: enrollment RPC failed for %q (operation %s): %v", sanitizeLog(req.Name), req.OperationID, err)
+		logger.Printf("CDR: enrollment RPC failed for %q (operation %q): %q", sanitizeLog(req.Name), sanitizeLog(req.OperationID), sanitizeLog(err.Error()))
 		enrollDispatchFailed(w, r, req, err)
 		return
 	}
@@ -484,7 +484,7 @@ func apiCDREnroll(w http.ResponseWriter, r *http.Request) {
 		rc.State = cdrReceiptStored
 		rc.Fingerprint = stored.ClientCertFingerprint
 	}); rerr != nil {
-		logger.Printf("CDR: enrollment receipt %s: record stored: %v", req.OperationID, rerr)
+		logger.Printf("CDR: enrollment receipt %q: record stored: %q", sanitizeLog(req.OperationID), sanitizeLog(rerr.Error()))
 		receiptState = cdrReceiptDispatched
 		receiptRecorded = false
 		receiptErr = sanitizeLog(rerr.Error())
@@ -607,7 +607,7 @@ func persistCDREnrollment(req cdrEnrollRequest, resp *pb.EnrollResponse) (CDREnr
 			rc.Fingerprint = fp
 			rc.Note = err.Error()
 		}); rerr != nil {
-			logger.Printf("CDR: enrollment receipt %s: record issued_not_stored: %v", req.OperationID, rerr)
+			logger.Printf("CDR: enrollment receipt %q: record issued_not_stored: %q", sanitizeLog(req.OperationID), sanitizeLog(rerr.Error()))
 			receiptNote = fmt.Sprintf("; the receipt could not be updated (%v) and stays dispatched", rerr)
 		}
 	}
@@ -618,7 +618,7 @@ func persistCDREnrollment(req cdrEnrollRequest, resp *pb.EnrollResponse) (CDREnr
 		Detail: fmt.Sprintf("Sluice issued client cert fingerprint %s (operation %s) but local persistence failed: %v; the credential remains trusted by Sluice until revoked",
 			fp, req.OperationID, err),
 	})
-	logger.Printf("CDR: enrollment %q: issued credential %s was NOT stored (operation %s): %v", sanitizeLog(req.Name), fp, req.OperationID, err)
+	logger.Printf("CDR: enrollment %q: issued credential %q was NOT stored (operation %q): %q", sanitizeLog(req.Name), sanitizeLog(fp), sanitizeLog(req.OperationID), sanitizeLog(err.Error()))
 	return CDREnrolledInstance{}, fmt.Errorf("%w; issued credential %s is not stored — revoke it%s", err, fp, receiptNote)
 }
 
@@ -1087,7 +1087,7 @@ func apiCDRRevokeOrphan(w http.ResponseWriter, r *http.Request, fp, reason strin
 	localOK := len(unrecorded) == 0
 	if name, held := cdrRegistryHoldsFingerprint(fp); held {
 		if merr := cdrInstances.MarkCredentialRevoked(name, fp); merr != nil {
-			logger.Printf("CDR: revoke %s: record on %q: %v", fp, sanitizeLog(name), merr)
+			logger.Printf("CDR: revoke %q: record on %q: %q", sanitizeLog(fp), sanitizeLog(name), sanitizeLog(merr.Error()))
 			localOK = false
 		}
 	}

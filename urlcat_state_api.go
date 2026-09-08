@@ -68,7 +68,7 @@ func enrichURLCategories(all []CategoryEntry, feedOwned bool) []enrichedURLCateg
 		enriched[i] = enrichedURLCategory{
 			CategoryEntry: e,
 			FeedBacked:    ut1Set[strings.ToLower(e.Name)],
-			Writable:      !(e.BuiltIn && feedOwned),
+			Writable:      !e.BuiltIn || !feedOwned,
 		}
 	}
 	return enriched

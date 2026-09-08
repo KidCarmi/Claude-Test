@@ -1034,7 +1034,7 @@ func pacCompleteCommittedLocked(lc *pac.ProfileLifecycle, op *pac.PendingOp, mod
 			err = publishCurrentConfigSnapshot()
 		}
 		if err != nil {
-			logger.Printf("PAC: cluster publication for %s of %q failed; pending reconciliation: %v", sanitizeLog(op.OperationID), sanitizeLog(op.ProfileID), err)
+			logger.Printf("PAC: cluster publication for %q of %q failed; pending reconciliation: %q", sanitizeLog(op.OperationID), sanitizeLog(op.ProfileID), sanitizeLog(err.Error()))
 			return pac.HistoryStatePendingReconciliation, n
 		}
 		pacResetProfileAlert(op.ProfileID)

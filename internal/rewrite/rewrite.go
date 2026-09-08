@@ -179,7 +179,7 @@ func (rw *Rewriter) RemoveByStableID(stableID string) bool {
 // StateSnapshot returns the ordered rules AND the content-derived revision
 // that describes exactly them, from ONE lock hold (v2 coherent-read
 // contract): rows from one state must never pair with another state's fence.
-func (rw *Rewriter) StateSnapshot() ([]Rule, string) {
+func (rw *Rewriter) StateSnapshot() (rules []Rule, revision string) {
 	rw.mu.RLock()
 	defer rw.mu.RUnlock()
 	out := make([]Rule, len(rw.rules))
@@ -202,19 +202,19 @@ func FingerprintRules(rules []Rule) string {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		fmt.Fprintf(h, "%s:%d\x00", tag, len(keys))
+		_, _ = fmt.Fprintf(h, "%s:%d\x00", tag, len(keys)) // hash.Hash never errors
 		for _, k := range keys {
-			fmt.Fprintf(h, "%d\x00%s\x00%d\x00%s\x00", len(k), k, len(m[k]), m[k])
+			_, _ = fmt.Fprintf(h, "%d\x00%s\x00%d\x00%s\x00", len(k), k, len(m[k]), m[k])
 		}
 	}
 	writeList := func(tag string, l []string) {
-		fmt.Fprintf(h, "%s:%d\x00", tag, len(l))
+		_, _ = fmt.Fprintf(h, "%s:%d\x00", tag, len(l))
 		for _, v := range l {
-			fmt.Fprintf(h, "%d\x00%s\x00", len(v), v)
+			_, _ = fmt.Fprintf(h, "%d\x00%s\x00", len(v), v)
 		}
 	}
 	for i, r := range rules {
-		fmt.Fprintf(h, "rule:%d\x00%d\x00%s\x00%d\x00%s\x00", i, len(r.StableID), r.StableID, len(r.Host), r.Host)
+		_, _ = fmt.Fprintf(h, "rule:%d\x00%d\x00%s\x00%d\x00%s\x00", i, len(r.StableID), r.StableID, len(r.Host), r.Host)
 		writeMap("qs", r.ReqSet)
 		writeMap("qa", r.ReqAdd)
 		writeList("qr", r.ReqRemove)

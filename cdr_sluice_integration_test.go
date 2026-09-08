@@ -57,7 +57,8 @@ func buildPinnedSluice(t *testing.T) string {
 			return
 		}
 		sluiceBinPath = filepath.Join(dir, "sluice")
-		cmd := exec.Command("go", "build", "-o", sluiceBinPath, "github.com/KidCarmi/Sluice/cmd/sluice")
+		//nolint:gosec // G204: the module path is the go.mod-pinned Sluice engine, the output path is this harness's tmp dir
+		cmd := exec.CommandContext(context.Background(), "go", "build", "-o", sluiceBinPath, "github.com/KidCarmi/Sluice/cmd/sluice")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			sluiceBinErr = fmt.Errorf("build pinned sluice: %v\n%s", err, out)
@@ -83,7 +84,7 @@ type sluiceDaemon struct {
 
 func freeTCPPort(t *testing.T) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +136,8 @@ logging:
 func (d *sluiceDaemon) boot() {
 	d.t.Helper()
 	_ = os.Remove(filepath.Join(d.dataDir, "enrollment_token"))
-	cmd := exec.Command(d.bin, "-config", d.cfgPath)
+	//nolint:gosec // G204: d.bin is the daemon this harness built from the pinned module above
+	cmd := exec.CommandContext(context.Background(), d.bin, "-config", d.cfgPath)
 	logPath := filepath.Join(d.dataDir, "sluice.log")
 	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -154,7 +156,7 @@ func (d *sluiceDaemon) boot() {
 			d.t.Fatalf("sluice did not come up on %s:\n%s", d.addr, logs)
 		}
 		tok, terr := os.ReadFile(filepath.Join(d.dataDir, "enrollment_token"))
-		conn, cerr := net.DialTimeout("tcp", d.addr, 500*time.Millisecond)
+		conn, cerr := (&net.Dialer{Timeout: 500 * time.Millisecond}).DialContext(context.Background(), "tcp", d.addr)
 		if cerr == nil {
 			_ = conn.Close()
 		}
@@ -213,6 +215,7 @@ func (d *sluiceDaemon) client(t *testing.T, resp *pb.EnrollResponse, clientCert,
 	return c
 }
 
+//nolint:gocognit // linear proof script: every step is part of the specification
 func TestSluiceIntegration_TrustLifecycleContract(t *testing.T) {
 	d := startSluiceDaemon(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
