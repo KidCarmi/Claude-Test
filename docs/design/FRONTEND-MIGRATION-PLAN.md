@@ -3530,6 +3530,25 @@ frozen program branch is untouched.
 > answer held open and proves the controls are disabled until it lands
 > and re-enabled after. Frontend only; `frontend/dist` regenerated.
 >
+> **PR-C11 — the third Codex round (one P2).** Confirmed against both
+> sides (the Go normaliser and the browser's URL parser) and pinned in
+> `frontend/src/test/pr-c11-codex-red.test.tsx` (K6, eight failing cases,
+> three companions and one control) before the correction. The
+> appliance's `normalizeHost` recognises only a full dotted-quad as IPv4
+> and otherwise keeps the UTS-46 mapping of what was typed, so `127.1`,
+> `2130706433` and `0x7f.1` are stored and returned VERBATIM and
+> full-width `１２７.１` becomes `127.1`; the PR-C10 `canonicalSpec` mapped
+> every non-IPv6 host through the WHATWG URL parser, which treats a last
+> label that ends in a number as an IPv4 literal and collapses all four
+> to `127.0.0.1`, so a genuine create/update success on such a host was
+> classified UNPROVEN. `canonicalSpec` now asks the parser to map the
+> host with a sentinel trailing label appended (never a last label, never
+> numeric) and strips the sentinel again, which keeps the IDNA punycode
+> mapping the parser was used for (`bücher.example` →
+> `xn--bcher-kva.example`) and mirrors the appliance on every spelling; a
+> different numeric host still stays unproven. Frontend only;
+> `frontend/dist` regenerated.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
