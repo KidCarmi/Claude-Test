@@ -1096,6 +1096,17 @@ run_mutation M115 \
   . mcp_canary_autostop.go \
   's/\tif gen == 0 \{\n\t\treturn\n\t\}\n//'
 
+# M116 is the THIRD seam of the same round-18 rule. Round 18 hardened the two reporters it was
+# looking at and left the admission gate forwarding whatever currentGeneration returned straight to
+# tripCanaryAbortForGeneration — where a zero is the wildcard, not a null. The guard is deliberately
+# duplicated at each seam rather than centralised, so each one is independently breakable and each
+# needs its own mutation; two of the three being pinned is exactly how this one survived.
+run_mutation M116 \
+  'the admission gate forwards the zero wildcard to the abort authority' \
+  'TestAutoStop_ZeroGenerationDriftAtAdmissionCannotStopALiveActivation' \
+  . mcp_live_gate.go \
+  's/if g\.tripBreach != nil && admittingGen != 0 \{/if g\.tripBreach != nil \{/'
+
 # ── (17) THE PROOF RULE ITSELF ──────────────────────────────────────────────
 #
 # The defect from M16 is invisible to a permissive test sink. This mutation proves

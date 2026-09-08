@@ -1705,3 +1705,67 @@ func TestAutoStop_ZeroGenerationBreachCannotStopALiveActivation(t *testing.T) {
 		t.Fatal("control: the unbound abort must have stopped the Canary")
 	}
 }
+
+// TestAutoStop_ZeroGenerationDriftAtAdmissionCannotStopALiveActivation is the SAME round-18
+// invariant at the third breach seam — the one it was never applied to.
+//
+// Round 18 hardened two of the three generation-bound breach reporters against a zero generation
+// (Deps.reportCanaryBreach, canarySafetyFunnel.Breach). The admission gate is the third, and it
+// forwarded whatever mcpLiveSideEffectGate.currentGeneration returned straight to
+// tripCanaryAbortForGeneration — where a zero is not a null but a WILDCARD that skips the
+// generation check and latches whatever activation is current.
+//
+// The gap is narrow and fail-closed in the ordinary case (an unarmed capability's trip is a no-op),
+// which is precisely why it survived: the harmful interleaving is an admission that read the
+// generation before any activation existed and reported after one landed, and the cost is a fresh
+// experiment stopped at birth for something observed on behalf of no experiment at all. Stopping a
+// healthy Canary for something outside its own blast radius is the direction this subsystem's own
+// round-15 note calls indistinguishable, to an operator, from the control being wrong.
+//
+// currentGeneration is stubbed rather than raced, because the interleaving is not schedulable from
+// a test: the seam exists so the value can be supplied, and supplying the value the race would
+// produce is the faithful reproduction.
+func TestAutoStop_ZeroGenerationDriftAtAdmissionCannotStopALiveActivation(t *testing.T) {
+	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
+	capb := rollout.CapabilityGateway
+	g, sid, tool, fpHex, now := armDriftFixture(t, rt, capb)
+
+	// PREMISE: a real activation is running, healthy, and holds execution authority.
+	if rt.abortedNow(capb) {
+		t.Fatal("premise: a freshly armed activation must not already be aborted")
+	}
+	if rt.currentGeneration(capb) == 0 {
+		t.Fatal("premise: an armed activation must report a non-zero generation")
+	}
+
+	// THE UNATTRIBUTABLE OBSERVATION: the admission names no activation.
+	g.currentGeneration = func() uint64 { return 0 }
+	republishToolWithNewFingerprint(t, sid, tool)
+
+	if d := g.AdmitSideEffect(driftGateInput(sid, tool, fpHex, now)); d.Admit {
+		t.Fatal("a request whose reviewed fingerprint no longer matches the live tool must fail closed")
+	}
+	if rt.abortedNow(capb) {
+		t.Fatal("SECURITY: an unattributable drift observation stopped the live activation — zero is " +
+			"a WILDCARD downstream (\"whatever is current\"), not a null, so an observation that " +
+			"belongs to no activation latched the one that happened to be running")
+	}
+	if st := canaryAbortStatusFor(capb); st.ExecutionAuthority != "granted" {
+		t.Fatalf("the live activation must keep its authority, got %q", st.ExecutionAuthority)
+	}
+
+	// THE CONTROL, and it is what stops this gate from passing on a build where the admission seam
+	// simply reports nothing: once the observation CAN be attributed, the very same rug-pull must
+	// still stop the whole Canary.
+	g.currentGeneration = func() uint64 { return rt.currentGeneration(capb) }
+	if d := g.AdmitSideEffect(driftGateInput(sid, tool, fpHex, now)); d.Admit {
+		t.Fatal("control: the drifted request must still fail closed")
+	}
+	if !rt.abortedNow(capb) {
+		t.Fatal("control: an ATTRIBUTABLE rug-pull must still stop the whole Canary — the guard must " +
+			"drop only reports that name no activation, never disable the breach path")
+	}
+	if st := canaryAbortStatusFor(capb); st.FirstAbortReason != "tool_fingerprint_drift" {
+		t.Fatalf("control: the first cause must name the drift, got %q", st.FirstAbortReason)
+	}
+}

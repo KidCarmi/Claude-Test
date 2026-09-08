@@ -119,8 +119,8 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	// activation that was admitting this request, not to whatever is current by the time the trip
 	// runs. A demote-and-reactivate in between makes the observation stale, and a stale observation
 	// must not stop a fresh experiment.
-	// Optional seam: a gate built without it (the injected doubles) reports 0, which the trip reads
-	// as "no activation named" and treats as the current one — the pre-existing behaviour.
+	// Optional seam: a gate built without it (the injected doubles) reports 0, which names no
+	// activation at all — and a report that names none is DROPPED below rather than forwarded.
 	var admittingGen uint64
 	if g.currentGeneration != nil {
 		admittingGen = g.currentGeneration()
@@ -132,7 +132,19 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		// it is proof the experiment's premise (a pinned, reviewed target) no longer holds, so the
 		// request fails closed AND the whole Canary latches. The trip goes through the one abort
 		// authority; it never latches anything locally.
-		if g.tripBreach != nil {
+		//
+		// A ZERO GENERATION IS DROPPED, for the same reason it is dropped at the other two breach
+		// seams (Deps.reportCanaryBreach and canarySafetyFunnel.Breach, Codex round 18). Zero is
+		// not a null downstream: tripCanaryAbortForGeneration documents wantGen == 0 as "whatever
+		// is current" and SKIPS the generation check entirely — a wildcard reserved for the unbound
+		// tripCanaryAbort entry point. This seam is generation-BOUND, so forwarding a zero would
+		// mean "stop whichever activation is running now" on the strength of an observation that
+		// could not be attributed to any activation: exactly the inversion the other two seams were
+		// hardened against, left standing at the third. beginCanaryActivation increments before it
+		// arms, so an armed activation always has a generation >= 1 and dropping a zero can never
+		// suppress an attributable trip — it can only decline to charge one experiment for what was
+		// observed on behalf of another (or of none).
+		if g.tripBreach != nil && admittingGen != 0 {
 			g.tripBreach(admittingGen, driftCode)
 		}
 	}
