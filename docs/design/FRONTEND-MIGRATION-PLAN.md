@@ -3597,6 +3597,26 @@ frozen program branch is untouched.
 > keeps; a character neither side trims (U+200B) still binds only to
 > itself. Frontend only; `frontend/dist` regenerated.
 >
+> **PR-C15 — the seventh Codex round (two P2s).** Both confirmed and
+> pinned before the correction (`upstream_codex_r7_red_test.go`,
+> `frontend/src/test/pr-c15-codex-red.test.tsx`). (R7-A) `normalizeHost`
+> accepted hosts with EMPTY labels (`.example`, `parent..example`) — the
+> IDNA mapping passes them through unchanged — so an invalid DNS name was
+> persisted and published as an eligible parent; `validateHostLabels` now
+> refuses any empty label after the mapping while keeping the single
+> trailing FQDN dot, and the endpoints answer `invalid_entry`. (R7-B) The
+> manual probe's client deadline was sized from the page's entry count,
+> which is not an upper bound (the appliance probes the CURRENT entries
+> sequentially, so entries added by another admin after the page's read
+> outran the deadline and the completed run latched as unproven). The
+> read model now exposes the node-local single-flight state
+> (`probe.manualInFlight`, additive; OpenAPI + bundle regenerated), and
+> the page resolves a timed-out probe against the appliance: it polls the
+> read model until no run is in flight and counts the run as completed
+> only when at least one eligible entry's health advanced with the manual
+> source; nothing in flight and nothing advanced stays unproven,
+> fail-closed. Backend + frontend; `frontend/dist` regenerated.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
