@@ -17,7 +17,10 @@ version is `info.version` in `api/openapi/openapi.yaml` and follows
   backend trust and concurrency corrections recorded in
   `docs/design/FRONTEND-MIGRATION-PLAN.md` §FE-5.
 - `CULVERT_DATA_DIR` — startup-scoped override of the persisted-state root
-  (default `/data`, unchanged when unset).
+  (default `/data`, unchanged when unset). Every persisted-state path —
+  including the config-version store, registry settings, the CDR
+  enrollment certs root and runtime marker, and the alert retry queue —
+  follows the override.
 - Admin API operations (contract 2.0.0): `GET /api/rewrite/state`,
   `GET /api/fileblock/profiles/state`, `GET /api/urlcat/state`,
   `GET /api/pac/profiles/{name}/lifecycle`, the Upstream v2 entry endpoints

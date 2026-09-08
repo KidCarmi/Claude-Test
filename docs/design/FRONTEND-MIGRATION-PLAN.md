@@ -3340,6 +3340,19 @@ frozen program branch is untouched.
 > `unshare -m` + read-only tmpfs shape) so a root-only premise can never
 > pass again.
 >
+> **PR-C1b — five roots ignored the override.** The read-only-`/data`
+> re-run after PR-C1 still failed the PAC lifecycle journeys (409
+> `operation_pending`, `progress.configVersion=false`): the config-version
+> store, registry settings, the CDR enrollment certs root, the CDR runtime
+> marker and the alert retry queue were package-level literals spelled as
+> `/data/...`, bound at init time before any env was consulted. Correction:
+> `rebindDataDirPaths()` re-derives every one of them from the effective
+> root after the override resolves, the CDR startup resolver takes the data
+> root as a parameter (pure, no global read), and the committed RED
+> (`data_dir_paths_red_test.go`) asserts each rebound root so a new literal
+> cannot land unnoticed. The PAC, network and CDR journeys pass under the
+> read-only-`/data` shape after this.
+>
 > **PR-C2 — determinism gate.** Under `-shuffle -count=2` the
 > process-global "stored document rejected at load" latch armed by the R3
 > rejected-document test outlived its environment and handed a 409
