@@ -176,7 +176,7 @@ func TestUpstreamV2_YAMLDuplicateSeedIsRefusedFailClosed(t *testing.T) {
 	}
 	// An existing YAML inline credential is RETAINED (review blocker 2):
 	// usable, read-only, in memory only — and the seed still validates.
-	if err := upstreamPool.Configure([]UpstreamEntry{{URL: "http://u:p@parent-y.test:3128"}}, 5, time.Minute); err != nil {
+	if err := upstreamPool.Configure([]UpstreamEntry{{URL: "http://u:p@parent-y.test:3128"}}, 5, time.Minute); err != nil { //nolint:gosec // G101: fixture credential in a test URL, not a secret
 		t.Fatalf("a YAML URL with an inline credential must be retained: %v", err)
 	}
 	if l := upstreamPool.List(); len(l) != 1 || l[0].CredentialState != upstream.CredentialConfigured || strings.Contains(l[0].URL, "@") {

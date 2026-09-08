@@ -3384,7 +3384,13 @@ frozen program branch is untouched.
 > `rewriteRuleStableIDs` / `diffRewriteRulesLegacy` / `rewriteRulesReordered`,
 > `applyAdminSettingsOverridesUnpersisted`), the rename, and reasoned
 > `//nolint:gosec` on the three test fixtures (the repository's lint
-> suppression convention). No accepted RED assertion changed.
+> suppression convention). No accepted RED assertion changed. The pass
+> widened the review context and surfaced three more of the same class on
+> the next head (cognitive complexity 58 on `apiRewrite`, which this
+> program grew from 48 to 145 lines, and two more fixture-URL G101 hits):
+> the POST/DELETE branches are `apiRewriteAdd` / `apiRewriteRemove` with
+> the removal selector `rewriteRulesWithout`, and the fixtures carry the
+> same reasoned suppression.
 >
 > **PR-C2 — determinism gate.** Under `-shuffle -count=2` the
 > process-global "stored document rejected at load" latch armed by the R3

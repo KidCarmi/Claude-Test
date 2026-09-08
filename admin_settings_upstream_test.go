@@ -287,7 +287,7 @@ func TestAdminSettings_LegacyMigrationParseFailureIsDegradedNotDestructive(t *te
 	if err := json.Unmarshal(after, &s); err != nil {
 		t.Fatal(err)
 	}
-	if s.UpstreamProxiesV2 != nil || len(s.UpstreamProxies) != 2 || s.UpstreamProxies[0].URL != "http://svc:secret@parent-a.test:3128" {
+	if s.UpstreamProxiesV2 != nil || len(s.UpstreamProxies) != 2 || s.UpstreamProxies[0].URL != "http://svc:secret@parent-a.test:3128" { //nolint:gosec // G101: fixture credential in a test URL, not a secret
 		t.Fatalf("a failed migration must leave the legacy upstream sections untouched, got v2=%v legacy=%+v", s.UpstreamProxiesV2, s.UpstreamProxies)
 	}
 	if upstreamPool.Enabled() {

@@ -1638,131 +1638,156 @@ func apiRewrite(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		// AFTER the RBAC boundary (authorization precedes degradation
-		// disclosure): while management identity is not durable a v2
-		// mutation could create/address identity that re-mints on restart
-		// (and a save could clobber a refused/corrupt settings file) — refuse
-		// with the structured 503, visible to authorized Operators only.
-		if d := rewriteIdentityDegraded(); d != nil {
-			writeRewriteIdentityDegraded(w, d)
-			return
-		}
-		var rule RewriteRule
-		if err := decodeJSON(r, &rule); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if err := validateIncomingRewriteRule(rule); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		// Server-owned identity (§22): a client-supplied stableId is ignored.
-		rule.StableID = rewrite.NewStableID()
-		ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
-		// Durable-or-nothing (§24): fence + target build + settings persist +
-		// runtime publication in ONE adminSettingsMu critical section. A hard
-		// persist failure means the rule was never active anywhere.
-		err := saveAdminSettingsWithOverrides(adminSaveOverrides{
-			rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
-				if ferr := rewriteFence(ifRev, current); ferr != nil {
-					return nil, ferr
-				}
-				return append(append([]RewriteRule(nil), current...), rule), nil
-			},
-		})
-		if err != nil {
-			var conflict *errRewriteRevisionConflict
-			if errors.As(err, &conflict) {
-				writeRewriteRevisionConflict(w, conflict.current, ifRev)
-				return
-			}
-			http.Error(w, "rewrite rule not persisted: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// The published copy carries the process-local integer id assigned at
-		// publication — return it for legacy-client compatibility.
-		added := rule
-		for _, lr := range rewriter.List() {
-			if lr.StableID == rule.StableID {
-				added = lr
-				break
-			}
-		}
-		logger.Printf("UI: rewrite rule added stableId=%s host=%q", sanitizeLog(added.StableID), sanitizeLog(added.Host))
-		auditEvent(r, "rewrite.add", fmt.Sprintf("stableId=%s host=%s", added.StableID, added.Host), "")
-		saveConfigVersion(sessionAdmin(r), "rewrite.add")
-		jsonOK(w, added)
+		apiRewriteAdd(w, r)
 
 	case http.MethodDelete:
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		// AFTER the RBAC boundary — same ordering contract as POST.
-		if d := rewriteIdentityDegraded(); d != nil {
-			writeRewriteIdentityDegraded(w, d)
-			return
-		}
-		// v2 addressing: ?stableId= (durable identity). Legacy ?id= (process-
-		// local integer) stays supported for existing clients; it is resolved
-		// to the durable identity INSIDE the critical section so a concurrent
-		// reload cannot retarget it.
-		stableID := strings.TrimSpace(r.URL.Query().Get("stableId"))
-		idStr := strings.TrimSpace(r.URL.Query().Get("id"))
-		var legacyID int
-		hasLegacy := false
-		if stableID == "" {
-			if _, err := fmt.Sscanf(idStr, "%d", &legacyID); err != nil {
-				http.Error(w, "missing or invalid id/stableId param", http.StatusBadRequest)
-				return
-			}
-			hasLegacy = true
-		}
-		ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
-		removedStable := stableID
-		err := saveAdminSettingsWithOverrides(adminSaveOverrides{
-			rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
-				if ferr := rewriteFence(ifRev, current); ferr != nil {
-					return nil, ferr
-				}
-				target := make([]RewriteRule, 0, len(current))
-				found := false
-				for _, cr := range current {
-					match := (stableID != "" && cr.StableID == stableID) ||
-						(hasLegacy && cr.ID == legacyID)
-					if match && !found {
-						found = true
-						removedStable = cr.StableID
-						continue
-					}
-					target = append(target, cr)
-				}
-				if !found {
-					return nil, errRewriteRuleNotFound
-				}
-				return target, nil
-			},
-		})
-		if err != nil {
-			var conflict *errRewriteRevisionConflict
-			if errors.As(err, &conflict) {
-				writeRewriteRevisionConflict(w, conflict.current, ifRev)
-				return
-			}
-			if errors.Is(err, errRewriteRuleNotFound) {
-				http.Error(w, "rule not found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, "rewrite rule removal not persisted: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		logger.Printf("UI: rewrite rule removed stableId=%s", sanitizeLog(removedStable))
-		auditEvent(r, "rewrite.remove", "stableId="+removedStable, "")
-		saveConfigVersion(sessionAdmin(r), "rewrite.remove")
-		w.WriteHeader(http.StatusNoContent)
+		apiRewriteRemove(w, r)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// apiRewriteAdd is the POST branch of apiRewrite (the caller has already
+// enforced the operator role): degradation disclosure AFTER the RBAC
+// boundary, server-owned identity, and the durable-or-nothing append inside
+// one adminSettingsMu critical section (§22/§24).
+func apiRewriteAdd(w http.ResponseWriter, r *http.Request) {
+	// AFTER the RBAC boundary (authorization precedes degradation
+	// disclosure): while management identity is not durable a v2
+	// mutation could create/address identity that re-mints on restart
+	// (and a save could clobber a refused/corrupt settings file) — refuse
+	// with the structured 503, visible to authorized Operators only.
+	if d := rewriteIdentityDegraded(); d != nil {
+		writeRewriteIdentityDegraded(w, d)
+		return
+	}
+	var rule RewriteRule
+	if err := decodeJSON(r, &rule); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := validateIncomingRewriteRule(rule); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Server-owned identity (§22): a client-supplied stableId is ignored.
+	rule.StableID = rewrite.NewStableID()
+	ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
+	// Durable-or-nothing (§24): fence + target build + settings persist +
+	// runtime publication in ONE adminSettingsMu critical section. A hard
+	// persist failure means the rule was never active anywhere.
+	err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+		rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
+			if ferr := rewriteFence(ifRev, current); ferr != nil {
+				return nil, ferr
+			}
+			return append(append([]RewriteRule(nil), current...), rule), nil
+		},
+	})
+	if err != nil {
+		var conflict *errRewriteRevisionConflict
+		if errors.As(err, &conflict) {
+			writeRewriteRevisionConflict(w, conflict.current, ifRev)
+			return
+		}
+		http.Error(w, "rewrite rule not persisted: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// The published copy carries the process-local integer id assigned at
+	// publication — return it for legacy-client compatibility.
+	added := rule
+	for _, lr := range rewriter.List() {
+		if lr.StableID == rule.StableID {
+			added = lr
+			break
+		}
+	}
+	logger.Printf("UI: rewrite rule added stableId=%s host=%q", sanitizeLog(added.StableID), sanitizeLog(added.Host))
+	auditEvent(r, "rewrite.add", fmt.Sprintf("stableId=%s host=%s", added.StableID, added.Host), "")
+	saveConfigVersion(sessionAdmin(r), "rewrite.add")
+	jsonOK(w, added)
+}
+
+// apiRewriteRemove is the DELETE branch of apiRewrite (the caller has already
+// enforced the operator role): v2 ?stableId= addressing with the legacy ?id=
+// resolved to the durable identity INSIDE the critical section, so a
+// concurrent reload cannot retarget it.
+func apiRewriteRemove(w http.ResponseWriter, r *http.Request) {
+	// AFTER the RBAC boundary — same ordering contract as POST.
+	if d := rewriteIdentityDegraded(); d != nil {
+		writeRewriteIdentityDegraded(w, d)
+		return
+	}
+	// v2 addressing: ?stableId= (durable identity). Legacy ?id= (process-
+	// local integer) stays supported for existing clients; it is resolved
+	// to the durable identity INSIDE the critical section so a concurrent
+	// reload cannot retarget it.
+	stableID := strings.TrimSpace(r.URL.Query().Get("stableId"))
+	idStr := strings.TrimSpace(r.URL.Query().Get("id"))
+	var legacyID int
+	hasLegacy := false
+	if stableID == "" {
+		if _, err := fmt.Sscanf(idStr, "%d", &legacyID); err != nil {
+			http.Error(w, "missing or invalid id/stableId param", http.StatusBadRequest)
+			return
+		}
+		hasLegacy = true
+	}
+	ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
+	removedStable := stableID
+	err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+		rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
+			if ferr := rewriteFence(ifRev, current); ferr != nil {
+				return nil, ferr
+			}
+			target, removed, ok := rewriteRulesWithout(current, stableID, hasLegacy, legacyID)
+			if !ok {
+				return nil, errRewriteRuleNotFound
+			}
+			removedStable = removed
+			return target, nil
+		},
+	})
+	if err != nil {
+		var conflict *errRewriteRevisionConflict
+		if errors.As(err, &conflict) {
+			writeRewriteRevisionConflict(w, conflict.current, ifRev)
+			return
+		}
+		if errors.Is(err, errRewriteRuleNotFound) {
+			http.Error(w, "rule not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "rewrite rule removal not persisted: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	logger.Printf("UI: rewrite rule removed stableId=%s", sanitizeLog(removedStable))
+	auditEvent(r, "rewrite.remove", "stableId="+removedStable, "")
+	saveConfigVersion(sessionAdmin(r), "rewrite.remove")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// rewriteRulesWithout returns current minus the FIRST rule addressed by
+// stableID (durable identity) or, when hasLegacy, by the process-local
+// legacy id; removed is the StableID of the dropped rule and ok is false
+// when nothing matched.
+func rewriteRulesWithout(current []RewriteRule, stableID string, hasLegacy bool, legacyID int) (target []RewriteRule, removed string, ok bool) {
+	target = make([]RewriteRule, 0, len(current))
+	for _, cr := range current {
+		match := (stableID != "" && cr.StableID == stableID) ||
+			(hasLegacy && cr.ID == legacyID)
+		if match && !ok {
+			ok = true
+			removed = cr.StableID
+			continue
+		}
+		target = append(target, cr)
+	}
+	return target, removed, ok
 }
 
 // ─── Policy API ───────────────────────────────────────────────────────────────
