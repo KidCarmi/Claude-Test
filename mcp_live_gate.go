@@ -222,31 +222,6 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	}
 }
 
-// mcpLiveTrustRevalidate is the runtime live-execution trust revalidation (§10). It resolves the
-// CURRENT authoritative target for (serverID, toolName) from the tool-trust coordinator (never a
-// request-supplied claim) and requires an active, unexpired live_execution approval that binds
-// that EXACT (tenant, server, tool, fingerprint, format) under the full first-Canary governance
-// (canary.SatisfiesLiveExecution). It is fail-closed: an uncomposed coordinator, a missing tool,
-// a tenant mismatch, an unusable server, a fingerprint that no longer matches the decision, or no
-// satisfying approval all deny. It NEVER consults a shadow approval (SatisfiesLiveExecution rejects
-// a non-live purpose) and NEVER materializes a credential.
-//
-// decisionFP is the DECISION's composite fingerprint (hex) — the fingerprint the request was
-// actually decided against. Two boundary bindings close the F1→F2→F1 catalog-flap and stale-server
-// gaps (Codex P1, PR #1290):
-//   - the reviewed SERVER must still be USABLE now (a disable / lost identity verification after the
-//     decision snapshot fails closed here, even if a stale approval exists), and
-//   - the CURRENT target fingerprint must still EQUAL the decision fingerprint, so an approval issued
-//     for a DIFFERENT fingerprint (e.g. an F2 approval when this request was decided under F1) can
-//     never authorize this side effect. The approval is then validated against that same fingerprint.
-func mcpLiveTrustRevalidate(tenant, serverID, toolName, decisionFP string, now time.Time) (trusted bool, driftCode string) {
-	pre := mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP)
-	if pre.DriftCode != "" || !pre.Eligible {
-		return false, pre.DriftCode
-	}
-	return mcpLiveApprovalSatisfied(pre.Target, now), ""
-}
-
 // liveTrustPrecheck is the LOCK-FREE half of live-execution trust revalidation: everything that can
 // produce an authoritative whole-Canary DRIFT verdict, and nothing that can block.
 type liveTrustPrecheck struct {

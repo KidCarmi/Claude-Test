@@ -1199,9 +1199,3 @@ func cloneTimePtr(t *time.Time) *time.Time {
 	v := *t
 	return &v
 }
-
-// LockForTest / UnlockForTest expose the store mutex so a test can hold it and prove that a
-// reader which must never block on it does not. Test-only by convention; production code takes
-// mu through the methods above.
-func (s *Store) LockForTest()   { s.mu.Lock() }
-func (s *Store) UnlockForTest() { s.mu.Unlock() }

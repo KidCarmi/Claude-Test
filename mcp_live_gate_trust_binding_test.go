@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
 )
@@ -9,7 +10,20 @@ import (
 // Codex round-4 P1 fixes: the runtime live-trust revalidation must bind to the DECISION's fingerprint
 // (not merely the current one) and reject a server that is no longer usable at the boundary.
 
-// P1a: mcpLiveTrustRevalidate binds trust to the decision fingerprint. A valid live approval for the
+// liveTrustVerdict composes the two halves EXACTLY as mcpLiveSideEffectGate does, so these tests
+// exercise the shipped path. A single convenience wrapper used to exist for this, but once the
+// halves were split it had no production caller left — a function that only tests reach is not the
+// live path, however faithfully it is written, and keeping it would have let these tests drift away
+// from what the gate actually runs.
+func liveTrustVerdict(tenant, serverID, toolName, decisionFP string, now time.Time) (bool, string) {
+	live := mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP)
+	if live.DriftCode != "" {
+		return false, live.DriftCode
+	}
+	return live.Eligible && mcpLiveApprovalSatisfied(live.Target, now), ""
+}
+
+// P1a: live-trust revalidation binds trust to the decision fingerprint. A valid live approval for the
 // CURRENT fingerprint must NOT authorize a request that was decided under a DIFFERENT fingerprint
 // (the F1→F2→F1 catalog-flap class), and an empty decision fingerprint fails closed.
 func TestLiveTrustRevalidate_BindsToDecisionFingerprint(t *testing.T) {
@@ -23,7 +37,7 @@ func TestLiveTrustRevalidate_BindsToDecisionFingerprint(t *testing.T) {
 	now := mcpToolTrust.now()
 
 	// Baseline: the decision fingerprint equals the current target ⇒ a valid approval revalidates OK.
-	if ok, _ := mcpLiveTrustRevalidate(ttTenant, sid, tool, fpHex, now); !ok {
+	if ok, _ := liveTrustVerdict(ttTenant, sid, tool, fpHex, now); !ok {
 		t.Fatal("a valid live approval bound to the current fingerprint must revalidate OK")
 	}
 	// P1a: a decision fingerprint that does NOT match the current target is denied, even though a
@@ -32,12 +46,23 @@ func TestLiveTrustRevalidate_BindsToDecisionFingerprint(t *testing.T) {
 	if otherFP == fpHex {
 		otherFP = "0123456789abcdef" + fpHex[16:]
 	}
-	if ok, _ := mcpLiveTrustRevalidate(ttTenant, sid, tool, otherFP, now); ok {
+	if ok, _ := liveTrustVerdict(ttTenant, sid, tool, otherFP, now); ok {
 		t.Fatal("P1a: a decision fingerprint that does not match the current target must be denied")
 	}
 	// An empty decision fingerprint fails closed.
-	if ok, _ := mcpLiveTrustRevalidate(ttTenant, sid, tool, "", now); ok {
+	if ok, _ := liveTrustVerdict(ttTenant, sid, tool, "", now); ok {
 		t.Fatal("an empty decision fingerprint must be denied")
+	}
+	// A DIFFERENT tenant naming the same server/tool is denied, and denied REQUEST-SCOPED rather
+	// than as drift: a Canary correctly refusing another tenant's request is a Canary working, not
+	// evidence the reviewed target changed, so it must never stop the experiment.
+	ok, code := liveTrustVerdict("tenant-not-ours", sid, tool, fpHex, now)
+	if ok {
+		t.Fatal("a target that is not this tenant's reviewed one must be denied")
+	}
+	if code != "" {
+		t.Fatalf("a cross-tenant denial reported drift code %q — it must be request-scoped, or one "+
+			"tenant could stop another tenant's Canary by naming its server", code)
 	}
 }
 
@@ -52,7 +77,7 @@ func TestLiveTrustRevalidate_RejectsUnusableServer(t *testing.T) {
 	_ = clk
 	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
 	now := mcpToolTrust.now()
-	if ok, _ := mcpLiveTrustRevalidate(ttTenant, sid, tool, fpHex, now); !ok {
+	if ok, _ := liveTrustVerdict(ttTenant, sid, tool, fpHex, now); !ok {
 		t.Fatal("precondition: the valid approval must revalidate OK before the server is disabled")
 	}
 
@@ -71,7 +96,7 @@ func TestLiveTrustRevalidate_RejectsUnusableServer(t *testing.T) {
 	}
 	publishMCPInventory(mcpInvLoaded, "", reg2, cat2)
 
-	if ok, _ := mcpLiveTrustRevalidate(ttTenant, sid, tool, fpHex, now); ok {
+	if ok, _ := liveTrustVerdict(ttTenant, sid, tool, fpHex, now); ok {
 		t.Fatal("P1b: a request against a server that is no longer usable must be denied at the boundary")
 	}
 }
