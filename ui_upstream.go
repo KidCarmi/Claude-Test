@@ -318,13 +318,17 @@ func apiUpstreamV1Replace(w http.ResponseWriter, r *http.Request) {
 		if ref := upstreamFenceDoc(body.Revision, cur.Revision); ref != nil {
 			return cur, nil, ref
 		}
-		// The state gate comes first: while any managed entry holds a
-		// credential the credential-free replacement is refused whatever
-		// the body says (a re-POST of the listed authorities included).
+		// The state gate comes first: while any managed entry is PROTECTED —
+		// it holds credential material OR carries the durable
+		// requiresReplacement marker (a restored/imported credentialed parent
+		// that only the T2 replace / T3 clear ceremony may resolve; PR-C5) —
+		// the credential-free replacement is refused whatever the body says
+		// (a re-POST of the listed authorities included): a bulk rebuild
+		// could otherwise omit the entry and discard the marker silently.
 		for i := range cur.Entries {
-			if cur.Entries[i].Credential != nil {
+			if upstreamEntryProtected(&cur.Entries[i]) {
 				return cur, nil, &upstreamRefusal{Status: http.StatusConflict, Code: "credentialed_entries_present",
-					Msg:     "the managed pool holds credentialed entries; the credential-free v1 replacement is refused — manage entries individually through /api/upstream/entries",
+					Msg:     "the managed pool holds credentialed entries (or entries awaiting credential replacement); the credential-free v1 replacement is refused — manage entries individually through /api/upstream/entries",
 					Current: map[string]any{"revision": cur.Revision, "credentialed": upstreamCredentialedIDs(cur)}}
 			}
 		}
@@ -350,10 +354,14 @@ func apiUpstreamV1Replace(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// upstreamCredentialedIDs lists the PROTECTED entries a credential-free bulk
+// replacement may not touch: those holding material and those carrying the
+// requiresReplacement marker (PR-C5) — the same set upstreamEntryProtected
+// guards on the import planner.
 func upstreamCredentialedIDs(doc upstream.Document) []string {
 	var ids []string
 	for i := range doc.Entries {
-		if doc.Entries[i].Credential != nil {
+		if upstreamEntryProtected(&doc.Entries[i]) {
 			ids = append(ids, doc.Entries[i].ID)
 		}
 	}
@@ -587,9 +595,11 @@ func apiUpstreamEntryDelete(w http.ResponseWriter, r *http.Request, id string) {
 			return cur, nil, ref
 		}
 		e := cur.Entries[i]
-		if e.Credential != nil {
+		// Material OR the durable requiresReplacement marker (PR-C5): both
+		// are resolved only by the exact-id Tier-3 clear, never by a delete.
+		if upstreamEntryProtected(&e) {
 			return cur, nil, &upstreamRefusal{Status: http.StatusConflict, Code: "credential_present",
-				Msg:     "this entry holds credential material (configured, unusable or mismatch); clear the credential (T3) before deleting it",
+				Msg:     "this entry holds credential material (configured, unusable or mismatch) or awaits credential replacement; clear the credential (T3) before deleting it",
 				Current: map[string]any{"id": e.ID, "revision": e.Revision, "credentialState": upstreamEntryDTO(e)["credentialState"]}}
 		}
 		next := cur.Clone()

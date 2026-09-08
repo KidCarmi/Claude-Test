@@ -381,12 +381,7 @@ func handleOneShotCommands(s *startupState) {
 	}
 	// ── One-shot: prepare-downgrade (2F-D, C10) — dry-run unless --confirm <word> ──
 	if *s.prepareDowngrade {
-		word, err := prepareDowngradeConfirmWord(s.restoreConfirm, flag.Args())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Prepare-downgrade error: %v\n", err)
-			os.Exit(1)
-		}
-		if err := runPrepareDowngrade(dataDir, *s.downgradeTargetSchema, word, os.Stdout); err != nil {
+		if err := runPrepareDowngradeCommand(s, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "Prepare-downgrade error: %v\n", err)
 			os.Exit(1)
 		}

@@ -1405,9 +1405,11 @@ components:
         Structured 2F-C refusal. `code` is bounded: precondition_required (428),
         stale (409, `current.revision`), vanished (404), yaml_owned (409),
         credential_bound (409 — authority change while a credential exists;
-        clear it first), credential_present (409 — delete refused), confirm_required
+        clear it first), credential_present (409 — delete refused while the entry
+        holds material OR awaits credential replacement), confirm_required
         (409, `current.confirmValue`), credentialed_entries_present (409 — the v1
-        bulk adapter while any managed entry holds a credential),
+        bulk adapter while any managed entry holds a credential or awaits
+        credential replacement),
         duplicate_authority (409, `count`), no_credential (409 — clear on an entry
         without material), invalid_entry / userinfo_not_allowed /
         credential_state_not_accepted / invalid_password / invalid_action /
@@ -6754,9 +6756,9 @@ paths:
       description: >-
         Deletes a credential-free managed entry (2F-C). `?revision=` must echo
         the ENTRY revision (428/409/404). 409 credential_present while the
-        entry holds a configured, unusable or mismatched credential (clear it
-        first, T3); 409 yaml_owned for a config.yaml entry. Persisted before
-        the 200.
+        entry holds a configured, unusable or mismatched credential OR carries
+        the requiresReplacement marker (clear it first, T3); 409 yaml_owned
+        for a config.yaml entry. Persisted before the 200.
       security:
         - sessionCookie: []
         - basicAuth: []
