@@ -59,6 +59,15 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 	if err := dec.Decode(&root); err != nil {
 		return nil, 0, fmt.Errorf("admin_settings.json is not a JSON object: %w", err)
 	}
+	// PR-C28 R18-A: the JSON literal `null` decodes into a NIL map without
+	// error, so every check below saw an empty document and the zero-strip
+	// branch handed the original `null` back to be archived — a restore of
+	// that archive silently boots zero-valued settings. A null root is not
+	// a settings object and refuses the backup like every other non-object
+	// root.
+	if root == nil {
+		return nil, 0, errors.New("admin_settings.json is not a JSON object: the settings root is null")
+	}
 	// PR-C19 R10-A: ONE settings object and nothing after it but
 	// whitespace. Decode reads a single value and never looks at the
 	// remaining bytes, so a credential-free leading object followed by a

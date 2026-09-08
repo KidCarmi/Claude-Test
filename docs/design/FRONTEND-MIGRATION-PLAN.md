@@ -3646,6 +3646,19 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C28 — the eighteenth Codex round (one P2).** Confirmed and pinned
+> before the correction (`upstream_codex_r18_red_test.go`). (R18-A, P2)
+> `stripUpstreamCredentialsFromSettings` decoded the settings body into a
+> `map[string]any`, and the JSON literal `null` decodes into a NIL map
+> without error — so the duplicate-key walk, the trailing-data check, the
+> legacy gate and the v2 strip all saw an empty document and the
+> zero-strip branch handed the original `null` back to be archived, though
+> the function's contract is that a non-object root is refused; a restore
+> of such an archive silently boots zero-valued settings. A nil root is now
+> refused after decoding, like every other non-object root (the
+> array/string/number/bool controls stay refused and `{}` stays a sound,
+> unchanged settings file). Backend only.
+>
 > **PR-C27 — the seventeenth Codex round (one P2).** Confirmed and pinned
 > before the correction (`upstream_codex_r17_red_test.go`). (R17-A, P2)
 > `verifyV2CredentialsRemoved` searched the re-serialized v2 document's
