@@ -124,10 +124,18 @@ EOF
 
 start_instance() {
   # $1=name $2=ui-port $3=proxy-port $4=extra args...
+  # Every instance persists into its OWN data root (CULVERT_DATA_DIR, PR-C1):
+  # the appliance's default is the fixed absolute /data, which (a) a CI
+  # runner's unprivileged user cannot write — every /data-backed mutation
+  # (admin settings, object stores, PAC profiles, CDR, drafts) then answered
+  # persist_failed/503 while root-run qualification passed — and (b) was
+  # SHARED by all four local instances, so state leaked across instances
+  # and across runs. A per-instance root under the harness tmp dir makes
+  # the suite hermetic on any host and for any user.
   name="$1"; uiport="$2"; pport="$3"; shift 3
   d="$WORK/run-$name"
   mkdir -p "$d"
-  (cd "$d" && CULVERT_EXPERIMENTAL_UI=1 "$BIN" \
+  (cd "$d" && CULVERT_EXPERIMENTAL_UI=1 CULVERT_DATA_DIR="$d" "$BIN" \
     -port "$pport" -ui-port "$uiport" -ui-no-tls "$@" \
     >"$WORK/$name.log" 2>&1) &
   eval "${name}_PID=\$!"
@@ -169,15 +177,14 @@ EOF2
   printf ']\n'
 } > "$WORK/auth/policy.json"
 
-# FRESH/SETUPFAIL get their OWN log_store_path (recorded harness debt: the
-# dataDir is a fixed absolute /data SHARED by all local instances, and the
-# shared admin_settings.json can carry log_store_enabled from a previous
-# run/instance — at boot every path-less instance then races for the ONE
-# badger flock on /data/logstore, so whichever instance loses cannot enable
-# history mid-suite: "cannot enable history store" on a coin flip). A
-# per-instance path makes the FRESH history journeys deterministic; a config
-# file does not affect the fresh appliance's needsSetup state (that is the
-# ui-users roster).
+# FRESH/SETUPFAIL get their OWN log_store_path. (Historically this closed a
+# harness debt: dataDir was a fixed absolute /data SHARED by all local
+# instances, so a shared admin_settings.json could carry log_store_enabled
+# and every path-less instance raced for the ONE badger flock on
+# /data/logstore. Since PR-C1 every instance has its own data root, so the
+# explicit path is now only the deterministic, self-describing premise.) A
+# config file does not affect the fresh appliance's needsSetup state (that
+# is the ui-users roster).
 cat > "$WORK/fresh/config.yaml" <<EOF2
 log_store_path: $WORK/fresh/logstore
 EOF2
@@ -226,12 +233,11 @@ wait_ready "$FAIL_PORT" FAIL
 wait_ready "$YAML_PORT" YAMLUP
 echo "e2e-smoke: all four instances ready"
 
-# API-establish the retained-history premise (§19): the AUTH instance's
-# log-store boot state inherits the SHARED /data/admin_settings.json left by
-# the PREVIOUS run (recorded harness debt — dataDir is a fixed absolute
-# path), so if a prior run ended with the store disabled the seeds below
-# would silently land only in the memory ring and every retained-history
-# assertion would fail. Enable it through the supported admin API first.
+# API-establish the retained-history premise (§19): the AUTH instance boots
+# from a FRESH per-instance data root (PR-C1), so the retained-history store
+# is off until the harness enables it through the supported admin API —
+# otherwise the seeds below would land only in the memory ring and every
+# retained-history assertion would fail.
 # criticalDiskPct=99: on dev machines the session disk allowance makes
 # statvfs read ~90%+ used permanently, and the default 90% threshold
 # engages EMERGENCY minimal logging + retained-history cleanup mid-suite
@@ -280,12 +286,12 @@ echo "e2e-smoke: disk-guard preflight ok (used ${DISK_USED}%, critical ${DISK_CR
 curl -s -o /dev/null -b "$SEED_JAR" -X POST -H 'Content-Type: application/json' \
   -d '{"base_url":"","ui_sans":[],"trust_forwarded_headers":false,"trusted_proxy_cidrs":["127.0.0.1"]}' \
   "http://127.0.0.1:$UI_PORT/api/settings/network"
-# Draft-mode hygiene: the SHARED /data admin_settings.json can carry
-# require_commit=true (and /data/policy_draft state) from an interrupted
-# previous run — e.g. a test's own cleanup drew a 429 — which breaks the 2A/2B
-# live-write premises. Revert any inherited draft (tolerated 4xx when none is
-# active), then disarm (the disarm refuses while a candidate is dirty, hence
-# revert first).
+# Draft-mode hygiene: establish the 2A/2B live-write premise explicitly —
+# no draft is open and commit mode is disarmed. (The data root is fresh per
+# run since PR-C1; this used to also scrub require_commit/policy_draft state
+# inherited through the shared /data.) Revert tolerates a 4xx when no draft
+# is active; the disarm refuses while a candidate is dirty, hence revert
+# first.
 curl -s -o /dev/null -b "$SEED_JAR" -X POST \
   "http://127.0.0.1:$UI_PORT/api/policy/draft/revert" || true
 curl -s -o /dev/null -b "$SEED_JAR" -X PUT -H 'Content-Type: application/json' \
@@ -309,6 +315,7 @@ CULVERT_E2E_BASE_URL="http://127.0.0.1:$UI_PORT" \
 CULVERT_E2E_FRESH_URL="http://127.0.0.1:$FRESH_PORT" \
 CULVERT_E2E_SETUPFAIL_URL="http://127.0.0.1:$FAIL_PORT" \
 CULVERT_E2E_YAML_URL="http://127.0.0.1:$YAML_PORT" \
+CULVERT_E2E_AUTH_DATA_DIR="$WORK/run-AUTH" \
 CULVERT_E2E_SLUICE_ADDR="127.0.0.1:$SLUICE_PORT" \
 CULVERT_E2E_SLUICE_FP="$SLUICE_FP" \
 CULVERT_E2E_SLUICE_TOKEN="$SLUICE_TOKEN" \

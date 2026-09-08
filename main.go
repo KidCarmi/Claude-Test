@@ -173,6 +173,11 @@ func main() {
 	// must run BEFORE the global flag set is defined (it is not a flag).
 	maybeRunBootstrapResolve(os.Args)
 
+	// PR-C1: the persisted-state root (default /data) is resolved ONCE from
+	// CULVERT_DATA_DIR before the flag set and before any one-shot command,
+	// so every consumer of dataDir sees one value for the life of the process.
+	applyDataDirFromEnv()
+
 	s := &startupState{}
 	parseFlags(s)
 	handleOneShotCommands(s)
@@ -189,6 +194,9 @@ func main() {
 	loadFileConfigAndFlags(s)
 	initUIExtras(s)
 	initLogger(s)
+	if dataDirOverridden() {
+		logger.Printf("DataDir: persisted-state root set by %s: %s", dataDirEnv, dataDir)
+	}
 	initMemoryBackstop() // P0-2: soft GOMEMLIMIT so a large config-apply degrades to GC, not OOM
 	initLifecycleContext(s)
 	defer appLifecycleCancel() // kept in main() for panic safety; initLifecycleContext only creates the context.
