@@ -240,8 +240,8 @@ describe("K11 the read model exposes the manual-probe state", () => {
       withProbe(configWith(entry, 200).body, true),
       "$",
     );
-    const probe: Record<string, unknown> = cfg.probe;
-    expect(probe["manualInFlight"]).toBe(true);
+    const probe: unknown = cfg.probe;
+    expect(probe).toMatchObject({ manualInFlight: true });
   });
 });
 
