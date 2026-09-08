@@ -283,6 +283,15 @@ is marked `requiresReplacement: true`; the manifest records
 `credentialsOmitted: true`; `.upstream_cred_key` is never archived. The
 live file and the running pool are not touched by a backup.
 
+A backup is **refused** while `admin_settings.json` carries credential
+material in its legacy `upstream_proxies` list — the prepared-downgrade
+state (§9: after `--prepare-downgrade`, before the next boot of this
+binary re-migrates and seals the credentials), or a pre-v2 file that was
+never booted on this binary. An archive never carries material and the
+manifest's `credentialsOmitted: true` must be true of every archive that
+is produced, so the backup fails with a counts-only error naming the
+state; boot this binary once, or complete the downgrade, then back up.
+
 **Restore** boots every formerly credentialed entry into the distinct
 state `requiresReplacement`: ineligible, never probed, never sent
 unauthenticated. Until you act, the effective mode is

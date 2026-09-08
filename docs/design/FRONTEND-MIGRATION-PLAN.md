@@ -3631,6 +3631,21 @@ frozen program branch is untouched.
 > tests judge only what their own request produced (the positive
 > attribution test included). No assertion weakened; test-only.
 >
+> **PR-C17 — the eighth Codex round (one P1, one P2).** Both confirmed
+> and pinned before the correction (`upstream_codex_r8_red_test.go`).
+> (R8-A, P1) A backup taken in the prepared-downgrade state — after
+> `--prepare-downgrade`, before the next boot re-migrates — packed the
+> legacy `upstream_proxies` URLs, which then carry the unsealed passwords
+> by design, verbatim while the manifest asserted `credentialsOmitted:
+> true`; a pre-v2 file never booted on this binary has the same shape.
+> The sanitizer now REFUSES such a body (a password in any legacy URL, or
+> the prepared-downgrade marker) with a counts-only error the packer
+> turns into a failed backup; a password-free legacy list still archives
+> unchanged; runbook §8 updated. (R8-B, P2) `validateHostLabels` checked
+> emptiness only; it now enforces the DNS length limits on the A-label
+> form (63 octets per label, 253 per name, trailing FQDN dot excluded)
+> with `invalid_entry`. Backend only.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
