@@ -117,16 +117,41 @@ func stripUpstreamCredentialsFromSettings(body []byte) (sanitized []byte, stripp
 }
 
 // errUpstreamSettingsDuplicateKey is the refusal for a settings body that
-// repeats a key inside one JSON object (see rejectDuplicateJSONKeys).
+// repeats a key inside one JSON object — exactly, or differing only by
+// case (see rejectDuplicateJSONKeys).
 var errUpstreamSettingsDuplicateKey = errors.New("admin_settings.json repeats a key inside one JSON object; a backup archives only a sound settings file")
+
+// errUpstreamSettingsKeyCase is the refusal for a settings body that spells
+// a key the sanitizer reads in a case variant the settings loader would
+// still accept (see sanitizerReadKeys).
+var errUpstreamSettingsKeyCase = errors.New("admin_settings.json spells an upstream key in a case variant; a backup archives only a sound settings file")
+
+// sanitizerReadKeys are the keys the sanitizer reads by exact spelling.
+// PR-C22 R13-A: encoding/json matches struct fields CASE-INSENSITIVELY, so
+// the settings loader reads `UPSTREAM_PROXIES` or `Upstream_Proxies_V2`
+// exactly as the canonical spelling while an exact map lookup treats the
+// variant as absent — a credential-bearing list under a variant bypassed
+// the gate, a sealed record under a variant was never stripped, and a
+// variant prepared-downgrade marker never refused. Any key, at any depth,
+// that equals one of these under case folding without being its exact
+// spelling refuses the archive: the appliance never writes a variant, so
+// one is a hand-edited file the sanitizer cannot read as the loader does.
+var sanitizerReadKeys = []string{
+	"upstream_proxies", "upstream_proxies_v2", "upstream_prepared_downgrade",
+	"entries", "credential", "url", "requiresReplacement",
+	"ciphertext", "keyId", "authorityHash",
+}
 
 // rejectDuplicateJSONKeys walks the raw token stream of body and refuses
 // any JSON object that carries the same key twice, at every nesting level
-// (an object inside an array inside an object included). It reports
-// nothing about VALUES — the same key in two different objects is normal —
-// and never decodes into a map, which is exactly the representation that
+// (an object inside an array inside an object included), and any key that
+// is a case variant of one the sanitizer reads. Two keys that differ only
+// by case are a collision too: encoding/json resolves one to the struct
+// field by a preference rule the sanitizer cannot see. It reports nothing
+// about VALUES — the same key in two different objects is normal — and
+// never decodes into a map, which is exactly the representation that
 // discards the earlier value. Syntax errors are left to the decoder that
-// follows; only a duplicate is refused here.
+// follows.
 func rejectDuplicateJSONKeys(body []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -136,8 +161,8 @@ func rejectDuplicateJSONKeys(body []byte) error {
 		if err != nil {
 			return nil // io.EOF, or a syntax error the decoder that follows reports
 		}
-		if dup := w.step(tok); dup {
-			return errUpstreamSettingsDuplicateKey
+		if err := w.step(tok); err != nil {
+			return err
 		}
 	}
 }
@@ -146,7 +171,7 @@ func rejectDuplicateJSONKeys(body []byte) error {
 // object, the keys seen so far and whether the next token is a key.
 type jsonObjectFrame struct {
 	object    bool
-	keys      map[string]struct{}
+	keys      []string
 	expectKey bool
 }
 
@@ -156,8 +181,8 @@ type jsonKeyWalker struct {
 	stack []*jsonObjectFrame
 }
 
-// step consumes one token and reports true when it is a duplicate key.
-func (w *jsonKeyWalker) step(tok json.Token) bool {
+// step consumes one token and reports a duplicate or case-variant key.
+func (w *jsonKeyWalker) step(tok json.Token) error {
 	if top := w.top(); top != nil && top.object && top.expectKey {
 		return w.stepKeyPosition(top, tok)
 	}
@@ -165,26 +190,34 @@ func (w *jsonKeyWalker) step(tok json.Token) bool {
 		top.expectKey = true // the value has been consumed, or begins below
 	}
 	w.stepDelim(tok)
-	return false
+	return nil
 }
 
 // stepKeyPosition handles a token where an object expects a key: the closing
-// brace, or the key itself (a duplicate reports true).
-func (w *jsonKeyWalker) stepKeyPosition(top *jsonObjectFrame, tok json.Token) bool {
+// brace, or the key itself (a duplicate under case folding, or a case
+// variant of a key the sanitizer reads, is refused).
+func (w *jsonKeyWalker) stepKeyPosition(top *jsonObjectFrame, tok json.Token) error {
 	if d, ok := tok.(json.Delim); ok && d == '}' {
 		w.pop()
-		return false
+		return nil
 	}
 	key, ok := tok.(string)
 	if !ok {
-		return false // not a key where one is required: a syntax error
+		return nil // not a key where one is required: a syntax error
 	}
-	if _, dup := top.keys[key]; dup {
-		return true
+	for _, seen := range top.keys {
+		if strings.EqualFold(seen, key) {
+			return errUpstreamSettingsDuplicateKey
+		}
 	}
-	top.keys[key] = struct{}{}
+	for _, name := range sanitizerReadKeys {
+		if key != name && strings.EqualFold(key, name) {
+			return errUpstreamSettingsKeyCase
+		}
+	}
+	top.keys = append(top.keys, key)
 	top.expectKey = false
-	return false
+	return nil
 }
 
 // stepDelim opens or closes a container for a delimiter token.
@@ -195,7 +228,7 @@ func (w *jsonKeyWalker) stepDelim(tok json.Token) {
 	}
 	switch d {
 	case '{':
-		w.stack = append(w.stack, &jsonObjectFrame{object: true, keys: map[string]struct{}{}, expectKey: true})
+		w.stack = append(w.stack, &jsonObjectFrame{object: true, expectKey: true})
 	case '[':
 		w.stack = append(w.stack, &jsonObjectFrame{})
 	case '}', ']':

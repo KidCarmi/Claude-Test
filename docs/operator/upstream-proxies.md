@@ -303,7 +303,11 @@ object that repeats a key at any nesting level (a JSON decoder keeps only
 the last value of a repeated key, so the gate could otherwise be shown a
 value the archive would not carry), and so is a legacy `upstream_proxies`
 value that is not the persisted shape (an array of objects each carrying
-a non-empty `url` string): only a sound settings file is archived, and
+a non-empty `url` string), and so is any upstream key spelled in a case
+variant (`UPSTREAM_PROXIES`, `Entries`, `CREDENTIAL`) or repeated under a
+case-only difference — the settings loader matches keys
+case-insensitively, the sanitizer reads exact spellings, and the appliance
+never writes a variant: only a sound settings file is archived, and
 nothing the gate did not inspect is ever packed.
 
 **Restore** boots every formerly credentialed entry into the distinct

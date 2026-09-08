@@ -3646,6 +3646,24 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C22 — the thirteenth Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r13_red_test.go`, with a
+> loader-evidence test proving `encoding/json` reads the variants into
+> `AdminSettings`). (R13-A, P1) The sanitizer looked every key up by EXACT
+> spelling while the settings loader matches struct fields
+> case-insensitively, so a legacy list under `UPSTREAM_PROXIES`, a v2
+> document under `Upstream_Proxies_V2`, `entries`/`credential`/
+> `requiresReplacement` under case variants, a case-variant
+> prepared-downgrade marker, and a case-only key collision (`upstream_proxies`
+> beside `UPSTREAM_PROXIES`) all bypassed the gate or the strip and the
+> original bytes were archived under `credentialsOmitted: true`. The token
+> walker now refuses, at any depth, a key repeated under case folding and
+> any key that equals one the sanitizer reads (`sanitizerReadKeys`)
+> without being its exact spelling — the appliance never writes a variant,
+> so one is a hand-edited file the sanitizer cannot read as the loader
+> does; canonical spellings and unrelated keys in any case stay ordinary
+> (pinned as a control). Runbook §8 updated. Backend only.
+>
 > **PR-C21 — the twelfth Codex round (one P1).** Confirmed and pinned
 > before the correction (`upstream_codex_r12_red_test.go`). (R12-A, P1)
 > The backup sanitizer asserted the legacy `upstream_proxies` value to a
