@@ -3467,6 +3467,33 @@ frozen program branch is untouched.
 > once here under three concurrent test runs (it has passed in every CI
 > run; it is not this PR's).
 >
+> **PR-C9 — the owner-triggered Codex review of the PR head (three P2s).**
+> Each was confirmed against the code, pinned in
+> `frontend/src/test/pr-c9-codex-red.test.tsx` on the untouched head
+> (K1–K3, ten failing cases and one control), then corrected. (K1) The
+> route-intent allowlist (`routeIntent.ts`) never learned the three routes
+> the program added last — `/policies/header-rewrite`,
+> `/objects/url-categories`, `/objects/file-profiles` — so a deep link or a
+> re-authentication on them landed on Overview; they are known viewer
+> routes now. (K2) The Upstream client bound a create/update success to a
+> client-rebuilt authority string, while the appliance renders the
+> username percent-escaped inside `authority` (`url.PathEscape`: `?`, `#`,
+> `%`, `;`, non-ASCII), so a genuine success with such a username was
+> classified UNPROVEN and latched the page; the success is now bound FIELD
+> BY FIELD (`canonicalSpec` + `matchesSpec` on scheme/host/port/username,
+> the fields the appliance already returns), never through a rebuilt or
+> re-escaped string, and the control keeps a different username, host or
+> port unproven. (K3) The appliance runs a manual probe SEQUENTIALLY at 5 s
+> per eligible entry while the page dispatched it under the 30 s default
+> request deadline, so eight or more entries aborted a run the appliance
+> was still executing into an unproven outcome; `runUpstreamProbe` now
+> sizes its deadline from the read model (`probeDeadlineMs`: never below
+> the default, never below entries × 5 s + 10 s), the 5 s constant is
+> `PROBE_PER_ENTRY_MS` and is pinned to the engine's `ProbeTimeout` by
+> `upstream_probe_deadline_lockstep_test.go` (the engine constant is
+> exported for that test only; engine behaviour is byte-identical). No
+> Go handler changed; `frontend/dist` regenerated.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
