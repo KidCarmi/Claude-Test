@@ -3564,6 +3564,24 @@ frozen program branch is untouched.
 > answer keeping a dot the appliance would have stripped still stays
 > unproven. Frontend only; `frontend/dist` regenerated.
 >
+> **PR-C13 — the fifth Codex round (one P2).** Confirmed against both
+> sides and pinned in `frontend/src/test/pr-c13-codex-red.test.tsx` (K8,
+> four failing cases, five companions and two controls) before the
+> correction. `ℵx.example` is mapped by UTS-46 to `אx.example`, a label
+> mixing right-to-left and left-to-right letters that the browser's URL
+> parser refuses while the appliance's IDNA tables accept it and return
+> `xn--x-zhc.example`; the client kept the raw spelling on a parser
+> failure and refused the genuine success as UNPROVEN. The appliance's
+> tables cannot be reproduced exactly in the browser, so the binding no
+> longer tries: `matchesSpec` accepts a returned host when it equals the
+> client's ASCII form OR when its punycode-decoded, NFC-normalised form
+> (`hostUnicodeKey`, an RFC 3492 decoder that yields no key for a
+> malformed label) equals the typed host's mapped form — the browser's
+> own mapping when it succeeds, NFKC plus Go-style lower-casing when the
+> browser refuses the host. Scheme, port and username stay exact; a host
+> that decodes to different letters, or carries a malformed punycode
+> label, stays unproven. Frontend only; `frontend/dist` regenerated.
+>
 > **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
 > the per-entry DELETE keyed their refusals on credential material only,
 > so an entry in the durable `requiresReplacement` state (Credential nil,
