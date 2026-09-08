@@ -3467,6 +3467,18 @@ frozen program branch is untouched.
 > once here under three concurrent test runs (it has passed in every CI
 > run; it is not this PR's).
 >
+> **PR-C3b, round 3 — the three reviewdog threads still open.** The
+> advisory pass on the frozen head had also posted `cyclop` findings on
+> three functions this program grew — `applyAdminServices` (18),
+> `propagateServerRotation` (16), `apiAuthPolicyReorder` (17) — which the
+> diff-scoped gate never sees (their declaration lines are outside the
+> diff). Pure helper extraction, no behaviour change, the role gate stays
+> in the handler for the C1.5 parity: `applyAdminTrafficPseudonym` +
+> `applyAdminLogStore`, `reconcileMemberRotation` (per member, reports
+> whether the registry changed), `validateAuthReorderBody` (the
+> state-independent grammar check). The full linter no longer reports the
+> three; the diff-scoped gate stays at 0.
+>
 > **PR-C9 — the owner-triggered Codex review of the PR head (three P2s).**
 > Each was confirmed against the code, pinned in
 > `frontend/src/test/pr-c9-codex-red.test.tsx` on the untouched head
