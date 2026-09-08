@@ -37,6 +37,23 @@ import (
 // logic; D1.3b.1 rejects any other value.
 const restoreSchemaVersion = 1
 
+// maxRestoreEntryBytes bounds a single tarball entry's declared (decompressed)
+// size, checked against the tar header BEFORE readTarball's io.ReadAll(tr)
+// allocates it. A highly compressible payload (e.g. all-zero bytes) lets a
+// tiny .tar.gz file declare an enormous Size in its tar header — a classic
+// decompression bomb — and readTarball is reachable from a plain `culvert
+// --restore <path>` dry-run (no --confirm needed), so a corrupted or hostile
+// backup file must not be able to drive an unbounded allocation.
+// runBackupWith documents that a real backup (admin-config JSON/text files
+// only — no logs, no feed DBs) is "well under 100MB"; 256 MiB leaves
+// generous headroom for growth (e.g. 50 retained config_versions) while
+// still bounding memory use. Mirrors the same per-entry declared-size guard
+// release_catalog_bundle.go applies (catalogMaxReadBytes) and the
+// total-decompressed guard support_validate.go applies to support bundles
+// (maxValidateDecompressed) — restore.go was the one tar/gzip consumer in
+// this codebase with no such bound.
+const maxRestoreEntryBytes = 256 << 20 // 256 MiB
+
 // restoreSummary is the data shape printed by printRestoreSummary and
 // returned to tests for assertion.
 type restoreSummary struct {
@@ -266,6 +283,13 @@ func readTarball(path, backupPassphrase string) (map[string][]byte, []string, er
 		}
 		if err != nil {
 			return nil, nil, fmt.Errorf("restore: tar read: %w", err)
+		}
+		// Decompression-bomb guard: reject an implausibly large declared size
+		// before io.ReadAll(tr) below allocates it. Checked first — cheaper
+		// than every other guard and the one that matters before any bytes of
+		// the entry body are read.
+		if hdr.Size > maxRestoreEntryBytes {
+			return nil, nil, fmt.Errorf("restore: tarball entry %q declares %d bytes, exceeding the %d-byte bound", hdr.Name, hdr.Size, maxRestoreEntryBytes)
 		}
 		// Absolute-path guard: tar entries must be relative under the
 		// backup namespace. Reject anything starting with "/" so a
