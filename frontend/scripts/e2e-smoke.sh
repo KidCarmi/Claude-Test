@@ -16,6 +16,13 @@ UI_PORT="${CULVERT_E2E_UI_PORT:-19090}"
 FRESH_PORT="${CULVERT_E2E_FRESH_PORT:-19091}"
 FAIL_PORT="${CULVERT_E2E_FAIL_PORT:-19092}"
 PROXY_PORT="${CULVERT_E2E_PROXY_PORT:-19080}"
+# 2F-G: a FOURTH appliance whose config.yaml seeds a read-only `yaml`
+# upstream entry (the YAML read-only posture proof). It is a separate
+# instance because a config.yaml parent proxy CHAINS every allowed
+# plain-HTTP request of the appliance that carries it (PX-1), which would
+# change the data-plane premise of every other journey on the AUTH
+# instance. Nobody proxies traffic through it.
+YAML_PORT="${CULVERT_E2E_YAML_PORT:-19093}"
 WORK="$(mktemp -d)"
 BIN="$WORK/culvert"
 
@@ -176,6 +183,19 @@ EOF2
 cat > "$WORK/failcfg.yaml" <<EOF2
 log_store_path: $WORK/faillogstore
 EOF2
+# 2F-G YAML-seeded appliance: same roster as AUTH (a private copy — the
+# roster file is written back on user changes), its own history path, and
+# one config.yaml parent proxy under the `.invalid` TLD (RFC 6761: never
+# resolves), so its periodic probe fails deterministically and nothing is
+# ever dialled. Its only role in the suite is the read-only `yaml` row.
+mkdir -p "$WORK/yamlup"
+cp "$WORK/auth/ui_users.json" "$WORK/yamlup/ui_users.json"
+cat > "$WORK/yamlup/config.yaml" <<EOF2
+log_store_path: $WORK/yamlup/logstore
+upstream:
+  proxies:
+    - url: http://yaml-parent.invalid:3128
+EOF2
 
 # 2E-A premise: a per-run LOCAL YARA rules directory so the Content Security
 # YARA journey exercises the real engine deterministically (no external
@@ -184,6 +204,7 @@ mkdir -p "$WORK/auth/yara"
 start_instance AUTH "$UI_PORT" "$PROXY_PORT" -ui-users-file "$WORK/auth/ui_users.json" -config "$WORK/auth/config.yaml" -policy "$WORK/auth/policy.json" -yara-rules-dir "$WORK/auth/yara"
 start_instance FRESH "$FRESH_PORT" "$((PROXY_PORT + 1))" -ui-users-file "$WORK/fresh/ui_users.json" -config "$WORK/fresh/config.yaml"
 start_instance FAIL "$FAIL_PORT" "$((PROXY_PORT + 2))" -ui-users-file "$WORK/failparent/blocker/ui_users.json" -config "$WORK/failcfg.yaml"
+start_instance YAMLUP "$YAML_PORT" "$((PROXY_PORT + 3))" -ui-users-file "$WORK/yamlup/ui_users.json" -config "$WORK/yamlup/config.yaml"
 
 wait_ready() {
   port="$1"; name="$2"
@@ -201,7 +222,8 @@ wait_ready() {
 wait_ready "$UI_PORT" AUTH
 wait_ready "$FRESH_PORT" FRESH
 wait_ready "$FAIL_PORT" FAIL
-echo "e2e-smoke: all three instances ready"
+wait_ready "$YAML_PORT" YAMLUP
+echo "e2e-smoke: all four instances ready"
 
 # API-establish the retained-history premise (§19): the AUTH instance's
 # log-store boot state inherits the SHARED /data/admin_settings.json left by
@@ -285,6 +307,7 @@ cd "$FRONTEND"
 CULVERT_E2E_BASE_URL="http://127.0.0.1:$UI_PORT" \
 CULVERT_E2E_FRESH_URL="http://127.0.0.1:$FRESH_PORT" \
 CULVERT_E2E_SETUPFAIL_URL="http://127.0.0.1:$FAIL_PORT" \
+CULVERT_E2E_YAML_URL="http://127.0.0.1:$YAML_PORT" \
 CULVERT_E2E_SLUICE_ADDR="127.0.0.1:$SLUICE_PORT" \
 CULVERT_E2E_SLUICE_FP="$SLUICE_FP" \
 CULVERT_E2E_SLUICE_TOKEN="$SLUICE_TOKEN" \

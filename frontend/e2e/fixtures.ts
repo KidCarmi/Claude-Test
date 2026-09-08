@@ -11,6 +11,10 @@ export const FRESH_URL =
   process.env["CULVERT_E2E_FRESH_URL"] ?? "http://127.0.0.1:19091";
 export const SETUPFAIL_URL =
   process.env["CULVERT_E2E_SETUPFAIL_URL"] ?? "http://127.0.0.1:19092";
+/** 2F-G: the appliance whose config.yaml seeds a read-only `yaml` upstream
+ * entry (see scripts/e2e-smoke.sh). */
+export const YAML_URL =
+  process.env["CULVERT_E2E_YAML_URL"] ?? "http://127.0.0.1:19093";
 
 export const ADMIN_STATE = "e2e/.state/admin.json";
 export const EMPTY_STATE = { cookies: [], origins: [] };
