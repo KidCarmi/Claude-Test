@@ -3646,6 +3646,22 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C29 — the nineteenth Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r19_red_test.go`; seven of its
+> eight shapes were accepted on the untouched head — the document-level
+> `Credential` object was already refused by the exact-case `ciphertext`
+> key inside it). (R19-A, P1) `walkV2Keys` compared the sealed-record key
+> names and the `credential` key EXACTLY, and the duplicate-key walker
+> folds case only for the keys BOUND at a structural role — so a
+> case-variant sealed field placed OUTSIDE its normal role (a
+> document-level `Ciphertext`, an entry-level `KeyId`, a nested
+> `AuthorityHash`, a misplaced `CREDENTIAL`) passed both and the
+> zero-strip branch archived the field unchanged while the manifest
+> asserted `credentialsOmitted`. The verifier now folds case for the
+> v2-owned key names at every depth (`strings.EqualFold`); a VALUE equal
+> to a case variant stays ordinary (PR-C27) and a case variant IN its
+> bound role stays refused by the walker (PR-C22). Backend only.
+>
 > **PR-C28 — the eighteenth Codex round (one P2).** Confirmed and pinned
 > before the correction (`upstream_codex_r18_red_test.go`). (R18-A, P2)
 > `stripUpstreamCredentialsFromSettings` decoded the settings body into a

@@ -145,17 +145,25 @@ func verifyV2CredentialsRemoved(doc any) error {
 }
 
 // walkV2Keys recurses through objects and arrays and refuses the first
-// sealed-record key it meets.
+// sealed-record key it meets. PR-C29 R19-A: the comparison folds CASE —
+// the loader decodes case-insensitively, and the duplicate-key walker
+// folds case only for the keys BOUND at a structural role, so a
+// case-variant sealed field placed OUTSIDE its normal role (a
+// document-level `Ciphertext`, an entry-level `KeyId`, a nested
+// `AuthorityHash`, a misplaced `Credential`) passed both the walker and an
+// exact comparison here and was archived unchanged at the zero-strip
+// branch. The v2 document is upstream-owned in full, so any spelling of
+// its owned key names at any depth is refused.
 func walkV2Keys(v any) error {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, child := range t {
 			for _, name := range upstreamSettingsCredentialKeys {
-				if `"`+k+`"` == name {
+				if strings.EqualFold(`"`+k+`"`, name) {
 					return fmt.Errorf("sanitized upstream_proxies_v2 still carries %s", k)
 				}
 			}
-			if k == "credential" {
+			if strings.EqualFold(k, "credential") {
 				return errors.New("sanitized upstream_proxies_v2 still carries credential")
 			}
 			if err := walkV2Keys(child); err != nil {
