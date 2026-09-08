@@ -3311,7 +3311,7 @@ UI leans on C2 semantics and must not cut over onto a known enforcement gap).
 > commits cleanly. Both shapes are proven at the Go layer and against the
 > real binary (policy-2d.spec.ts).
 
-#### Batch 2 PR correction round (PR #1340, append-only on `claude/culvert-frontend-batch2-pr`)
+#### Batch 2 PR correction round (PR #1340, append-only on the PR branch)
 
 The frozen Batch 2F head (`8e73a619`) was opened as a draft PR and the real
 CI matrix plus the repository's automated reviewer found what a root-run,
