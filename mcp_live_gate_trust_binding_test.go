@@ -15,7 +15,7 @@ import (
 // halves were split it had no production caller left — a function that only tests reach is not the
 // live path, however faithfully it is written, and keeping it would have let these tests drift away
 // from what the gate actually runs.
-func liveTrustVerdict(tenant, serverID, toolName, decisionFP string, now time.Time) (bool, string) {
+func liveTrustVerdict(tenant, serverID, toolName, decisionFP string, now time.Time) (trusted bool, driftCode string) {
 	live := mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP)
 	if live.DriftCode != "" {
 		return false, live.DriftCode
