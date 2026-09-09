@@ -4859,6 +4859,10 @@ Firefox (all platforms):
           <p class="hint">
             Set per-group bandwidth limits using token bucket rate limiting. Higher priority policies take precedence.
           </p>
+          <div class="banner warn" style="margin-bottom:12px">
+            <span>&#9888;</span>
+            <span>Not yet enforced on the data path — policies below are stored and synced across the cluster, but traffic is not currently rate-limited by them. See the Diagnostics tab (<code>bandwidth_qos_enforcement</code>) for the live status.</span>
+          </div>
           <div id="bandwidth-policies-list">
             <em style="color:var(--muted);font-size:.82rem">Loading policies...</em>
           </div>
@@ -18256,7 +18260,7 @@ async function createBandwidthPolicy() {
 }
 
 async function deleteBandwidthPolicy(name) {
-  if (!await confirmAction('Delete Bandwidth Policy', `Delete bandwidth policy "${name}"? Rate limits will no longer apply.`)) return;
+  if (!await confirmAction('Delete Bandwidth Policy', `Delete bandwidth policy "${name}"? It is not currently enforced, but will no longer sync to the cluster or appear in configuration exports.`)) return;
   try {
     await api('/api/cluster/bandwidth?name=' + encodeURIComponent(name), { method: 'DELETE' });
     loadBandwidthPolicies(true);
