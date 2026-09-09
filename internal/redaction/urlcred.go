@@ -35,27 +35,50 @@ import (
 // string carries no credential" are different statements, and treating the
 // first as the second is how the awkward inputs leak.
 func URLUserinfo(raw string) string {
-	if u, err := url.Parse(raw); err == nil && u.User != nil {
-		u.User = nil
-		return u.String()
+	u, err := url.Parse(raw)
+	if err == nil {
+		if u.User != nil {
+			u.User = nil
+			return u.String()
+		}
+		// net/url parsed the whole string and found no userinfo. Its verdict is
+		// authoritative for every hierarchical URL, so an '@' in the path,
+		// query or fragment is left alone. The one place a credential can still
+		// hide is the OPAQUE form ("http:u:pw@host", "u:pw@host:8484"), which
+		// net/url does not read as an authority at all.
+		if u.Opaque == "" || !strings.ContainsRune(u.Opaque, '@') {
+			return raw
+		}
+		return stripThroughLastAt(raw)
 	}
-	return stripAuthorityUserinfo(raw)
+	// PARSE FAILED. Nothing about this string's structure is established: the
+	// '/', '?' and '#' that delimit an authority in a WELL-FORMED URL prove
+	// nothing here, and a password may contain any of them
+	// ("http://user:pw?part@host" parses as neither an authority nor a query).
+	// Bounding the search by those delimiters is what let the first version of
+	// this helper hand such a password back verbatim, so the search runs to the
+	// LAST '@' in the string instead.
+	//
+	// The cost is over-redaction on malformed input that carries an unrelated
+	// '@' later on — a mangled diagnostic string. That is the correct trade:
+	// this branch only ever sees input net/url already rejected, and returning
+	// a credential is not recoverable while a mangled URL is.
+	return stripThroughLastAt(raw)
 }
 
-// stripAuthorityUserinfo removes `userinfo@` from the authority of a URL-shaped
-// string that url.Parse rejected. It deliberately reasons about the authority
-// only: an '@' in a path, query or fragment is not userinfo and is left alone.
-func stripAuthorityUserinfo(raw string) string {
+// stripThroughLastAt removes everything from the start of the authority through
+// the LAST '@' in the string. Input carrying no '@' cannot hold userinfo and is
+// returned unchanged.
+func stripThroughLastAt(raw string) string {
 	start := authorityStart(raw)
 	if start < 0 {
 		return raw
 	}
-	end := start + authorityLen(raw[start:])
-	at := strings.LastIndexByte(raw[start:end], '@')
+	at := strings.LastIndexByte(raw[start:], '@')
 	if at < 0 {
 		return raw
 	}
-	return raw[:start] + raw[start+at+1:end] + raw[end:]
+	return raw[:start] + raw[start+at+1:]
 }
 
 // authorityStart returns the index at which the authority begins, or -1 when
@@ -73,14 +96,4 @@ func authorityStart(raw string) int {
 		return 0
 	}
 	return -1
-}
-
-// authorityLen returns the length of the authority at the head of s — up to
-// the first path, query or fragment delimiter, which are the only three
-// characters that can terminate an authority.
-func authorityLen(s string) int {
-	if i := strings.IndexAny(s, "/?#"); i >= 0 {
-		return i
-	}
-	return len(s)
 }

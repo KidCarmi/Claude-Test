@@ -35,6 +35,14 @@ func TestURLUserinfo_FailsClosedOnUnparseableInput(t *testing.T) {
 		{"tab in authority", "http://u:pw\tspace@host/x", "pw\tspace"},
 		{"no scheme", "u:pwbare%zz@host:8484", "pwbare%zz"},
 		{"nul byte", "http://u:pw\x00null@host/x", "pw\x00null"},
+		// Codex P1: a password carrying an AUTHORITY DELIMITER. The first fix
+		// bounded its search at the first '/', '?' or '#', which on a string
+		// url.Parse rejected proves nothing — the search stopped before the '@'
+		// and the whole input, password included, was handed back.
+		{"question mark in password", "http://user:pw?part@host", "pw?part"},
+		{"slash in password", "http://user:pw/part@host", "pw/part"},
+		{"hash in password", "http://user:pw#part@host", "pw#part"},
+		{"all three delimiters", "http://user:p/w?x#y@host:8484", "p/w?x#y"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := URLUserinfo(tc.in)
@@ -99,4 +107,57 @@ func TestURLUserinfo_ConcurrentUseIsSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestURLUserinfo_NoDelimiterInAPasswordCanDefeatIt is the PROPERTY behind the
+// Codex P1: the first fix leaked for exactly the characters it used as its
+// authority bound, so pinning the three known ones would leave the class open.
+// This sweeps every ASCII byte as the password's payload and requires that none
+// of them lets the credential through.
+func TestURLUserinfo_NoDelimiterInAPasswordCanDefeatIt(t *testing.T) {
+	for b := 0; b < 128; b++ {
+		c := byte(b)
+		if c == '@' { // an '@' inside the password moves the separator, not a leak
+			continue
+		}
+		pw := "aa" + string(c) + "bb"
+		raw := "http://user:" + pw + "@host.example:8484/p"
+		got := URLUserinfo(raw)
+		if strings.Contains(got, pw) {
+			t.Fatalf("byte %#02x in the password survived: URLUserinfo(%q) = %q", c, raw, got)
+		}
+		if strings.Contains(got, "user:") {
+			t.Fatalf("byte %#02x left the username behind: %q", c, got)
+		}
+	}
+}
+
+// TestURLUserinfo_NeverReturnsAnAuthorityAt is the invariant in its most
+// general form: whatever comes out, no '@' may remain in an authority
+// position. It is the single assertion that a future rewrite cannot pass while
+// reintroducing this class.
+func TestURLUserinfo_NeverReturnsAnAuthorityAt(t *testing.T) {
+	for _, raw := range []string{
+		"http://user:pw?part@host",
+		"http://user:pw/part@host",
+		"http://user:pw#part@host",
+		"http://u:pw%zz@host:8484/x",
+		"http:// u:pw@host/x",
+		"u:pw@host:8484",
+		"//u:pw@host/x",
+		"http://a@b@c@host/x",
+	} {
+		got := URLUserinfo(raw)
+		start := authorityStart(got)
+		if start < 0 {
+			continue
+		}
+		authority := got[start:]
+		if i := strings.IndexAny(authority, "/?#"); i >= 0 {
+			authority = authority[:i]
+		}
+		if strings.ContainsRune(authority, '@') {
+			t.Fatalf("URLUserinfo(%q) = %q — authority %q still carries an '@'", raw, got, authority)
+		}
+	}
 }
