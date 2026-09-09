@@ -165,29 +165,7 @@ func TestScheduleTests_NoWallClockFullDayWindowEndsAt2359(t *testing.T) {
 			if !ok || fn.Body == nil || !strings.HasPrefix(fn.Name.Name, "Test") {
 				continue
 			}
-			startsAt0000, endsAt2359 := false, false
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				kv, ok := n.(*ast.KeyValueExpr)
-				if !ok {
-					return true
-				}
-				k, ok := kv.Key.(*ast.Ident)
-				if !ok {
-					return true
-				}
-				v, ok := kv.Value.(*ast.BasicLit)
-				if !ok {
-					return true
-				}
-				switch {
-				case k.Name == "TimeStart" && v.Value == `"00:00"`:
-					startsAt0000 = true
-				case k.Name == "TimeEnd" && v.Value == `"23:59"`:
-					endsAt2359 = true
-				}
-				return true
-			})
-			if startsAt0000 && endsAt2359 {
+			if c30BuildsFullDayWindowEndingAt2359(fn.Body) {
 				offenders = append(offenders, f+":"+fn.Name.Name)
 			}
 		}
@@ -195,4 +173,32 @@ func TestScheduleTests_NoWallClockFullDayWindowEndsAt2359(t *testing.T) {
 	if len(offenders) != 0 {
 		t.Fatalf("full-day schedules built as \"00:00\"–\"23:59\" (false for the last minute of every day against the wall clock; close a full day with \"24:00\"): %v", offenders)
 	}
+}
+
+// c30BuildsFullDayWindowEndingAt2359 reports whether a test body carries
+// both the `TimeStart: "00:00"` and the `TimeEnd: "23:59"` schedule fields.
+func c30BuildsFullDayWindowEndingAt2359(body *ast.BlockStmt) bool {
+	startsAt0000, endsAt2359 := false, false
+	ast.Inspect(body, func(n ast.Node) bool {
+		kv, ok := n.(*ast.KeyValueExpr)
+		if !ok {
+			return true
+		}
+		k, ok := kv.Key.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		v, ok := kv.Value.(*ast.BasicLit)
+		if !ok {
+			return true
+		}
+		switch {
+		case k.Name == "TimeStart" && v.Value == `"00:00"`:
+			startsAt0000 = true
+		case k.Name == "TimeEnd" && v.Value == `"23:59"`:
+			endsAt2359 = true
+		}
+		return true
+	})
+	return startsAt0000 && endsAt2359
 }

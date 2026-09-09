@@ -3646,6 +3646,35 @@ frozen program branch is untouched.
 > form (63 octets per label, 253 per name, trailing FQDN dot excluded)
 > with `invalid_entry`. Backend only.
 >
+> **PR-C30 — the seeded determinism run on the corrected head (two test
+> defects).** The root-package shuffle that failed the gate on `8e73a619`
+> (`-shuffle=1788866999688368609 -count=2`), re-run on `7fd9c852`, failed
+> two tests; both were pinned RED-first
+> (`test_order_isolation_c30_red_test.go`, executed on `7fd9c852` before the
+> correction) and neither is a product defect. (C30-A)
+> `TestDCFin5_LegacyImportReplaceAndMergeAreDurable` read `[]` back from a
+> settings file it had just proven to carry both imported identities: the
+> restart helper `dcFinBoot` reset the live rewriter to "fresh process" and
+> loaded the file, and a best-effort admin-settings save still in flight
+> (`adminSettingsSave` spawns one on every admin mutation, the merge import's
+> own included) landed inside that window, serializing the empty live list
+> as saved-authoritative — the PR-C7b class. RED: with a save held open the
+> helper returned anyway, and the loss itself reproduced; a mechanism
+> control (green at both trees) documents the erasure. Correction: `dcFinBoot`
+> drains `adminSettingsSaveWG` BEFORE the fresh-process reset and
+> `dcFinYAMLBootEnv` drains it before handing over the settings path;
+> isolation only, no assertion changed. (C30-B)
+> `TestMatchSchedule_InvalidTimezone` asserted a `"00:00"`–`"23:59"` window
+> against the wall clock; the matcher is half-open, so the claim is false
+> for the last minute of every day and the run crossed 23:59 UTC. Main's own
+> commit `08545fa5` corrected the two sibling tests to `"24:00"` and left
+> this one and `TestPolicyPrecompute_ScheduleTimezone` (the same window in
+> America/New_York, asserted through `Evaluate`'s per-scan clock) behind.
+> RED: a source wall over the root test files refuses a full-day schedule
+> built as `"00:00"`–`"23:59"` (two offenders on the untouched tree).
+> Correction: both windows close at `"24:00"`, exactly as `08545fa5` did;
+> the engine is unchanged. Test-side only.
+>
 > **PR-C29 — the nineteenth Codex round (one P1).** Confirmed and pinned
 > before the correction (`upstream_codex_r19_red_test.go`; seven of its
 > eight shapes were accepted on the untouched head — the document-level

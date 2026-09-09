@@ -37,12 +37,22 @@ func dcFinYAMLBootEnv(t *testing.T) (settingsPath string) {
 	// omnibus-save/CP-publish process-wide, so it must not leak.
 	t.Cleanup(clearRewriteIdentityDegraded)
 	rewriter.SetRules(nil) // isolate from rules other tests left live
+	// PR-C30: a predecessor's best-effort save (adminSettingsSave spawns one
+	// on every admin mutation) must not land on this test's file after the
+	// path is handed over.
+	adminSettingsSaveWG.Wait()
 	swapAdminSettingsPath(t, settingsPath)
 	return settingsPath
 }
 
 func dcFinBoot(t *testing.T, settingsPath string, yaml []RewriteRule) []RewriteRule {
 	t.Helper()
+	// PR-C30: drain every detached save BEFORE the fresh-process reset. A
+	// save still in flight (the import's own included) that lands between
+	// the reset and the load serializes the empty live rewriter as
+	// saved-authoritative, and the "restart" reads [] from a file that had
+	// just been proven to carry the identities.
+	adminSettingsSaveWG.Wait()
 	rewriter.SetRules(nil) // fresh process
 	loadRewriteAndDefaultAction(rewriteDefaultActionStartupConfig{Rules: yaml, DefaultAction: "allow"}, 0)
 	LoadAdminSettings(settingsPath)

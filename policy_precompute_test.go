@@ -140,7 +140,10 @@ func TestPolicyPrecompute_ScheduleTimezone(t *testing.T) {
 	ps := &PolicyStore{}
 	ps.ReplaceAll([]PolicyRule{{
 		Priority: 1, Name: "workday", DestFQDN: "*",
-		Schedule: &PolicySchedule{TimeStart: "00:00", TimeEnd: "23:59", Timezone: "America/New_York"},
+		// "24:00" closes a full day; a "23:59" end bound is exclusive and
+		// this wall-clock assertion was false for the last minute of every
+		// New York day (PR-C30).
+		Schedule: &PolicySchedule{TimeStart: "00:00", TimeEnd: "24:00", Timezone: "America/New_York"},
 		Action:   ActionAllow,
 	}})
 	if m := ps.Evaluate("203.0.113.7", "", "unauth", "example.com", nil); m == nil {
