@@ -35,6 +35,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/KidCarmi/Culvert/internal/secscan"
 )
 
 // unparseableCredURL is an ordinary operator URL whose password contains a
@@ -111,12 +113,32 @@ func TestRed_ScanSvcErrorTextLeaksParseableCredential(t *testing.T) {
 
 // ─── GREEN contracts: what the fixed surface must guarantee ─────────────────
 
+// boundedProbeClasses is the rendered vocabulary. The security property is
+// that remote_status is drawn from THIS set — not that any particular network
+// fault maps to any particular member — so the reachability cases assert
+// membership. The parse case touches no network and is asserted exactly.
+var boundedProbeClasses = map[string]bool{
+	secscan.ProbeReasonNotConfigured: true,
+	secscan.ProbeReasonInvalidURL:    true,
+	secscan.ProbeReasonTimeout:       true,
+	secscan.ProbeReasonConnectFailed: true,
+	secscan.ProbeReasonTLSFailed:     true,
+	secscan.ProbeReasonBadResponse:   true,
+	secscan.ProbeReasonUnavailable:   true,
+}
+
 // TestScanSvc_ProbeStatusIsABoundedClass pins that the rendered probe status
 // is drawn from the bounded vocabulary and never interpolates an error string.
 func TestScanSvc_ProbeStatusIsABoundedClass(t *testing.T) {
-	for _, tc := range []struct{ name, url, want string }{
-		{"unparseable", unparseableCredURL, "unreachable: invalid_url"},
-		{"refused", "http://127.0.0.1:1", "unreachable: connect_failed"},
+	for _, tc := range []struct {
+		name, url, wantExact string
+	}{
+		// No network: http.NewRequestWithContext fails on the URL itself, so
+		// this case is fully deterministic on any host.
+		{name: "unparseable", url: unparseableCredURL, wantExact: "unreachable: " + secscan.ProbeReasonInvalidURL},
+		// Reachability-dependent: refused on an ordinary host, but a sandbox
+		// may black-hole it into a timeout instead. Membership is the contract.
+		{name: "unreachable port", url: "http://127.0.0.1:1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			orig := globalRemoteScanner
@@ -131,8 +153,19 @@ func TestScanSvc_ProbeStatusIsABoundedClass(t *testing.T) {
 			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			if got["remote_status"] != tc.want {
-				t.Fatalf("remote_status = %v, want %q", got["remote_status"], tc.want)
+			status, _ := got["remote_status"].(string)
+			if tc.wantExact != "" {
+				if status != tc.wantExact {
+					t.Fatalf("remote_status = %q, want %q", status, tc.wantExact)
+				}
+				return
+			}
+			reason, ok := strings.CutPrefix(status, "unreachable: ")
+			if !ok {
+				t.Fatalf("remote_status = %q, want the \"unreachable: \" contract", status)
+			}
+			if !boundedProbeClasses[reason] && !strings.HasPrefix(reason, "http_") {
+				t.Fatalf("remote_status carried %q, which is outside the bounded vocabulary", reason)
 			}
 		})
 	}
