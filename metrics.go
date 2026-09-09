@@ -724,9 +724,13 @@ culvert_clamav_blocked_total %d
 # TYPE culvert_yara_blocked_total counter
 culvert_yara_blocked_total %d
 
-# HELP culvert_clam_scan_errors_total Total ClamAV scan errors mid-request (content forwarded unscanned, fail-open)
+# HELP culvert_clam_scan_errors_total Total ClamAV scan errors mid-request (content forwarded unscanned, fail-open). Deprecated alias of culvert_clamav_scan_errors_total, kept for wire compatibility with existing dashboards/alerts; carries the identical value.
 # TYPE culvert_clam_scan_errors_total counter
 culvert_clam_scan_errors_total %d
+
+# HELP culvert_clamav_scan_errors_total Total ClamAV scan errors mid-request (content forwarded unscanned, fail-open). Canonical name, matching culvert_clamav_blocked_total; identical value to culvert_clam_scan_errors_total.
+# TYPE culvert_clamav_scan_errors_total counter
+culvert_clamav_scan_errors_total %d
 
 # HELP culvert_scan_timeout_total Total body scans that exceeded the scan budget and were refused (fail-closed)
 # TYPE culvert_scan_timeout_total counter
@@ -810,6 +814,7 @@ culvert_auth_sso_required_total %d
 		clamBlocked,
 		yaraBlocked,
 		scanCounters.ClamScanError,
+		scanCounters.ClamScanError, // dual-emit: culvert_clamav_scan_errors_total (canonical), see culvert_clam_scan_errors_total above
 		scanCounters.ScanTimeout,
 		scanCounters.ClamSaturated,
 		scanCounters.ScanLateDiscarded,
