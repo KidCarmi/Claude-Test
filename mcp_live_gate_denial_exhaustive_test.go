@@ -13,6 +13,7 @@ package main
 // CWE-636 (not failing securely) / CWE-1071; OWASP A04:2021.
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -98,16 +99,22 @@ func TestLiveGate_EveryKnownDenialClassDenies(t *testing.T) {
 // exactly one value may admit. A gate that admits on more than one value has
 // a hole no per-class test would find.
 func TestLiveGate_GrantedIsTheOnlyAdmittingClass(t *testing.T) {
-	admitting := make([]int, 0, 1)
-	for v := 0; v < 256; v++ {
+	// Walk the domain in its OWN type so the sweep needs no int→uint8
+	// conversion (gosec G115). canaryAdmissionDenial wraps at its maximum, so
+	// the terminator is the last value rather than a bound on a counter.
+	admitting := make([]canaryAdmissionDenial, 0, 1)
+	for v := canaryAdmissionDenial(0); ; v++ {
 		g := gateWithAdmission(canaryAdmission{
-			Denial: canaryAdmissionDenial(v), Active: true, Generation: 7, Trusted: true,
+			Denial: v, Active: true, Generation: 7, Trusted: true,
 		})
 		if g.AdmitSideEffect(liveGateInput()).Admit {
 			admitting = append(admitting, v)
 		}
+		if v == math.MaxUint8 {
+			break
+		}
 	}
-	if len(admitting) != 1 || canaryAdmissionDenial(admitting[0]) != canaryAdmitGranted {
+	if len(admitting) != 1 || admitting[0] != canaryAdmitGranted {
 		t.Fatalf("admitting denial values = %v, want only canaryAdmitGranted (%d)", admitting, canaryAdmitGranted)
 	}
 }

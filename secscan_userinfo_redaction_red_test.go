@@ -42,15 +42,15 @@ import (
 // unparseableCredURL is an ordinary operator URL whose password contains a
 // bare '%' — legal in a password, fatal to url.Parse.
 const (
-	unparseableCredURL = "http://svcuser:pw%zzleak-red@127.0.0.1:1"
-	unparseableCredPw  = "pw%zzleak-red"
+	unparseableCredURL    = "http://svcuser:pw%zzleak-red@127.0.0.1:1"
+	unparseableCredNeedle = "pw%zzleak-red"
 )
 
 // TestRed_RedactURLUserinfoFailsOpenOnUnparseableURL is the unit-level proof:
 // the helper returns the credential verbatim rather than redacting it.
 func TestRed_RedactURLUserinfoFailsOpenOnUnparseableURL(t *testing.T) {
 	for _, tc := range []struct {
-		name, raw, secret string
+		name, raw, needle string
 	}{
 		{"percent-escape", "http://u:pw%zzleak@host:8484/x", "pw%zzleak"},
 		{"control-char", "http://u:pw\x7fleak@host:8484/x", "pw\x7fleak"},
@@ -59,7 +59,7 @@ func TestRed_RedactURLUserinfoFailsOpenOnUnparseableURL(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := redactURLUserinfo(tc.raw)
-			if strings.Contains(got, tc.secret) {
+			if strings.Contains(got, tc.needle) {
 				t.Fatalf("redactURLUserinfo returned the credential verbatim: %q", got)
 			}
 		})
@@ -79,7 +79,7 @@ func TestRed_ScanSvcURLLeaksUnparseableCredentialToViewer(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("svc GET = %d", w.Code)
 	}
-	if strings.Contains(w.Body.String(), unparseableCredPw) {
+	if strings.Contains(w.Body.String(), unparseableCredNeedle) {
 		t.Fatalf("viewer svc surface leaked the scan-service password: %s", w.Body.String())
 	}
 
@@ -88,7 +88,7 @@ func TestRed_ScanSvcURLLeaksUnparseableCredentialToViewer(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("status GET = %d", w.Code)
 	}
-	if strings.Contains(w.Body.String(), unparseableCredPw) {
+	if strings.Contains(w.Body.String(), unparseableCredNeedle) {
 		t.Fatalf("viewer status surface leaked the scan-service password: %s", w.Body.String())
 	}
 }
@@ -210,7 +210,7 @@ func TestScanSvc_RequiresViewerRole(t *testing.T) {
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("role %q got %d, want 403", role, w.Code)
 		}
-		if strings.Contains(w.Body.String(), unparseableCredPw) {
+		if strings.Contains(w.Body.String(), unparseableCredNeedle) {
 			t.Fatalf("the 403 body leaked the credential: %s", w.Body.String())
 		}
 	}
@@ -230,7 +230,7 @@ func TestScanSvc_MethodBoundary(t *testing.T) {
 		if w.Code != http.StatusMethodNotAllowed {
 			t.Fatalf("%s got %d, want 405", m, w.Code)
 		}
-		if strings.Contains(w.Body.String(), unparseableCredPw) {
+		if strings.Contains(w.Body.String(), unparseableCredNeedle) {
 			t.Fatalf("%s leaked the credential: %s", m, w.Body.String())
 		}
 	}
@@ -253,7 +253,7 @@ func TestScanSvc_ConcurrentReadsNeverLeak(t *testing.T) {
 			for j := 0; j < 8; j++ {
 				w := httptest.NewRecorder()
 				apiScanSvcConfig(w, jsonReq("GET", "/api/security-scan/svc", nil))
-				if strings.Contains(w.Body.String(), unparseableCredPw) {
+				if strings.Contains(w.Body.String(), unparseableCredNeedle) {
 					t.Error("concurrent read leaked the credential")
 					return
 				}

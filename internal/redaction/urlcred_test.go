@@ -28,7 +28,7 @@ func TestURLUserinfo_RemovesCredentials(t *testing.T) {
 // first shipped shape returned unparseable input verbatim, which leaked every
 // password containing a character url.Parse rejects.
 func TestURLUserinfo_FailsClosedOnUnparseableInput(t *testing.T) {
-	for _, tc := range []struct{ name, in, secret string }{
+	for _, tc := range []struct{ name, in, needle string }{
 		{"bare percent", "http://u:pw%zz@host:8484/x", "pw%zz"},
 		{"control char", "http://u:pw\x7f@host:8484/x", "pw\x7f"},
 		{"space in authority", "http:// u:pwspace@host/x", "pwspace"},
@@ -38,7 +38,7 @@ func TestURLUserinfo_FailsClosedOnUnparseableInput(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := URLUserinfo(tc.in)
-			if strings.Contains(got, tc.secret) {
+			if strings.Contains(got, tc.needle) {
 				t.Fatalf("URLUserinfo(%q) = %q — credential survived", tc.in, got)
 			}
 			if strings.Contains(got, "@") {
@@ -83,15 +83,15 @@ func TestURLUserinfo_UnparseableKeepsAuthorityOutsideCredential(t *testing.T) {
 // TestURLUserinfo_ConcurrentUseIsSafe runs the redactor from many goroutines:
 // it must be pure and hold no shared state (run under -race).
 func TestURLUserinfo_ConcurrentUseIsSafe(t *testing.T) {
-	const secret = "pw%zzconcurrent"
-	in := "http://u:" + secret + "@host:8484/x"
+	const needle = "pw%zzconcurrent"
+	in := "http://u:" + needle + "@host:8484/x"
 	var wg sync.WaitGroup
 	for i := 0; i < 64; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
-				if strings.Contains(URLUserinfo(in), secret) {
+				if strings.Contains(URLUserinfo(in), needle) {
 					t.Error("credential survived under concurrent use")
 					return
 				}
