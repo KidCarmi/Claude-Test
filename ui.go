@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -183,29 +182,51 @@ func startUI(port int, certFile, keyFile string, noTLS bool) *http.Server {
 		}
 	}
 
-	stop := make(chan struct{})
-	adminUIStop.Store(&stop)
-	go serveAdminUIWithRetry(srv, port, certFile, keyFile, stop)
+	go serveAdminUIWithRetry(srv, port, certFile, keyFile, armAdminUIStop())
 	return srv
 }
 
-// adminUIStop carries the retry loop's interrupt channel so the shutdown hook
-// can wake it out of a backoff sleep. A pointer-to-channel because
-// atomic.Pointer needs a pointer type; the channel is closed exactly once,
-// guarded by adminUIStopOnce.
+// The retry loop's interrupt channel, so the shutdown hook can wake it out of a
+// backoff sleep.
+//
+// One dedicated mutex covers the channel AND the closed flag. A sync.Once plus
+// an atomic.Pointer would be shorter, but the test reset has to re-arm both, and
+// re-arming a Once is only safe under the same lock its reader takes — so the
+// lock is the thing that actually makes reset correct, and adding the Once on
+// top would just be a second, weaker guard over the same state.
 var (
-	adminUIStop     atomic.Pointer[chan struct{}]
-	adminUIStopOnce sync.Once
+	adminUIStopMu     sync.Mutex
+	adminUIStopCh     chan struct{}
+	adminUIStopClosed bool
 )
+
+// armAdminUIStop creates the interrupt channel for a fresh listener.
+func armAdminUIStop() <-chan struct{} {
+	adminUIStopMu.Lock()
+	defer adminUIStopMu.Unlock()
+	adminUIStopCh = make(chan struct{})
+	adminUIStopClosed = false
+	return adminUIStopCh
+}
 
 // stopAdminUIListener interrupts the rebind loop. Idempotent, and safe to call
 // when no UI was ever started.
 func stopAdminUIListener() {
-	adminUIStopOnce.Do(func() {
-		if ch := adminUIStop.Load(); ch != nil {
-			close(*ch)
-		}
-	})
+	adminUIStopMu.Lock()
+	defer adminUIStopMu.Unlock()
+	if adminUIStopCh != nil && !adminUIStopClosed {
+		close(adminUIStopCh)
+		adminUIStopClosed = true
+	}
+}
+
+// resetAdminUIStopForTest re-arms the stop machinery between tests. Test
+// isolation only; see resetAdminUIHealthForTest, which calls it.
+func resetAdminUIStopForTest() {
+	adminUIStopMu.Lock()
+	defer adminUIStopMu.Unlock()
+	adminUIStopCh = nil
+	adminUIStopClosed = false
 }
 
 // serveAdminUIWithRetry binds and serves the admin UI, rebinding with a

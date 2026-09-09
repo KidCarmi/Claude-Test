@@ -415,6 +415,11 @@ func adminUIListenerState() adminUIListenerSnapshot {
 // under the lock replaces the held mutex with an unlocked zero value and the
 // following Unlock is a fatal "unlock of unlocked mutex" (the CHAOS-54 note).
 func resetAdminUIHealthForTest() {
+	// Re-armed BEFORE the health lock is taken: the stop machinery carries its
+	// own lock (ui.go), and taking a second lock from under this one would
+	// establish an ordering that nothing else in the file needs.
+	resetAdminUIStopForTest()
+
 	adminUIListener.mu.Lock()
 	defer adminUIListener.mu.Unlock()
 	adminUIListener.configured = false
@@ -434,11 +439,6 @@ func resetAdminUIHealthForTest() {
 	adminUIListener.alerted = false
 	adminUIEverFailed.Store(false)
 
-	// The stop machinery is process-global and sync.Once-guarded, so a test that
-	// exercised the shutdown path would otherwise make every later
-	// stopAdminUIListener call a no-op.
-	adminUIStop.Store(nil)
-	adminUIStopOnce = sync.Once{}
 }
 
 // adminUIListenerStatus is the /health posture string for the admin UI
