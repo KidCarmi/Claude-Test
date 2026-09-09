@@ -18,4 +18,6 @@ func resolveLifecycleCtx() context.Context {
 // rendering DP enrollment artifacts. Retained after the legacy updater removal
 // (the /api/update/registry writer is gone; the file is still read as an
 // optional override, falling back to the default registry when absent).
-const registrySettingsFile = "/data/registry_settings.json"
+// A var (not const) only so rebindDataDirPaths can follow CULVERT_DATA_DIR;
+// production code never mutates it otherwise.
+var registrySettingsFile = defaultDataDir + "/registry_settings.json"
