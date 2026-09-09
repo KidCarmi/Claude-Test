@@ -17,6 +17,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/fileblock"
 	"github.com/KidCarmi/Culvert/internal/fileutil"
 	"github.com/KidCarmi/Culvert/internal/geoip"
+	"github.com/KidCarmi/Culvert/internal/secscan"
 )
 
 // pendingCARotation holds a confirmation token for the two-step CA rotation flow.
@@ -1439,7 +1440,15 @@ func apiScanSvcConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if globalRemoteScanner.Enabled() {
 		if err := globalRemoteScanner.Health(); err != nil {
-			resp["remote_status"] = "unreachable: " + err.Error()
+			// BOUNDED class only. The raw error is not renderable here: an
+			// unparseable base URL yields *url.Error{Op:"parse"} carrying the
+			// URL — password included — which would walk straight past the
+			// redaction applied to remote_url above, and a transport error
+			// still carries the username. Full cause goes to the log.
+			reason := secscan.ProbeFailureReason(err)
+			resp["remote_status"] = "unreachable: " + reason
+			logger.Printf("ScanSvc: health probe failed for %q: reason=%s",
+				sanitizeLog(redactURLUserinfo(globalRemoteScanner.URL())), sanitizeLog(reason))
 		} else {
 			resp["remote_status"] = "connected"
 		}

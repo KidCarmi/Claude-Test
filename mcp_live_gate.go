@@ -184,6 +184,24 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	case canaryAdmitAborted, canaryAdmitBudget:
 		releaseAdmit()
 		return deny(mcperr.ReasonRolloutBudgetExhausted)
+	case canaryAdmitGranted:
+		// The one class that authorizes a physical attempt. Named explicitly so
+		// the default below can be what it should be.
+	default:
+		// FAIL CLOSED on a class this gate does not know. Reaching the admit
+		// path by falling out of a switch is how a denial added to
+		// canaryAdmissionDenial later would silently authorize an irreversible
+		// upstream call: every existing class is handled above, so this branch
+		// changes nothing today and is the whole point — the boundary must deny
+		// what it cannot classify, not admit it.
+		releaseAdmit()
+		return deny(mcperr.ReasonRolloutModeInvalid)
+	}
+	if !adm.Granted() {
+		// Belt-and-braces against the two halves disagreeing: Granted() is the
+		// single authority on whether a physical attempt is authorized.
+		releaseAdmit()
+		return deny(mcperr.ReasonRolloutModeInvalid)
 	}
 	gen := adm.Generation
 
