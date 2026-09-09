@@ -9,6 +9,23 @@ version is `info.version` in `api/openapi/openapi.yaml` and follows
 
 ### Security
 
+- Scan-service credential exposure on the viewer-role read surfaces
+  (`GET /api/security-scan/svc`, `GET /api/security-scan/status`). The
+  userinfo redaction added for those surfaces returned unparseable input
+  verbatim, so a `-scan-svc-url` password containing a bare `%`, a control
+  character or a space — all of which make `url.Parse` fail while remaining
+  perfectly legal in a password — was echoed in cleartext to any viewer.
+  The same input also produced a `*url.Error{Op:"parse"}` carrying the raw
+  URL, which both surfaces spliced into their JSON. Redaction is now
+  fail-closed (`internal/redaction.URLUserinfo`, lexical fallback), probe
+  failures render a bounded reason class only
+  (`internal/secscan.ProbeFailureReason`), and the two startup log lines
+  that wrote the configured URL verbatim are redacted.
+- MCP live side-effect boundary: `AdmitSideEffect` switched on the
+  admission denial class with no `default`, so a class added later would
+  fall through onto the admit path and authorize an irreversible upstream
+  tool call. Every class defined today was handled, so the hole was latent;
+  the boundary now denies what it cannot classify.
 - `google.golang.org/grpc` bumped `v1.83.1` → `v1.83.2` (CVE-2026-84445,
   HIGH: gRPC-Go xDS servers, denial of service via crash). Module graph
   only; no code change.
