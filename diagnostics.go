@@ -163,6 +163,7 @@ func buildOperatorContract() OperatorContract {
 		checkAuditPersistence(),
 		checkCategoryFeedDB(),
 		checkSOCKS5Listener(),
+		checkAdminUIListener(),
 		checkRequestLogPersistence(),
 		checkIdentityBackend(),
 		checkInteractiveLoginState(),
