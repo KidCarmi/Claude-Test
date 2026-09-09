@@ -7,6 +7,12 @@ version is `info.version` in `api/openapi/openapi.yaml` and follows
 
 ## [Unreleased]
 
+### Security
+
+- `google.golang.org/grpc` bumped `v1.83.1` → `v1.83.2` (CVE-2026-84445,
+  HIGH: gRPC-Go xDS servers, denial of service via crash). Module graph
+  only; no code change.
+
 ### Added
 
 - New React/TypeScript admin frontend, Batch 2 (`CULVERT_EXPERIMENTAL_UI`,
