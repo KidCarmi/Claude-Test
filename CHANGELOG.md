@@ -77,6 +77,19 @@ listed deletes; echo the current `etag`/`revision` on PAC deletes; send the
 now-required identity parameters and body fields; use the per-entry Upstream
 endpoints for credentialed parents.
 
+### Performance
+
+- The top-hosts counter's tracked-host path is lock-free. `topHosts.Record`
+  runs on every allowed request and took a process-wide `RWMutex` read lock
+  to read a map that in steady state never changes; `RLock`/`RUnlock` are two
+  atomic read-modify-writes on one shared word, so this was a throughput
+  ceiling rather than a constant cost — on a 4-core box it measured 35.8 /
+  92.6 / 96.8 ns/op at 1 / 2 / 4 cores, i.e. four cores delivered 0.37x the
+  throughput of one. Backed by a `sync.Map` it measures 42.0 / 26.1 / 16.1
+  ns/op — 6.0x at four cores and a curve that improves with core count. The
+  distinct-host cap, the decay pass and `Top` are unchanged and still
+  serialised. No API, metric, or dashboard change.
+
 ### Fixed
 
 - `culvert --prepare-downgrade` now writes its counts-only audit record to
