@@ -195,9 +195,10 @@ func dcFinSeedRenamedProfile(t *testing.T) (profilesPath, ruleID string) {
 
 func dcFinRuleFileProfileName(t *testing.T, ruleID string) string {
 	t.Helper()
-	for _, r := range policyStore.List() {
-		if r.ID == ruleID {
-			return string(r.FileProfile)
+	rules := policyStore.List()
+	for i := range rules {
+		if rules[i].ID == ruleID {
+			return string(rules[i].FileProfile)
 		}
 	}
 	t.Fatalf("staged rule %s disappeared", ruleID)

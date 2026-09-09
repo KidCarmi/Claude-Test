@@ -15,6 +15,12 @@ export const SETUPFAIL_URL =
  * entry (see scripts/e2e-smoke.sh). */
 export const YAML_URL =
   process.env["CULVERT_E2E_YAML_URL"] ?? "http://127.0.0.1:19093";
+/** PR-C1: the AUTH appliance's per-instance data root (CULVERT_DATA_DIR,
+ * exported by scripts/e2e-smoke.sh) — where its admin_settings.json lives
+ * for the on-disk ciphertext needle checks. Defaults to the appliance's
+ * built-in root. */
+export const AUTH_DATA_DIR =
+  process.env["CULVERT_E2E_AUTH_DATA_DIR"] ?? "/data";
 
 export const ADMIN_STATE = "e2e/.state/admin.json";
 export const EMPTY_STATE = { cookies: [], origins: [] };

@@ -718,7 +718,7 @@ func (s *Store) All() []Entry {
 // happens under the SAME mu.RLock as the rev/fingerprint capture, so no
 // writer's critical section can land between the rows and the revision that
 // names them.
-func (s *Store) SnapshotWithRevision() ([]Entry, string) {
+func (s *Store) SnapshotWithRevision() (entries []Entry, revision string) {
 	s.mutMu.Lock()
 	defer s.mutMu.Unlock()
 	s.fpMu.Lock()

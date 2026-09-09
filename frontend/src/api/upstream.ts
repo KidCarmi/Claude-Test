@@ -186,6 +186,9 @@ export interface UpstreamCoverage {
 export interface UpstreamProbeConfig {
   configured: boolean;
   interval: string;
+  /** True while a manual probe run is executing on the appliance (PR-C15
+   *  K11); absent only on an appliance that predates the field. */
+  manualInFlight?: boolean;
 }
 
 export interface UpstreamDirectFallback {
@@ -460,9 +463,16 @@ export const decodeUpstreamConfig: Decoder<UpstreamConfig> = (
     coverage: field(o, "coverage", decodeCoverage, path),
     probe: (() => {
       const p = readRecord(o["probe"], `${path}.probe`);
+      const manualInFlight = opt(
+        p,
+        "manualInFlight",
+        readBoolean,
+        `${path}.probe`,
+      );
       return {
         configured: field(p, "configured", readBoolean, `${path}.probe`),
         interval: field(p, "interval", readString, `${path}.probe`),
+        ...(manualInFlight !== undefined ? { manualInFlight } : {}),
       };
     })(),
     revision: field(o, "revision", readNumber, path),
@@ -760,22 +770,197 @@ function specWire(
   };
 }
 
-/** The canonical authority the appliance derives from a submitted spec
+/** The canonical FIELDS the appliance derives from a submitted spec
  * (`Normalize`: scheme + host lower-cased, trailing dot stripped, IDNA via
- * the URL parser, the scheme default port). Used ONLY to bind a success
- * answer to the request — never to render or to send. */
-export function canonicalAuthority(spec: UpstreamEntrySpec): string {
-  const scheme = spec.scheme.trim().toLowerCase();
-  let host = spec.host.trim().toLowerCase().replace(/\.+$/, "");
-  try {
-    const u = new URL(`${scheme}://${host}`);
-    if (u.hostname !== "") host = u.hostname;
-  } catch {
-    /* keep the lowered host; the appliance would have refused it anyway */
+ * the URL parser, the scheme default port, the username trimmed). Used
+ * ONLY to bind a success answer to the request — never to render or to
+ * send. The answer is bound FIELD BY FIELD, never through a rebuilt
+ * authority string: the appliance percent-escapes the username inside
+ * `authority` (url.PathEscape — `?`, `#`, `%`, `;`, non-ASCII), and a
+ * client-side re-implementation of that escaping would turn a genuine
+ * success into an unproven outcome on exactly the usernames it got wrong
+ * (PR-C9 K2). */
+export interface CanonicalSpec {
+  scheme: string;
+  host: string;
+  /** The host at the Unicode level (see hostUnicodeKey) — the appliance's
+   *  IDNA tables cannot be reproduced exactly in the browser, so a returned
+   *  host is ALSO accepted when it decodes to the same letters. */
+  hostKey: string;
+  port: number;
+  username: string;
+}
+
+// ── Unicode-level host identity (PR-C13 K8) ─────────────────────────────
+// RFC 3492 punycode decoding of one label (the part after `xn--`).
+// Returns undefined for a malformed label — never a guess.
+function punycodeDecode(input: string): string | undefined {
+  const base = 36;
+  const tMin = 1;
+  const tMax = 26;
+  const skew = 38;
+  const damp = 700;
+  const out: number[] = [];
+  let n = 128;
+  let i = 0;
+  let bias = 72;
+  const delim = input.lastIndexOf("-");
+  const basicEnd = delim > 0 ? delim : 0;
+  for (let j = 0; j < basicEnd; j++) {
+    const c = input.charCodeAt(j);
+    if (c >= 0x80) return undefined;
+    out.push(c);
+  }
+  const digit = (c: number): number => {
+    if (c >= 48 && c <= 57) return c - 22;
+    if (c >= 65 && c <= 90) return c - 65;
+    if (c >= 97 && c <= 122) return c - 97;
+    return base;
+  };
+  const adapt = (d: number, numPoints: number, first: boolean): number => {
+    let delta = first ? Math.floor(d / damp) : d >> 1;
+    delta += Math.floor(delta / numPoints);
+    let k = 0;
+    while (delta > ((base - tMin) * tMax) >> 1) {
+      delta = Math.floor(delta / (base - tMin));
+      k += base;
+    }
+    return k + Math.floor(((base - tMin + 1) * delta) / (delta + skew));
+  };
+  let idx = basicEnd > 0 ? basicEnd + 1 : 0;
+  while (idx < input.length) {
+    const oldi = i;
+    let w = 1;
+    for (let k = base; ; k += base) {
+      if (idx >= input.length) return undefined;
+      const d = digit(input.charCodeAt(idx++));
+      if (d >= base) return undefined;
+      i += d * w;
+      const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+      if (d < t) break;
+      w *= base - t;
+    }
+    const numPoints = out.length + 1;
+    bias = adapt(i - oldi, numPoints, oldi === 0);
+    n += Math.floor(i / numPoints);
+    i %= numPoints;
+    if (n > 0x10ffff) return undefined;
+    out.splice(i, 0, n);
+    i++;
+  }
+  return String.fromCodePoint(...out);
+}
+
+// The Unicode form of an ASCII (A-label) host: every `xn--` label decoded,
+// NFC-normalised. A host with a malformed punycode label has NO key (an
+// empty string can never equal a typed host).
+export function hostUnicodeKey(host: string): string {
+  if (host === "" || host.startsWith("[")) return host;
+  const labels: string[] = [];
+  for (const label of host.split(".")) {
+    if (label.toLowerCase().startsWith("xn--")) {
+      const u = punycodeDecode(label.slice(4));
+      if (u === undefined || u === "") return "";
+      labels.push(u);
+    } else {
+      labels.push(label);
+    }
+  }
+  return labels.join(".").normalize("NFC");
+}
+// A trailing label appended ONLY while the browser maps a host through the
+// URL parser (see canonicalSpec); it is stripped again and never reaches the
+// appliance.
+const HOST_MAP_SENTINEL = ".culvert-host-map-sentinel";
+
+// Go's strings.TrimSpace strips Unicode White_Space — '\t' '\n' '\v' '\f'
+// '\r' ' ' U+0085 U+00A0 and the Zs/Zl/Zp separators — while JavaScript's
+// trim() strips its own WhiteSpace + LineTerminator set, which KEEPS U+0085
+// and additionally strips U+FEFF. The appliance trims every spec field with
+// Go's set, so the client trims with the same set (PR-C14 K9).
+const GO_SPACE =
+  /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g;
+export function trimAsGo(s: string): string {
+  return s.replace(GO_SPACE, "");
+}
+
+// Go's strings.ToLower applies the SIMPLE Unicode case mapping; JavaScript's
+// toLowerCase applies the FULL mapping, which differs unconditionally for
+// U+0130 (`İ` → `i̇`, two code points, vs `i`) and conditionally for a final
+// sigma (`Σ` → `ς` at the end of a word vs `σ` always). Both are mapped to
+// Go's result before the JavaScript lower-casing so the client agrees with
+// the appliance on every host (PR-C12 K7).
+function lowerAsGo(s: string): string {
+  return s
+    .replace(/\u0130/g, "i")
+    .replace(/\u03a3/g, "\u03c3")
+    .toLowerCase();
+}
+
+export function canonicalSpec(spec: UpstreamEntrySpec): CanonicalSpec {
+  const scheme = trimAsGo(spec.scheme).toLowerCase();
+  // The appliance strips exactly ONE trailing dot (`example.com..` is
+  // accepted and kept as `example.com.`) — never all of them (PR-C12 K7).
+  let host = lowerAsGo(trimAsGo(spec.host)).replace(/\.$/, "");
+  let hostKey: string | undefined;
+  if (host.includes(":")) {
+    // An IPv6 literal: the appliance brackets a bare one and keeps the
+    // literal AS TYPED (lower-cased, never compressed) — the URL parser
+    // throws on a bare literal and compresses a bracketed one, so it must
+    // not see it (PR-C10 K4).
+    host = `[${host.replace(/^\[|\]$/g, "")}]`;
+  } else {
+    // Every other host is an IDNA name to the appliance: normalizeHost
+    // recognises only a full dotted-quad as IPv4 and otherwise keeps the
+    // UTS-46 mapping of what was typed (`127.1`, `2130706433`, `0x7f.1`
+    // stay verbatim; full-width digits map to ASCII). The URL parser gives
+    // the same UTS-46 mapping, but treats a LAST label that ends in a
+    // number as an IPv4 literal and collapses those spellings to
+    // `127.0.0.1` — so it is asked to map the host with a sentinel label
+    // appended (never a last label, never numeric) and the sentinel is
+    // stripped again (PR-C11 K6).
+    try {
+      const u = new URL(`http://${host}${HOST_MAP_SENTINEL}`);
+      if (u.hostname.endsWith(HOST_MAP_SENTINEL)) {
+        host = u.hostname.slice(0, -HOST_MAP_SENTINEL.length);
+      }
+    } catch {
+      // The browser refuses a host the appliance's IDNA tables may still
+      // accept (`ℵx.example` maps to `אx.example`, a label the browser's
+      // bidi check rejects, which the appliance returns as
+      // `xn--x-zhc.example`). The lowered host is kept, and the binding
+      // falls back to the Unicode-level key: UTS-46 is NFKC plus case
+      // folding for every mapped character seen so far, so the typed host
+      // is NFKC-mapped and lower-cased again (PR-C13 K8).
+      hostKey = lowerAsGo(host.normalize("NFKC"));
+    }
   }
   const port = spec.port === 0 ? (scheme === "https" ? 443 : 80) : spec.port;
-  const user = spec.username.trim();
-  return `${scheme}://${user !== "" ? `${user}@` : ""}${host}:${String(port)}`;
+  return {
+    scheme,
+    host,
+    hostKey: hostKey ?? hostUnicodeKey(host),
+    port,
+    username: trimAsGo(spec.username),
+  };
+}
+
+function matchesSpec(
+  e: { scheme: string; host: string; port: number; username: string },
+  want: CanonicalSpec,
+): boolean {
+  if (
+    e.scheme !== want.scheme ||
+    e.port !== want.port ||
+    e.username !== want.username
+  ) {
+    return false;
+  }
+  if (e.host === want.host) return true;
+  // The appliance's ASCII form differs from the browser's: accept it only
+  // when it decodes to exactly the letters that were typed (PR-C13 K8).
+  const key = hostUnicodeKey(e.host);
+  return key !== "" && key === want.hostKey;
 }
 
 /** Wrap the read-model decoder with an ACTION-SPECIFIC evidence check: a
@@ -801,7 +986,7 @@ export function createUpstreamEntry(
   documentRevision: number,
   signal?: AbortSignal,
 ): Promise<UpstreamConfig> {
-  const authority = canonicalAuthority(spec);
+  const want = canonicalSpec(spec);
   return apiRequest(
     "/api/upstream/entries",
     bound(
@@ -809,7 +994,7 @@ export function createUpstreamEntry(
       (cfg) =>
         cfg.entry !== undefined &&
         cfg.entry.source === "managed" &&
-        cfg.entry.authority === authority &&
+        matchesSpec(cfg.entry, want) &&
         cfg.entries.some((e) => e.id === cfg.entry?.id),
     ),
     { method: "POST", body: specWire(spec, documentRevision), ...sig(signal) },
@@ -824,7 +1009,7 @@ export function updateUpstreamEntry(
   entryRevision: number,
   signal?: AbortSignal,
 ): Promise<UpstreamConfig> {
-  const authority = canonicalAuthority(spec);
+  const want = canonicalSpec(spec);
   return apiRequest(
     `/api/upstream/entries/${encodeURIComponent(id)}`,
     bound(
@@ -832,8 +1017,8 @@ export function updateUpstreamEntry(
       (cfg) =>
         cfg.entry !== undefined &&
         cfg.entry.id === id &&
-        cfg.entry.authority === authority &&
-        cfg.entries.some((e) => e.id === id && e.authority === authority),
+        matchesSpec(cfg.entry, want) &&
+        cfg.entries.some((e) => e.id === id && matchesSpec(e, want)),
     ),
     { method: "PUT", body: specWire(spec, entryRevision), ...sig(signal) },
   );
@@ -909,11 +1094,35 @@ export function clearUpstreamCredential(
   );
 }
 
+/** The appliance bounds each probe at 5 s and runs the entries
+ * SEQUENTIALLY (`internal/upstream` probeTimeout — pinned in lockstep by
+ * the Go side), so a manual run legitimately takes up to
+ * entries x 5 s. */
+export const PROBE_PER_ENTRY_MS = 5_000;
+/** Headroom above the appliance's worst case for the answer itself. */
+export const PROBE_DEADLINE_MARGIN_MS = 10_000;
+const PROBE_DEADLINE_FLOOR_MS = 30_000;
+
+/** The client deadline for a manual probe run over `entryCount` entries:
+ * never below the default request deadline, never below the appliance's
+ * sequential worst case plus the margin. A run the appliance is still
+ * executing must not be aborted into an unproven outcome (PR-C9 K3). */
+export function probeDeadlineMs(entryCount: number): number {
+  const n = Number.isFinite(entryCount) && entryCount > 0 ? entryCount : 0;
+  return Math.max(
+    PROBE_DEADLINE_FLOOR_MS,
+    n * PROBE_PER_ENTRY_MS + PROBE_DEADLINE_MARGIN_MS,
+  );
+}
+
 /** POST /api/upstream/health — the bounded, audited manual probe run; the
  * answer must carry the explicit result (`ok: true`) and its counts-only
- * `summary`. */
+ * `summary`. `entryCount` is the read model's entry count (an upper bound
+ * of the eligible entries the appliance will probe) and sizes the request
+ * deadline. */
 export function runUpstreamProbe(
   signal?: AbortSignal,
+  entryCount = 0,
 ): Promise<UpstreamConfig> {
   return apiRequest(
     "/api/upstream/health",
@@ -921,6 +1130,6 @@ export function runUpstreamProbe(
       "the explicit probe result with its summary",
       (cfg) => cfg.ok === true && cfg.summary !== undefined,
     ),
-    { method: "POST", ...sig(signal) },
+    { method: "POST", timeoutMs: probeDeadlineMs(entryCount), ...sig(signal) },
   );
 }

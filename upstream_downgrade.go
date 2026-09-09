@@ -30,6 +30,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/url"
@@ -156,9 +157,10 @@ func runPrepareDowngrade(dir string, target int, confirm string, out io.Writer) 
 	if err := fileutil.AtomicWrite(path, data, 0o600); err != nil {
 		return &downgradeRefusal{Code: "persist_failed", Msg: "the predecessor-compatible settings file could not be written; nothing was changed"}
 	}
-	// Headless audit line (counts only) into the durable audit log beside
-	// the settings file; best-effort — a CLI one-shot has no request actor.
-	auditPrepareDowngrade(dir, plan)
+	// Headless audit line (counts only). The durable sink is the audit log
+	// the one-shot dispatcher opened from `-audit-log` (PR-C5); without one
+	// the record stays in the in-memory ring and the command says so.
+	auditPrepareDowngrade(plan)
 	p("\nPrepared: admin_settings.json rewritten for the predecessor (%d entr(y/ies), %d credential(s)).\n", plan.Entries, plan.Credentials)
 	p("Boot the predecessor binary (%s) now, or boot this binary to re-migrate.\n", downgradePredecessorSHA[:8])
 	return nil
@@ -247,15 +249,43 @@ func upstreamAuthenticatedLegacyURL(e *upstream.ManagedEntry, pw string) string 
 	return scheme + "://" + url.UserPassword(e.Username, pw).String() + "@" + rest
 }
 
-// auditPrepareDowngrade appends a counts-only line to the durable audit
-// log when one is configured under dir (best-effort).
-func auditPrepareDowngrade(dir string, plan downgradePlan) {
+// auditPrepareDowngrade appends a counts-only line to the audit sink
+// (durable when runPrepareDowngradeCommand opened one; best-effort).
+func auditPrepareDowngrade(plan downgradePlan) {
 	defer func() { _ = recover() }()
 	audit.Add(audit.Entry{
 		Actor: "cli", Action: "upstream.prepare_downgrade", Object: "admin_settings.json",
 		Detail: fmt.Sprintf("entries=%d credentials=%d target_schema=%d scope=node-local", plan.Entries, plan.Credentials, adminSettingsSchemaPredecessor),
 	})
-	_ = dir
+}
+
+// runPrepareDowngradeCommand is the one-shot composition behind
+// `culvert --prepare-downgrade` (PR-C5). The dispatcher runs BEFORE
+// initObservability, so the durable audit sink must be opened HERE: with
+// `-audit-log` configured the counts-only record is on disk before the
+// process exits (the sink is closed — flushed — after the command), and
+// an audit path that cannot be opened REFUSES the command rather than
+// committing a credential-unsealing rewrite with no durable trace. Without
+// `-audit-log` the command states that nothing durable is recorded. The
+// YAML `audit_log_file` is not consulted: one-shot commands never load the
+// config file.
+func runPrepareDowngradeCommand(s *startupState, out io.Writer) error {
+	word, err := prepareDowngradeConfirmWord(s.restoreConfirm, flag.Args())
+	if err != nil {
+		return err
+	}
+	auditPath := strings.TrimSpace(*s.auditLog)
+	if auditPath != "" {
+		if err := InitAuditLog(auditPath); err != nil {
+			return &downgradeRefusal{Code: "audit_sink_unavailable",
+				Msg: fmt.Sprintf("the configured audit log (%s) could not be opened; nothing was changed — fix the path or run without -audit-log to proceed unrecorded", auditPath)}
+		}
+		defer func() { _ = audit.Close() }()
+		_, _ = fmt.Fprintf(out, "Audit: recording to %s\n", auditPath)
+	} else {
+		_, _ = fmt.Fprintln(out, "Audit: NOT persisted (no -audit-log configured; the record stays in this process's memory)")
+	}
+	return runPrepareDowngrade(dataDir, *s.downgradeTargetSchema, word, out)
 }
 
 // confirmFlag is the shared `--confirm` flag: a bare `--confirm` (restore

@@ -51,11 +51,26 @@ func upEnv(t *testing.T) {
 	prevData := dataDir
 	dataDir = dir
 	pt, fh := upstream.ProbeTransport, upstream.FallbackAlertHook
+	// PR-C2: the rejected-document latch and the managed/YAML degradation
+	// surface are process-global boot outcomes (applyUpstreamV2); a test
+	// that arms them (the R3 premise) must not hand them to whichever test
+	// the shuffle runs next. Reset them with the rest of the process state
+	// — at entry AND at cleanup (PR-C7b: an entry-only reset protects the
+	// next upstream test and nobody else; a non-upstream successor's save
+	// carried the rejected sections forward verbatim).
+	resetUpstreamBootOutcome := func() {
+		upstreamClearRejected()
+		setUpstreamState(func(st *upstreamState) {
+			*st = upstreamState{Migration: upstreamMigrationState{State: "none"}, Key: upstreamKeyState{State: "unused"}}
+		})
+	}
 	t.Cleanup(func() {
+		resetUpstreamBootOutcome()
 		dataDir = prevData
 		upstream.ProbeTransport, upstream.FallbackAlertHook = pt, fh
 	})
 	upstream.ProbeTransport, upstream.FallbackAlertHook = nil, nil
+	resetUpstreamBootOutcome()
 	upstreamPool.Configure(nil, 5, 60*time.Second)
 	applyUpstreamProxy()
 }

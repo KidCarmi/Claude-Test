@@ -82,8 +82,12 @@ credential.
 **An authority change while a credential exists is refused** (409
 `credential_bound`). There is no combined rebind: clear the credential (T3),
 edit the entry, then set the credential again. Deleting an entry whose
-credential is `configured`, `unusable` or `mismatch` is refused too (409
-`credential_present`) — clearing is always an explicit, confirmed step.
+credential is `configured`, `unusable` or `mismatch` — or whose state is
+`requiresReplacement` (a restored or imported credentialed parent, see the
+portability section) — is refused too (409 `credential_present`): clearing
+is always an explicit, confirmed step, and the replacement marker is
+resolved only by that same Tier-3 clear or a Tier-2 replace, never by a
+delete.
 
 ### When the stored document is rejected
 
@@ -124,8 +128,10 @@ The legacy bulk endpoint survives as a **credential-free** adapter for
 scripts: a URL carrying any userinfo is refused (400 `userinfo_not_allowed`),
 an invalid entry refuses the whole list (400 `invalid_entry` — nothing is
 dropped), and the call is refused outright while any managed entry holds a
-credential (409 `credentialed_entries_present`). A credentialed entry can
-never be replaced or removed by omission. GET URLs never carry userinfo.
+credential or awaits credential replacement (`requiresReplacement`) (409
+`credentialed_entries_present`; `current.credentialed` names every such
+entry). A credentialed entry — or one carrying the replacement marker —
+can never be replaced or removed by omission. GET URLs never carry userinfo.
 
 The shipped admin panel (`static/index.html`) uses the per-entry endpoints;
 the adapter restrictions and the panel switch landed in the same commit.
@@ -277,6 +283,38 @@ is marked `requiresReplacement: true`; the manifest records
 `credentialsOmitted: true`; `.upstream_cred_key` is never archived. The
 live file and the running pool are not touched by a backup.
 
+A backup is **refused** while `admin_settings.json` carries credential
+material in its legacy `upstream_proxies` list — the prepared-downgrade
+state (§9: after `--prepare-downgrade`, before the next boot of this
+binary re-migrates and seals the credentials), or a pre-v2 file that was
+never booted on this binary. An archive never carries material and the
+manifest's `credentialsOmitted: true` must be true of every archive that
+is produced, so the backup fails with a counts-only error naming the
+state; boot this binary once, or complete the downgrade, then back up.
+The same refusal covers a legacy URL the sanitizer cannot read — one that
+fails to parse, or that parses without a host (a scheme-less `user:pw@host`
+spelling): the gate can only answer "does this URL carry a password?" for
+a URL it can parse, so an unreadable one fails the backup closed rather
+than being archived as password-free. Repair the entry (the legacy list
+carries `scheme://[user@]host:port`), then back up. A settings file that
+carries anything but whitespace after its single JSON object (a second
+value, trailing garbage) is refused the same way, and so is a settings
+object that repeats a key at any nesting level (a JSON decoder keeps only
+the last value of a repeated key, so the gate could otherwise be shown a
+value the archive would not carry), and so is a legacy `upstream_proxies`
+value that is not the persisted shape (an array of objects each carrying
+a non-empty `url` string), an `upstream_proxies_v2` document whose
+document, `entries`, item or `credential` is not the persisted shape, and
+any upstream key spelled in a case variant (`UPSTREAM_PROXIES`, `Entries`,
+`CREDENTIAL`) or repeated under a case-only difference inside the
+upstream structures — the settings loader matches those keys
+case-insensitively, the sanitizer reads exact spellings, and the appliance
+never writes a variant. The case rules apply only inside the upstream
+structures: an operator-controlled map such as `otlp_headers` may carry a
+header named `URL` or `KeyId`, and unrelated sections may use any name.
+Only a sound settings file is archived, and nothing the gate did not
+inspect is ever packed.
+
 **Restore** boots every formerly credentialed entry into the distinct
 state `requiresReplacement`: ineligible, never probed, never sent
 unauthenticated. Until you act, the effective mode is
@@ -307,9 +345,15 @@ only and atomically rewrites `admin_settings.json` (0600, fsync, rename)
 with full legacy URLs, removing `upstream_proxies_v2`; it refuses when
 the key is missing or unusable, when any credential is `mismatch`,
 `unusable` or `requiresReplacement` (fix those first), and when the file is
-already prepared. Output, log and audit carry counts only. The prepared
-file contains the passwords in cleartext by construction — that is the
-predecessor's format, and the reason the command is explicit and offline.
+already prepared. Output, log and audit carry counts only. The audit
+record (`upstream.prepare_downgrade`) is durable only when the one-shot is
+started with `-audit-log <path>` (the same flag the appliance runs with;
+the YAML `audit_log_file` is not consulted by one-shot commands): the
+command opens that log itself, refuses to run if the configured log cannot
+be opened (`audit_sink_unavailable`), and states `Audit: NOT persisted`
+when no audit log is configured. The prepared file contains the passwords
+in cleartext by construction — that is the predecessor's format, and the
+reason the command is explicit and offline.
 
 Booting the CURRENT binary on a prepared file re-migrates it once
 (`migration.reason: re-migrated_after_prepare`, credentials re-sealed).

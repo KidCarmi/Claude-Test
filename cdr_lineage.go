@@ -118,9 +118,9 @@ var (
 // normalizeLineageLocked synthesises the lineage for a pre-lineage entry
 // (one recorded fingerprint, no generations) so every instance carries
 // at least the credential it dials with. MUST be called under r.mu.
-func normalizeLineageLocked(inst *CDREnrolledInstance) bool {
+func normalizeLineageLocked(inst *CDREnrolledInstance) {
 	if len(inst.Credentials) > 0 || inst.ClientCertFingerprint == "" {
-		return false
+		return
 	}
 	var notAfter int64
 	if exp, err := loadCertExpiry(inst.ClientCertPath); err == nil {
@@ -130,7 +130,6 @@ func normalizeLineageLocked(inst *CDREnrolledInstance) bool {
 		Seq: 1, Fingerprint: inst.ClientCertFingerprint, NotAfterUnix: notAfter,
 		State: cdrCredActive, IssuedAt: inst.EnrolledAt, Source: "legacy",
 	}}
-	return true
 }
 
 // LiveFingerprints returns every fingerprint Sluice may still trust for
@@ -348,8 +347,9 @@ func (r *CDRInstanceRegistry) MarkCredentialRevoked(name, fp string) error {
 //     EnrollStatus (needs a client);
 //   - a legacy entry gets its synthesized lineage persisted.
 func reconcileCredentialLineage() {
-	for _, inst := range cdrInstances.SnapshotView() {
-		inst := inst
+	insts := cdrInstances.SnapshotView()
+	for idx := range insts {
+		inst := insts[idx]
 		if len(inst.Credentials) == 0 {
 			if inst.ClientCertFingerprint != "" {
 				if err := cdrInstances.mutateLineage(inst.Name, func(i *CDREnrolledInstance) error {
@@ -377,8 +377,8 @@ func finishStagedRenewal(inst CDREnrolledInstance, g CDRCredentialGeneration) {
 	defer unlock()
 	certTmp, keyTmp := inst.ClientCertPath+".tmp", inst.ClientKeyPath+".tmp"
 	diskFP, _ := loadCertFingerprint(inst.ClientCertPath)
-	switch {
-	case diskFP == g.Fingerprint:
+	switch diskFP {
+	case g.Fingerprint:
 		// Cert landed; the key rename may not have.
 		if _, err := os.Stat(keyTmp); err == nil {
 			if rerr := os.Rename(keyTmp, inst.ClientKeyPath); rerr != nil {

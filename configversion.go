@@ -31,9 +31,11 @@ import (
 // ConfigVersion is metadata for a stored config snapshot.
 type ConfigVersion = configver.Meta
 
-// configVersions is the process-wide snapshot store. Tests redirect it via
-// SetDirForTest/SetSeqForTest (production code never does).
-var configVersions = configver.New("/data/config_versions", 0)
+// configVersions is the process-wide snapshot store. It is re-bound to the
+// effective persisted-state root by rebindDataDirPaths (CULVERT_DATA_DIR)
+// before anything reads it; tests redirect it via SetDirForTest/
+// SetSeqForTest or swap the variable.
+var configVersions = configver.New(defaultDataDir+"/config_versions", 0)
 
 func initConfigVersioning() {
 	configVersions.Init()
@@ -1108,38 +1110,10 @@ func diffPolicyRules(a, b []PolicyRule, out *[]configChange) {
 // "no change". Backend truth only; the change entry shape stays the existing
 // {Field, From, To} envelope.
 func diffRewriteRules(a, b []RewriteRule, out *[]configChange) {
-	idsOf := func(rules []RewriteRule) (map[string]int, bool) {
-		m := make(map[string]int, len(rules))
-		for i := range rules {
-			if rules[i].StableID == "" {
-				return nil, false
-			}
-			m[rules[i].StableID] = i
-		}
-		return m, len(m) == len(rules) // duplicates ⇒ fall back conservatively
-	}
-	mapA, okA := idsOf(a)
-	mapB, okB := idsOf(b)
-
+	mapA, okA := rewriteRuleStableIDs(a)
+	mapB, okB := rewriteRuleStableIDs(b)
 	if !okA || !okB {
-		// Legacy/partial identity: conservative ordered content comparison —
-		// never claim "no change" when the actual rewrite set changed.
-		same := len(a) == len(b)
-		if same {
-			for i := range a {
-				if a[i].Host != b[i].Host || !rewriteRuleContentEqual(a[i], b[i]) {
-					same = false
-					break
-				}
-			}
-		}
-		if !same {
-			*out = append(*out, configChange{
-				Field: "rewrite_rules",
-				From:  map[string]any{"count": len(a)},
-				To:    map[string]any{"count": len(b), "note": "rewrite set changed (legacy entries without stable identity — content compared conservatively)"},
-			})
-		}
+		diffRewriteRulesLegacy(a, b, out)
 		return
 	}
 
@@ -1159,15 +1133,7 @@ func diffRewriteRules(a, b []RewriteRule, out *[]configChange) {
 			removed = append(removed, a[i].StableID)
 		}
 	}
-	reordered := false
-	if len(added) == 0 && len(removed) == 0 && len(a) == len(b) {
-		for i := range a {
-			if a[i].StableID != b[i].StableID {
-				reordered = true
-				break
-			}
-		}
-	}
+	reordered := len(added) == 0 && len(removed) == 0 && rewriteRulesReordered(a, b)
 	if len(added) > 0 || len(removed) > 0 || len(changed) > 0 || reordered {
 		*out = append(*out, configChange{
 			Field: "rewrite_rules",
@@ -1175,6 +1141,57 @@ func diffRewriteRules(a, b []RewriteRule, out *[]configChange) {
 			To:    map[string]any{"count": len(b), "added": added, "changed": changed, "reordered": reordered},
 		})
 	}
+}
+
+// rewriteRuleStableIDs indexes rules by StableID. ok is false when any rule
+// lacks an identity or two rules share one — the caller then falls back to
+// the conservative ordered comparison.
+func rewriteRuleStableIDs(rules []RewriteRule) (map[string]int, bool) {
+	m := make(map[string]int, len(rules))
+	for i := range rules {
+		if rules[i].StableID == "" {
+			return nil, false
+		}
+		m[rules[i].StableID] = i
+	}
+	return m, len(m) == len(rules) // duplicates ⇒ fall back conservatively
+}
+
+// diffRewriteRulesLegacy is the legacy/partial-identity path of
+// diffRewriteRules: a conservative ordered content comparison that never
+// claims "no change" when the actual rewrite set changed.
+func diffRewriteRulesLegacy(a, b []RewriteRule, out *[]configChange) {
+	same := len(a) == len(b)
+	if same {
+		for i := range a {
+			if a[i].Host != b[i].Host || !rewriteRuleContentEqual(a[i], b[i]) {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		return
+	}
+	*out = append(*out, configChange{
+		Field: "rewrite_rules",
+		From:  map[string]any{"count": len(a)},
+		To:    map[string]any{"count": len(b), "note": "rewrite set changed (legacy entries without stable identity — content compared conservatively)"},
+	})
+}
+
+// rewriteRulesReordered reports whether two same-membership rule lists differ
+// only in order (evaluation order is semantics).
+func rewriteRulesReordered(a, b []RewriteRule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].StableID != b[i].StableID {
+			return true
+		}
+	}
+	return false
 }
 
 // diffPACObjects is the shared ID-keyed differ for PAC profiles and pools

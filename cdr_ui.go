@@ -461,7 +461,7 @@ func apiCDREnroll(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	resp, err := cdrEnrollRPC(ctx, req.Endpoint, req.ServerFingerprint, req.Token, req.OperationID)
 	if err != nil {
-		logger.Printf("CDR: enrollment RPC failed for %q (operation %s): %v", sanitizeLog(req.Name), req.OperationID, err)
+		logger.Printf("CDR: enrollment RPC failed for %q (operation %q): %q", sanitizeLog(req.Name), sanitizeLog(req.OperationID), sanitizeLog(err.Error()))
 		enrollDispatchFailed(w, r, req, err)
 		return
 	}
@@ -484,7 +484,7 @@ func apiCDREnroll(w http.ResponseWriter, r *http.Request) {
 		rc.State = cdrReceiptStored
 		rc.Fingerprint = stored.ClientCertFingerprint
 	}); rerr != nil {
-		logger.Printf("CDR: enrollment receipt %s: record stored: %v", req.OperationID, rerr)
+		logger.Printf("CDR: enrollment receipt %q: record stored: %q", sanitizeLog(req.OperationID), sanitizeLog(rerr.Error()))
 		receiptState = cdrReceiptDispatched
 		receiptRecorded = false
 		receiptErr = sanitizeLog(rerr.Error())
@@ -607,7 +607,7 @@ func persistCDREnrollment(req cdrEnrollRequest, resp *pb.EnrollResponse) (CDREnr
 			rc.Fingerprint = fp
 			rc.Note = err.Error()
 		}); rerr != nil {
-			logger.Printf("CDR: enrollment receipt %s: record issued_not_stored: %v", req.OperationID, rerr)
+			logger.Printf("CDR: enrollment receipt %q: record issued_not_stored: %q", sanitizeLog(req.OperationID), sanitizeLog(rerr.Error()))
 			receiptNote = fmt.Sprintf("; the receipt could not be updated (%v) and stays dispatched", rerr)
 		}
 	}
@@ -618,7 +618,7 @@ func persistCDREnrollment(req cdrEnrollRequest, resp *pb.EnrollResponse) (CDREnr
 		Detail: fmt.Sprintf("Sluice issued client cert fingerprint %s (operation %s) but local persistence failed: %v; the credential remains trusted by Sluice until revoked",
 			fp, req.OperationID, err),
 	})
-	logger.Printf("CDR: enrollment %q: issued credential %s was NOT stored (operation %s): %v", sanitizeLog(req.Name), fp, req.OperationID, err)
+	logger.Printf("CDR: enrollment %q: issued credential %q was NOT stored (operation %q): %q", sanitizeLog(req.Name), sanitizeLog(fp), sanitizeLog(req.OperationID), sanitizeLog(err.Error()))
 	return CDREnrolledInstance{}, fmt.Errorf("%w; issued credential %s is not stored — revoke it%s", err, fp, receiptNote)
 }
 
@@ -736,9 +736,10 @@ func validateEnrollRequest(req cdrEnrollRequest) error {
 }
 
 // cdrCertsRoot is the parent directory under which every enrolled
-// instance's mTLS bundle lives.  Constant — never constructed from
-// user input.
-const cdrCertsRoot = "/data/integrations/sluice"
+// instance's mTLS bundle lives.  Fixed for the life of the process and
+// never constructed from user input: it is bound once, at boot, to the
+// effective persisted-state root (rebindDataDirPaths / CULVERT_DATA_DIR).
+var cdrCertsRoot = defaultDataDir + "/integrations/sluice"
 
 // cdrInstanceCertsDir returns the per-instance cert directory after
 // verifying that the resolved path is STILL inside cdrCertsRoot even if
@@ -979,18 +980,10 @@ func apiCDRRevokeRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Targets: every still-valid generation (active first) from the
-	// durable lineage; a pre-lineage entry falls back to the cert on disk.
-	fps := target.LiveFingerprints(time.Now())
-	if len(fps) == 0 {
-		diskFP, err := loadCertFingerprint(target.ClientCertPath)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("load target cert: %v", err), http.StatusInternalServerError)
-			return
-		}
-		fps = []string{diskFP}
+	fps, ok := cdrRevokeTargets(w, &target)
+	if !ok {
+		return
 	}
-	fp := fps[0]
 
 	// Pick ANY other active pool member to make the call — Sluice
 	// refuses self-revocation, and even if it didn't, revoking from
@@ -1004,40 +997,11 @@ func apiCDRRevokeRPC(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	outcomes := map[string]string{}
-	for _, gfp := range fps {
-		outcome, err := revokeWithProof(ctx, caller, gfp, strings.TrimSpace(req.Reason))
-		if err != nil {
-			http.Error(w, fmt.Sprintf("%v (proven so far: %d of %d generations — retry to finish)", err, len(outcomes), len(fps)), http.StatusBadGateway)
-			return
-		}
-		if merr := cdrInstances.MarkCredentialRevoked(name, gfp); merr != nil {
-			http.Error(w, fmt.Sprintf("Sluice proved the deny for %s (%s) but it could not be recorded locally: %v — retry (idempotent)", gfp, outcome, merr), http.StatusInternalServerError)
-			return
-		}
-		outcomes[gfp] = outcome
+	outcomes, ok := cdrRevokeGenerations(ctx, w, caller, name, fps, strings.TrimSpace(req.Reason))
+	if !ok {
+		return
 	}
-
-	// Prune the local registry entry now that every generation is dead
-	// on the Sluice side.  shredCDRCerts removes the PEMs from disk.
-	// A failed prune-persist is loud, not fatal: the revocation itself
-	// is durable on the Sluice side (its ledger) AND every generation is
-	// durably marked revoked here, so a resurrected entry can only fail
-	// to dial — but the operator should know the registry disagrees.
-	pruned := true
-	if _, rerr := cdrInstances.RemoveByName(name); rerr != nil {
-		pruned = false
-		logger.Printf("CDR: revoke %q: prune registry entry: %v", sanitizeLog(name), rerr)
-	}
-	shredCDRCerts(&target)
-	if cdrActiveClient() != nil {
-		// Drop the pool entry by re-init so we stop trying to dial
-		// the revoked instance.
-		if rerr := initCDRClient(cdrActiveConfig()); rerr != nil {
-			logger.Printf("CDR: revoke %q succeeded but reinit failed: %q",
-				sanitizeLog(name), sanitizeLog(rerr.Error()))
-		}
-	}
+	pruned := cdrPruneRevokedInstance(name, &target)
 
 	auditEventDiff(r, "cdr.instance.revoke_rpc", name,
 		fmt.Sprintf("fingerprints=%s outcomes=%v reason=%q", strings.Join(fps, ","), outcomes, sanitizeLog(req.Reason)),
@@ -1052,7 +1016,69 @@ func apiCDRRevokeRPC(w http.ResponseWriter, r *http.Request) {
 	// does NOT read cdr_instances.json) so the call was misleading even
 	// before the security concern. Category D-sec finding from
 	// roadmap/CONFIG-VERSIONING-TRIAGE.md + roadmap/CATEGORY-D-PRIME-DIRECTION.md.
-	jsonOK(w, map[string]any{"revoked": name, "fingerprint": fp, "fingerprints": fps, "outcomes": outcomes, "localPruned": pruned})
+	jsonOK(w, map[string]any{"revoked": name, "fingerprint": fps[0], "fingerprints": fps, "outcomes": outcomes, "localPruned": pruned})
+}
+
+// cdrRevokeTargets resolves the revocation targets: every still-valid
+// generation (active first) from the durable lineage; a pre-lineage entry
+// falls back to the cert on disk. It writes the 500 itself.
+func cdrRevokeTargets(w http.ResponseWriter, target *CDREnrolledInstance) ([]string, bool) {
+	fps := target.LiveFingerprints(time.Now())
+	if len(fps) == 0 {
+		diskFP, err := loadCertFingerprint(target.ClientCertPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("load target cert: %v", err), http.StatusInternalServerError)
+			return nil, false
+		}
+		fps = []string{diskFP}
+	}
+	return fps, true
+}
+
+// cdrRevokeGenerations revokes every generation in fps with a proven durable
+// deny (R6) and marks each revoked locally before moving on, so a failure
+// midway leaves the proven generations recorded and a retry finishes the
+// rest. It writes the refusal itself; ok is false when it did.
+func cdrRevokeGenerations(ctx context.Context, w http.ResponseWriter, caller *CDRClient, name string, fps []string, reason string) (map[string]string, bool) {
+	outcomes := map[string]string{}
+	for _, gfp := range fps {
+		outcome, err := revokeWithProof(ctx, caller, gfp, reason)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("%v (proven so far: %d of %d generations — retry to finish)", err, len(outcomes), len(fps)), http.StatusBadGateway)
+			return nil, false
+		}
+		if merr := cdrInstances.MarkCredentialRevoked(name, gfp); merr != nil {
+			http.Error(w, fmt.Sprintf("Sluice proved the deny for %s (%s) but it could not be recorded locally: %v — retry (idempotent)", gfp, outcome, merr), http.StatusInternalServerError)
+			return nil, false
+		}
+		outcomes[gfp] = outcome
+	}
+	return outcomes, true
+}
+
+// cdrPruneRevokedInstance prunes the local registry entry now that every
+// generation is dead on the Sluice side, shreds the PEMs, and re-inits the
+// pool so the revoked instance is no longer dialled. A failed prune-persist
+// is loud, not fatal: the revocation itself is durable on the Sluice side
+// (its ledger) AND every generation is durably marked revoked here, so a
+// resurrected entry can only fail to dial — but the operator should know
+// the registry disagrees. Returns whether the prune persisted.
+func cdrPruneRevokedInstance(name string, target *CDREnrolledInstance) bool {
+	pruned := true
+	if _, rerr := cdrInstances.RemoveByName(name); rerr != nil {
+		pruned = false
+		logger.Printf("CDR: revoke %q: prune registry entry: %v", sanitizeLog(name), rerr)
+	}
+	shredCDRCerts(target)
+	if cdrActiveClient() != nil {
+		// Drop the pool entry by re-init so we stop trying to dial
+		// the revoked instance.
+		if rerr := initCDRClient(cdrActiveConfig()); rerr != nil {
+			logger.Printf("CDR: revoke %q succeeded but reinit failed: %q",
+				sanitizeLog(name), sanitizeLog(rerr.Error()))
+		}
+	}
+	return pruned
 }
 
 // apiCDRRevokeOrphan revokes ONE credential by fingerprint — the exact
@@ -1087,7 +1113,7 @@ func apiCDRRevokeOrphan(w http.ResponseWriter, r *http.Request, fp, reason strin
 	localOK := len(unrecorded) == 0
 	if name, held := cdrRegistryHoldsFingerprint(fp); held {
 		if merr := cdrInstances.MarkCredentialRevoked(name, fp); merr != nil {
-			logger.Printf("CDR: revoke %s: record on %q: %v", fp, sanitizeLog(name), merr)
+			logger.Printf("CDR: revoke %q: record on %q: %q", sanitizeLog(fp), sanitizeLog(name), sanitizeLog(merr.Error()))
 			localOK = false
 		}
 	}

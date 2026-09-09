@@ -144,7 +144,7 @@ func TestAdminSettings_UpstreamRoundTrip(t *testing.T) {
 	// is the credentialed one, and it must unseal to the original password.
 	var got string
 	for i := 0; i < 2; i++ {
-		u, err := upstreamPool.ProxyFunc()(httptest.NewRequest("GET", "http://origin.example/", http.NoBody))
+		u, err := upstreamPool.ProxyFunc()(httptest.NewRequestWithContext(t.Context(), "GET", "http://origin.example/", http.NoBody))
 		if err != nil || u == nil {
 			t.Fatalf("ProxyFunc after restore: %v %v", u, err)
 		}
@@ -248,7 +248,7 @@ func TestAdminSettings_LegacyMigrationSealsUserinfo(t *testing.T) {
 	}
 	var got string
 	for i := 0; i < 2; i++ {
-		u, err := upstreamPool.ProxyFunc()(httptest.NewRequest("GET", "http://origin.example/", http.NoBody))
+		u, err := upstreamPool.ProxyFunc()(httptest.NewRequestWithContext(t.Context(), "GET", "http://origin.example/", http.NoBody))
 		if err != nil || u == nil {
 			t.Fatalf("ProxyFunc after migration: %v %v", u, err)
 		}
@@ -274,7 +274,7 @@ func TestAdminSettings_LegacyMigrationParseFailureIsDegradedNotDestructive(t *te
 	t.Cleanup(func() { dataDir = prevData })
 	upstreamPool.Configure(nil, 5, time.Minute)
 
-	legacy := `{"upstream_proxies_saved":true,"upstream_proxies":[{"url":"http://svc:secret@parent-a.test:3128"},{"url":"://not a url"}]}`
+	legacy := `{"upstream_proxies_saved":true,"upstream_proxies":[{"url":"http://svc:secret@parent-a.test:3128"},{"url":"://not a url"}]}` //nolint:gosec // G101: fixture credential in a test URL, not a secret
 	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestAdminSettings_LegacyMigrationParseFailureIsDegradedNotDestructive(t *te
 	if err := json.Unmarshal(after, &s); err != nil {
 		t.Fatal(err)
 	}
-	if s.UpstreamProxiesV2 != nil || len(s.UpstreamProxies) != 2 || s.UpstreamProxies[0].URL != "http://svc:secret@parent-a.test:3128" {
+	if s.UpstreamProxiesV2 != nil || len(s.UpstreamProxies) != 2 || s.UpstreamProxies[0].URL != "http://svc:secret@parent-a.test:3128" { //nolint:gosec // G101: fixture credential in a test URL, not a secret
 		t.Fatalf("a failed migration must leave the legacy upstream sections untouched, got v2=%v legacy=%+v", s.UpstreamProxiesV2, s.UpstreamProxies)
 	}
 	if upstreamPool.Enabled() {

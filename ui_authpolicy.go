@@ -489,29 +489,8 @@ func apiAuthPolicyReorder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	switch {
-	case len(body.IDs) > 0 && len(body.Priorities) > 0:
-		http.Error(w, "provide ids or priorities, not both", http.StatusBadRequest)
+	if !validateAuthReorderBody(w, body.IDs, body.Priorities) {
 		return
-	case len(body.IDs) == 0 && len(body.Priorities) == 0:
-		http.Error(w, "ids (or legacy priorities) must list every auth rule exactly once", http.StatusBadRequest)
-		return
-	}
-	// Shape-check ids before the critical section so every id echoed into a
-	// later error message is ULID-charset-bounded.
-	seenID := make(map[string]bool, len(body.IDs))
-	for _, id := range body.IDs {
-		if !validRuleID(id) {
-			http.Error(w, "ids entries must be rule ULIDs", http.StatusBadRequest)
-			return
-		}
-		// A duplicate inside the client's own list is malformed on its own
-		// terms (state-independent) — a pre-fence 400, like the grammar check.
-		if seenID[id] {
-			http.Error(w, "ids contains a duplicate entry "+strconv.Quote(id), http.StatusBadRequest)
-			return
-		}
-		seenID[id] = true
 	}
 	policyWriteStateDecision(r, "resolved")
 	policyWriteStateDecision(r, "fence")
@@ -556,6 +535,38 @@ func apiAuthPolicyReorder(w http.ResponseWriter, r *http.Request) {
 	auditEvent(r, "authpolicy.reorder", fmt.Sprintf("%d rule(s)", count), "")
 	finalizeFencedPolicyWrite(r, "authpolicy.reorder", res)
 	jsonOK(w, map[string]any{"ok": true})
+}
+
+// validateAuthReorderBody is the state-independent grammar check of a
+// reorder body: exactly one of ids/priorities, ULID-shaped ids with no
+// duplicates. It writes the 400 and returns false on a malformed body
+// (extracted from apiAuthPolicyReorder, behaviour unchanged).
+func validateAuthReorderBody(w http.ResponseWriter, ids []string, priorities []int) bool {
+	switch {
+	case len(ids) > 0 && len(priorities) > 0:
+		http.Error(w, "provide ids or priorities, not both", http.StatusBadRequest)
+		return false
+	case len(ids) == 0 && len(priorities) == 0:
+		http.Error(w, "ids (or legacy priorities) must list every auth rule exactly once", http.StatusBadRequest)
+		return false
+	}
+	// Shape-check ids before the critical section so every id echoed into a
+	// later error message is ULID-charset-bounded.
+	seenID := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if !validRuleID(id) {
+			http.Error(w, "ids entries must be rule ULIDs", http.StatusBadRequest)
+			return false
+		}
+		// A duplicate inside the client's own list is malformed on its own
+		// terms (state-independent) — a pre-fence 400, like the grammar check.
+		if seenID[id] {
+			http.Error(w, "ids contains a duplicate entry "+strconv.Quote(id), http.StatusBadRequest)
+			return false
+		}
+		seenID[id] = true
+	}
+	return true
 }
 
 // authReorderPermutation resolves the requested order — stable IDs (preferred)

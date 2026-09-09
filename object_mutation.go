@@ -103,8 +103,9 @@ func reconcileObjectRefNames() {
 		groupNames[g.ID] = g.Name
 	}
 	profileNames := make(map[string]string)
-	for _, p := range globalDecryptionProfiles.List() {
-		profileNames[p.ID] = p.Name
+	profiles := globalDecryptionProfiles.List()
+	for i := range profiles {
+		profileNames[profiles[i].ID] = profiles[i].Name
 	}
 	fileProfileNames := make(map[string]string)
 	for _, p := range globalProfileStore.List() {

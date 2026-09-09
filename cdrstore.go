@@ -217,15 +217,15 @@ func (r *CDRInstanceRegistry) Add(inst CDREnrolledInstance) (CDREnrolledInstance
 	// write reverts the in-memory append so memory never claims an
 	// instance the next boot will not load (2E-C commit boundary).
 	prev := r.instances
-	copy := inst
-	normalizeLineageLocked(&copy)
-	r.instances = append(append([]*CDREnrolledInstance(nil), prev...), &copy)
+	entry := inst
+	normalizeLineageLocked(&entry)
+	r.instances = append(append([]*CDREnrolledInstance(nil), prev...), &entry)
 	if err := r.saveLocked(); err != nil {
 		r.instances = prev
 		return CDREnrolledInstance{}, err
 	}
 	r.bumpVersion()
-	return copy, nil
+	return entry, nil
 }
 
 // RemoveByName removes an instance; returns false if no match.
@@ -430,10 +430,11 @@ var (
 // CDR on without restarting Culvert (and so the first enrollment via
 // the GUI works without ops pre-setting the flag).
 //
-// A var (not const) so tests can redirect the path to a tmp dir — real
-// Culvert always uses /data/cdr_enabled (baked into the Docker image's
-// persistent volume layout).  Production code never mutates this.
-var cdrRuntimeEnabledPath = "/data/cdr_enabled"
+// A var (not const) so tests can redirect the path to a tmp dir and so
+// rebindDataDirPaths can follow CULVERT_DATA_DIR; the default is
+// /data/cdr_enabled (the Docker image's persistent volume layout).
+// Production code never mutates this after boot.
+var cdrRuntimeEnabledPath = defaultDataDir + "/cdr_enabled"
 
 // cdrRuntimeEnabled reports whether the runtime-enable sentinel exists.
 // Called at startup (config merge time) and whenever the toggle

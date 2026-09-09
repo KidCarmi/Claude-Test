@@ -1026,6 +1026,7 @@ func TestAPIRewrite_Get(t *testing.T) {
 }
 
 func TestAPIRewrite_Add(t *testing.T) {
+	t.Cleanup(rewriter.Snapshot()) // the added rule must not outlive the test (PR-C7)
 	w := httptest.NewRecorder()
 	apiRewrite(w, jsonReq(http.MethodPost, "/api/rewrite", RewriteRule{
 		Host:   "test.example.com",

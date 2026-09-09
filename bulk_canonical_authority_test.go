@@ -58,9 +58,10 @@ func canonImportBackup(t *testing.T, mode string, b *configBackup) *httptest.Res
 }
 
 func installedRuleByName(name string) *PolicyRule {
-	for _, r := range policyStore.List() {
-		if r.Name == name {
-			cp := r
+	rules := policyStore.List()
+	for i := range rules {
+		if rules[i].Name == name {
+			cp := rules[i]
 			return &cp
 		}
 	}

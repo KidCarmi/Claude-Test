@@ -5484,7 +5484,7 @@
           },
           "probe": {
             "additionalProperties": false,
-            "description": "The periodic health-probe configuration armed at startup (config.yaml upstream.health_interval).",
+            "description": "The periodic health-probe configuration armed at startup (config.yaml upstream.health_interval) and the node-local manual-run state.",
             "properties": {
               "configured": {
                 "type": "boolean"
@@ -5492,11 +5492,16 @@
               "interval": {
                 "description": "Go duration; \"0s\" when no periodic probe runs.",
                 "type": "string"
+              },
+              "manualInFlight": {
+                "description": "True while an admin-triggered manual probe run (POST /api/upstream/health, single-flight) is executing on this node. A client whose manual-run answer outran its deadline resolves the run against this flag and the entries' health instead of a deadline sized from a possibly stale entry count.",
+                "type": "boolean"
               }
             },
             "required": [
               "configured",
-              "interval"
+              "interval",
+              "manualInFlight"
             ],
             "type": "object"
           },
@@ -6130,7 +6135,7 @@
       },
       "UpstreamRefusal": {
         "additionalProperties": false,
-        "description": "Structured 2F-C refusal. `code` is bounded: precondition_required (428), stale (409, `current.revision`), vanished (404), yaml_owned (409), credential_bound (409 — authority change while a credential exists; clear it first), credential_present (409 — delete refused), confirm_required (409, `current.confirmValue`), credentialed_entries_present (409 — the v1 bulk adapter while any managed entry holds a credential), duplicate_authority (409, `count`), no_credential (409 — clear on an entry without material), invalid_entry / userinfo_not_allowed / credential_state_not_accepted / invalid_password / invalid_action / invalid_json (400), key_unusable (409), document_rejected (409 — the stored document failed validation at load; nothing is accepted until repair), persist_failed / seal_failed (500 — nothing was changed).",
+        "description": "Structured 2F-C refusal. `code` is bounded: precondition_required (428), stale (409, `current.revision`), vanished (404), yaml_owned (409), credential_bound (409 — authority change while a credential exists; clear it first), credential_present (409 — delete refused while the entry holds material OR awaits credential replacement), confirm_required (409, `current.confirmValue`), credentialed_entries_present (409 — the v1 bulk adapter while any managed entry holds a credential or awaits credential replacement), duplicate_authority (409, `count`), no_credential (409 — clear on an entry without material), invalid_entry / userinfo_not_allowed / credential_state_not_accepted / invalid_password / invalid_action / invalid_json (400), key_unusable (409), document_rejected (409 — the stored document failed validation at load; nothing is accepted until repair), persist_failed / seal_failed (500 — nothing was changed).",
         "properties": {
           "code": {
             "type": "string"
@@ -6278,8 +6283,8 @@
       "url": "https://github.com/KidCarmi/Culvert"
     },
     "title": "Culvert Admin API",
-    "version": "1.2.0",
-    "x-culvert-api-contract-version": "1.2.0"
+    "version": "2.0.0",
+    "x-culvert-api-contract-version": "2.0.0"
   },
   "openapi": "3.0.4",
   "paths": {
@@ -9295,7 +9300,7 @@
         "x-culvert-audit-event": "cdr.instance.enroll.receipt.remove",
         "x-culvert-danger-level": "medium",
         "x-culvert-idempotency": "idempotent",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "admin",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -9332,7 +9337,7 @@
           "cluster"
         ],
         "x-culvert-idempotency": "safe",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "viewer",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -9414,7 +9419,7 @@
         "x-culvert-audit-event": "cdr.instance.enroll.recover",
         "x-culvert-danger-level": "medium",
         "x-culvert-idempotency": "idempotent",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "admin",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -13992,7 +13997,7 @@
           "policy"
         ],
         "x-culvert-idempotency": "safe",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "viewer",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -18600,7 +18605,7 @@
           "pac"
         ],
         "x-culvert-idempotency": "safe",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "viewer",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -20408,7 +20413,7 @@
           "policy"
         ],
         "x-culvert-idempotency": "safe",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "viewer",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -24842,7 +24847,7 @@
         "x-culvert-audit-event": "upstream.entry.create",
         "x-culvert-danger-level": "medium",
         "x-culvert-idempotency": "non-idempotent",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "admin",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -24851,7 +24856,7 @@
     },
     "/api/upstream/entries/{id}": {
       "delete": {
-        "description": "Deletes a credential-free managed entry (2F-C). `?revision=` must echo the ENTRY revision (428/409/404). 409 credential_present while the entry holds a configured, unusable or mismatched credential (clear it first, T3); 409 yaml_owned for a config.yaml entry. Persisted before the 200.",
+        "description": "Deletes a credential-free managed entry (2F-C). `?revision=` must echo the ENTRY revision (428/409/404). 409 credential_present while the entry holds a configured, unusable or mismatched credential OR carries the requiresReplacement marker (clear it first, T3); 409 yaml_owned for a config.yaml entry. Persisted before the 200.",
         "operationId": "deleteUpstreamEntry",
         "parameters": [
           {
@@ -24927,7 +24932,7 @@
         "x-culvert-audit-event": "upstream.entry.delete",
         "x-culvert-danger-level": "medium",
         "x-culvert-idempotency": "idempotent",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "admin",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -25029,7 +25034,7 @@
         "x-culvert-audit-event": "upstream.entry.update",
         "x-culvert-danger-level": "medium",
         "x-culvert-idempotency": "idempotent",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "admin",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -25133,7 +25138,7 @@
         "x-culvert-audit-event": "upstream.credential.replace",
         "x-culvert-danger-level": "high",
         "x-culvert-idempotency": "idempotent",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "admin",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
@@ -25763,7 +25768,7 @@
           "policy"
         ],
         "x-culvert-idempotency": "safe",
-        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-introduced-version": "2.0.0",
         "x-culvert-permission": "viewer",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",

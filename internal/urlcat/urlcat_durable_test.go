@@ -23,7 +23,7 @@ import (
 )
 
 // newDurableStore returns an EMPTY store persisting into a fresh temp dir.
-func newDurableStore(t *testing.T) (*Store, string) {
+func newDurableStore(t *testing.T) (store *Store, filePath string) {
 	t.Helper()
 	s := New(nil)
 	path := filepath.Join(t.TempDir(), "url_categories.json")

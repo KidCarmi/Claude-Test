@@ -173,6 +173,11 @@ func main() {
 	// must run BEFORE the global flag set is defined (it is not a flag).
 	maybeRunBootstrapResolve(os.Args)
 
+	// PR-C1: the persisted-state root (default /data) is resolved ONCE from
+	// CULVERT_DATA_DIR before the flag set and before any one-shot command,
+	// so every consumer of dataDir sees one value for the life of the process.
+	applyDataDirFromEnv()
+
 	s := &startupState{}
 	parseFlags(s)
 	handleOneShotCommands(s)
@@ -189,6 +194,9 @@ func main() {
 	loadFileConfigAndFlags(s)
 	initUIExtras(s)
 	initLogger(s)
+	if dataDirOverridden() {
+		logger.Printf("DataDir: persisted-state root set by %s: %s", dataDirEnv, dataDir)
+	}
 	initMemoryBackstop() // P0-2: soft GOMEMLIMIT so a large config-apply degrades to GC, not OOM
 	initLifecycleContext(s)
 	defer appLifecycleCancel() // kept in main() for panic safety; initLifecycleContext only creates the context.
@@ -373,12 +381,7 @@ func handleOneShotCommands(s *startupState) {
 	}
 	// ── One-shot: prepare-downgrade (2F-D, C10) — dry-run unless --confirm <word> ──
 	if *s.prepareDowngrade {
-		word, err := prepareDowngradeConfirmWord(s.restoreConfirm, flag.Args())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Prepare-downgrade error: %v\n", err)
-			os.Exit(1)
-		}
-		if err := runPrepareDowngrade(dataDir, *s.downgradeTargetSchema, word, os.Stdout); err != nil {
+		if err := runPrepareDowngradeCommand(s, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "Prepare-downgrade error: %v\n", err)
 			os.Exit(1)
 		}
@@ -447,7 +450,7 @@ func handleOneShotCommands(s *startupState) {
 		}
 		usersPath := *s.uiUsersFile
 		if usersPath == "" {
-			usersPath = "/data/ui_users.json"
+			usersPath = filepath.Join(dataDir, "ui_users.json")
 		}
 		cfg.SetUIUsersFile(usersPath)
 		_ = cfg.LoadUIUsersFile() // may not exist yet, that's fine
@@ -870,7 +873,7 @@ func initCDR(s *startupState) {
 		log.Fatalf("Invalid -cdr-fail-mode %q: must be \"open\" or \"closed\"", fm)
 	}
 	loadCDR(
-		resolveCDRStartupConfig(s.fc, cdrCLIFlags{
+		resolveCDRStartupConfig(s.fc, dataDir, cdrCLIFlags{
 			Enabled:     *s.cdrEnabledFlag,
 			Endpoint:    *s.cdrEndpointFlag,
 			FailMode:    *s.cdrFailModeFlag,

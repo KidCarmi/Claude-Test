@@ -73,6 +73,8 @@ func wdAssertAgreement(t *testing.T, path string, want saasFeedDurable) {
 // wdPausedPUTTransaction starts writer A — the PUT's transaction shape with a
 // pause inside the critical section, after its precondition (revision fence)
 // has passed. Returns the entered/release/done channels and the error slot.
+//
+//nolint:gocritic // ptrToRefParam: the slot is written by the paused goroutine and read after done closes
 func wdPausedPUTTransaction(t *testing.T, target saasFeedDurable, expectRev string) (entered, release, done chan struct{}, errSlot *error) {
 	t.Helper()
 	entered = make(chan struct{})
@@ -99,6 +101,8 @@ func wdPausedPUTTransaction(t *testing.T, target saasFeedDurable, expectRev stri
 
 // wdAssertBlockedThenRelease asserts opDone has NOT closed while writer A is
 // paused inside the domain, then releases A and waits for both to finish.
+//
+//nolint:gocritic // ptrToRefParam: the slot is written by the paused goroutine and read after aDone closes
 func wdAssertBlockedThenRelease(t *testing.T, what string, opDone, release, aDone chan struct{}, aErr *error) {
 	t.Helper()
 	for i := 0; i < 200000; i++ {

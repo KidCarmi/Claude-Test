@@ -237,42 +237,9 @@ func (s *Store) Load(path string) error {
 	// because every mutation acknowledged under the envelope model persists
 	// its epoch atomically with the content, so a changed-content/lost-epoch
 	// state is no longer producible by this store).
-	var groups []Group
-	var loadedVersion int64
-	if isLegacyArrayFile(data) {
-		if err := json.Unmarshal(data, &groups); err != nil {
-			obs.Printf("CategoryGroups: unmarshal error from %s", path)
-			return err
-		}
-		var meta storeMeta
-		if mdata, merr := os.ReadFile(path + ".meta"); merr == nil { // #nosec G304 -- sibling of the operator-configured path
-			_ = json.Unmarshal(mdata, &meta)
-		}
-		loadedVersion = meta.Version
-	} else {
-		var env storeEnvelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			obs.Printf("CategoryGroups: unmarshal error from %s", path)
-			return err
-		}
-		// The schema discriminator is LOAD-BEARING (fail-closed format
-		// validation): exactly schema_version 1 is accepted. Missing/zero,
-		// negative, and unknown/future versions are refused with an explicit
-		// error — a future envelope must never be silently parsed with
-		// today's struct (fields it relies on would be dropped and the
-		// truncated state re-persisted as if authoritative).
-		if env.SchemaVersion != 1 {
-			obs.Printf("CategoryGroups: unsupported envelope schema_version %d in %s (this binary supports 1)", env.SchemaVersion, path)
-			return fmt.Errorf("category groups: unsupported envelope schema_version %d (want 1)", env.SchemaVersion)
-		}
-		// A negative persisted fence generation is impossible for this store
-		// to have written — refuse rather than install a corrupt epoch.
-		if env.Version < 0 {
-			obs.Printf("CategoryGroups: invalid negative persisted version %d in %s", env.Version, path)
-			return fmt.Errorf("category groups: invalid negative persisted version %d", env.Version)
-		}
-		groups = env.Groups
-		loadedVersion = env.Version
+	groups, loadedVersion, err := decodeGroupsFile(path, data)
+	if err != nil {
+		return err
 	}
 
 	built := make(map[string]*Group, len(groups))
@@ -866,4 +833,42 @@ func (s *Store) SetPathForTest(path string) {
 	s.mu.Lock()
 	s.path = path
 	s.mu.Unlock()
+}
+
+// decodeGroupsFile decodes either file shape: a LEGACY bare array (its fence
+// generation comes from the retired .meta sidecar; absent ⇒ 0) or the
+// durable envelope, whose schema discriminator is LOAD-BEARING (fail-closed
+// format validation): exactly schema_version 1 is accepted — missing/zero,
+// negative, and unknown/future versions are refused with an explicit error,
+// since a future envelope must never be silently parsed with today's struct
+// (fields it relies on would be dropped and the truncated state re-persisted
+// as if authoritative). A negative persisted fence generation is impossible
+// for this store to have written and is refused rather than installed.
+func decodeGroupsFile(path string, data []byte) ([]Group, int64, error) {
+	if isLegacyArrayFile(data) {
+		var groups []Group
+		if err := json.Unmarshal(data, &groups); err != nil {
+			obs.Printf("CategoryGroups: unmarshal error from %s", path)
+			return nil, 0, err
+		}
+		var meta storeMeta
+		if mdata, merr := os.ReadFile(path + ".meta"); merr == nil { // #nosec G304 -- sibling of the operator-configured path
+			_ = json.Unmarshal(mdata, &meta)
+		}
+		return groups, meta.Version, nil
+	}
+	var env storeEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		obs.Printf("CategoryGroups: unmarshal error from %s", path)
+		return nil, 0, err
+	}
+	if env.SchemaVersion != 1 {
+		obs.Printf("CategoryGroups: unsupported envelope schema_version %d in %s (this binary supports 1)", env.SchemaVersion, path)
+		return nil, 0, fmt.Errorf("category groups: unsupported envelope schema_version %d (want 1)", env.SchemaVersion)
+	}
+	if env.Version < 0 {
+		obs.Printf("CategoryGroups: invalid negative persisted version %d in %s", env.Version, path)
+		return nil, 0, fmt.Errorf("category groups: invalid negative persisted version %d", env.Version)
+	}
+	return env.Groups, env.Version, nil
 }

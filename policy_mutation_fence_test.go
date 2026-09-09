@@ -137,7 +137,8 @@ func TestFence_B_ConcurrentCreatesSameVersion(t *testing.T) {
 			func() *httptest.ResponseRecorder { return createRuleViaAPI(t, fmt.Sprintf("create-A-%d", i), verStr) },
 			func() *httptest.ResponseRecorder { return createRuleViaAPI(t, fmt.Sprintf("create-B-%d", i), verStr) },
 		)
-		if !((ra.Code == 200 && rb.Code == 409) || (ra.Code == 409 && rb.Code == 200)) {
+		oneWinner := (ra.Code == 200 && rb.Code == 409) || (ra.Code == 409 && rb.Code == 200)
+		if !oneWinner {
 			t.Fatalf("iter %d: want one 200 + one 409, got %d/%d", i, ra.Code, rb.Code)
 		}
 		if got := len(policyStore.List()); got != before+1 {
@@ -219,7 +220,8 @@ func TestFence_D_FirstWriteOpensDraftRace(t *testing.T) {
 			func() *httptest.ResponseRecorder { return createRuleViaAPI(t, fmt.Sprintf("stage-A-%d", i), verStr) },
 			func() *httptest.ResponseRecorder { return createRuleViaAPI(t, fmt.Sprintf("stage-B-%d", i), verStr) },
 		)
-		if !((ra.Code == 200 && rb.Code == 409) || (ra.Code == 409 && rb.Code == 200)) {
+		oneWinner := (ra.Code == 200 && rb.Code == 409) || (ra.Code == 409 && rb.Code == 200)
+		if !oneWinner {
 			t.Fatalf("iter %d: want one 200 + one 409, got %d/%d", i, ra.Code, rb.Code)
 		}
 		if !policyDraft.active() {
@@ -305,7 +307,8 @@ func TestFence_E_CommitVsDraftMutation(t *testing.T) {
 			return createRuleViaAPI(t, fmt.Sprintf("late-stage-%d", i), fmt.Sprintf("%d", candVer))
 		}
 		ra, rb := runConcurrentPair(commit, stage)
-		if !((ra.Code == 200 && rb.Code == 409) || (ra.Code == 409 && rb.Code == 200)) {
+		oneWinner := (ra.Code == 200 && rb.Code == 409) || (ra.Code == 409 && rb.Code == 200)
+		if !oneWinner {
 			t.Fatalf("iter %d: want one 200 + one 409, got commit=%d stage=%d", i, ra.Code, rb.Code)
 		}
 		if ra.Code == 200 {

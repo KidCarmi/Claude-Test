@@ -129,43 +129,8 @@ func probeCDRHealth(ctx context.Context) {
 func propagateServerRotation(members []*cdrPooledClient) {
 	var needReinit bool
 	for _, pc := range members {
-		h, _ := pc.HealthSnapshot()
-		if h == nil {
-			continue
-		}
-		inst, ok := cdrInstances.GetCopy(pc.Name)
-		if !ok {
-			continue
-		}
-		newRotated := normalisePinHex(h.RotatedFingerprint)
-		// Case 1: grace window expired — promote + clear.  The
-		// fingerprint advertised as "primary" in Health is the new one.
-		if inst.RotatedFingerprint != "" &&
-			inst.RotatedFingerprintUntilUnix > 0 &&
-			time.Now().Unix() >= inst.RotatedFingerprintUntilUnix {
-			changed, err := cdrInstances.PromoteRotation(pc.Name, normalisePinHex(h.ServerFingerprint))
-			if err != nil {
-				logger.Printf("CDR: rotation promote: save registry: %v", err)
-			}
-			if changed {
-				needReinit = true
-				logger.Printf("CDR: server-cert rotation complete for %q — promoted new fingerprint", sanitizeLog(pc.Name))
-			}
-			continue
-		}
-		// Case 2: new rotation signalled.
-		if newRotated != "" &&
-			h.RotatedFingerprintUntilUnix > 0 &&
-			inst.RotatedFingerprint != newRotated {
-			changed, err := cdrInstances.StageRotation(pc.Name, newRotated, h.RotatedFingerprintUntilUnix)
-			if err != nil {
-				logger.Printf("CDR: rotation stage: save registry: %v", err)
-			}
-			if changed {
-				needReinit = true
-				logger.Printf("CDR: server-cert rotation signalled by %q — dual-pin active until %s",
-					sanitizeLog(pc.Name), time.Unix(h.RotatedFingerprintUntilUnix, 0).UTC().Format(time.RFC3339))
-			}
+		if reconcileMemberRotation(pc) {
+			needReinit = true
 		}
 	}
 	if needReinit {
@@ -174,6 +139,52 @@ func propagateServerRotation(members []*cdrPooledClient) {
 				sanitizeLog(err.Error()))
 		}
 	}
+}
+
+// reconcileMemberRotation applies one member's advertised server-cert
+// rotation to the registry — promoting a rotation whose grace window has
+// expired, or staging a newly signalled one — and reports whether the
+// registry changed (extracted from propagateServerRotation, behaviour
+// unchanged).
+func reconcileMemberRotation(pc *cdrPooledClient) bool {
+	h, _ := pc.HealthSnapshot()
+	if h == nil {
+		return false
+	}
+	inst, ok := cdrInstances.GetCopy(pc.Name)
+	if !ok {
+		return false
+	}
+	newRotated := normalisePinHex(h.RotatedFingerprint)
+	// Case 1: grace window expired — promote + clear.  The
+	// fingerprint advertised as "primary" in Health is the new one.
+	if inst.RotatedFingerprint != "" &&
+		inst.RotatedFingerprintUntilUnix > 0 &&
+		time.Now().Unix() >= inst.RotatedFingerprintUntilUnix {
+		changed, err := cdrInstances.PromoteRotation(pc.Name, normalisePinHex(h.ServerFingerprint))
+		if err != nil {
+			logger.Printf("CDR: rotation promote: save registry: %v", err)
+		}
+		if changed {
+			logger.Printf("CDR: server-cert rotation complete for %q — promoted new fingerprint", sanitizeLog(pc.Name))
+		}
+		return changed
+	}
+	// Case 2: new rotation signalled.
+	if newRotated != "" &&
+		h.RotatedFingerprintUntilUnix > 0 &&
+		inst.RotatedFingerprint != newRotated {
+		changed, err := cdrInstances.StageRotation(pc.Name, newRotated, h.RotatedFingerprintUntilUnix)
+		if err != nil {
+			logger.Printf("CDR: rotation stage: save registry: %v", err)
+		}
+		if changed {
+			logger.Printf("CDR: server-cert rotation signalled by %q — dual-pin active until %s",
+				sanitizeLog(pc.Name), time.Unix(h.RotatedFingerprintUntilUnix, 0).UTC().Format(time.RFC3339))
+		}
+		return changed
+	}
+	return false
 }
 
 // cdrRenewWindow is the days-remaining threshold that triggers

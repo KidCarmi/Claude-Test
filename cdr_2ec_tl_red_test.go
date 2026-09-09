@@ -75,7 +75,7 @@ func (f *tlFakeSluice) RevokeClient(_ context.Context, _ *pb.RevokeClientRequest
 }
 
 // tlPooled dials a scripted server over bufconn and wraps it as a pool member.
-func tlPooled(t *testing.T, name string, srv pb.SluiceServiceServer) (*cdrPooledClient, func()) {
+func tlPooled(t *testing.T, name string, srv pb.SluiceServiceServer) (client *cdrPooledClient, stop func()) {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	s := grpc.NewServer()
@@ -95,7 +95,7 @@ func tlPooled(t *testing.T, name string, srv pb.SluiceServiceServer) (*cdrPooled
 // tlSeedInstance writes a real client cert under the sanitised certs root and
 // registers the instance in a DURABLE registry (tmp path). Returns the
 // instance copy, its cert fingerprint, and the registry path.
-func tlSeedInstance(t *testing.T, name string) (CDREnrolledInstance, string, string) {
+func tlSeedInstance(t *testing.T, name string) (instance CDREnrolledInstance, fingerprint, registryPath string) {
 	t.Helper()
 	dir, err := cdrInstanceCertsDir(name)
 	if err != nil {
@@ -134,7 +134,9 @@ func tlSeedInstance(t *testing.T, name string) (CDREnrolledInstance, string, str
 }
 
 func tlAuditHas(action, discriminator string) bool {
-	for _, e := range auditGet() {
+	entries := auditGet()
+	for i := range entries {
+		e := &entries[i]
 		if e.Action == action && strings.Contains(e.Detail, discriminator) {
 			return true
 		}
@@ -182,7 +184,7 @@ func TestCDR2ECTL_Revoke_UnprovenOutcomeIsNotSuccess(t *testing.T) {
 
 // ─── R7: renewal must preserve the credential lineage ───────────────────────
 
-func tlRenewedCert(t *testing.T) ([]byte, string) {
+func tlRenewedCert(t *testing.T) (certPEM []byte, fingerprint string) {
 	t.Helper()
 	pemBytes := mustGenerateTestCertPEM(t)
 	fp, err := sluiceauth.Fingerprint(pemBytes)
@@ -344,7 +346,7 @@ func TestCDR2ECTL_Renewal_PersistFailureAfterRPC_NeverNewPEMsWithOldFingerprint(
 	// Break durability: point the registry at a path whose directory
 	// cannot exist (AtomicWrite needs the parent).
 	cdrInstances.mu.Lock()
-	cdrInstances.path = filepath.Join("/proc/culvert-nonexistent", "cdr_instances.json")
+	cdrInstances.path = filepath.Join(string(filepath.Separator), "proc", "culvert-nonexistent", "cdr_instances.json")
 	cdrInstances.mu.Unlock()
 
 	runRenewFor(pc, inst)

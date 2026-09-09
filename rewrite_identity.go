@@ -47,15 +47,15 @@ import (
 
 // publishRewriteRules publishes a whole rule set to the live Rewriter INSIDE
 // the settings writer domain, so a bulk publish can never interleave with an
-// interactive mutation's read→persist→publish critical section. Returns the
-// number of stable IDs backfilled (legacy input). Runtime-only — the caller
-// owns persistence semantics (CP snapshot: CP-authoritative, deliberately not
-// written to the follower's admin_settings; startup: YAML seed, durable at
-// the first ordinary save).
-func publishRewriteRules(rules []RewriteRule) int {
+// interactive mutation's read→persist→publish critical section. Runtime-only
+// — the caller owns persistence semantics (CP snapshot: CP-authoritative,
+// deliberately not written to the follower's admin_settings; startup: YAML
+// seed, durable at the first ordinary save). The Rewriter's legacy-backfill
+// count is not surfaced here: every caller publishes a canonical set.
+func publishRewriteRules(rules []RewriteRule) {
 	adminSettingsMu.Lock()
 	defer adminSettingsMu.Unlock()
-	return rewriter.SetRules(rules)
+	rewriter.SetRules(rules)
 }
 
 // installRewriteRulesDurable installs a whole target rule set durable-or-
@@ -230,27 +230,7 @@ func finalizeRewriteSeedIdentities() {
 	rewriteIDsBackfilledAtLoad = 0
 
 	if owned {
-		if refused != nil {
-			// The settings-owned slice carried malformed/ambiguous modern
-			// identity and was NOT published (recovery correction §2). The
-			// management surface must not present the surviving runtime
-			// state (the pre-restore seed) as healthy owned identity.
-			setRewriteIdentityDegraded(fmt.Sprintf("settings-owned rewrite rules refused: %v", refused))
-			return
-		}
-		if backfilled > 0 {
-			migrated := rewriter.List()
-			if err := persistRewriteIdentityMutation(func(s *AdminSettings) {
-				s.RewriteRules = migrated
-			}); err != nil {
-				// The backfilled identities exist only in memory — a restart
-				// re-mints them, so they must not be presented as durable
-				// management identity (recovery correction §4).
-				setRewriteIdentityDegraded(fmt.Sprintf("legacy stable-ID backfill (%d rule(s)) could not persist: %v", backfilled, err))
-			} else {
-				logger.Printf("AdminSettings: migrated %d rewrite rule(s) to durable stable identities", backfilled)
-			}
-		}
+		finalizeOwnedRewriteIdentity(refused, backfilled)
 		return
 	}
 
@@ -420,3 +400,28 @@ func apiRewriteState(w http.ResponseWriter, r *http.Request) {
 // errRewriteRuleNotFound is returned by a rewriteMutate closure whose
 // addressed rule no longer exists (already deleted / never existed).
 var errRewriteRuleNotFound = fmt.Errorf("rewrite rule not found")
+
+// finalizeOwnedRewriteIdentity is the settings-OWNED arm of
+// finalizeRewriteSeedIdentities: a refused slice degrades the management
+// surface (the surviving runtime state — the pre-restore seed — must not be
+// presented as healthy owned identity; recovery correction §2), and a legacy
+// backfill is persisted through the targeted writer or, if that fails,
+// degraded too (identities that exist only in memory are re-minted by a
+// restart and must not be presented as durable; recovery correction §4).
+func finalizeOwnedRewriteIdentity(refused error, backfilled int) {
+	if refused != nil {
+		setRewriteIdentityDegraded(fmt.Sprintf("settings-owned rewrite rules refused: %v", refused))
+		return
+	}
+	if backfilled == 0 {
+		return
+	}
+	migrated := rewriter.List()
+	if err := persistRewriteIdentityMutation(func(s *AdminSettings) {
+		s.RewriteRules = migrated
+	}); err != nil {
+		setRewriteIdentityDegraded(fmt.Sprintf("legacy stable-ID backfill (%d rule(s)) could not persist: %v", backfilled, err))
+		return
+	}
+	logger.Printf("AdminSettings: migrated %d rewrite rule(s) to durable stable identities", backfilled)
+}

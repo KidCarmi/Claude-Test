@@ -206,7 +206,7 @@ func TestOwnership_StateFieldsNeverTearAcrossTransition(t *testing.T) {
 		}
 		signed := resp.BuiltInAuthority == "signed-feed"
 		for _, c := range resp.Categories {
-			wantWritable := !(c.BuiltIn && signed)
+			wantWritable := !c.BuiltIn || !signed
 			if c.Writable != wantWritable {
 				t.Fatalf("read %d: TORN OWNERSHIP: builtInAuthority=%q but row %q (builtIn=%t) writable=%t — the two fields derive from different ownership reads", i, resp.BuiltInAuthority, c.Name, c.BuiltIn, c.Writable)
 			}

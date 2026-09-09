@@ -418,42 +418,9 @@ func (s *Store) Load(path string) error {
 	// from the retired sidecar (absent ⇒ 0 — safe for LEGACY files only:
 	// every mutation acknowledged under the envelope model persists its epoch
 	// atomically with the content).
-	var profiles []Profile
-	var loadedVersion int64
-	if isLegacyArrayFile(data) {
-		if err := json.Unmarshal(data, &profiles); err != nil {
-			obs.Printf("DecryptionProfiles: unmarshal error from %s", path)
-			return err
-		}
-		var meta storeMeta
-		if mdata, merr := os.ReadFile(path + ".meta"); merr == nil { // #nosec G304 -- sibling of the operator-configured path
-			_ = json.Unmarshal(mdata, &meta)
-		}
-		loadedVersion = meta.Version
-	} else {
-		var env storeEnvelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			obs.Printf("DecryptionProfiles: unmarshal error from %s", path)
-			return err
-		}
-		// The schema discriminator is LOAD-BEARING (fail-closed format
-		// validation): exactly schema_version 1 is accepted. Missing/zero,
-		// negative, and unknown/future versions are refused with an explicit
-		// error — a future envelope must never be silently parsed with
-		// today's struct (fields it relies on would be dropped and the
-		// truncated state re-persisted as if authoritative).
-		if env.SchemaVersion != 1 {
-			obs.Printf("DecryptionProfiles: unsupported envelope schema_version %d in %s (this binary supports 1)", env.SchemaVersion, path)
-			return fmt.Errorf("decryption profiles: unsupported envelope schema_version %d (want 1)", env.SchemaVersion)
-		}
-		// A negative persisted fence generation is impossible for this store
-		// to have written — refuse rather than install a corrupt epoch.
-		if env.Version < 0 {
-			obs.Printf("DecryptionProfiles: invalid negative persisted version %d in %s", env.Version, path)
-			return fmt.Errorf("decryption profiles: invalid negative persisted version %d", env.Version)
-		}
-		profiles = env.Profiles
-		loadedVersion = env.Version
+	profiles, loadedVersion, err := decodeProfilesFile(path, data)
+	if err != nil {
+		return err
 	}
 	migrated, skipped, certMigrated := s.replaceContents(profiles, true)
 	s.mu.Lock()
@@ -1045,4 +1012,42 @@ func (s *Store) SetPathForTest(path string) {
 	s.mu.Lock()
 	s.path = path
 	s.mu.Unlock()
+}
+
+// decodeProfilesFile decodes either file shape: a LEGACY bare array (its
+// fence generation comes from the retired .meta sidecar; absent ⇒ 0) or the
+// durable envelope, whose schema discriminator is LOAD-BEARING (fail-closed
+// format validation): exactly schema_version 1 is accepted — missing/zero,
+// negative, and unknown/future versions are refused with an explicit error,
+// since a future envelope must never be silently parsed with today's struct
+// (fields it relies on would be dropped and the truncated state re-persisted
+// as if authoritative). A negative persisted fence generation is impossible
+// for this store to have written and is refused rather than installed.
+func decodeProfilesFile(path string, data []byte) ([]Profile, int64, error) {
+	if isLegacyArrayFile(data) {
+		var profiles []Profile
+		if err := json.Unmarshal(data, &profiles); err != nil {
+			obs.Printf("DecryptionProfiles: unmarshal error from %s", path)
+			return nil, 0, err
+		}
+		var meta storeMeta
+		if mdata, merr := os.ReadFile(path + ".meta"); merr == nil { // #nosec G304 -- sibling of the operator-configured path
+			_ = json.Unmarshal(mdata, &meta)
+		}
+		return profiles, meta.Version, nil
+	}
+	var env storeEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		obs.Printf("DecryptionProfiles: unmarshal error from %s", path)
+		return nil, 0, err
+	}
+	if env.SchemaVersion != 1 {
+		obs.Printf("DecryptionProfiles: unsupported envelope schema_version %d in %s (this binary supports 1)", env.SchemaVersion, path)
+		return nil, 0, fmt.Errorf("decryption profiles: unsupported envelope schema_version %d (want 1)", env.SchemaVersion)
+	}
+	if env.Version < 0 {
+		obs.Printf("DecryptionProfiles: invalid negative persisted version %d in %s", env.Version, path)
+		return nil, 0, fmt.Errorf("decryption profiles: invalid negative persisted version %d", env.Version)
+	}
+	return env.Profiles, env.Version, nil
 }

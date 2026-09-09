@@ -15,7 +15,7 @@ import (
 )
 
 // newDurableStore returns a store persisting into a fresh temp dir.
-func newDurableStore(t *testing.T) (*Store, string) {
+func newDurableStore(t *testing.T) (store *Store, filePath string) {
 	t.Helper()
 	s := New()
 	path := filepath.Join(t.TempDir(), "category_groups.json")

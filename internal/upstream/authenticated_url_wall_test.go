@@ -71,7 +71,7 @@ func TestWall_PeriodicLoopLabelsSourceAndSeamIsCredentialFree(t *testing.T) {
 	prev := ProbeTransport
 	t.Cleanup(func() { ProbeTransport = prev })
 	pool := &Pool{}
-	if err := pool.Configure([]Entry{{URL: "http://svc:loop-pw@parent.test:3128"}}, 5, time.Minute); err != nil {
+	if err := pool.Configure([]Entry{{URL: "http://svc:loop-pw@parent.test:3128"}}, 5, time.Minute); err != nil { //nolint:gosec // G101: fixture credential in a test URL, not a secret
 		t.Fatal(err)
 	}
 	probed := make(chan string, 4)

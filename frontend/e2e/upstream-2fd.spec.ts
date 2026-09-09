@@ -17,17 +17,18 @@
 // Tier-3 clear + delete endpoints (with revision fencing), so the shared
 // appliance ends the spec with no trace of the fixture entry.
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { expect, request } from "@playwright/test";
 import { test } from "./test";
 import type { APIRequestContext, Page, Response } from "@playwright/test";
-import { AUTH_URL, USERS } from "./fixtures";
+import { AUTH_DATA_DIR, AUTH_URL, USERS } from "./fixtures";
 
 test.use({ extraHTTPHeaders: { "X-Forwarded-For": "198.51.100.77" } });
 
 const CANARY_PW = "Canary-Browser-PW-2fd-4b9e";
 const HOST = "parent-2fd.test";
 const PORT = 3128;
-const SETTINGS = "/data/admin_settings.json";
+const SETTINGS = join(AUTH_DATA_DIR, "admin_settings.json");
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -269,8 +270,7 @@ test.describe("2F-D — legacy Upstream Proxies panel never receives credential 
       if (cts === null) {
         test.info().annotations.push({
           type: "note",
-          description:
-            "ciphertext needle skipped: /data/admin_settings.json not reachable from the runner",
+          description: `ciphertext needle skipped: ${SETTINGS} not reachable from the runner`,
         });
       }
     } finally {

@@ -45,7 +45,9 @@ func dcFinLoadStore(t *testing.T, jsonBody string) *FileProfileStore {
 // across independent stores (the restart-stability the browser fence needs).
 func TestDCFin_RevisionStableForSameContent(t *testing.T) {
 	body := `[{"id":"x","name":"n","extensions":[".a",".b"]},{"id":"y","name":"m","extensions":[".c"]}]`
-	if dcFinLoadStore(t, body).Revision() != dcFinLoadStore(t, body).Revision() {
+	first := dcFinLoadStore(t, body).Revision()
+	second := dcFinLoadStore(t, body).Revision()
+	if first != second {
 		t.Fatal("revision must be a pure content function (restart-stable)")
 	}
 }

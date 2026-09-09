@@ -541,74 +541,7 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 		// Prefer stable-ID addressing (rename-safe) when ?id= is supplied; fall
 		// back to name for legacy clients. Mirrors the policy ?id= path (#695).
 		if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
-			before := globalCategoryGroups.GetByID(id)
-			if before == nil {
-				http.Error(w, "group not found", http.StatusNotFound)
-				return
-			}
-			// Rename (references-by-id S2): UpdateByID keeps the current name, so a
-			// name change must be applied explicitly via Rename (re-keys the store)
-			// and cascaded onto referencing rules. Rules link by the group ID, so
-			// matching survives regardless; the cascade keeps the denormalized name
-			// honest for display/export/DP-sync.
-			newName := strings.TrimSpace(body.Name)
-			renamed := newName != "" && !strings.EqualFold(newName, before.Name)
-			// Phase 1 — the OBJECT domain, durable-or-nothing (2D-A.0): content
-			// update + rename apply and persist in one serialized critical section
-			// under the optional ?ifVersion= fence. Validation rejects before any
-			// state changes; a persist failure rolls everything back (500); a name
-			// collision is refused under the store lock (409, no TOCTOU).
-			err := globalCategoryGroups.MutateDurable(parseIfVersion(r), func() error {
-				if uerr := globalCategoryGroups.UpdateByID(id, body.Categories); uerr != nil {
-					return uerr
-				}
-				if renamed {
-					if _, rerr := globalCategoryGroups.Rename(id, newName); rerr != nil {
-						return rerr
-					}
-				}
-				return nil
-			})
-			if writeObjectMutationError(w, err) {
-				return
-			}
-			detail := fmt.Sprintf("%d categories", len(body.Categories))
-			// Phase 2/3 — the rename cascade onto RUNNING policy and the open
-			// draft candidate (composed cross-store operation, §6/§7): each is a
-			// real policy mutation that must survive a restart, so both persists
-			// are error-aware. A failure after the durable object rename keeps the
-			// (correct) in-memory cascade, is surfaced as a truthful 500 — never a
-			// 2xx with a known-failed durable domain — and converges at the next
-			// restart via reconcileObjectRefNames (the object store owns name truth).
-			var cascadeErr error
-			if renamed {
-				if n := policyStore.CascadeDestCategoryGroupRename(id, before.Name, newName); n > 0 {
-					if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
-						cascadeErr = fmt.Errorf("running policy: %w", perr)
-					}
-				}
-				if derr := policyDraft.cascadeDestCategoryGroupRename(id, before.Name, newName); derr != nil {
-					if cascadeErr != nil {
-						cascadeErr = fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
-					} else {
-						cascadeErr = fmt.Errorf("draft candidate: %w", derr)
-					}
-				}
-				detail += ", renamed from " + sanitizeLog(before.Name)
-			}
-			auditName := before.Name
-			if renamed {
-				auditName = newName
-			}
-			if cascadeErr != nil {
-				auditEventDiffID(r, "category-group.update", auditName, id,
-					detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error(), nil, nil)
-				writeRenameCascadePersistFailure(w, "category group", cascadeErr)
-				return
-			}
-			auditEventDiffID(r, "category-group.update", auditName, id, detail, nil, nil)
-			saveConfigVersion(sessionAdmin(r), "category-group.update")
-			jsonOK(w, map[string]any{"ok": true, "version": globalCategoryGroups.Version()})
+			apiCategoryGroupUpdateByID(w, r, id, body.Name, body.Categories)
 			return
 		}
 		if err := globalCategoryGroups.MutateDurable(nil, func() error {
@@ -676,6 +609,92 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// apiCategoryGroupUpdateByID is the stable-ID PUT branch of apiCategoryGroups
+// (rename-safe addressing, mirrors the policy ?id= path, #695): the durable
+// content update + rename in one fenced critical section, then the rename
+// cascade onto running policy and the open draft candidate. The caller holds
+// the reference-integrity write gate.
+func apiCategoryGroupUpdateByID(w http.ResponseWriter, r *http.Request, id, name string, categories []string) {
+	before := globalCategoryGroups.GetByID(id)
+	if before == nil {
+		http.Error(w, "group not found", http.StatusNotFound)
+		return
+	}
+	// Rename (references-by-id S2): UpdateByID keeps the current name, so a
+	// name change must be applied explicitly via Rename (re-keys the store)
+	// and cascaded onto referencing rules. Rules link by the group ID, so
+	// matching survives regardless; the cascade keeps the denormalized name
+	// honest for display/export/DP-sync.
+	newName := strings.TrimSpace(name)
+	renamed := newName != "" && !strings.EqualFold(newName, before.Name)
+	// Phase 1 — the OBJECT domain, durable-or-nothing (2D-A.0): content
+	// update + rename apply and persist in one serialized critical section
+	// under the optional ?ifVersion= fence. Validation rejects before any
+	// state changes; a persist failure rolls everything back (500); a name
+	// collision is refused under the store lock (409, no TOCTOU).
+	err := globalCategoryGroups.MutateDurable(parseIfVersion(r), func() error {
+		if uerr := globalCategoryGroups.UpdateByID(id, categories); uerr != nil {
+			return uerr
+		}
+		if renamed {
+			if _, rerr := globalCategoryGroups.Rename(id, newName); rerr != nil {
+				return rerr
+			}
+		}
+		return nil
+	})
+	if writeObjectMutationError(w, err) {
+		return
+	}
+	detail := fmt.Sprintf("%d categories", len(categories))
+	// Phase 2/3 — the rename cascade onto RUNNING policy and the open
+	// draft candidate (composed cross-store operation, §6/§7): each is a
+	// real policy mutation that must survive a restart, so both persists
+	// are error-aware. A failure after the durable object rename keeps the
+	// (correct) in-memory cascade, is surfaced as a truthful 500 — never a
+	// 2xx with a known-failed durable domain — and converges at the next
+	// restart via reconcileObjectRefNames (the object store owns name truth).
+	var cascadeErr error
+	if renamed {
+		cascadeErr = cascadeCategoryGroupRenameDurable(id, before.Name, newName)
+		detail += ", renamed from " + sanitizeLog(before.Name)
+	}
+	auditName := before.Name
+	if renamed {
+		auditName = newName
+	}
+	if cascadeErr != nil {
+		auditEventDiffID(r, "category-group.update", auditName, id,
+			detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error(), nil, nil)
+		writeRenameCascadePersistFailure(w, "category group", cascadeErr)
+		return
+	}
+	auditEventDiffID(r, "category-group.update", auditName, id, detail, nil, nil)
+	saveConfigVersion(sessionAdmin(r), "category-group.update")
+	jsonOK(w, map[string]any{"ok": true, "version": globalCategoryGroups.Version()})
+}
+
+// cascadeCategoryGroupRenameDurable cascades a category-group rename onto
+// RUNNING policy and the open draft candidate and reports the first persist
+// failure of either domain (both are attempted; the errors are joined). The
+// in-memory cascade is kept on failure — the caller surfaces a truthful 500
+// and reconcileObjectRefNames converges at the next restart.
+func cascadeCategoryGroupRenameDurable(id, oldName, newName string) error {
+	var cascadeErr error
+	if n := policyStore.CascadeDestCategoryGroupRename(id, oldName, newName); n > 0 {
+		if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
+			cascadeErr = fmt.Errorf("running policy: %w", perr)
+		}
+	}
+	if derr := policyDraft.cascadeDestCategoryGroupRename(id, oldName, newName); derr != nil {
+		if cascadeErr != nil {
+			return fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
+		}
+		return fmt.Errorf("draft candidate: %w", derr)
+	}
+	return cascadeErr
 }
 
 // apiDecryptionProfiles is the CRUD handler for named SSL-decryption profiles
@@ -1619,131 +1638,156 @@ func apiRewrite(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		// AFTER the RBAC boundary (authorization precedes degradation
-		// disclosure): while management identity is not durable a v2
-		// mutation could create/address identity that re-mints on restart
-		// (and a save could clobber a refused/corrupt settings file) — refuse
-		// with the structured 503, visible to authorized Operators only.
-		if d := rewriteIdentityDegraded(); d != nil {
-			writeRewriteIdentityDegraded(w, d)
-			return
-		}
-		var rule RewriteRule
-		if err := decodeJSON(r, &rule); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if err := validateIncomingRewriteRule(rule); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		// Server-owned identity (§22): a client-supplied stableId is ignored.
-		rule.StableID = rewrite.NewStableID()
-		ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
-		// Durable-or-nothing (§24): fence + target build + settings persist +
-		// runtime publication in ONE adminSettingsMu critical section. A hard
-		// persist failure means the rule was never active anywhere.
-		err := saveAdminSettingsWithOverrides(adminSaveOverrides{
-			rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
-				if ferr := rewriteFence(ifRev, current); ferr != nil {
-					return nil, ferr
-				}
-				return append(append([]RewriteRule(nil), current...), rule), nil
-			},
-		})
-		if err != nil {
-			var conflict *errRewriteRevisionConflict
-			if errors.As(err, &conflict) {
-				writeRewriteRevisionConflict(w, conflict.current, ifRev)
-				return
-			}
-			http.Error(w, "rewrite rule not persisted: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// The published copy carries the process-local integer id assigned at
-		// publication — return it for legacy-client compatibility.
-		added := rule
-		for _, lr := range rewriter.List() {
-			if lr.StableID == rule.StableID {
-				added = lr
-				break
-			}
-		}
-		logger.Printf("UI: rewrite rule added stableId=%s host=%q", sanitizeLog(added.StableID), sanitizeLog(added.Host))
-		auditEvent(r, "rewrite.add", fmt.Sprintf("stableId=%s host=%s", added.StableID, added.Host), "")
-		saveConfigVersion(sessionAdmin(r), "rewrite.add")
-		jsonOK(w, added)
+		apiRewriteAdd(w, r)
 
 	case http.MethodDelete:
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		// AFTER the RBAC boundary — same ordering contract as POST.
-		if d := rewriteIdentityDegraded(); d != nil {
-			writeRewriteIdentityDegraded(w, d)
-			return
-		}
-		// v2 addressing: ?stableId= (durable identity). Legacy ?id= (process-
-		// local integer) stays supported for existing clients; it is resolved
-		// to the durable identity INSIDE the critical section so a concurrent
-		// reload cannot retarget it.
-		stableID := strings.TrimSpace(r.URL.Query().Get("stableId"))
-		idStr := strings.TrimSpace(r.URL.Query().Get("id"))
-		var legacyID int
-		hasLegacy := false
-		if stableID == "" {
-			if _, err := fmt.Sscanf(idStr, "%d", &legacyID); err != nil {
-				http.Error(w, "missing or invalid id/stableId param", http.StatusBadRequest)
-				return
-			}
-			hasLegacy = true
-		}
-		ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
-		removedStable := stableID
-		err := saveAdminSettingsWithOverrides(adminSaveOverrides{
-			rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
-				if ferr := rewriteFence(ifRev, current); ferr != nil {
-					return nil, ferr
-				}
-				target := make([]RewriteRule, 0, len(current))
-				found := false
-				for _, cr := range current {
-					match := (stableID != "" && cr.StableID == stableID) ||
-						(hasLegacy && cr.ID == legacyID)
-					if match && !found {
-						found = true
-						removedStable = cr.StableID
-						continue
-					}
-					target = append(target, cr)
-				}
-				if !found {
-					return nil, errRewriteRuleNotFound
-				}
-				return target, nil
-			},
-		})
-		if err != nil {
-			var conflict *errRewriteRevisionConflict
-			if errors.As(err, &conflict) {
-				writeRewriteRevisionConflict(w, conflict.current, ifRev)
-				return
-			}
-			if errors.Is(err, errRewriteRuleNotFound) {
-				http.Error(w, "rule not found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, "rewrite rule removal not persisted: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		logger.Printf("UI: rewrite rule removed stableId=%s", sanitizeLog(removedStable))
-		auditEvent(r, "rewrite.remove", "stableId="+removedStable, "")
-		saveConfigVersion(sessionAdmin(r), "rewrite.remove")
-		w.WriteHeader(http.StatusNoContent)
+		apiRewriteRemove(w, r)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// apiRewriteAdd is the POST branch of apiRewrite (the caller has already
+// enforced the operator role): degradation disclosure AFTER the RBAC
+// boundary, server-owned identity, and the durable-or-nothing append inside
+// one adminSettingsMu critical section (§22/§24).
+func apiRewriteAdd(w http.ResponseWriter, r *http.Request) {
+	// AFTER the RBAC boundary (authorization precedes degradation
+	// disclosure): while management identity is not durable a v2
+	// mutation could create/address identity that re-mints on restart
+	// (and a save could clobber a refused/corrupt settings file) — refuse
+	// with the structured 503, visible to authorized Operators only.
+	if d := rewriteIdentityDegraded(); d != nil {
+		writeRewriteIdentityDegraded(w, d)
+		return
+	}
+	var rule RewriteRule
+	if err := decodeJSON(r, &rule); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := validateIncomingRewriteRule(rule); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Server-owned identity (§22): a client-supplied stableId is ignored.
+	rule.StableID = rewrite.NewStableID()
+	ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
+	// Durable-or-nothing (§24): fence + target build + settings persist +
+	// runtime publication in ONE adminSettingsMu critical section. A hard
+	// persist failure means the rule was never active anywhere.
+	err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+		rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
+			if ferr := rewriteFence(ifRev, current); ferr != nil {
+				return nil, ferr
+			}
+			return append(append([]RewriteRule(nil), current...), rule), nil
+		},
+	})
+	if err != nil {
+		var conflict *errRewriteRevisionConflict
+		if errors.As(err, &conflict) {
+			writeRewriteRevisionConflict(w, conflict.current, ifRev)
+			return
+		}
+		http.Error(w, "rewrite rule not persisted: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// The published copy carries the process-local integer id assigned at
+	// publication — return it for legacy-client compatibility.
+	added := rule
+	for _, lr := range rewriter.List() {
+		if lr.StableID == rule.StableID {
+			added = lr
+			break
+		}
+	}
+	logger.Printf("UI: rewrite rule added stableId=%s host=%q", sanitizeLog(added.StableID), sanitizeLog(added.Host))
+	auditEvent(r, "rewrite.add", fmt.Sprintf("stableId=%s host=%s", added.StableID, added.Host), "")
+	saveConfigVersion(sessionAdmin(r), "rewrite.add")
+	jsonOK(w, added)
+}
+
+// apiRewriteRemove is the DELETE branch of apiRewrite (the caller has already
+// enforced the operator role): v2 ?stableId= addressing with the legacy ?id=
+// resolved to the durable identity INSIDE the critical section, so a
+// concurrent reload cannot retarget it.
+func apiRewriteRemove(w http.ResponseWriter, r *http.Request) {
+	// AFTER the RBAC boundary — same ordering contract as POST.
+	if d := rewriteIdentityDegraded(); d != nil {
+		writeRewriteIdentityDegraded(w, d)
+		return
+	}
+	// v2 addressing: ?stableId= (durable identity). Legacy ?id= (process-
+	// local integer) stays supported for existing clients; it is resolved
+	// to the durable identity INSIDE the critical section so a concurrent
+	// reload cannot retarget it.
+	stableID := strings.TrimSpace(r.URL.Query().Get("stableId"))
+	idStr := strings.TrimSpace(r.URL.Query().Get("id"))
+	var legacyID int
+	hasLegacy := false
+	if stableID == "" {
+		if _, err := fmt.Sscanf(idStr, "%d", &legacyID); err != nil {
+			http.Error(w, "missing or invalid id/stableId param", http.StatusBadRequest)
+			return
+		}
+		hasLegacy = true
+	}
+	ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
+	removedStable := stableID
+	err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+		rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
+			if ferr := rewriteFence(ifRev, current); ferr != nil {
+				return nil, ferr
+			}
+			target, removed, ok := rewriteRulesWithout(current, stableID, hasLegacy, legacyID)
+			if !ok {
+				return nil, errRewriteRuleNotFound
+			}
+			removedStable = removed
+			return target, nil
+		},
+	})
+	if err != nil {
+		var conflict *errRewriteRevisionConflict
+		if errors.As(err, &conflict) {
+			writeRewriteRevisionConflict(w, conflict.current, ifRev)
+			return
+		}
+		if errors.Is(err, errRewriteRuleNotFound) {
+			http.Error(w, "rule not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "rewrite rule removal not persisted: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	logger.Printf("UI: rewrite rule removed stableId=%s", sanitizeLog(removedStable))
+	auditEvent(r, "rewrite.remove", "stableId="+removedStable, "")
+	saveConfigVersion(sessionAdmin(r), "rewrite.remove")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// rewriteRulesWithout returns current minus the FIRST rule addressed by
+// stableID (durable identity) or, when hasLegacy, by the process-local
+// legacy id; removed is the StableID of the dropped rule and ok is false
+// when nothing matched.
+func rewriteRulesWithout(current []RewriteRule, stableID string, hasLegacy bool, legacyID int) (target []RewriteRule, removed string, ok bool) {
+	target = make([]RewriteRule, 0, len(current))
+	for _, cr := range current {
+		match := (stableID != "" && cr.StableID == stableID) ||
+			(hasLegacy && cr.ID == legacyID)
+		if match && !ok {
+			ok = true
+			removed = cr.StableID
+			continue
+		}
+		target = append(target, cr)
+	}
+	return target, removed, ok
 }
 
 // ─── Policy API ───────────────────────────────────────────────────────────────

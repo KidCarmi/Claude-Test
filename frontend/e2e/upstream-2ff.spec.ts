@@ -29,11 +29,12 @@
 // Everything created is removed in finally blocks through the fenced API
 // (clear → delete), so the shared appliance ends the spec unchanged.
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { expect, request } from "@playwright/test";
 import { test } from "./test";
 import type { APIRequestContext, Page, Response } from "@playwright/test";
-import { AUTH_URL, EMPTY_STATE, USERS } from "./fixtures";
+import { AUTH_DATA_DIR, AUTH_URL, EMPTY_STATE, USERS } from "./fixtures";
 
 const ROUTE = "/app/network/upstream";
 const SUFFIX = Date.now().toString(36).slice(-6);
@@ -42,7 +43,7 @@ const HOST3 = `parent-2ff-${SUFFIX}-j3.test`;
 const HOST5 = `parent-2ff-${SUFFIX}-j5.test`;
 const PORT = 3128;
 const CANARY_PW = `Canary-Browser-PW-2ff-${SUFFIX}`;
-const SETTINGS = "/data/admin_settings.json";
+const SETTINGS = join(AUTH_DATA_DIR, "admin_settings.json");
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -381,8 +382,7 @@ test("admin: create → seal credential (canary) → no browser sink carries it 
     if (cts === null) {
       test.info().annotations.push({
         type: "note",
-        description:
-          "ciphertext needle skipped: /data/admin_settings.json not reachable from the runner",
+        description: `ciphertext needle skipped: ${SETTINGS} not reachable from the runner`,
       });
     }
 

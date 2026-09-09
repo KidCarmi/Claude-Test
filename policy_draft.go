@@ -105,13 +105,6 @@ func (c *policyDraftCoordinator) active() bool {
 	return c.state.Active
 }
 
-// snapshotState returns a copy of the draft metadata.
-func (c *policyDraftCoordinator) snapshotState() draftState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state
-}
-
 // stageTarget returns the candidate store for a policy WRITE, opening the draft
 // (seeding it from running) on the first write of a new draft. Only called when
 // RequireCommit is on.
@@ -641,39 +634,6 @@ func (c *policyDraftCoordinator) refreshObjectRefNames(groupNames, profileNames,
 		return 0, nil
 	}
 	return n, c.persistLocked()
-}
-
-// reconcile auto-discards the draft when its candidate has become identical to
-// running — i.e. the last edit was a NO-OP (re-save with no change, drag-in-place,
-// bulk-delete of absent priorities) or FAILED (TOCTOU mutation returned false
-// after the draft was opened). Without this, such an edit would leave a
-// zero-diff "active" draft that blocks commit-mode disarm and makes reads render
-// the (identical) candidate — undermining the byte-identical-when-nothing-changed
-// promise. A draft carrying REAL prior staged changes is never cleared (its diff
-// is non-zero). Returns true if it cleared. No-op (returns false) when no draft
-// is open, so callers can invoke it unconditionally, including in live-write mode.
-func (c *policyDraftCoordinator) reconcile() bool {
-	c.mu.Lock()
-	if !c.state.Active {
-		c.mu.Unlock()
-		return false
-	}
-	// Compare under c.mu (lock order c.mu → PolicyStore.mu, as in stageTarget).
-	if !sameRuleSet(policyStore.List(), c.cand.List()) {
-		c.mu.Unlock()
-		return false
-	}
-	candVer, _ := c.cand.policyVersion()
-	path := c.clearLocked()
-	// Candidate retirement (2B.0a): see clear() — stale candidate-era tokens
-	// must conflict, never numerically collide with later running generations.
-	policyStore.ensureVersionAbove(candVer)
-	c.mu.Unlock()
-	policyStore.saveMeta()
-	if path != "" {
-		_ = os.Remove(path)
-	}
-	return true
 }
 
 // sameRuleSet reports whether two rule sets are content-identical (by stable ID,

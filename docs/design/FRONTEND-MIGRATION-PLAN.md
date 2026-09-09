@@ -3311,6 +3311,602 @@ UI leans on C2 semantics and must not cut over onto a known enforcement gap).
 > commits cleanly. Both shapes are proven at the Go layer and against the
 > real binary (policy-2d.spec.ts).
 
+#### Batch 2 PR correction round (PR #1340, append-only on the PR branch)
+
+The frozen Batch 2F head (`8e73a619`) was opened as a draft PR and the real
+CI matrix plus the repository's automated reviewer found what a root-run,
+single-order qualification could not. Every product correction below was
+preceded by a RED proof executed on the tree immediately before it; the
+frozen program branch is untouched.
+
+> **PR-C1 — the browser smoke depended on a writable `/data`.** The
+> appliance's persisted-state root was the fixed absolute `/data`; a CI
+> runner's unprivileged user cannot read or create it, so every
+> `/data`-backed mutation (admin settings, object stores, PAC profiles, CDR
+> state, drafts) answered `persist_failed`/503 while file-path-backed
+> stores kept working — 45 failed / 102 passed / 3 skipped, reproduced
+> verbatim on the PR head inside a private mount namespace with an empty
+> read-only tmpfs over `/data` (the exact CI premise: ENOENT on read, EROFS
+> on write). Correction: `CULVERT_DATA_DIR` (`data_dir.go`), a
+> startup-scoped, env-only override resolved once in `main()` before flag
+> parsing and any one-shot command (blank ⇒ `/data`, byte-identical;
+> otherwise an absolute, cleaned, non-root path, else FATAL; recorded
+> GUI-parity deferral of the HA-lease-endpoint class); the harness gives
+> every appliance instance its own root under the harness tmp dir, which
+> also retires the recorded "shared `/data` across instances and runs"
+> debt, and exports the AUTH root so the on-disk ciphertext needle checks
+> run everywhere instead of annotating a skip. **Qualification rule going
+> forward: the smoke is run at least once with `/data` unwritable** (the
+> `unshare -m` + read-only tmpfs shape) so a root-only premise can never
+> pass again.
+>
+> **PR-C1b — five roots ignored the override.** The read-only-`/data`
+> re-run after PR-C1 still failed the PAC lifecycle journeys (409
+> `operation_pending`, `progress.configVersion=false`): the config-version
+> store, registry settings, the CDR enrollment certs root, the CDR runtime
+> marker and the alert retry queue were package-level literals spelled as
+> `/data/...`, bound at init time before any env was consulted. Correction:
+> `rebindDataDirPaths()` re-derives every one of them from the effective
+> root after the override resolves, the CDR startup resolver takes the data
+> root as a parameter (pure, no global read), and the committed RED
+> (`data_dir_paths_red_test.go`) asserts each rebound root so a new literal
+> cannot land unnoticed. The PAC, network and CDR journeys pass under the
+> read-only-`/data` shape after this.
+>
+> **PR-C1c — the Go race gate had the same dependence.** The frozen head's
+> `Gate · go test -race + coverage floors` run failed four
+> `TestAPIPACLifecycle_*` journeys with `409 operation_pending`: their
+> environment helper isolated every PAC store but left the config-version
+> store on the process default `/data/config_versions`, which the CI
+> runner's unprivileged user cannot create, so the first publish's version
+> capture failed and the next publish was refused. A root-run qualification
+> never saw it. Correction: `resetPACPublishGlobals` swaps the
+> config-version store to the test's temp dir (the shape `pacFenceEnv`
+> already used), pinned by `pac_publish_env_red_test.go` (the store must
+> never sit under the process data root and must be writable), and the
+> root suite is now also qualified under `-race` with `/data` unwritable.
+>
+> **PR-C3b — advisory reviewdog findings on the corrected head.** The
+> `Code Review` workflow's inline golangci pass (advisory, `diff_context`
+> filter — it reports a finding whose line sits near a changed line, where
+> the blocking Fast-Gate run reports only findings ON changed lines) posted
+> nine findings on the corrected head: cyclomatic complexity 20 on
+> `apiCDRRevokeRPC`, cognitive complexity 33 on `apiFileblockProfiles` and
+> 35 on `diffRewriteRules`, nested-block complexity 20 on the category-group
+> stable-ID PUT branch and 5 on the no-persistence branch of
+> `saveAdminSettingsWithOverrides`, a shadowed `copy` builtin in the CDR
+> store, and three gosec G101 hits on fixture URLs in tests. Correction:
+> pure helper extraction with no behaviour change — the handler role gates
+> stay in the method switch so the C1.5 AST parity keeps seeing them
+> (`apiCategoryGroupUpdateByID` + `cascadeCategoryGroupRenameDurable`,
+> `apiFileblockProfileUpdate` + `apiFileblockProfileDelete`,
+> `cdrRevokeTargets` / `cdrRevokeGenerations` / `cdrPruneRevokedInstance`,
+> `rewriteRuleStableIDs` / `diffRewriteRulesLegacy` / `rewriteRulesReordered`,
+> `applyAdminSettingsOverridesUnpersisted`), the rename, and reasoned
+> `//nolint:gosec` on the three test fixtures (the repository's lint
+> suppression convention). No accepted RED assertion changed. The pass
+> widened the review context and surfaced three more of the same class on
+> the next head (cognitive complexity 58 on `apiRewrite`, which this
+> program grew from 48 to 145 lines, and two more fixture-URL G101 hits):
+> the POST/DELETE branches are `apiRewriteAdd` / `apiRewriteRemove` with
+> the removal selector `rewriteRulesWithout`, and the fixtures carry the
+> same reasoned suppression.
+>
+> **PR-C2 — determinism gate.** Under `-shuffle -count=2` the
+> process-global "stored document rejected at load" latch armed by the R3
+> rejected-document test outlived its environment and handed a 409
+> `document_rejected` to the next upstream test. `upEnv` now resets the
+> latch and the degradation surface with the rest of the upstream process
+> state (`upstream_v2_env_isolation_red_test.go`).
+>
+> **PR-C7 — two more order dependencies under the same seed.** With the
+> PR-C2 latch cleared, `-shuffle=1788866999688368609 -count=2` reached the
+> next two: `TestLoadAdminSettings_CorruptFileQuarantinedNotOverwritten`
+> asserts the settings file is absent after the corrupt copy is quarantined,
+> but `LoadAdminSettings` finalizes the YAML-seeded rewrite identities on
+> every load path and deliberately writes a fresh minimal ledger there
+> whenever a predecessor left rules in the global rewriter
+> (`TestAPIRewrite_Add` added one through the API and never restored it);
+> `TestAPIPolicyReorder_Post_Success` sends a two-rule list, which the 2E-C
+> reorder contract refuses with `409` whenever a predecessor left another
+> access rule in the global policy store. Both were rebuilt deterministically
+> in-process (`test_order_isolation_red_test.go`: seed the leaked state, run
+> the victim unchanged), and the corrections are isolation only — the
+> quarantine tests own an EMPTY rewriter (`isolateRewriterForTest`, a
+> snapshot/restore), the reorder test owns its policy store
+> (`withFreshPolicyStore`), and the leaking rewrite test restores the
+> rewriter it mutated. No product code changed and no accepted assertion
+> changed.
+>
+> **PR-C7b — the same seed, one more.** With PR-C7's two isolated, the
+> seeded run reached `TestLegacyLDAP_RetirementSentinelDurableRoundTrip`
+> ("sentinel did not survive the admin_settings.json round trip"). Two
+> process-global leaks meet there: a predecessor's best-effort
+> admin-settings save (`adminSettingsSave` spawns a goroutine on every
+> admin mutation) was still in flight when the test pinned and rewrote its
+> fixture with the flag already reset, so the stale save landed on the
+> fixture and the load read `legacy_ldap_retired:false`; and the same load
+> logged `duplicate_authority`, because `upEnv` cleared the R3
+> rejected-document latch at ENTRY only (PR-C2), which protects the next
+> upstream test and nobody else — a non-upstream successor's save carried
+> the rejected sections forward verbatim. Both are pinned in
+> `test_order_isolation_red_test.go` (a held-open pending save that the
+> fixture helper must wait out; R3 as a subtest whose cleanup must clear
+> the latch and the degradation surface), and the corrections are isolation
+> only: the LDAP fixture helper drains `adminSettingsSaveWG` before it hands
+> the path to the test and the victim drains again before the rewrite (the
+> drain the upstream suites already use), and `upEnv` resets the latch and
+> state at cleanup as well as at entry. No product code changed and no
+> accepted assertion changed.
+>
+> **PR-C8 — the root package's `-race` run overran the CI per-binary
+> budget.** `Gate · go test -race + coverage floors` on the PR-C7 head
+> ended in `panic: test timed out after 25m0s` (FAIL at 1502.7s, one test
+> 1s into its run — a budget overrun, not a hang); the run before it had
+> cleared the same budget by well under a minute. Measured per test
+> (`-race -json`, same box, both runs under the same background load):
+> `origin/main` alone is 1445s against the 1500s budget — 3.7% of
+> headroom, and the QA gate's main-push run of that suite already takes
+> 24m35s end to end — and this PR adds 58s of new root tests (445, the
+> RED matrices and harnesses of the program) plus ~20s on the OpenAPI
+> conformance slices for the larger contract, 1553s in total. This is
+> CI-01 (`docs/engineering/security-reviews/2026-08-25-mcp-overnight-hardening-run.md`)
+> two weeks on: the budget that was raised from 15m to 25m has been
+> consumed by `main` itself, and removing every test this PR adds would
+> leave a coin flip. The correction is the same decision with today's
+> numbers — the per-binary budget in `pr-fast-gate.yml` and `qa-gate.yml`
+> (which must move together) goes to 40m with the measurements recorded
+> beside the step; no test was shortened, skipped or weakened, and the
+> durable fix the record already names (split the root package) is
+> unchanged and remains an owner decision. Two related observations are
+> recorded, not changed: `security-release-gate.yml` still runs the same
+> suite under `-timeout=15m` on tags and the weekly cron, which `main`
+> exceeds today; and the root copy of `TestMatchDPIRegexWithTimeout_TimeoutReturnsTrue`
+> (`scanner_test.go`) keeps the racy 1 ns-timer shape the
+> `internal/scanner` test replaced with a blocking-fn seam, and failed
+> once here under three concurrent test runs (it has passed in every CI
+> run; it is not this PR's).
+>
+> **PR-C3b, round 3 — the three reviewdog threads still open.** The
+> advisory pass on the frozen head had also posted `cyclop` findings on
+> three functions this program grew — `applyAdminServices` (18),
+> `propagateServerRotation` (16), `apiAuthPolicyReorder` (17) — which the
+> diff-scoped gate never sees (their declaration lines are outside the
+> diff). Pure helper extraction, no behaviour change, the role gate stays
+> in the handler for the C1.5 parity: `applyAdminTrafficPseudonym` +
+> `applyAdminLogStore`, `reconcileMemberRotation` (per member, reports
+> whether the registry changed), `validateAuthReorderBody` (the
+> state-independent grammar check). The full linter no longer reports the
+> three; the diff-scoped gate stays at 0. The pass on that head then
+> reached two `noctx` findings in `admin_settings_upstream_test.go` (bare
+> `httptest.NewRequest` on lines this program's edits brought into the
+> review context); both use the repo's `NewRequestWithContext(t.Context(), …)`
+> convention now.
+>
+> **PR-C9 — the owner-triggered Codex review of the PR head (three P2s).**
+> Each was confirmed against the code, pinned in
+> `frontend/src/test/pr-c9-codex-red.test.tsx` on the untouched head
+> (K1–K3, ten failing cases and one control), then corrected. (K1) The
+> route-intent allowlist (`routeIntent.ts`) never learned the three routes
+> the program added last — `/policies/header-rewrite`,
+> `/objects/url-categories`, `/objects/file-profiles` — so a deep link or a
+> re-authentication on them landed on Overview; they are known viewer
+> routes now. (K2) The Upstream client bound a create/update success to a
+> client-rebuilt authority string, while the appliance renders the
+> username percent-escaped inside `authority` (`url.PathEscape`: `?`, `#`,
+> `%`, `;`, non-ASCII), so a genuine success with such a username was
+> classified UNPROVEN and latched the page; the success is now bound FIELD
+> BY FIELD (`canonicalSpec` + `matchesSpec` on scheme/host/port/username,
+> the fields the appliance already returns), never through a rebuilt or
+> re-escaped string, and the control keeps a different username, host or
+> port unproven. (K3) The appliance runs a manual probe SEQUENTIALLY at 5 s
+> per eligible entry while the page dispatched it under the 30 s default
+> request deadline, so eight or more entries aborted a run the appliance
+> was still executing into an unproven outcome; `runUpstreamProbe` now
+> sizes its deadline from the read model (`probeDeadlineMs`: never below
+> the default, never below entries × 5 s + 10 s), the 5 s constant is
+> `PROBE_PER_ENTRY_MS` and is pinned to the engine's `ProbeTimeout` by
+> `upstream_probe_deadline_lockstep_test.go` (the engine constant is
+> exported for that test only; engine behaviour is byte-identical). No
+> Go handler changed; `frontend/dist` regenerated.
+>
+> **PR-C10 — the second Codex round (two P2s).** Both confirmed against
+> the code and pinned in `frontend/src/test/pr-c10-codex-red.test.tsx`
+> (K4–K5, nine failing cases and three controls) before the correction.
+> (K4) The appliance brackets a bare IPv6 literal and keeps the literal AS
+> TYPED (lower-cased, never compressed — `internal/upstream` `normalizeHost`),
+> while the client's canonical host went through the URL parser, which
+> throws on a bare literal and compresses a bracketed one, so a genuine
+> success on `2001:db8::1`, `2001:DB8::1`, `2001:0db8::1` or
+> `[2001:0db8::1]` was classified UNPROVEN; `canonicalSpec` now brackets
+> and lower-cases an IPv6 literal itself and never hands it to the URL
+> parser, and a different literal still stays unproven. (K5) A manual
+> probe and every mutation share one run owner (`begin()` aborts the
+> predecessor), but `canMutate` ignored `probing`, so New entry / Edit /
+> Delete entry / the credential ceremonies stayed live during a probe and
+> a confirmed mutation would abort the probe's request into an unproven
+> outcome while the appliance kept probing; `canMutate` now includes the
+> in-flight probe, the page test drives the real page with the probe
+> answer held open and proves the controls are disabled until it lands
+> and re-enabled after. Frontend only; `frontend/dist` regenerated.
+>
+> **PR-C11 — the third Codex round (one P2).** Confirmed against both
+> sides (the Go normaliser and the browser's URL parser) and pinned in
+> `frontend/src/test/pr-c11-codex-red.test.tsx` (K6, eight failing cases,
+> three companions and one control) before the correction. The
+> appliance's `normalizeHost` recognises only a full dotted-quad as IPv4
+> and otherwise keeps the UTS-46 mapping of what was typed, so `127.1`,
+> `2130706433` and `0x7f.1` are stored and returned VERBATIM and
+> full-width `１２７.１` becomes `127.1`; the PR-C10 `canonicalSpec` mapped
+> every non-IPv6 host through the WHATWG URL parser, which treats a last
+> label that ends in a number as an IPv4 literal and collapses all four
+> to `127.0.0.1`, so a genuine create/update success on such a host was
+> classified UNPROVEN. `canonicalSpec` now asks the parser to map the
+> host with a sentinel trailing label appended (never a last label, never
+> numeric) and strips the sentinel again, which keeps the IDNA punycode
+> mapping the parser was used for (`bücher.example` →
+> `xn--bcher-kva.example`) and mirrors the appliance on every spelling; a
+> different numeric host still stays unproven. Frontend only;
+> `frontend/dist` regenerated.
+>
+> **PR-C12 — the fourth Codex round (one P2).** Confirmed against both
+> sides and pinned in `frontend/src/test/pr-c12-codex-red.test.tsx` (K7,
+> eight failing cases, four companions and one control) before the
+> correction. The appliance lower-cases with Go's SIMPLE Unicode case
+> mapping (`strings.ToLower`: U+0130 `İ` → `i`, `Σ` → `σ` always) and
+> strips exactly ONE trailing dot before the IDNA mapping, so `İ.example`
+> is returned as `i.example` and `example.com..` as `example.com.`; the
+> client used JavaScript's FULL mapping (`İ` → `i̇`, which the IDNA mapping
+> turns into `xn--i-9bb`) and stripped every trailing dot, so a genuine
+> create/update success on such a host was classified UNPROVEN.
+> `canonicalSpec` now maps the two full-mapping specials to Go's result
+> before lower-casing (`lowerAsGo`) and strips a single trailing dot; an
+> answer keeping a dot the appliance would have stripped still stays
+> unproven. Frontend only; `frontend/dist` regenerated.
+>
+> **PR-C13 — the fifth Codex round (one P2).** Confirmed against both
+> sides and pinned in `frontend/src/test/pr-c13-codex-red.test.tsx` (K8,
+> four failing cases, five companions and two controls) before the
+> correction. `ℵx.example` is mapped by UTS-46 to `אx.example`, a label
+> mixing right-to-left and left-to-right letters that the browser's URL
+> parser refuses while the appliance's IDNA tables accept it and return
+> `xn--x-zhc.example`; the client kept the raw spelling on a parser
+> failure and refused the genuine success as UNPROVEN. The appliance's
+> tables cannot be reproduced exactly in the browser, so the binding no
+> longer tries: `matchesSpec` accepts a returned host when it equals the
+> client's ASCII form OR when its punycode-decoded, NFC-normalised form
+> (`hostUnicodeKey`, an RFC 3492 decoder that yields no key for a
+> malformed label) equals the typed host's mapped form — the browser's
+> own mapping when it succeeds, NFKC plus Go-style lower-casing when the
+> browser refuses the host. Scheme, port and username stay exact; a host
+> that decodes to different letters, or carries a malformed punycode
+> label, stays unproven. Frontend only; `frontend/dist` regenerated.
+>
+> **PR-C14 — the sixth Codex round (one P2).** Confirmed against both
+> sides and pinned in `frontend/src/test/pr-c14-codex-red.test.tsx` (K9,
+> ten failing cases, four companions and one control) before the
+> correction. Go's `strings.TrimSpace` and JavaScript's `trim()` use
+> different whitespace sets: the appliance strips U+0085 NEXT LINE (and
+> U+00A0, U+2028, U+3000) from a username or host and KEEPS U+FEFF, while
+> `trim()` keeps U+0085 and strips U+FEFF, so a username pasted with a
+> NEXT LINE was returned as `svc` and the client's binding refused the
+> genuine success as UNPROVEN; the editor sent the untrimmed value for the
+> same reason. `trimAsGo` now trims exactly Go's set and is used by
+> `canonicalSpec` (scheme, host, username) and by the editor's
+> `draftToSpec` (host, username), so what is sent is what the appliance
+> keeps; a character neither side trims (U+200B) still binds only to
+> itself. Frontend only; `frontend/dist` regenerated.
+>
+> **PR-C15 — the seventh Codex round (two P2s).** Both confirmed and
+> pinned before the correction (`upstream_codex_r7_red_test.go`,
+> `frontend/src/test/pr-c15-codex-red.test.tsx`). (R7-A) `normalizeHost`
+> accepted hosts with EMPTY labels (`.example`, `parent..example`) — the
+> IDNA mapping passes them through unchanged — so an invalid DNS name was
+> persisted and published as an eligible parent; `validateHostLabels` now
+> refuses any empty label after the mapping while keeping the single
+> trailing FQDN dot, and the endpoints answer `invalid_entry`. (R7-B) The
+> manual probe's client deadline was sized from the page's entry count,
+> which is not an upper bound (the appliance probes the CURRENT entries
+> sequentially, so entries added by another admin after the page's read
+> outran the deadline and the completed run latched as unproven). The
+> read model now exposes the node-local single-flight state
+> (`probe.manualInFlight`, additive; OpenAPI + bundle regenerated), and
+> the page resolves a timed-out probe against the appliance: it polls the
+> read model until no run is in flight and counts the run as completed
+> only when at least one eligible entry's health advanced with the manual
+> source; nothing in flight and nothing advanced stays unproven,
+> fail-closed. Backend + frontend; `frontend/dist` regenerated.
+>
+> **PR-C16 — the CI-shaped seeded shuffle on the PR-C15 head.** The
+> `-shuffle=1788873409540952482 ./... -count=2` run under a read-only
+> `/data` failed `TestIdentityIngress_NoBackendSpoofDenied` on a request-log
+> entry attributed to `alice` while the test's own request was logged with
+> an empty identity: the assertion judged every ring entry whose host
+> matched the backend's ephemeral port, and an earlier test that
+> authenticated alice against a backend on the same recycled port had left
+> its entry in the process-global ring. Reproduced deterministically
+> without the shuffle (`TestOrder_IdentityIngressAttributionIsScopedToOwnRequest`,
+> RED-before) and corrected in the fixture only: `logEntriesSince(prev)`
+> yields the entries recorded after a ring snapshot, and the three ingress
+> tests judge only what their own request produced (the positive
+> attribution test included). No assertion weakened; test-only.
+>
+> **PR-C17 — the eighth Codex round (one P1, one P2).** Both confirmed
+> and pinned before the correction (`upstream_codex_r8_red_test.go`).
+> (R8-A, P1) A backup taken in the prepared-downgrade state — after
+> `--prepare-downgrade`, before the next boot re-migrates — packed the
+> legacy `upstream_proxies` URLs, which then carry the unsealed passwords
+> by design, verbatim while the manifest asserted `credentialsOmitted:
+> true`; a pre-v2 file never booted on this binary has the same shape.
+> The sanitizer now REFUSES such a body (a password in any legacy URL, or
+> the prepared-downgrade marker) with a counts-only error the packer
+> turns into a failed backup; a password-free legacy list still archives
+> unchanged; runbook §8 updated. (R8-B, P2) `validateHostLabels` checked
+> emptiness only; it now enforces the DNS length limits on the A-label
+> form (63 octets per label, 253 per name, trailing FQDN dot excluded)
+> with `invalid_entry`. Backend only.
+>
+> **PR-C30 — the seeded determinism run on the corrected head (two test
+> defects).** The root-package shuffle that failed the gate on `8e73a619`
+> (`-shuffle=1788866999688368609 -count=2`), re-run on `7fd9c852`, failed
+> two tests; both were pinned RED-first
+> (`test_order_isolation_c30_red_test.go`, executed on `7fd9c852` before the
+> correction) and neither is a product defect. (C30-A)
+> `TestDCFin5_LegacyImportReplaceAndMergeAreDurable` read `[]` back from a
+> settings file it had just proven to carry both imported identities: the
+> restart helper `dcFinBoot` reset the live rewriter to "fresh process" and
+> loaded the file, and a best-effort admin-settings save still in flight
+> (`adminSettingsSave` spawns one on every admin mutation, the merge import's
+> own included) landed inside that window, serializing the empty live list
+> as saved-authoritative — the PR-C7b class. RED: with a save held open the
+> helper returned anyway, and the loss itself reproduced; a mechanism
+> control (green at both trees) documents the erasure. Correction: `dcFinBoot`
+> drains `adminSettingsSaveWG` BEFORE the fresh-process reset and
+> `dcFinYAMLBootEnv` drains it before handing over the settings path;
+> isolation only, no assertion changed. (C30-B)
+> `TestMatchSchedule_InvalidTimezone` asserted a `"00:00"`–`"23:59"` window
+> against the wall clock; the matcher is half-open, so the claim is false
+> for the last minute of every day and the run crossed 23:59 UTC. Main's own
+> commit `08545fa5` corrected the two sibling tests to `"24:00"` and left
+> this one and `TestPolicyPrecompute_ScheduleTimezone` (the same window in
+> America/New_York, asserted through `Evaluate`'s per-scan clock) behind.
+> RED: a source wall over the root test files refuses a full-day schedule
+> built as `"00:00"`–`"23:59"` (two offenders on the untouched tree).
+> Correction: both windows close at `"24:00"`, exactly as `08545fa5` did;
+> the engine is unchanged. Test-side only.
+>
+> **PR-C29 — the nineteenth Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r19_red_test.go`; seven of its
+> eight shapes were accepted on the untouched head — the document-level
+> `Credential` object was already refused by the exact-case `ciphertext`
+> key inside it). (R19-A, P1) `walkV2Keys` compared the sealed-record key
+> names and the `credential` key EXACTLY, and the duplicate-key walker
+> folds case only for the keys BOUND at a structural role — so a
+> case-variant sealed field placed OUTSIDE its normal role (a
+> document-level `Ciphertext`, an entry-level `KeyId`, a nested
+> `AuthorityHash`, a misplaced `CREDENTIAL`) passed both and the
+> zero-strip branch archived the field unchanged while the manifest
+> asserted `credentialsOmitted`. The verifier now folds case for the
+> v2-owned key names at every depth (`strings.EqualFold`); a VALUE equal
+> to a case variant stays ordinary (PR-C27) and a case variant IN its
+> bound role stays refused by the walker (PR-C22). Backend only.
+>
+> **PR-C28 — the eighteenth Codex round (one P2).** Confirmed and pinned
+> before the correction (`upstream_codex_r18_red_test.go`). (R18-A, P2)
+> `stripUpstreamCredentialsFromSettings` decoded the settings body into a
+> `map[string]any`, and the JSON literal `null` decodes into a NIL map
+> without error — so the duplicate-key walk, the trailing-data check, the
+> legacy gate and the v2 strip all saw an empty document and the
+> zero-strip branch handed the original `null` back to be archived, though
+> the function's contract is that a non-object root is refused; a restore
+> of such an archive silently boots zero-valued settings. A nil root is now
+> refused after decoding, like every other non-object root (the
+> array/string/number/bool controls stay refused and `{}` stays a sound,
+> unchanged settings file). Backend only.
+>
+> **PR-C27 — the seventeenth Codex round (one P2).** Confirmed and pinned
+> before the correction (`upstream_codex_r17_red_test.go`). (R17-A, P2)
+> `verifyV2CredentialsRemoved` searched the re-serialized v2 document's
+> BYTES for the quoted sealed-record key names, so a sound entry whose
+> VALUE equals one of them — an uncredentialed parent whose username is
+> `keyId` or `ciphertext`, a host spelled `authorityhash`, a document-level
+> note — matched the same quoted bytes though no sealed-record key
+> remained, and because PR-C26 runs the verifier for every present
+> document such a settings file refused every backup. The verifier now
+> walks the document's object KEYS at every depth (`walkV2Keys`) and
+> refuses a sealed-record key or a surviving `credential` key; values are
+> never inspected. The fail-closed controls (an entry-level `keyId` key, a
+> document-level `ciphertext` key, a nested `authorityHash` key) stay
+> refused. Backend only.
+>
+> **PR-C26 — the sixteenth Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r16_red_test.go`). (R16-A, P1)
+> The PR-C25 v2-document verification ran only AFTER at least one
+> credential object had been stripped, so a v2 document carrying
+> misplaced sealed fields with no recognized `credential` object — a
+> document-level `ciphertext` or `keyId`, an entry-level `authorityHash`
+> or `ciphertext`, a nested object inside the document — returned the
+> ORIGINAL bytes at the zero-strip branch before the verifier ran, and
+> the material was archived under `credentialsOmitted: true`. The
+> verification now runs whenever a v2 document is present, before the
+> zero-strip return; a sound document with no credential and the sealed
+> names outside the document stay ordinary (pinned as controls). Backend
+> only.
+>
+> **PR-C25 — the fifteenth Codex round (one P2).** Confirmed and pinned
+> before the correction (`upstream_codex_r15_red_test.go`). (R15-A, P2)
+> After stripping a v2 credential the sanitizer scanned the WHOLE
+> re-serialized settings document for the sealed-record key names
+> (`ciphertext`, `keyId`, `authorityHash`) and refused the backup on any
+> hit, so an OTLP header or an unrelated section using one of those names
+> combined with a real v2 credential refused a sound backup after the
+> credential had already been removed. The post-strip check now verifies
+> removal within the v2 document alone (`verifyV2CredentialsRemoved`
+> re-serializes that subtree and refuses any surviving name inside it — the
+> document is upstream-owned in full, so the fail-closed posture there is
+> kept, pinned by two controls) and unrelated sections may use any name.
+> Backend only.
+>
+> **PR-C24 — a newly published dependency advisory in the generator
+> workspace.** `Gate · frontend / Frontend · verify + determinism` failed on
+> the PR-C23 head at the last verify step — `npm audit --audit-level=high`
+> in `frontend/tools/openapi-gen` — because GHSA-2883-xcg3-v3hh (js-yaml
+> `4.0.0`–`4.3.1`, CPU exhaustion on empty merge sources) was published
+> between two runs of the same gate on the same generator lockfile, which
+> has been unchanged since the workspace was created and is identical on
+> `main`. `openapi-typescript@7.13.0` requires `@redocly/openapi-core
+> ^1.34.6`, whose latest `1.34.19` pins `js-yaml` to exactly `4.3.1`, so no
+> in-range update exists and `npm audit fix` is a no-op; the workspace now
+> carries an npm `overrides` entry pinning `js-yaml` to the patched `4.3.2`
+> (lockfile regenerated with `--package-lock-only`, integrity recorded).
+> The generator's YAML parsing is the only consumer; the canonical
+> `npm run verify` proves the regenerated `src/api/types.gen.ts` and
+> `frontend/dist` are byte-identical (drift gates pass) and both audits are
+> clean. Frontend workspace only; no product code changed.
+>
+> **PR-C23 — the fourteenth Codex round (one P1, one P2).** Both
+> confirmed and pinned before the correction
+> (`upstream_codex_r14_red_test.go`). (R14-A, P1) The sanitizer asserted
+> the v2 document to an object and its `entries` to an array and on any
+> other shape fell through to the no-op path, which hands back the
+> ORIGINAL bytes — so an `entries` object or string, a non-object item, an
+> array/string/`null` document, or a non-object `credential` carried
+> sealed material into the archive under `credentialsOmitted: true`. A
+> present document, `entries`, item or `credential` of any other shape
+> now refuses the archive. (R14-B, P2) The PR-C22 case-variant and
+> case-collision checks ran for every object at every depth, so a
+> legitimate operator-controlled map key — an OTLP header named `URL` or
+> `KeyId` under `otlp_headers`, a case-colliding header pair, or an
+> unrelated section using those names — refused every backup even with no
+> upstream credential anywhere. The token walker now tracks the
+> STRUCTURAL ROLE of every container (`jsonRole`: root, legacy list/item,
+> v2 document/entries/entry/credential, other) and applies the alias check
+> and the case-fold collision check only where the settings loader binds
+> the key to an upstream field (`upstreamBoundKeys`); an exact duplicate is
+> still refused anywhere. Runbook §8 updated. Backend only.
+>
+> **PR-C22 — the thirteenth Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r13_red_test.go`, with a
+> loader-evidence test proving `encoding/json` reads the variants into
+> `AdminSettings`). (R13-A, P1) The sanitizer looked every key up by EXACT
+> spelling while the settings loader matches struct fields
+> case-insensitively, so a legacy list under `UPSTREAM_PROXIES`, a v2
+> document under `Upstream_Proxies_V2`, `entries`/`credential`/
+> `requiresReplacement` under case variants, a case-variant
+> prepared-downgrade marker, and a case-only key collision (`upstream_proxies`
+> beside `UPSTREAM_PROXIES`) all bypassed the gate or the strip and the
+> original bytes were archived under `credentialsOmitted: true`. The token
+> walker now refuses, at any depth, a key repeated under case folding and
+> any key that equals one the sanitizer reads (`sanitizerReadKeys`)
+> without being its exact spelling — the appliance never writes a variant,
+> so one is a hand-edited file the sanitizer cannot read as the loader
+> does; canonical spellings and unrelated keys in any case stay ordinary
+> (pinned as a control). Runbook §8 updated. Backend only.
+>
+> **PR-C21 — the twelfth Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r12_red_test.go`). (R12-A, P1)
+> The backup sanitizer asserted the legacy `upstream_proxies` value to a
+> JSON array and silently skipped the credential gate on any other shape
+> (an object, a string, `null`, a number, a nested array) and, inside a
+> well-formed array, on an item that is not an object, an object whose
+> `url` is not a string, and an object with no `url` — every one of which
+> carried the plaintext material past the gate into a verbatim archive
+> under `credentialsOmitted: true`. The container shape is now part of
+> what the gate reads: the persisted shape of
+> `AdminSettings.UpstreamProxies` is an array of objects each carrying a
+> non-empty `url` string (the settings loader can read nothing else), and
+> a present key of any other shape is counted as malformed and refuses the
+> archive (counts only); an absent key and the persisted shape stay
+> ordinary (pinned as controls). Runbook §8 updated. Backend only.
+>
+> **PR-C20 — the eleventh Codex round (one P1).** Confirmed and pinned
+> before the correction (`upstream_codex_r11_red_test.go`). (R11-A, P1)
+> The backup sanitizer decoded the settings object into a map, and
+> `encoding/json` keeps only the LAST value of a repeated key, so a
+> settings object repeating `upstream_proxies` (a credential-bearing list
+> first, an empty list last), a repeated nested `url`, or a repeated
+> `upstream_proxies_v2` document had the credential gate inspect only the
+> surviving value while the no-op path handed back the ORIGINAL bytes,
+> secret included, under `credentialsOmitted: true`. The sanitizer now
+> walks the raw token stream first (`rejectDuplicateJSONKeys`) and refuses
+> any object that repeats a key at any nesting level — never decoding
+> into the representation that discards the earlier value — before the
+> PR-C19 EOF check and the map decode; the same key in different objects
+> stays ordinary (pinned as a control). Runbook §8 updated. Backend only.
+>
+> **PR-C19 — the tenth Codex round (one P1, one P2).** Both confirmed
+> and pinned before the correction (`upstream_codex_r10_red_test.go`).
+> (R10-A, P1) The backup sanitizer decoded ONE JSON value and never
+> looked at the bytes after it, so a settings body whose leading object
+> is credential-free followed by a second value or trailing garbage
+> carrying a plaintext legacy upstream URL was returned UNCHANGED (the
+> no-op path hands back the original body) and packed verbatim while the
+> manifest asserted `credentialsOmitted: true`. The sanitizer now requires
+> the decoder to reach EOF after the settings object (trailing whitespace
+> stays accepted) and refuses anything else before inspecting it; runbook
+> §8 updated. (R10-B, P2) `normalizeHost` decided "IPv6" by
+> `net.ParseIP(host).To4() == nil`, so an IPv4-mapped spelling
+> (`::ffff:192.0.2.1`, whose `To4()` is non-nil) was left unbracketed:
+> `Authority()` produced a URL `url.Parse` refuses and the pool rebuild
+> silently omitted the persisted entry, and the bracketed spelling was
+> refused by the same test. IPv6 URL SYNTAX now decides (`isIPv6Literal`:
+> a colon and a `net.ParseIP` parse), `To4()` never does, a bare literal
+> is bracketed as typed and the PR-C18 single-bracket-pair rule is kept;
+> the client already binds every colon-bearing host to its bracketed
+> form, so no frontend change was needed. Backend only.
+>
+> **PR-C18 — the ninth Codex round (one P1, one P2).** Both confirmed
+> and pinned before the correction (`upstream_codex_r9_red_test.go`).
+> (R9-A, P1) The PR-C17 backup refusal skipped a legacy `upstream_proxies`
+> URL that `url.Parse` could not parse (a malformed escape in the
+> password) or that parsed as an opaque, host-less scheme-less
+> `user:pw@host` spelling, treating a parse failure as "no password" —
+> so exactly the material the gate exists to keep out of an archive was
+> packed verbatim under `credentialsOmitted: true`. The gate now fails
+> CLOSED: every legacy URL must parse to an absolute URL with a host, and
+> an unreadable one is counted as unparseable and refuses the archive
+> (counts only; runbook §8 updated). (R9-B, P2) `normalizeHost` stripped
+> EVERY outer bracket with `strings.Trim(host, "[]")` before parsing the
+> IPv6 literal, so `[[::1]]` and a mismatched pair (`[[2001:db8::1]`,
+> `[2001:db8::1]]`) passed normalization and were persisted; the pool
+> rebuild cannot parse the resulting authority and silently omitted the
+> entry, so an update could remove a working parent from the effective
+> pool. Exactly one bracket pair is now required — a host that starts or
+> ends with a bracket must be `[` + an IPv6 literal without brackets +
+> `]` — and every other bracket shape is `invalid_entry` before it can
+> reach the store. Backend only.
+>
+> **PR-C5 — reviewer findings.** (P1) The credential-free v1 adapter and
+> the per-entry DELETE keyed their refusals on credential material only,
+> so an entry in the durable `requiresReplacement` state (Credential nil,
+> marker set) could be omitted or deleted without the exact-id Tier-3
+> clear; both now use the same `upstreamEntryProtected` predicate as the
+> import planner and name every protected entry. (P2)
+> `culvert --prepare-downgrade` audited into the in-memory ring of a
+> process that exits immediately; `runPrepareDowngradeCommand` opens the
+> `-audit-log` sink before the command and refuses to run when the
+> configured sink cannot be opened. Proofs in
+> `upstream_v2_codex_red_test.go`, the P2 one driving the real one-shot
+> dispatcher in a re-executed test binary.
+>
+> **PR-C3/C4 — hygiene.** The 50 diff-scoped lint findings and the three
+> staticcheck findings inherited from the program's earlier slices are
+> cleared (helpers extracted for the complexity findings; dead draft
+> helpers removed; test-only nolint directives carry their reason), and
+> the eleven CodeQL log-injection alerts on new code are closed with the
+> repository's `sanitizeLog` + `%q` convention.
+>
+> **PR-C6 — API contract.** oasdiff against `main` reports 36 breaking
+> changes, all the documented behaviour of the Batch 2 backend
+> corrections (JSON refusals instead of `text/plain`, 204 deletes, required
+> revision fences and identity parameters, closed security enumerations).
+> The contract takes the MAJOR bump the versioning policy requires
+> (1.2.0 → 2.0.0; the eleven operations this PR introduces are tagged
+> `x-culvert-introduced-version: 2.0.0`), the entry is recorded in
+> `CHANGELOG.md`, and the PR body carries the `Breaking-Change-Rationale:`,
+> `Migration-Instructions:` and `Version-Impact:` sections. The
+> `api-breaking-approved` label and the CODEOWNER approval are the owner's.
+
 ### FE-6 — Cluster, identity, certificates, settings, releases, support, MCP, decryption
 - **Objective**: FE-V27..V30, FE-V33, FE-V35, FE-V36 (settings decomposed per IA §5),
   FE-V37, FE-V04/05, FE-V07..V15.

@@ -162,26 +162,104 @@ func normalizeHost(raw string) (string, error) {
 	}
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
 	switch {
-	case strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]"):
-		if ip := net.ParseIP(strings.Trim(host, "[]")); ip == nil || ip.To4() != nil {
+	case strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]"):
+		if !isBracketedIPv6Literal(host) {
 			return "", errors.New("bracketed host must be an IPv6 literal")
 		}
-	case net.ParseIP(host) != nil:
-		if ip := net.ParseIP(host); ip.To4() == nil {
-			host = "[" + host + "]"
+	case strings.Contains(host, ":"):
+		// IPv6 URL SYNTAX decides, never net.IP.To4() (PR-C19 R10-B): an
+		// IPv4-mapped spelling such as `::ffff:192.0.2.1` parses as an IP
+		// whose To4() is non-nil, so a To4-keyed branch left the
+		// colon-bearing host unbracketed, Authority() produced a URL
+		// url.Parse refuses, and the pool rebuild silently omitted the
+		// persisted entry. A host carrying a colon is an IPv6 literal or
+		// nothing, and a bare literal is bracketed AS TYPED.
+		if !isIPv6Literal(host) {
+			return "", errors.New("host contains an invalid character")
 		}
+		host = "[" + host + "]"
+	case net.ParseIP(host) != nil:
+		// A full dotted-quad IPv4 literal, kept verbatim.
 	default:
-		if strings.ContainsAny(host, " /?#@:\\") {
+		if strings.ContainsAny(host, " /?#@\\") {
 			return "", errors.New("host contains an invalid character")
 		}
 		ascii, err := idna.Lookup.ToASCII(host)
 		if err != nil {
 			return "", fmt.Errorf("host is not a valid IDNA host name")
 		}
+		if err := validateHostLabels(ascii); err != nil {
+			return "", err
+		}
 		host = ascii
 	}
 	return host, nil
 }
+
+// isBracketedIPv6Literal reports whether host is exactly ONE bracket pair
+// around an IPv6 literal: `[` + a literal that itself carries no bracket +
+// `]`. PR-C18 R9-B: `strings.Trim(host, "[]")` stripped every outer
+// bracket, so `[[::1]]` and a mismatched pair passed normalization and
+// were persisted; the pool rebuild cannot parse the resulting authority
+// and silently omits the entry, so an update could remove a working parent
+// from the effective pool. Every other bracket shape is refused before it
+// can reach the store.
+func isBracketedIPv6Literal(host string) bool {
+	if len(host) < 2 || host[0] != '[' || host[len(host)-1] != ']' {
+		return false
+	}
+	inner := host[1 : len(host)-1]
+	if strings.ContainsAny(inner, "[]") {
+		return false
+	}
+	return isIPv6Literal(inner)
+}
+
+// isIPv6Literal reports whether s is an IPv6 literal in URL syntax: it
+// carries a colon and net.ParseIP accepts it. IPv4-mapped and
+// IPv4-embedded spellings (`::ffff:192.0.2.1`, `64:ff9b::192.0.2.1`) are
+// IPv6 literals here even though net.IP.To4() is non-nil for the former —
+// the URL grammar brackets them, and that is what Authority() must emit
+// (PR-C19 R10-B). A dotted-quad (no colon) is never one.
+func isIPv6Literal(s string) bool {
+	return strings.Contains(s, ":") && net.ParseIP(s) != nil
+}
+
+// validateHostLabels refuses an IDNA host with an EMPTY label — a leading
+// dot, consecutive dots, or more than the single trailing FQDN dot that
+// normalizeHost deliberately keeps — which the IDNA mapping passes through
+// unchanged; without it an invalid DNS name was persisted and published as
+// an eligible parent instead of the mutation receiving invalid_entry
+// (PR-C15 R7-A).
+func validateHostLabels(host string) error {
+	labels := strings.Split(host, ".")
+	if n := len(labels); n > 1 && labels[n-1] == "" {
+		labels = labels[:n-1] // the single trailing FQDN dot
+	}
+	// DNS length limits on the A-label form (RFC 1035 §2.3.4): the IDNA
+	// Lookup profile does not verify them, and an over-long label or name
+	// is a parent standard DNS cannot resolve (PR-C17 R8-B).
+	total := len(labels) - 1 // the dots between labels
+	for _, l := range labels {
+		if l == "" {
+			return errors.New("host contains an empty label")
+		}
+		if len(l) > maxDNSLabelOctets {
+			return errors.New("host contains a label longer than 63 octets")
+		}
+		total += len(l)
+	}
+	if total > maxDNSNameOctets {
+		return errors.New("host is longer than 253 octets")
+	}
+	return nil
+}
+
+// DNS length limits on the ASCII (A-label) form.
+const (
+	maxDNSLabelOctets = 63
+	maxDNSNameOctets  = 253
+)
 
 // SpecFromURL parses a legacy `scheme://[user[:pass]@]host[:port]` URL into
 // a normalized Spec plus the plaintext password it carried (empty when

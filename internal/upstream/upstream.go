@@ -301,6 +301,17 @@ func (p *Pool) BeginManualProbe(now time.Time) (ok bool, code string, retryAfter
 	return true, "", 0
 }
 
+// ManualProbeInFlight reports whether an admitted manual probe run is
+// executing. The read model exposes it so a client whose POST answer
+// outran its deadline can resolve the run against the appliance (no run
+// in flight + the entries' health advanced) instead of sizing a deadline
+// from a possibly stale entry count (PR-C15 R7-B).
+func (p *Pool) ManualProbeInFlight() bool {
+	p.manualMu.Lock()
+	defer p.manualMu.Unlock()
+	return p.manualInflight
+}
+
 // EndManualProbe releases the single-flight slot of an admitted run.
 func (p *Pool) EndManualProbe() {
 	p.manualMu.Lock()
@@ -861,6 +872,11 @@ const healthCheckURL = "http://detectportal.firefox.com/success.txt"
 
 // probeTimeout bounds one probe.
 const probeTimeout = 5 * time.Second
+
+// ProbeTimeout is the per-entry probe bound, exported so the admin frontend's
+// manual-probe deadline (frontend/src/api/upstream.ts PROBE_PER_ENTRY_MS) can
+// be pinned to it in lockstep; the engine itself reads probeTimeout.
+const ProbeTimeout = probeTimeout
 
 // HealthCheck probes every credential-eligible parent with the shared
 // classifier and stores the bounded outcome. Credential-ineligible entries

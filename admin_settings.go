@@ -503,72 +503,14 @@ func applyAdminServices(s *AdminSettings) {
 	if s.MetricsToken != "" {
 		metricsToken = s.MetricsToken
 	}
-	// PR3 Option B node-local pseudonym key. Accept ONLY a full-length (32-byte) key —
-	// a truncated/corrupt/hand-edited value is ignored so the posture fails closed to a
-	// sentinel rather than HMACing with a weak key.
-	if len(s.TrafficPseudonymKey) == trafficKeyLen {
-		// Restore the PERSISTED generation id so a restart never changes the
-		// observable pseudonym generation (2E-B §B exact-once truth). A legacy
-		// file carrying a key but no id gets one minted here; it persists on
-		// the next settings save (same precedent as the key mint below).
-		id := s.TrafficPseudonymKeyID
-		if id == "" {
-			id = mintTrafficKeyID()
-		}
-		setTrafficPseudonymKeyPair(s.TrafficPseudonymKey, id)
-	}
-	// Restore the durable rotation operation-identity record (2E-B correction,
-	// Blocker A) — unconditionally, so the FILE's truth replaces any live
-	// residue: a legacy file without the fields restores seq 0 / no receipts.
-	// The guarded vars live under adminSettingsMu; load runs outside it.
-	adminSettingsMu.Lock()
-	trafficRotationSeq = s.TrafficKeyRotationSeq
-	trafficRotationReceipts = append([]trafficRotationReceipt(nil), s.TrafficKeyRotationReceipts...)
-	adminSettingsMu.Unlock()
-	// If the destination-privacy posture is ON but no valid key was restored (a node
-	// upgrading from the legacy/B0 host/SNI toggle, which had no key), mint one now so
-	// redaction produces real tokens instead of the fail-closed sentinel. Generated
-	// in-memory here; it persists on the next SaveAdminSettings. Logged so the operator
-	// knows a key was minted (pseudonym correlation for this node begins here).
-	//
-	// Gate on the LOADED posture (s.DecryptionRedactHosts), NOT the live decRedactHosts()
-	// flag: applyAdminServices runs BEFORE setDecRedactHosts restores the flag at the end
-	// of LoadAdminSettings, so the live flag still holds the pre-load default here. Reading
-	// it would make a legacy `decryption_redact_hosts:true` file with no key skip minting,
-	// leaving the node emitting the fail-closed sentinel until the next settings save.
-	if s.DecryptionRedactHosts && len(getTrafficPseudonymKey()) != trafficKeyLen {
-		if err := ensureTrafficPseudonymKey(); err != nil {
-			logger.Printf("TrafficRedaction: pseudonym key generation failed; destination redaction fails closed to a sentinel: %v", err)
-		} else {
-			logger.Printf("TrafficRedaction: destination-privacy posture is on but no key was stored; minted a node-local pseudonym key (persists on next settings save)")
-		}
-	}
+	applyAdminTrafficPseudonym(s)
 	if s.LogLevel != "" {
 		SetLogLevel(ParseLogLevel(s.LogLevel))
 	}
 	if s.SessionTimeoutHours > 0 {
 		SetSessionTTL(time.Duration(s.SessionTimeoutHours) * time.Hour)
 	}
-	switch {
-	case s.LogStoreEnabledSaved:
-		// GUI-controlled enable state is authoritative.
-		setLogStoreDesired(s.LogRetentionDays, s.LogRetentionMaxGB)
-		if s.LogStoreEnabled {
-			if err := enableLogStore(resolveLifecycleCtx(), logStoreDir, s.LogRetentionDays, s.LogRetentionMaxGB); err != nil {
-				logger.Printf("WARN AdminSettings: cannot enable history store: %v", err)
-			}
-		} else {
-			disableLogStore()
-		}
-	case s.LogRetentionSaved && globalLogStore.Load() != nil:
-		// Legacy settings (pre-GUI-toggle): store enabled via YAML, apply saved
-		// retention only — never force-disable.
-		globalLogStore.Load().SetRetention(s.LogRetentionDays, s.LogRetentionMaxGB)
-		setLogStoreDesired(s.LogRetentionDays, s.LogRetentionMaxGB)
-	}
-	if s.LogCriticalDiskPct > 0 {
-		setCriticalDiskPct(s.LogCriticalDiskPct)
-	}
+	applyAdminLogStore(s)
 	applyBlocklistFeeds(s)
 	// F3a-2: the signed-feed URL is NO LONGER routed into the legacy additive
 	// syncer (globalSaaSFeed). The legacy syncer keeps whatever URL it was
@@ -642,6 +584,80 @@ func applyLegacyLDAPRetirement(s *AdminSettings) {
 	if legacyLDAPRetired() && !s.LegacyLDAPRetired {
 		// In-memory cutover predates the settings load — make it durable.
 		adminSettingsSave()
+	}
+}
+
+// applyAdminTrafficPseudonym restores the node-local destination-privacy
+// pseudonym key, its persisted generation id and the durable rotation
+// operation-identity record, minting a key when the loaded posture is on
+// and none was stored (extracted from applyAdminServices, behaviour
+// unchanged).
+func applyAdminTrafficPseudonym(s *AdminSettings) {
+	// PR3 Option B node-local pseudonym key. Accept ONLY a full-length (32-byte) key —
+	// a truncated/corrupt/hand-edited value is ignored so the posture fails closed to a
+	// sentinel rather than HMACing with a weak key.
+	if len(s.TrafficPseudonymKey) == trafficKeyLen {
+		// Restore the PERSISTED generation id so a restart never changes the
+		// observable pseudonym generation (2E-B §B exact-once truth). A legacy
+		// file carrying a key but no id gets one minted here; it persists on
+		// the next settings save (same precedent as the key mint below).
+		id := s.TrafficPseudonymKeyID
+		if id == "" {
+			id = mintTrafficKeyID()
+		}
+		setTrafficPseudonymKeyPair(s.TrafficPseudonymKey, id)
+	}
+	// Restore the durable rotation operation-identity record (2E-B correction,
+	// Blocker A) — unconditionally, so the FILE's truth replaces any live
+	// residue: a legacy file without the fields restores seq 0 / no receipts.
+	// The guarded vars live under adminSettingsMu; load runs outside it.
+	adminSettingsMu.Lock()
+	trafficRotationSeq = s.TrafficKeyRotationSeq
+	trafficRotationReceipts = append([]trafficRotationReceipt(nil), s.TrafficKeyRotationReceipts...)
+	adminSettingsMu.Unlock()
+	// If the destination-privacy posture is ON but no valid key was restored (a node
+	// upgrading from the legacy/B0 host/SNI toggle, which had no key), mint one now so
+	// redaction produces real tokens instead of the fail-closed sentinel. Generated
+	// in-memory here; it persists on the next SaveAdminSettings. Logged so the operator
+	// knows a key was minted (pseudonym correlation for this node begins here).
+	//
+	// Gate on the LOADED posture (s.DecryptionRedactHosts), NOT the live decRedactHosts()
+	// flag: applyAdminServices runs BEFORE setDecRedactHosts restores the flag at the end
+	// of LoadAdminSettings, so the live flag still holds the pre-load default here. Reading
+	// it would make a legacy `decryption_redact_hosts:true` file with no key skip minting,
+	// leaving the node emitting the fail-closed sentinel until the next settings save.
+	if s.DecryptionRedactHosts && len(getTrafficPseudonymKey()) != trafficKeyLen {
+		if err := ensureTrafficPseudonymKey(); err != nil {
+			logger.Printf("TrafficRedaction: pseudonym key generation failed; destination redaction fails closed to a sentinel: %v", err)
+		} else {
+			logger.Printf("TrafficRedaction: destination-privacy posture is on but no key was stored; minted a node-local pseudonym key (persists on next settings save)")
+		}
+	}
+}
+
+// applyAdminLogStore applies the GUI-controlled history-store enable state
+// and retention, or the legacy retention-only shape (extracted from
+// applyAdminServices, behaviour unchanged).
+func applyAdminLogStore(s *AdminSettings) {
+	switch {
+	case s.LogStoreEnabledSaved:
+		// GUI-controlled enable state is authoritative.
+		setLogStoreDesired(s.LogRetentionDays, s.LogRetentionMaxGB)
+		if s.LogStoreEnabled {
+			if err := enableLogStore(resolveLifecycleCtx(), logStoreDir, s.LogRetentionDays, s.LogRetentionMaxGB); err != nil {
+				logger.Printf("WARN AdminSettings: cannot enable history store: %v", err)
+			}
+		} else {
+			disableLogStore()
+		}
+	case s.LogRetentionSaved && globalLogStore.Load() != nil:
+		// Legacy settings (pre-GUI-toggle): store enabled via YAML, apply saved
+		// retention only — never force-disable.
+		globalLogStore.Load().SetRetention(s.LogRetentionDays, s.LogRetentionMaxGB)
+		setLogStoreDesired(s.LogRetentionDays, s.LogRetentionMaxGB)
+	}
+	if s.LogCriticalDiskPct > 0 {
+		setCriticalDiskPct(s.LogCriticalDiskPct)
 	}
 }
 
@@ -952,19 +968,7 @@ func saveAdminSettingsWithOverrides(ov adminSaveOverrides) error {
 		// No persistence configured: the (empty) write trivially succeeds, so a
 		// persist-before-apply target still applies — the caller was promised
 		// "returns nil ⇒ the target is live".
-		if rewriteApply {
-			rewriter.SetRules(rewriteTarget)
-		}
-		if upstreamApply {
-			if err := upstreamPool.SetDocument(upstreamDoc); err != nil {
-				return err
-			}
-			applyUpstreamProxy()
-		}
-		if ov.applyOnSuccess != nil {
-			ov.applyOnSuccess()
-		}
-		return nil
+		return applyAdminSettingsOverridesUnpersisted(ov, rewriteApply, rewriteTarget, upstreamApply, upstreamDoc)
 	}
 
 	s := AdminSettings{
@@ -1115,6 +1119,26 @@ func saveAdminSettingsWithOverrides(ov adminSaveOverrides) error {
 		if err := upstreamPool.SetDocument(upstreamDoc); err != nil {
 			// Validated above under the same lock; unreachable in practice.
 			logger.Printf("AdminSettings: upstream document publication refused after a durable write: %v", err)
+			return err
+		}
+		applyUpstreamProxy()
+	}
+	if ov.applyOnSuccess != nil {
+		ov.applyOnSuccess()
+	}
+	return nil
+}
+
+// applyAdminSettingsOverridesUnpersisted is the no-persistence-path half of
+// saveAdminSettingsWithOverrides: with no settings file configured the
+// (empty) write trivially succeeds, so every persist-before-apply target is
+// applied in the same order the persisted path applies it.
+func applyAdminSettingsOverridesUnpersisted(ov adminSaveOverrides, rewriteApply bool, rewriteTarget []RewriteRule, upstreamApply bool, upstreamDoc upstream.Document) error {
+	if rewriteApply {
+		rewriter.SetRules(rewriteTarget)
+	}
+	if upstreamApply {
+		if err := upstreamPool.SetDocument(upstreamDoc); err != nil {
 			return err
 		}
 		applyUpstreamProxy()

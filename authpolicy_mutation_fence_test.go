@@ -187,7 +187,8 @@ func TestAuthFence_B_ConcurrentCreatesSameVersion(t *testing.T) {
 				return createAuthRuleViaAPI(t, fmt.Sprintf("auth-create-B-%d", i), verStr)
 			},
 		)
-		if !((ra.Code == 200 && rb.Code == 409) || (ra.Code == 409 && rb.Code == 200)) {
+		oneWinner := (ra.Code == 200 && rb.Code == 409) || (ra.Code == 409 && rb.Code == 200)
+		if !oneWinner {
 			t.Fatalf("iter %d: want one 200 + one 409, got %d/%d", i, ra.Code, rb.Code)
 		}
 		if got := len(policyStore.List()); got != before+1 {

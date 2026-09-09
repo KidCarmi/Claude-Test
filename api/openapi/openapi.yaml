@@ -1,8 +1,8 @@
 openapi: 3.0.4
 info:
   title: Culvert Admin API
-  version: 1.2.0
-  x-culvert-api-contract-version: 1.2.0
+  version: 2.0.0
+  x-culvert-api-contract-version: 2.0.0
   description: |
     Machine-readable contract for the Culvert admin/control-plane REST API served
     on the UI port (`-ui-port`, default 9090).
@@ -1324,12 +1324,13 @@ components:
             summary: { type: string, enum: [plain_http_only] }
         probe:
           type: object
-          description: The periodic health-probe configuration armed at startup (config.yaml upstream.health_interval).
-          required: [configured, interval]
+          description: The periodic health-probe configuration armed at startup (config.yaml upstream.health_interval) and the node-local manual-run state.
+          required: [configured, interval, manualInFlight]
           additionalProperties: false
           properties:
             configured: { type: boolean }
             interval: { type: string, description: 'Go duration; "0s" when no periodic probe runs.' }
+            manualInFlight: { type: boolean, description: 'True while an admin-triggered manual probe run (POST /api/upstream/health, single-flight) is executing on this node. A client whose manual-run answer outran its deadline resolves the run against this flag and the entries'' health instead of a deadline sized from a possibly stale entry count.' }
         revision: { type: integer, format: int64 }
         entries: { type: array, items: { $ref: '#/components/schemas/UpstreamEntry' }, nullable: true }
         proxies: { type: array, items: { $ref: '#/components/schemas/UpstreamEntry' }, nullable: true, description: 'Legacy alias of `entries`.' }
@@ -1405,9 +1406,11 @@ components:
         Structured 2F-C refusal. `code` is bounded: precondition_required (428),
         stale (409, `current.revision`), vanished (404), yaml_owned (409),
         credential_bound (409 — authority change while a credential exists;
-        clear it first), credential_present (409 — delete refused), confirm_required
+        clear it first), credential_present (409 — delete refused while the entry
+        holds material OR awaits credential replacement), confirm_required
         (409, `current.confirmValue`), credentialed_entries_present (409 — the v1
-        bulk adapter while any managed entry holds a credential),
+        bulk adapter while any managed entry holds a credential or awaits
+        credential replacement),
         duplicate_authority (409, `count`), no_credential (409 — clear on an entry
         without material), invalid_entry / userinfo_not_allowed /
         credential_state_not_accepted / invalid_password / invalid_action /
@@ -4423,7 +4426,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       responses:
         '200':
           description: Ordered rules + content revision.
@@ -5363,7 +5366,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       responses:
         '200':
           description: Profiles + content revision.
@@ -6656,7 +6659,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: non-idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: upstream.entry.create
       requestBody:
@@ -6711,7 +6714,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: upstream.entry.update
       requestBody:
@@ -6754,9 +6757,9 @@ paths:
       description: >-
         Deletes a credential-free managed entry (2F-C). `?revision=` must echo
         the ENTRY revision (428/409/404). 409 credential_present while the
-        entry holds a configured, unusable or mismatched credential (clear it
-        first, T3); 409 yaml_owned for a config.yaml entry. Persisted before
-        the 200.
+        entry holds a configured, unusable or mismatched credential OR carries
+        the requiresReplacement marker (clear it first, T3); 409 yaml_owned
+        for a config.yaml entry. Persisted before the 200.
       security:
         - sessionCookie: []
         - basicAuth: []
@@ -6765,7 +6768,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: upstream.entry.delete
       parameters:
@@ -6822,7 +6825,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: high
       x-culvert-audit-event: upstream.credential.replace
       requestBody:
@@ -8755,7 +8758,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       parameters:
         - name: name
           in: path
@@ -11189,7 +11192,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       responses:
         '200':
           description: Categories + semantic revision.
@@ -12277,7 +12280,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: cdr.instance.enroll.recover
       requestBody:
@@ -12321,7 +12324,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: safe
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       responses:
         '200':
           description: Receipts.
@@ -12349,7 +12352,7 @@ paths:
       x-culvert-tenant-scope: appliance
       x-culvert-stability: stable
       x-culvert-idempotency: idempotent
-      x-culvert-introduced-version: 1.0.0
+      x-culvert-introduced-version: 2.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: cdr.instance.enroll.receipt.remove
       parameters:

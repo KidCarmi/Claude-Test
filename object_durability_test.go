@@ -332,6 +332,8 @@ func TestRename_DraftCascadePersistFailure(t *testing.T) {
 // TestRename_ReferenceIntegrity_RunningAndDraft is the §27 proof for category
 // groups: object + running reference + staged draft reference, rename, then
 // every identity/name/blocking assertion — and the same via disk reload.
+//
+//nolint:gocognit // linear proof script: every step is part of the specification
 func TestRename_ReferenceIntegrity_RunningAndDraft(t *testing.T) {
 	groupPath, _ := objDurSetup(t)
 	dir := t.TempDir()
@@ -544,9 +546,10 @@ func createRuleReferencingProfile(t *testing.T, name, profileName string) {
 // store in live mode (the draft candidate is consulted by callers that need it).
 func findRunningRuleByName(t *testing.T, name string) *PolicyRule {
 	t.Helper()
-	for _, r := range policyStore.List() {
-		if r.Name == name {
-			cp := r
+	rules := policyStore.List()
+	for i := range rules {
+		if rules[i].Name == name {
+			cp := rules[i]
 			return &cp
 		}
 	}
