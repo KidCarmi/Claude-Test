@@ -222,7 +222,7 @@ run_mutation M08 \
   'the lock is released after the observation and the latch stops re-verifying the generation' \
   'TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation' \
   . "$ADM" \
-  's/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\}\n/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \\
+  's/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\}\n/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \
   's/\tif !cr\.active \|\| cr\.aborter == nil \|\| cr\.generation != gen \{\n\t\treturn canary\.TripCanaryLatched\n\t\}\n//'
 
 
