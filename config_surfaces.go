@@ -266,11 +266,26 @@ var configSurfaces = []configSurfaceRow{
 			{Struct: "configBackup", Field: "BlockPageHTML"},
 			{Struct: "AdminSettings", Field: "BlockPageHTML"}}},
 	{ID: "upstream_proxies", Kind: kindConfig, Owner: "upstreamPool",
-		Export: true, Import: true, Sensitive: true, AdminDurable: true,
-		Note: "export via List() (redacted); admin_settings persists RAW entries (0600, UpstreamProxiesSaved sentinel); URLs may embed credentials — off the rollback surface by design",
+		Import: true, Sensitive: true, AdminDurable: true,
+		Note: "2F-D: the legacy credential-free list is IMPORT-ONLY compatibility (authority-keyed, versioned xxxxx rule) — no export writes it since schema version 2; admin_settings persists it CREDENTIAL-FREE beside upstream_proxies_v2 (UpstreamProxiesSaved sentinel; a sentinel-less legacy file with userinfo URLs is migrated once at boot; prepare-downgrade rewrites it WITH credentials for the frozen predecessor) — off the rollback surface by design",
 		Bindings: []surfaceBinding{
 			{Struct: "configBackup", Field: "UpstreamProxies", Redacted: true},
 			{Struct: "AdminSettings", Field: "UpstreamProxies"}}},
+	{ID: "admin_settings_schema", Kind: kindMeta, Owner: "adminSettings",
+		AdminDurable: true,
+		Note:         "2F-D: the schema number the file was written under (2 = sealed upstream v2 + credential-free legacy list; absent = 1, the frozen 2F-B predecessor); removed by prepare-downgrade; node-local, off every other surface",
+		Bindings:     []surfaceBinding{{Struct: "AdminSettings", Field: "AdminSettingsSchema"}}},
+	{ID: "upstream_prepared_downgrade", Kind: kindMeta, Owner: "upstreamPool",
+		AdminDurable: true,
+		Note:         "2F-D: counts-only marker prepare-downgrade leaves beside the credential-bearing legacy list; consumed by the next boot's re-migration (re-migrated_after_prepare); node-local, off every other surface",
+		Bindings:     []surfaceBinding{{Struct: "AdminSettings", Field: "UpstreamPreparedDowngrade"}}},
+	{ID: "upstream_proxies_v2", Kind: kindConfig, Owner: "upstreamPool",
+		Export: true, Import: true, Sensitive: true, AdminDurable: true,
+		Note: "2F-C/2F-D: the managed Upstream v2 document (ULID identities, canonical authorities, SEALED credentials under the node-local .upstream_cred_key). Exported ONLY as the credential-free C5 representation {id, scheme, host, port, username, credentialState} + upstream_credentials:\"omitted\" (upstream_portability.go); imported via the identity-keyed whole-file plan (C9); the SEALED document itself is node-local — never exported, rolled back or CP→DP synced; backups archive it credential-STRIPPED (requiresReplacement markers)",
+		Bindings: []surfaceBinding{
+			{Struct: "AdminSettings", Field: "UpstreamProxiesV2"},
+			{Struct: "configBackup", Field: "UpstreamProxiesV2", Redacted: true},
+			{Struct: "configBackup", Field: "UpstreamCredentials", Redacted: true}}},
 	{ID: "conn_limit_enabled", Kind: kindConfig, Owner: "connLimiter",
 		Export: true, Import: true, AdminDurable: true,
 		Note: "operational setting — off the rollback surface by design",
@@ -476,6 +491,23 @@ var configSurfaces = []configSurfaceRow{
 	// per-appliance privacy secret; fleet-wide key sync is the deferred B3 follow-up.
 	{ID: "traffic_pseudonym_key", Kind: kindConfig, Owner: "trafficRedact", AdminDurable: true, Sensitive: true,
 		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "TrafficPseudonymKey"}}},
+	// 2E-B §B: the NON-SECRET pseudonym-generation id persisted beside the key
+	// (random, never derived from key material) — what the admin API exposes as
+	// key_id so a lost rotation response is resolvable without a blind retry.
+	// AdminDurable-only like the key itself; deliberately NOT Sensitive (it is
+	// designed to be shown), but it travels nowhere the key doesn't.
+	{ID: "traffic_pseudonym_key_id", Kind: kindConfig, Owner: "trafficRedact", AdminDurable: true,
+		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "TrafficPseudonymKeyID"}}},
+
+	// Rotation operation-identity record (2E-B correction, Blocker A): the
+	// durable monotonic key-generation sequence + the bounded NON-SECRET
+	// rotation receipts ({op_id, key_id, seq, ts} — never key material, pinned
+	// by TestDec2EB2_RotationSurfacesCarryNoKeyMaterial). AdminDurable-only,
+	// node-local like the key they describe; deliberately NOT Sensitive.
+	{ID: "traffic_key_rotation_seq", Kind: kindConfig, Owner: "trafficRedact", AdminDurable: true,
+		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "TrafficKeyRotationSeq"}}},
+	{ID: "traffic_key_rotation_receipts", Kind: kindConfig, Owner: "trafficRedact", AdminDurable: true,
+		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "TrafficKeyRotationReceipts"}}},
 
 	// Support-bundle retention caps (Slice B). AdminDurable-only — node-local
 	// OPERATIONAL tuning over DURABLE forensic evidence: OFF export/import,
@@ -498,6 +530,12 @@ var configSurfaces = []configSurfaceRow{
 		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "UpstreamProxiesSaved"}}},
 	{ID: "trusted_proxy_cidrs_saved", Kind: kindSentinel, AdminDurable: true,
 		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "TrustedProxyCIDRsSaved"}}},
+	{ID: "rewrite_rules_saved", Kind: kindSentinel, AdminDurable: true,
+		Note:     "2D-C: saved-authoritative rewrite list (incl. explicit empty — deleting the last rule survives restart); sentinel-less legacy files keep the len>0 YAML-seed gate",
+		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "RewriteRulesSaved"}}},
+	{ID: "rewrite_seed_identities", Kind: kindSentinel, AdminDurable: true,
+		Note:     "2D-C final §7: durable identity LEDGER for YAML-seeded rewrite rules on nodes where AdminSettings does not own the rewrite surface — stable IDs re-attach per position+content each boot, written only by the targeted migration writer (never the omnibus snapshot, which drops it once the surface is admin-owned); node-local, OFF export/import/rollback/CP→DP",
+		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "RewriteSeedIdentities"}}},
 	{ID: "legacy_ldap_retired", Kind: kindSentinel, AdminDurable: true,
 		Note:     "ADR-0027 P1-2 durable LDAP-authority cutover: node-local, OFF export/import/rollback/CP→DP — a restore must never resurrect the retired YAML authenticator",
 		Bindings: []surfaceBinding{{Struct: "AdminSettings", Field: "LegacyLDAPRetired"}}},
