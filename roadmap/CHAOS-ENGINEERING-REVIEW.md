@@ -95,7 +95,7 @@ for the two cheapest wrong fixes (force-close at drain START — which passes ev
 being strictly worse than the defect — and a non-idempotent release, whose negative gauge restores
 the original blindness by accident). See rows PX-4/PX-8, §25 and
 `docs/operator/tunnel-drain-on-shutdown.md`.
-**2026-09-05 — CHAOS-58 sweep (the public admin-login endpoint's untrusted username).** The
+**2026-09-05 — CHAOS-59 sweep (the public admin-login endpoint's untrusted username).** The
 first sweep in this register to ask what an *unauthenticated caller gets to write*, rather than
 what happens when infrastructure fails. `apiAuthLogin` is on the public allowlist and bounded
 nothing: the username reached two lockout maps (retained ≥ 10 min), the audit ring, and the
@@ -103,12 +103,12 @@ durable audit JSONL — a 50 MB rotating file keeping ONE archive. Inside the en
 60-POST/min limit, one client commits ~60 MiB/min of chosen bytes and rotates the entire retained
 compliance record away in under two minutes. The instrument built for exactly this outcome
 (`internal/audit`'s `writeErrors`, CWE-778) cannot see it, because **every one of these writes
-succeeds**. Closes AU-14/AU-15; the count axis is recorded open as AU-16. The sweep also found and MEASURED the
+succeeds**. Closes AU-15/AU-16; the count axis is recorded open as AU-17. The sweep also found and MEASURED the
 same class on the **proxy data path** — `sanitizeLog(r.Host)` bounds nothing and the proxy server sets
 no `MaxHeaderBytes`, so one request with a 200 KB host writes 204,899 bytes to the process log and a
 204,812-byte `Host` field to the request log, on a port every client can reach. Recorded OPEN as
 **PX-21** rather than bundled: rejecting an over-long host is probably the right fix and is a
-data-plane behaviour change that needs its own review. See §25.
+data-plane behaviour change that needs its own review. See §27.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -492,7 +492,7 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | PX-17 | **An unrecoverable listener error was retried identically to a transient one.** EBADF/ENOTSOCK on the listening descriptor return instantly and forever, so the "retry" was a pure spin that could never accept anything, on a port that stayed BOUND — clients hung against a black hole instead of getting connection-refused. | NEW → **CLOSED** (CHAOS-54: the loop stops, closes the listener so clients fail fast, and records the service DOWN; transient/unknown errors still retry, which is the fail-safe direction) | M/H | was: `socks5.go` `serve`; now `socks5AcceptFatal` — see §22 |
 | PX-18 | **The SOCKS5 listener had NO health surface** — absent from `/healthz`, `/readyz`, `/api/diagnostics` and `/metrics`. A listener spinning on EMFILE and a listener that had stopped accepting entirely were both reported by every probe as a fully healthy node. | NEW → **CLOSED** (CHAOS-54: `socks5_listener` contract row, report-only `/readyz socks5` row, `/healthz socks5` field, `culvert_socks5_{listener_up,accept_errors_total,accept_degraded,accept_backoff_seconds}`, `socks5_listener_down` alert) | M/H | `socks5_health.go` — see §22 |
 | PX-20 | **Every `net.ErrClosed` from `Accept` was read as an expected shutdown.** `ErrClosed` says the listener is gone; it does NOT say a shutdown was requested, and `Stop` is only one of the ways a listener can end up closed. Any closure outside the shutdown path therefore terminated the accept loop with EVERY probe still green (`socks5: ready`, `culvert_socks5_listener_up 1`, `ok` contract row) — PX-18 reintroduced in a narrower costume, inside the very change that closed PX-18. Raised by Codex review on the PR, not by the sweep. | NEW → **CLOSED** (CHAOS-54: the loop checks whether `stopping` was actually closed; `Stop` closes it BEFORE `ln.Close()`, so the check is race-free in the direction that matters and errs toward silence, never toward a false page) | M/H | was: `socks5.go` `serve`; see §22.3 |
-| PX-21 | **The same unbounded-untrusted-value class as AU-14, on the PROXY data path, and it is NOT fixed.** `handleRequest` writes `sanitizeLog(r.Host)` into the POLICY_* process-log line and `r.Host` verbatim into the request-log entry. `sanitizeLog` neutralises control characters but bounds NOTHING, and the proxy `http.Server` sets no `MaxHeaderBytes`, so net/http admits a request line plus headers up to ~1 MiB. **Measured on the default-deny path: one request with a 200 KB host wrote 204,899 bytes to the process log and a 204,812-byte `Host` field to the request log.** Both sinks are rotating files with one archive, and the proxy port is reachable by every client on the network — a far broader audience than the admin login endpoint, with the process log holding the diagnostics for every other incident (the §22 amplification lesson). | **NEW, OPEN** | **H** | `proxy.go:689,728` (`sanitizeLog(r.Host)`), `recordRequestAuthURI` `proxy.go:688`; reproduction in §25.6 |
+| PX-21 | **The same unbounded-untrusted-value class as AU-15, on the PROXY data path, and it is NOT fixed.** `handleRequest` writes `sanitizeLog(r.Host)` into the POLICY_* process-log line and `r.Host` verbatim into the request-log entry. `sanitizeLog` neutralises control characters but bounds NOTHING, and the proxy `http.Server` sets no `MaxHeaderBytes`, so net/http admits a request line plus headers up to ~1 MiB. **Measured on the default-deny path: one request with a 200 KB host wrote 204,899 bytes to the process log and a 204,812-byte `Host` field to the request log.** Both sinks are rotating files with one archive, and the proxy port is reachable by every client on the network — a far broader audience than the admin login endpoint, with the process log holding the diagnostics for every other incident (the §22 amplification lesson). | **NEW, OPEN** | **H** | `proxy.go:689,728` (`sanitizeLog(r.Host)`), `recordRequestAuthURI` `proxy.go:688`; reproduction in §25.6 |
 | PX-19 | **The SOCKS5 accept loop had no panic guard.** `handleSOCKS5` carries `recoverGoroutine`, but a panic in `serve` itself propagated to the runtime and killed the whole proxy process (the PX-4 class, one level up). | NEW → **CLOSED** (CHAOS-54: contained and reported as listener DOWN — the CHAOS-24 objection to recovering in a worker goroutine does not apply when the recovery path is the loudest state the subsystem can produce) | M | was: `socks5.go` `serve`; see §22 |
 | PX-6 | **No global connection cap**; per-IP map is unbounded in cardinality; limiter ships **disabled by default**. Distributed flood → FD/memory exhaustion. | GAP | H | `internal/connlimit/connlimit.go:12,67` (default disabled, `Acquire`→true when off) |
 | PX-7 | Bandwidth/QoS token buckets are **never enforced on the data path** — `AllowBytes` has no call site in the relays. Configured QoS silently does nothing. | GAP (feature dead) | M | `internal/bandwidth` `AllowBytes` `bandwidth.go:261` — no caller in `proxy.go`/`socks5.go` |
@@ -592,8 +592,8 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | AU-11 | Multi-IdP registry: compile is isolated (all-or-nothing staging swap; bad profile dropped, not fatal). But the **request-time provider loop is sequential and unguarded** — one slow IdP adds latency to every request that reaches it. | ✓ compile / GAP request | M | `auth_idp.go:159-165,354-376` vs loop `proxy.go:209-220` |
 | AU-12 | All admin-configured IdP URLs dial through `ssrfSafeDialContext`; HTTPS+non-private pre-validated; response bodies `io.LimitReader`-capped. | ✓ | — | `auth_oidc_flow.go:64,300`, `auth_idp.go:556-565` |
 | AU-13 | Registry introspection also lacks **negative caching / circuit breaker** — a permanently-invalid token amplifies one IdP call per provider per request forever. | GAP | M | `auth_oidc_flow.go:623-636`; breaker exists unused `internal/upstream/upstream.go:89-96` |
-| AU-14 | **The public admin-login endpoint accepted an UNBOUNDED username and copied it verbatim into durable state.** `apiAuthLogin` is on `uiAuthMiddleware`'s public allowlist; nothing between the 1 MiB body cap and the handler limited `body.User`, and every failed attempt wrote it into the two lockout maps (retained ≥ `lockout.Window`), the 500-entry audit ring, and the **durable audit JSONL** — a 50 MB rotating file keeping exactly ONE archive. At the endpoint's own rate limit (60 mutating POSTs/min/IP) one unauthenticated client commits ~60 MiB/min of chosen bytes, rotating the entire 100 MB retained compliance record away in **under two minutes**, with no disk fault and every write SUCCEEDING (so `writeErrors`/`storage_write_failed` never fire). Measured by the gate: **4,195,672 bytes into the audit file from 8 requests.** | NEW → **CLOSED** (CHAOS-58: bounded at the handler; `lockout.MaxUsernameKeyLen` is the structural half; `culvert_login_oversize_rejected_total`) | **H** | was: `ui_auth.go` `apiAuthLogin`; `internal/audit/audit.go:213` (`NewRotatingFile(path, 50)`); see §25 |
-| AU-15 | **`internal/lockout` bounded its maps by ENTRY COUNT but not by KEY SIZE.** `Cleanup`'s own doc claims the maps are bounded "against an unbounded-memory DoS" — true on the count axis, and the janitor cannot sweep an entry before its `Window` elapses, so the SIZE axis was the whole exposure: one caller retained (rate × Window × username size) bytes in a leaf package whose stated contract is to be bounded. | NEW → **CLOSED** (CHAOS-58: `boundUsername` applied at every public entry point; consistency pinned so `Check` and `RecordFailure` cannot disagree on the key) | M/H | was: `internal/lockout/lockout.go`; see §25 |
+| AU-15 | **The public admin-login endpoint accepted an UNBOUNDED username and copied it verbatim into durable state.** `apiAuthLogin` is on `uiAuthMiddleware`'s public allowlist; nothing between the 1 MiB body cap and the handler limited `body.User`, and every failed attempt wrote it into the two lockout maps (retained ≥ `lockout.Window`), the 500-entry audit ring, and the **durable audit JSONL** — a 50 MB rotating file keeping exactly ONE archive. At the endpoint's own rate limit (60 mutating POSTs/min/IP) one unauthenticated client commits ~60 MiB/min of chosen bytes, rotating the entire 100 MB retained compliance record away in **under two minutes**, with no disk fault and every write SUCCEEDING (so `writeErrors`/`storage_write_failed` never fire). Measured by the gate: **4,195,672 bytes into the audit file from 8 requests.** | NEW → **CLOSED** (CHAOS-59: bounded at the handler; `lockout.MaxUsernameKeyLen` is the structural half; `culvert_login_oversize_rejected_total`) | **H** | was: `ui_auth.go` `apiAuthLogin`; `internal/audit/audit.go:213` (`NewRotatingFile(path, 50)`); see §25 |
+| AU-16 | **`internal/lockout` bounded its maps by ENTRY COUNT but not by KEY SIZE.** `Cleanup`'s own doc claims the maps are bounded "against an unbounded-memory DoS" — true on the count axis, and the janitor cannot sweep an entry before its `Window` elapses, so the SIZE axis was the whole exposure: one caller retained (rate × Window × username size) bytes in a leaf package whose stated contract is to be bounded. | NEW → **CLOSED** (CHAOS-59: `boundUsername` applied at every public entry point; consistency pinned so `Check` and `RecordFailure` cannot disagree on the key) | M/H | was: `internal/lockout/lockout.go`; see §25 |
 
 ### 2.6 Background Workers / Feeds / Scanning / Alerting
 
@@ -3295,10 +3295,10 @@ Recorded as **AU-14** so the next backend added to the credential chain inherits
 it instead of rediscovering it. The shipped backends satisfy it today: OIDC by
 `http.Client{Timeout}` on every call, SAML because it is browser-mediated, and
 LDAP as of this sweep.
-## 27. CHAOS-58 — The public admin-login endpoint's untrusted username
+## 27. CHAOS-59 — The public admin-login endpoint's untrusted username
 
 **Date:** 2026-09-05 · **Domain:** authentication / audit / persistence ·
-**Status:** shipped · **Closes:** AU-14, AU-15 ·
+**Status:** shipped · **Closes:** AU-15, AU-16 ·
 **Gates:** `login_input_bounds_test.go` (10) + `internal/lockout/lockout_keybound_test.go` (9) ·
 **Runbook:** `docs/operator/admin-login-input-bounds.md`
 
@@ -3319,7 +3319,7 @@ path validated its own at `maxUsernameLen` (256) years ago
 (`proxy_portal.go:145`). The admin login endpoint — the one an attacker
 actually finds first, because it is what the UI posts to — validated nothing.
 
-Note the handler-vs-store split that §25.4 turns on: those 1–64 caps live in the
+Note the handler-vs-store split that §27.4 turns on: those 1–64 caps live in the
 API *handlers*. Neither `cfg.SetAuth` nor `cfg.SetUIUser` bounds a username, and
 `validateAuthStartupCredentials` validates only the password — so `-user` /
 `auth.user` and `--reset-password` can persist an admin whose name is longer
@@ -3390,7 +3390,7 @@ is not a secret and is not a credential oracle for a name that exists nowhere.
 **A CONFIGURED account is never refused, however long its name**, and the first
 draft of this change got that wrong. It asserted that no local account could
 carry such a name because `apiSetupComplete` and the user-creation API cap at
-64 — but those are handlers, not the stores (see §25.1), so an over-long
+64 — but those are handlers, not the stores (see §27.1), so an over-long
 username can already be a valid persisted admin and the guard would have locked
 that operator out of their own admin UI on upgrade: a hardening change turned
 into an outage for the one person who has to fix it. Raised by Codex review on
@@ -3487,7 +3487,7 @@ for a write-amplification defect must not be one itself.
   field. Bundling either into an admin-auth fix would have shipped a data-path
   behaviour change under a security-hardening title.
 
-- **AU-16 (count axis, open).** The lockout maps are still bounded only by
+- **AU-17 (count axis, open).** The lockout maps are still bounded only by
   (attempt rate × `Window`). A distributed source with many IPs, each inside its
   own 60/min budget, still grows both maps linearly — now at ≤ 256 bytes per
   key instead of ≤ 1 MiB, so the exposure is reduced by ~4000× but not

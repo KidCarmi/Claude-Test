@@ -90,7 +90,7 @@ func apiAuthLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	// CHAOS-58: bound the username BEFORE it can reach the lockout maps, the
+	// CHAOS-59: bound the username BEFORE it can reach the lockout maps, the
 	// audit ring or the durable audit JSONL. This endpoint is public, so an
 	// unbounded name here is an unauthenticated write amplifier into all three
 	// (see login_input_bounds.go).

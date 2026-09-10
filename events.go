@@ -281,7 +281,7 @@ func liveFeedWritePrometheus(w *strings.Builder) {
 	fmt.Fprintf(w, "# TYPE culvert_login_state_evictions_total counter\nculvert_login_state_evictions_total{store=\"oidc_pkce\"} %d\nculvert_login_state_evictions_total{store=\"saml\"} %d\n",
 		globalPKCEStore.Evictions(), globalSAMLStateStore.Evictions())
 
-	// CHAOS-58: admin logins refused for an over-long username. The admin login
+	// CHAOS-59: admin logins refused for an over-long username. The admin login
 	// endpoint is public, and an unbounded username there was an unauthenticated
 	// write amplifier into the lockout maps and the durable audit log. The
 	// rejection is otherwise invisible (the caller gets a 400), so a climbing
