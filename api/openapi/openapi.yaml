@@ -385,8 +385,7 @@ components:
         draft: { type: boolean }
     AuthPolicyList:
       type: object
-      required: [rules, count, defaultAction, note, version, updatedAt]
-      required: [rules, count, defaultAction, note, killSwitch]
+      required: [rules, count, defaultAction, note, version, updatedAt, killSwitch]
       additionalProperties: false
       properties:
         rules: { type: array, items: { type: object, additionalProperties: true } }
