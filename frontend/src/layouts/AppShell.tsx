@@ -341,7 +341,7 @@ export function AppShell(): JSX.Element {
                 ? ` (${state.tlsFallbackReason})`
                 : ""}
               . The cause is on Settings → Network &amp; TLS and in the server
-              log. Restart the appliance to retry TLS.
+              log. Restart the node to retry TLS.
             </Callout>
           </div>
         )}
