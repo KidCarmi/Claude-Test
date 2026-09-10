@@ -443,28 +443,62 @@ func handleOneShotCommands(s *startupState) {
 	}
 	// ── One-shot: password reset (Finding 5.1) ─────────────────────────────
 	if *s.resetPwUser != "" {
-		parts := strings.SplitN(*s.resetPwUser, ":", 2)
-		if len(parts) != 2 || parts[0] == "" || len(parts[1]) < 8 {
-			fmt.Fprintln(os.Stderr, "Usage: --reset-password username:newpassword (min 8 chars)")
+		if err := runResetPasswordCommand(s); err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		usersPath := *s.uiUsersFile
-		if usersPath == "" {
-			usersPath = filepath.Join(dataDir, "ui_users.json")
-		}
-		cfg.SetUIUsersFile(usersPath)
-		_ = cfg.LoadUIUsersFile() // may not exist yet, that's fine
-		if err := cfg.SetUIUser(parts[0], parts[1], RoleAdmin); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		if err := cfg.SaveUIUsersFile(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Password reset for %q (role=admin). You can now start the proxy.\n", parts[0])
 		os.Exit(0)
 	}
+}
+
+// runResetPasswordCommand handles the --reset-password one-shot admin
+// recovery command (Finding 5.1). Extracted so the dispatch table in
+// handleOneShotCommands stays flat, matching the run*Command convention
+// used by --backup/--restore/--cleanup-restore-leftovers.
+func runResetPasswordCommand(s *startupState) error {
+	parts := strings.SplitN(*s.resetPwUser, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || len(parts[1]) < 8 {
+		return fmt.Errorf("usage: --reset-password username:newpassword (min 8 chars)")
+	}
+	usersPath := *s.uiUsersFile
+	if usersPath == "" {
+		usersPath = filepath.Join(dataDir, "ui_users.json")
+	}
+	cfg.SetUIUsersFile(usersPath)
+	if err := cfg.LoadUIUsersFile(); err != nil {
+		// A missing file loads as nil (first-run case, handled below by
+		// SetUIUser creating the roster from scratch). CHAOS-05 quarantines
+		// present-but-corrupt JSON by moving the bad file aside BEFORE
+		// returning its parse error, so nothing left at usersPath means the
+		// failure was already handled and starting fresh is the intended
+		// recovery. Anything still present at usersPath here is an
+		// UNRESOLVED load failure — wrong file ownership after an image
+		// upgrade (the container runs as the non-root "proxy" user), a
+		// bind-mount source that resolved to the wrong file type, a
+		// transient I/O fault — and must never be silently overwritten:
+		// SetUIUser+SaveUIUsersFile below would replace an intact roster
+		// with a single freshly-created admin, destroying every other
+		// admin/operator/viewer account and TOTP enrollment for good.
+		//
+		// Proceed ONLY when Lstat itself affirmatively proves usersPath is
+		// gone (os.IsNotExist). Any other Lstat outcome — the path exists,
+		// or Lstat fails for its own reason (e.g. a transient EIO, or an
+		// ENOTDIR from a path component that resolved to the wrong file
+		// type) — is not proof of absence, so it must abort too: falling
+		// through here would still risk destroying an intact roster once
+		// storage recovers and the save below succeeds (Codex review).
+		if _, statErr := os.Lstat(usersPath); !os.IsNotExist(statErr) {
+			return fmt.Errorf("refusing to reset password: %s failed to load (%w) and its presence could not be ruled out (stat: %v); fix the underlying issue (permissions, file type) and retry — proceeding would risk destroying the existing admin roster", usersPath, err, statErr)
+		}
+	}
+	if err := cfg.SetUIUser(parts[0], parts[1], RoleAdmin); err != nil {
+		return fmt.Errorf("error: %w", err)
+	}
+	if err := cfg.SaveUIUsersFile(); err != nil {
+		return fmt.Errorf("error saving: %w", err)
+	}
+	fmt.Printf("Password reset for %q (role=admin). You can now start the proxy.\n", parts[0])
+	return nil
 }
 
 // runCleanupCommand parses cleanup-restore-leftovers flags and dispatches
