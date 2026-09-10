@@ -2490,7 +2490,7 @@
             "type": "boolean"
           },
           "ui_custom_cert_corrupt": {
-            "description": "True when the persisted custom UI certificate/key pair does not parse as a matching TLS pair (interrupted or corrupted upload). The running server is on the self-signed fallback and a restart will NOT fix this — the pair must be re-uploaded.",
+            "description": "True when the persisted custom UI certificate/key pair does not parse as a matching TLS pair (interrupted or corrupted upload). It is NOT active, and a restart will NOT fix this — the pair must be re-uploaded.",
             "type": "boolean"
           },
           "ui_custom_cert_uploaded": {
