@@ -362,7 +362,7 @@ Stated plainly, because a security product should be honest about its edges:
 
 ## Roadmap
 
-Development phases, production-readiness items, and the engineering governance model are tracked under [`roadmap/`](roadmap/) and [`docs/engineering/`](docs/engineering/). Near-term focus: CRL support and completing the catalog-driven release path as the default update mechanism. GUI parity for the HA fencing lease's startup-scoped settings (`-ha-etcd-*`, `-ha-lease-ttl`) is a deliberate, permanent deferral rather than pending work - the panel already surfaces live lease status/epoch, while the connection endpoints stay boot-time config by design; see [`docs/operator/ha-lease-failover.md`](docs/operator/ha-lease-failover.md).
+Development phases, production-readiness items, and the engineering governance model are tracked under [`roadmap/`](roadmap/) and [`docs/engineering/`](docs/engineering/). Near-term focus: CRL support. The catalog-driven release path is no longer a near-term item - it shipped (legacy Docker updater sidecar removed, DEBT-008 closed) and is now the sole day-2 update mechanism, dispatched through the maintenance agent; see [`docs/operator/release-management-agent.md`](docs/operator/release-management-agent.md). GUI parity for the HA fencing lease's startup-scoped settings (`-ha-etcd-*`, `-ha-lease-ttl`) is a deliberate, permanent deferral rather than pending work - the panel already surfaces live lease status/epoch, while the connection endpoints stay boot-time config by design; see [`docs/operator/ha-lease-failover.md`](docs/operator/ha-lease-failover.md).
 
 ---
 
