@@ -38,7 +38,7 @@ This file is generated and drift-checked; the totals below are counted from the 
 | mcp | 36 | 36 |
 | observability | 2 | 2 |
 | pac | 23 | 23 |
-| policy | 83 | 83 |
+| policy | 85 | 85 |
 | release | 6 | 6 |
 | security | 51 | 51 |
 | settings | 30 | 30 |
