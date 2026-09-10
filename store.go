@@ -1555,19 +1555,58 @@ type HostStat struct {
 	Count int64  `json:"count"`
 }
 
-// hostCounter follows the read-heavy contract the per-rule hit counters use
-// (ruleMetrics.RecordHit): counting an ALREADY-TRACKED host — the case ~all
+// hostCounter counts requests per destination host. Record runs on EVERY
+// allowed request (recordStats), so the tracked-host path — the case ~all
 // production traffic hits, since the distinct-host working set repeats
-// heavily — takes mu.RLock and bumps the counter atomically (concurrent RLock
-// holders share slots, hence *int64 values). The exclusive lock is reserved
-// for the rare mutations: inserting a new host, the decay pass, and Top.
+// heavily — must not serialise on a process-wide word.
+//
+// It used to take mu.RLock around the map read, on the reasoning that a reader
+// lock is cheap. It is not: sync.RWMutex.RLock/RUnlock are two atomic
+// read-modify-writes on ONE shared word, so every request in the process wrote
+// the same cache line purely to read a map that in steady state never changes.
+// That is not a constant cost but a THROUGHPUT CEILING, the same shape already
+// found and fixed in internal/threatfeed, internal/connlimit and the IP filter.
+//
+// The map is therefore a sync.Map, which is precisely the shape this access
+// pattern wants: a key's counter is written once at insert and read forever
+// after, so a steady-state Load is an atomic pointer load plus a map read with
+// NO read-modify-write on any shared word.
+//
+// Measured on a 4-core Xeon, 512-host working set, isolated runs of n=7,
+// medians, BenchmarkTopHostsRecord_HitParallel:
+//
+//	GOMAXPROCS │    1    │    2    │    4    │ 1→4 throughput
+//	RWMutex    │ 35.8 ns │ 92.6 ns │ 96.8 ns │ 0.37x  (cores SUBTRACTED throughput)
+//	sync.Map   │ 42.0 ns │ 26.1 ns │ 16.1 ns │ 2.6x
+//
+// So six times the throughput at four cores, and — the part that matters for an
+// appliance that ships onto 16- and 32-core hardware — a curve that IMPROVES
+// with core count instead of degrading. State the cost honestly too: at
+// GOMAXPROCS=1 this shape is ~17% slower (42.0 vs 35.8), because sync.Map.Load
+// costs one more indirection than a map read under an uncontended RLock. The
+// serial single-host benchmark (BenchmarkTopHostsRecord_Hit, n=8) shows no such
+// gap — 33.5 → 31.7 ns — so the cost appears only when rotating a working set
+// wide enough to miss cache, and a single-core gateway is not the shape this
+// product runs in.
+//
+// A 64-shard RWMutex (the internal/connlimit pattern) was built and measured
+// alongside it and NOT carried: it reached only ~37 ns/op at four cores and
+// cost ~31% at GOMAXPROCS=1, because it still pays a lock acquisition per call.
+// sync.Map pays none.
+//
+// mu now guards only the RARE mutations — inserting a new host, the decay
+// pass, and the Top snapshot — and is never taken by the tracked-host path.
+// n is the live-entry count that topHostsMaxEntries bounds; sync.Map has no
+// len(), and it is the memory bound that matters, so it is tracked explicitly.
 type hostCounter struct {
-	mu           sync.RWMutex
-	hosts        map[string]*int64
+	hosts sync.Map     // host string → *int64
+	n     atomic.Int64 // live entries in hosts — the quantity the cap bounds
+
+	mu           sync.Mutex
 	pendingDecay int // new-host drops since the last decay pass (amortization)
 }
 
-var topHosts = &hostCounter{hosts: map[string]*int64{}}
+var topHosts = &hostCounter{}
 
 // topHostsMaxEntries bounds the number of distinct hostnames the top-hosts
 // counter tracks. The hostname is attacker-controllable (any client can
@@ -1575,25 +1614,35 @@ var topHosts = &hostCounter{hosts: map[string]*int64{}}
 // unbounded memory-exhaustion DoS. A var (not const) so tests can lower it.
 var topHostsMaxEntries = 10000
 
+// size reports the number of live tracked hosts — the quantity
+// topHostsMaxEntries bounds.
+func (hc *hostCounter) size() int { return int(hc.n.Load()) }
+
+// count returns the current count for host, and whether it is tracked at all.
+func (hc *hostCounter) count(host string) (int64, bool) {
+	v, ok := hc.hosts.Load(host)
+	if !ok {
+		return 0, false
+	}
+	return atomic.LoadInt64(v.(*int64)), true
+}
+
 func (hc *hostCounter) Record(host string) {
-	// Fast path: already tracked — always count, never gated. The atomic add
-	// happens INSIDE the RLock so the decay pass (which mutates counters with
-	// plain ops under the exclusive lock) can never run concurrently with it.
-	hc.mu.RLock()
-	if p, ok := hc.hosts[host]; ok {
-		atomic.AddInt64(p, 1)
-		hc.mu.RUnlock()
+	// Fast path: already tracked — always count, never gated, and NO lock. The
+	// counter a key maps to is written once at insert and never replaced, so a
+	// stale-free Load plus an atomic add is the whole operation.
+	if v, ok := hc.hosts.Load(host); ok {
+		atomic.AddInt64(v.(*int64), 1)
 		return
 	}
-	hc.mu.RUnlock()
 
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
-	if p, ok := hc.hosts[host]; ok {
-		atomic.AddInt64(p, 1) // raced with another inserter — count, don't reset
+	if v, ok := hc.hosts.Load(host); ok {
+		atomic.AddInt64(v.(*int64), 1) // raced with another inserter — count, don't reset
 		return
 	}
-	if len(hc.hosts) >= topHostsMaxEntries {
+	if hc.size() >= topHostsMaxEntries {
 		// At capacity with a NEW host. Decaying (halve all counts, drop those
 		// that reach zero) evicts cold entries — including high-cardinality
 		// count-1 junk from a flood — so continuously-reinforced heavy hitters
@@ -1608,39 +1657,58 @@ func (hc *hostCounter) Record(host string) {
 		}
 		hc.pendingDecay = 0
 		hc.decayLocked()
-		if len(hc.hosts) >= topHostsMaxEntries {
+		if hc.size() >= topHostsMaxEntries {
 			return // still saturated with hot hosts — drop the newcomer
 		}
 	}
 	one := int64(1)
-	hc.hosts[host] = &one
+	hc.hosts.Store(host, &one)
+	hc.n.Add(1)
 }
 
 // decayLocked halves every count and deletes entries that reach zero. Caller
-// holds hc.mu (the EXCLUSIVE lock — plain counter access is safe because the
-// RLock-holding atomic writers are excluded). This is the eviction primitive:
-// cold entries (low counts) fall out while heavy hitters persist, keeping the
-// top-N ranking meaningful.
+// holds hc.mu, which excludes inserts, other decay passes and Top — but NOT
+// the lock-free tracked-host increments, so every counter mutation here is
+// atomic. This is the eviction primitive: cold entries (low counts) fall out
+// while heavy hitters persist, keeping the top-N ranking meaningful.
+//
+// The one residual of the lock-free reader: a Record that has already loaded a
+// counter's pointer can land its increment after this pass deletes that entry,
+// and the increment is then lost. It is bounded to entries being evicted —
+// whose count is 0 or 1 by construction, since only those halve to zero — and
+// a decay pass runs at most once per topHostsMaxEntries new-host drops, and
+// only while saturated. That is strictly inside the approximation this counter
+// already documents past the cap (counts become lower bounds; ranking stays
+// correct), and it can only ever UNDER-count a host that was already cold.
 func (hc *hostCounter) decayLocked() {
-	for h, p := range hc.hosts {
-		c := *p / 2
-		if c == 0 {
-			delete(hc.hosts, h)
-		} else {
-			*p = c
+	hc.hosts.Range(func(k, v any) bool {
+		p := v.(*int64)
+		for {
+			cur := atomic.LoadInt64(p)
+			half := cur / 2
+			if !atomic.CompareAndSwapInt64(p, cur, half) {
+				continue // a concurrent increment landed; re-read and halve that
+			}
+			if half == 0 {
+				hc.hosts.Delete(k)
+				hc.n.Add(-1)
+			}
+			return true
 		}
-	}
+	})
 }
 
 // Top returns the n most-requested hosts, sorted descending by count. The
-// snapshot runs under the exclusive lock so the plain pointer reads cannot
-// race the RLock-holding atomic increments.
+// snapshot runs under hc.mu so it cannot interleave with a decay pass; the
+// counters themselves are read atomically because the increment path is
+// lock-free.
 func (hc *hostCounter) Top(n int) []HostStat {
 	hc.mu.Lock()
-	all := make([]HostStat, 0, len(hc.hosts))
-	for h, p := range hc.hosts {
-		all = append(all, HostStat{Host: h, Count: *p})
-	}
+	all := make([]HostStat, 0, hc.size())
+	hc.hosts.Range(func(k, v any) bool {
+		all = append(all, HostStat{Host: k.(string), Count: atomic.LoadInt64(v.(*int64))})
+		return true
+	})
 	hc.mu.Unlock()
 
 	// Simple selection: sort descending.

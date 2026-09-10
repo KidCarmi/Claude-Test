@@ -18,7 +18,7 @@ func withTopHostsCap(t *testing.T, maxEntries int) {
 }
 
 func freshHostCounter() *hostCounter {
-	return &hostCounter{hosts: map[string]*int64{}}
+	return &hostCounter{}
 }
 
 func TestTopHosts_MemoryBounded(t *testing.T) {
@@ -30,9 +30,7 @@ func TestTopHosts_MemoryBounded(t *testing.T) {
 		hc.Record(fmt.Sprintf("flood-%d.example", i))
 	}
 
-	hc.mu.Lock()
-	n := len(hc.hosts)
-	hc.mu.Unlock()
+	n := hc.size()
 	if n > topHostsMaxEntries {
 		t.Fatalf("map grew to %d entries, want <= cap %d (unbounded-memory DoS)", n, topHostsMaxEntries)
 	}
@@ -52,9 +50,7 @@ func TestTopHosts_HeavyHittersSurviveFlood(t *testing.T) {
 		hc.Record(fmt.Sprintf("junk-%d.example", i))
 	}
 
-	hc.mu.Lock()
-	n := len(hc.hosts)
-	hc.mu.Unlock()
+	n := hc.size()
 	if n > topHostsMaxEntries {
 		t.Fatalf("map grew to %d entries, want <= cap %d", n, topHostsMaxEntries)
 	}
@@ -81,13 +77,10 @@ func TestTopHosts_TrackedHostAlwaysCounts(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		hc.Record("h-0.example")
 	}
-	hc.mu.Lock()
-	p := hc.hosts["h-0.example"]
-	hc.mu.Unlock()
-	if p == nil {
+	c, ok := hc.count("h-0.example")
+	if !ok {
 		t.Fatal("tracked host evicted — already-tracked hosts must never be gated")
 	}
-	c := *p
 	if c < 6 {
 		t.Fatalf("tracked host count = %d, want >= 6 (already-tracked hosts must never be gated)", c)
 	}

@@ -49,6 +49,18 @@ type Config struct {
 	Clock func() time.Time
 	// Actor labels events emitted by this executor.
 	Actor string
+	// LiveGate is the OPTIONAL composition-layer side-effect gate consulted at the boundary
+	// BEFORE the executor's own tool-freshness + emergency-kill re-check, so the kill re-read
+	// stays the LAST authoritative check before Upstream.Call (PREREQ-MCP-KILL-1). It owns the
+	// gates that live OUTSIDE this package — Canary blast-radius budget reservation, runtime
+	// live-execution trust revalidation, and read-first enforcement. nil ⇒ the executor is
+	// byte-identical to the pre-gate path (the ShadowEvaluator and any non-live composition
+	// never set it). See livegate.go.
+	LiveGate LiveExecutionGate
+	// Safety is the OPTIONAL narrow whole-Canary breach seam (blocker #7). Nil means no Canary is
+	// composed; it is replaced by a no-op so call sites never branch. It is deliberately separate
+	// from Metrics — see safety.go for why observability and control must not share a sink.
+	Safety CanarySafety
 }
 
 // Executor implements runtime.ExecutionProvider. It is the LIVE object: it possesses
@@ -75,6 +87,9 @@ func New(cfg Config) (*Executor, error) {
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = time.Now
+	}
+	if cfg.Safety == nil {
+		cfg.Safety = noopCanarySafety{}
 	}
 	if cfg.Metrics == nil {
 		cfg.Metrics = noopMetrics{}

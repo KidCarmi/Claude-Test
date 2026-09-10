@@ -49,17 +49,93 @@ func spoofedGet(t *testing.T, proxyURL *url.URL, targetURL, spoof string) int {
 	return resp.StatusCode
 }
 
-// assertNoIdentityAttribution scans the request-log ring for entries about the
-// given destination host and fails if any carries a non-empty identity: the
-// only identity source on these test paths would be the spoofed header.
-func assertNoIdentityAttribution(t *testing.T, destHost string) {
+// sameLogEntry reports whether two ring entries are the same record (the
+// comparable request-level fields; Entry carries slices, so `==` is not
+// available).
+func sameLogEntry(a, b LogEntry) bool {
+	return a.TS == b.TS && a.Time == b.Time && a.IP == b.IP && a.Identity == b.Identity &&
+		a.Method == b.Method && a.Host == b.Host && a.URI == b.URI && a.Status == b.Status &&
+		a.Level == b.Level && a.RuleMatched == b.RuleMatched && a.RuleID == b.RuleID &&
+		a.ActionTaken == b.ActionTaken && a.SSLAction == b.SSLAction && a.DurationMs == b.DurationMs
+}
+
+// logEntriesSince returns the request-log entries recorded AFTER the ring
+// snapshot `prev` (newest-first): the prefix of the current ring that ends
+// where the snapshot's newest entry is found again. The ring is process-global
+// and never cleared between tests, and httptest backends sit on recycled
+// ephemeral ports, so an assertion keyed on the backend's host must judge only
+// what THIS test's request produced (PR-C16): a stale entry from an earlier
+// test on the same port is neither evidence for nor against this test.
+func logEntriesSince(prev []LogEntry) []LogEntry {
+	cur := logGet()
+	if len(prev) == 0 {
+		return cur
+	}
+	for i := range cur {
+		if sameLogEntry(cur[i], prev[0]) {
+			return cur[:i]
+		}
+	}
+	return cur
+}
+
+// identityAssertT is the subset of *testing.T the identity-attribution
+// assertion uses. It exists so the assertion's OWN failure behaviour can be
+// exercised by a control test with a recording stand-in: a gate that can only
+// ever be observed passing is not a gate.
+type identityAssertT interface {
+	Helper()
+	Errorf(format string, args ...any)
+}
+
+// assertNoIdentityAttributionIn is the window-scoped decision behind
+// assertNoIdentityAttributionSince, split out so both halves of its contract
+// can be driven directly.
+//
+// THE CONTRACT IS A CONJUNCTION, NOT A SEARCH FOR COUNTEREXAMPLES:
+//
+//	request under test
+//	  => an expected observation for destHost EXISTS
+//	  AND no observation for destHost carries an identity
+//
+// The second half alone is vacuously true whenever the window holds nothing
+// for destHost, so "the request produced no log entry" and "the request
+// produced a correctly unattributed log entry" used to serialise identically
+// — and the first of those proves nothing about the spoofing property while
+// reporting PASS. Every one of these requests IS logged (a policy denial is
+// still a request-log entry), so an empty scan means the fixture, the window
+// or the host key is wrong, and the assertion has to say so rather than
+// certify the absence of evidence as evidence of absence.
+func assertNoIdentityAttributionIn(t identityAssertT, destHost string, entries []LogEntry) {
 	t.Helper()
-	entries := logGet()
+	observed := 0
 	for i := range entries { // index-based: LogEntry is a large struct (rangeValCopy)
-		if entries[i].Host == destHost && entries[i].Identity != "" {
+		if entries[i].Host != destHost {
+			continue
+		}
+		observed++
+		if entries[i].Identity != "" {
 			t.Errorf("log entry for %s attributed to identity %q — client-controlled header must never reach log attribution", destHost, entries[i].Identity)
 		}
 	}
+	if observed == 0 {
+		t.Errorf("no request-log entry for %s in the window recorded after the request under test: the attribution scan matched nothing, so it proves nothing about identity attribution (anti-vacuity)", destHost)
+	}
+}
+
+// assertNoIdentityAttributionSince scans the entries recorded after the ring
+// snapshot `prev` (taken immediately before the request under test) for the
+// given destination host, requires that the request under test actually
+// produced one, and fails if any carries a non-empty identity: the only
+// identity source on these test paths would be the spoofed header.
+//
+// Known limitation, inherited and deliberately not changed here: the ring is
+// bounded, so if more than MaxRing entries land between `prev` and this call,
+// logEntriesSince can no longer find prev[0] and widens to the whole ring.
+// That direction costs precision, never the anti-vacuity guarantee.
+func assertNoIdentityAttributionSince(t identityAssertT, destHost string, prev []LogEntry) {
+	t.Helper()
+	assertNoIdentityAttributionIn(t, destHost, logEntriesSince(prev))
 }
 
 // TestIdentityIngress_ExemptSpoofDenied: default-Exempt (open) posture with a
@@ -75,6 +151,7 @@ func TestIdentityIngress_ExemptSpoofDenied(t *testing.T) {
 	cfg.SetDefaultAuthOutcome(OutcomeExempt)
 	t.Cleanup(func() { cfg.SetDefaultAuthOutcome(OutcomeDefault) })
 
+	prev := logGet()
 	got := spoofedGet(t, proxyURL, backend.URL+"/", "alice")
 	if got != http.StatusForbidden {
 		t.Errorf("exempt + spoofed X-User-Identity: status %d, want 403 — the spoofed header must not satisfy a SourceIdentity rule", got)
@@ -83,7 +160,7 @@ func TestIdentityIngress_ExemptSpoofDenied(t *testing.T) {
 		t.Errorf("spoofed-identity request reached upstream %d times, want 0", cb.hitCount())
 	}
 	if u, err := url.Parse(backend.URL); err == nil {
-		assertNoIdentityAttribution(t, u.Host)
+		assertNoIdentityAttributionSince(t, u.Host, prev)
 	}
 }
 
@@ -110,6 +187,7 @@ func TestIdentityIngress_NoBackendSpoofDenied(t *testing.T) {
 		t.Fatalf("parse proxy url: %v", err)
 	}
 
+	prev := logGet()
 	got := spoofedGet(t, proxyURL, backend.URL+"/", "alice")
 	if got != http.StatusForbidden {
 		t.Errorf("no-backend + spoofed X-User-Identity: status %d, want 403 (default deny)", got)
@@ -118,7 +196,7 @@ func TestIdentityIngress_NoBackendSpoofDenied(t *testing.T) {
 		t.Errorf("spoofed-identity request reached upstream %d times, want 0", cb.hitCount())
 	}
 	if u, err := url.Parse(backend.URL); err == nil {
-		assertNoIdentityAttribution(t, u.Host)
+		assertNoIdentityAttributionSince(t, u.Host, prev)
 	}
 }
 
@@ -139,6 +217,7 @@ func TestIdentityIngress_AuthenticatedIdentityStillAttributed(t *testing.T) {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("X-User-Identity", "mallory") // spoof attempt alongside real creds
+	prev := logGet()
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("authenticated GET: %v", err)
@@ -156,7 +235,7 @@ func TestIdentityIngress_AuthenticatedIdentityStillAttributed(t *testing.T) {
 		t.Fatalf("parse backend url: %v", err)
 	}
 	found := false
-	for _, e := range logGet() {
+	for _, e := range logEntriesSince(prev) {
 		if e.Host != u.Host {
 			continue
 		}
