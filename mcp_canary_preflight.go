@@ -5,6 +5,7 @@ import (
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
 	evmodel "github.com/KidCarmi/Culvert/internal/mcp/events/model"
+	"github.com/KidCarmi/Culvert/internal/mcp/registry"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
@@ -300,8 +301,14 @@ func buildLiveApprovalBindings(scope rollout.ScopeSpec) []canary.ToolApprovalBin
 				Fingerprint:       ti.target.Fingerprint,
 				FingerprintFormat: ti.target.FingerprintFormatVersion,
 			}
+			// The server's pinned identity is read HERE, in the same authoritative pass that
+			// resolved the target, so the activation snapshot binds the identity and the
+			// fingerprint as they were observed together (§3).
+			ident := mcpServerPinnedIdentity(st.Server)
 			for _, a := range byTool[liveApprovalKey{tenant: tenant, serverID: st.Server, toolName: st.Name}] {
-				bindings = append(bindings, canary.ToolApprovalBinding{Target: target, Approval: a})
+				bindings = append(bindings, canary.ToolApprovalBinding{
+					Target: target, Approval: a, ServerIdentity: ident,
+				})
 			}
 		}
 	}
@@ -404,4 +411,64 @@ func mcpCanaryStatus() map[string]any {
 			"read_first":             true,
 		},
 	}
+}
+
+// mcpServerPinnedIdentity returns a server's PINNED, verified identity in canonical string form,
+// or "" when the server is absent or the inventory is not composed.
+//
+// It reads the SAME pointer-published inventory the rest of the live-trust precheck does
+// (mcpInventory.sharedInventory takes an RLock that returns immediately; registry.Current is an
+// atomic pointer load), so it carries the lock profile the §5 audit already established for the
+// activation critical section and adds no new edge.
+//
+// This is the minimum immutable field needed to distinguish server_identity_drift from
+// tool_fingerprint_drift against what was REVIEWED. canary.LiveTarget deliberately does not carry
+// it: LiveTarget is the key an approval is matched on, approvals record no identity, and widening
+// it would break exact-target approval matching.
+func mcpServerPinnedIdentity(serverID string) string {
+	reg, _ := mcpInventory.sharedInventory()
+	if reg == nil {
+		return ""
+	}
+	srv, ok := reg.Current().Get(registry.ServerID(serverID))
+	if !ok {
+		return ""
+	}
+	return string(srv.PinnedIdentity)
+}
+
+// reviewedTargetsFromBindings projects the approval bindings the activation preflight just PROVED
+// into the activation's reviewed-target snapshot (§3).
+//
+// Each binding's Target is the CURRENT authoritative target resolved from the registry + catalog,
+// and canary.ValidateScopeApprovals has already established that every scoped (tenant, server,
+// tool) carries its own valid, four-eyes, exact-target live approval bound to it. So this is a
+// projection of what the review passed on — not a later reconstruction of what "must have been"
+// reviewed, which is exactly the move §3 forbids.
+//
+// Duplicates are left for canary.CanonicalizeReviewedTargets to judge: several approvals may bind
+// the same target, and it is that function's job — not this one's — to decide whether identical
+// entries collapse or disagreeing ones are refused. Resolving ambiguity here by overwriting would
+// be the "last one wins" §4 rules out.
+//
+// It performs NO lookup of its own: every field, the server identity included, comes from the
+// binding the preflight validated. A second read here would sample the inventory at a later
+// instant than the one the review passed on, which is precisely the reconstruction §3 forbids.
+func reviewedTargetsFromBindings(bindings []canary.ToolApprovalBinding) []canary.ReviewedTarget {
+	if len(bindings) == 0 {
+		return nil
+	}
+	out := make([]canary.ReviewedTarget, 0, len(bindings))
+	for i := range bindings { // index-based: the binding carries a 32-byte digest
+		t := bindings[i].Target
+		out = append(out, canary.ReviewedTarget{
+			Tenant:            t.Tenant,
+			ServerID:          t.ServerID,
+			ToolName:          t.ToolName,
+			Fingerprint:       t.Fingerprint,
+			FingerprintFormat: t.FingerprintFormat,
+			ServerIdentity:    bindings[i].ServerIdentity,
+		})
+	}
+	return out
 }

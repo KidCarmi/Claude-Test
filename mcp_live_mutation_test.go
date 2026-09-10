@@ -211,7 +211,7 @@ func mutRollbackInvalidatesGen(t *testing.T) {
 	resetLiveTierGlobals(t)
 	setDataDirForTest(t, t.TempDir())
 	capb := rollout.CapabilityGateway
-	if _, err := globalCanaryRuntime.beginCanaryActivation(capb, runtimeTestBudget(10), time.Unix(0, 1)); err != nil {
+	if _, err := testBeginActivation(globalCanaryRuntime, capb, runtimeTestBudget(10), time.Unix(0, 1)); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if !globalCanaryRuntime.armed(capb) {

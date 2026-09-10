@@ -37,7 +37,7 @@ import (
 // ever composed.
 
 // canaryRuntimeSchemaVersion is the durable-state schema version (fail-closed on any other value).
-const canaryRuntimeSchemaVersion = 1
+const canaryRuntimeSchemaVersion = 2
 
 // canaryRuntimeState is the restart-durable, node-local DTO for one capability's Canary activation
 // runtime. It carries ONLY the generation, build identity, the active budget, and the scalar
@@ -55,6 +55,14 @@ type canaryRuntimeState struct {
 	// for the same reason the budget is: a detector that resets on restart is one a crash can
 	// silently disarm, handing a misbehaving Canary a clean slate.
 	HealthSnapshot canary.HealthSnapshot `json:"health_snapshot"`
+	// ReviewedTargets is the activation's IMMUTABLE record of the exact targets it was
+	// reviewed and authorized to execute. It is durable for a reason the budget is not: the
+	// activation window (up to FirstCanaryMaxWindowCeiling, 7 days) outlives the approvals
+	// that recorded the review (MaxInitialCanaryApprovalTTL, 24h), so an activation that
+	// forgot this across a restart would have no way to tell a drifted target from an
+	// ordinary unauthorized one for the rest of its life. An active record that cannot
+	// produce a valid set does not come back armed (see restoreCapability).
+	ReviewedTargets []canary.ReviewedTarget `json:"reviewed_targets"`
 }
 
 // canaryCapRuntime is one capability's in-memory activation runtime.
@@ -63,9 +71,14 @@ type canaryCapRuntime struct {
 	generation uint64
 	active     bool
 	budget     canary.Budget
-	enforcer   *canary.BudgetEnforcer
-	aborter    *canary.AbortController
-	health     *canary.HealthMonitor
+	// reviewed is what THIS generation was reviewed to execute. It is set once, at
+	// beginCanaryActivation, and never mutated for the life of the generation: a running
+	// activation that could grow a new reviewed target would be able to evolve from the
+	// experiment that was approved into one that was not (§10).
+	reviewed canary.ReviewedTargetSet
+	enforcer *canary.BudgetEnforcer
+	aborter  *canary.AbortController
+	health   *canary.HealthMonitor
 	// windowStop cancels this activation's traffic-independent window watchdog. It is a
 	// convenience for a RUNNING process only: the authoritative expiry check is the derived
 	// deadline (enforcer.WindowDeadline), re-evaluated on restore, so losing this timer can
@@ -99,6 +112,12 @@ func canaryRuntimeStatePath(capb rollout.Capability) string {
 
 // errCanaryBudgetInvalid marks an activation refused because its budget is not first-Canary valid.
 var errCanaryBudgetInvalid = errors.New("canary_budget_invalid")
+
+// errCanaryReviewedTargetsInvalid marks an activation refused because it could not say what it
+// was reviewed to execute. An EMPTY set lands here too, deliberately: an activation with no
+// reviewed record cannot detect drift for the rest of its window, so refusing to arm is the
+// only fail-closed answer (§2).
+var errCanaryReviewedTargetsInvalid = errors.New("canary_reviewed_targets_invalid")
 
 // canarySyncParentDir is the parent-directory fsync seam for the runtime fail-closed cleanup, so a
 // test can inject a dir-sync failure and prove the cleanup reports the pre-rename-revival risk as
@@ -242,9 +261,33 @@ var canaryAtomicWrite = fileutil.AtomicWrite
 // composes no executor and reaches no upstream — it only initialises the accounting a live Canary
 // would consult. A budget that is not first-Canary valid is refused fail-closed. Returns the new
 // generation.
-func (rt *canaryRuntime) beginCanaryActivation(capb rollout.Capability, budget canary.Budget, now time.Time) (uint64, error) {
+// canaryActivationSpec is the typed input to an activation. It exists so the activation's
+// inputs can GROW without growing a positional parameter list across every call site, and so
+// a new required input (ReviewedTargets) cannot be silently omitted by a caller that simply
+// did not know about it — a missing field is the zero value, and the zero value fails closed.
+type canaryActivationSpec struct {
+	// Budget is the authoritative blast-radius budget, already proven valid by the preflight.
+	Budget canary.Budget
+	// ReviewedTargets is the exact bounded set this activation was reviewed and authorized to
+	// execute. It is REQUIRED: an activation with nothing reviewed carries no evidence of what
+	// it was approved to do, so it can never decide whether a target drifted. Empty fails closed.
+	ReviewedTargets []canary.ReviewedTarget
+	// StartedAt is the activation instant (injected clock).
+	StartedAt time.Time
+}
+
+func (rt *canaryRuntime) beginCanaryActivation(capb rollout.Capability, spec canaryActivationSpec) (uint64, error) {
+	budget, now := spec.Budget, spec.StartedAt
 	if canary.ValidateBudget(budget) != canary.BudgetOK {
 		return 0, errCanaryBudgetInvalid
+	}
+	// The reviewed set is canonicalized and validated BEFORE the generation is bumped, so a
+	// malformed or absent set is refused without consuming a generation or touching the runtime.
+	// This is the fail-closed half of §2: no production path may arm an activation that cannot
+	// say what it was reviewed against.
+	reviewed, rr := canary.CanonicalizeReviewedTargets(spec.ReviewedTargets)
+	if rr != canary.ReviewedOK {
+		return 0, fmt.Errorf("%w: %s", errCanaryReviewedTargetsInvalid, string(rr))
 	}
 	cr := rt.capRuntime(capb)
 	cr.mu.Lock()
@@ -253,6 +296,7 @@ func (rt *canaryRuntime) beginCanaryActivation(capb rollout.Capability, budget c
 	gen := cr.generation
 	cr.active = true
 	cr.budget = budget
+	cr.reviewed = reviewed
 	cr.enforcer = canary.NewBudgetEnforcer(budget, gen, now)
 	cr.aborter = canary.NewAbortController(gen)
 	cr.health = canary.NewHealthMonitor(gen)
@@ -265,6 +309,7 @@ func (rt *canaryRuntime) beginCanaryActivation(capb rollout.Capability, budget c
 		cr.aborter = nil
 		cr.health = nil
 		cr.budget = canary.Budget{}
+		cr.reviewed = canary.ReviewedTargetSet{}
 		// The persist may have left a VISIBLE Active record on disk (e.g. an AtomicWrite that replaced
 		// the target but could not fsync — ErrReplacedNotSynced). Durably remove it so a restart cannot
 		// re-arm an activation the caller was told never became durable (Codex P1).
@@ -301,6 +346,7 @@ func (rt *canaryRuntime) demoteCanary(capb rollout.Capability) error {
 	cr.aborter = nil
 	cr.health = nil
 	cr.budget = canary.Budget{}
+	cr.reviewed = canary.ReviewedTargetSet{}
 	if err := canaryRuntimePersist(rt, capb, cr); err != nil {
 		// Persisting the disarmed record failed — remove the durable file so a restart cannot restore
 		// the prior Active:true record and undo the rollback. The error is RETURNED so the caller
@@ -327,6 +373,20 @@ func (rt *canaryRuntime) activeBudget(capb rollout.Capability) (canary.Budget, b
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 	return cr.budget, cr.active
+}
+
+// activeReviewedTargets returns the reviewed set the active generation is bound to, and whether
+// an activation is currently armed. It backs the §10 same-generation immutability rule: a
+// same-mode live update may re-supply an IDENTICAL reviewed set, but a different one must go
+// through demote → re-activate, which begins a fresh generation. Letting generation G quietly
+// adopt a new reviewed target would let the running experiment evolve from the one that was
+// approved into one that was not — the drift this whole mechanism exists to catch, performed by
+// the control plane instead of the tool.
+func (rt *canaryRuntime) activeReviewedTargets(capb rollout.Capability) (canary.ReviewedTargetSet, bool) {
+	cr := rt.capRuntime(capb)
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	return cr.reviewed, cr.active
 }
 
 // generationActive reports whether the SPECIFIC activation generation gen is still the current, armed,
@@ -591,6 +651,9 @@ func (rt *canaryRuntime) persistLocked(capb rollout.Capability, cr *canaryCapRun
 		Generation:   cr.generation,
 		Active:       cr.active,
 		Budget:       cr.budget,
+		// The reviewed set is written on EVERY persist, including the disarmed ones, so the
+		// durable record never disagrees with the in-memory activation about what was reviewed.
+		ReviewedTargets: cr.reviewed.Targets(),
 	}
 	if cr.enforcer != nil {
 		st.BudgetSnapshot = cr.enforcer.Snapshot()
@@ -656,6 +719,7 @@ func (rt *canaryRuntime) restoreCapability(capb rollout.Capability) {
 		cr.enforcer = nil
 		cr.aborter = nil
 		cr.budget = canary.Budget{}
+		cr.reviewed = canary.ReviewedTargetSet{}
 		return
 	}
 	// An active record MUST carry generation-matched budget AND abort snapshots. A missing or
@@ -669,9 +733,27 @@ func (rt *canaryRuntime) restoreCapability(capb rollout.Capability) {
 		cr.enforcer = nil
 		cr.aborter = nil
 		cr.budget = canary.Budget{}
+		cr.reviewed = canary.ReviewedTargetSet{}
 		logger.Printf("MCP canary runtime restore for %s: active record has a foreign-generation budget/abort snapshot; disarmed (fail-closed)", capb.String())
 		return
 	}
+	// An ACTIVE record must be able to say what it was reviewed to execute. A record missing
+	// the set, or carrying one that no longer canonicalizes, does NOT come back armed: without
+	// it the activation could not distinguish a drifted target from an unauthorized one for the
+	// rest of its window, which is precisely the blind spot this record exists to close. The
+	// generation is preserved so a fresh activation bumps past it (§5/§11).
+	restoredReviewed, rr := canary.CanonicalizeReviewedTargets(st.ReviewedTargets)
+	if rr != canary.ReviewedOK {
+		cr.active = false
+		cr.enforcer = nil
+		cr.aborter = nil
+		cr.health = nil
+		cr.budget = canary.Budget{}
+		cr.reviewed = canary.ReviewedTargetSet{}
+		logger.Printf("MCP canary runtime restore for %s: active record has no valid reviewed-target set (%s); disarmed (fail-closed)", capb.String(), string(rr))
+		return
+	}
+	cr.reviewed = restoredReviewed
 	// Rebuild the enforcer + controller for the SAME generation. RestoreBudgetEnforcer /
 	// RestoreAbortController are generation-strict, so a snapshot from a different generation cannot
 	// resurrect state here. A budget that no longer validates (or a corrupt snapshot) disarms.

@@ -81,7 +81,7 @@ func TestAutoStop_LatchedAbortMakesNewReservationImpossible(t *testing.T) {
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
 	swapCanaryClock(t, func() time.Time { return now })
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if o, _ := rt.reserveCanaryExecution(capb, now, rtIdent); o != canary.BudgetGranted {
@@ -116,7 +116,7 @@ func TestAutoStop_WindowExpiresWithNoTrafficAtAll(t *testing.T) {
 	swapCanaryClockVar(t, &nowP)
 	fireIndex, armedFor, _ := swapCanaryTimer(t)
 
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), start); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), start); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Arming happens on activation, for the FULL window and not a poll interval.
@@ -147,11 +147,11 @@ func TestAutoStop_StaleWatchdogCannotAbortALaterActivation(t *testing.T) {
 	swapCanaryClockVar(t, &nowP)
 	fireIndex, _, _ := swapCanaryTimer(t)
 
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), start); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), start); err != nil {
 		t.Fatalf("begin gen1: %v", err)
 	}
 	// A new activation supersedes the first; the first activation's timer is now stale.
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), start); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), start); err != nil {
 		t.Fatalf("begin gen2: %v", err)
 	}
 	fireIndex(0) // gen1's callback — stale now that gen2 is current
@@ -170,7 +170,7 @@ func TestAutoStop_RestartAfterExpiryRestoresAborted(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
 	nowP := start
 	swapCanaryClockVar(t, &nowP)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), start); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), start); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// The process dies and comes back AFTER the window closed.
@@ -199,7 +199,7 @@ func TestAutoStop_RestartNeverGrantsAFreshWindow(t *testing.T) {
 	window := runtimeTestBudget(3).Window
 	nowP := start
 	swapCanaryClockVar(t, &nowP)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), start); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), start); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	deadlineBefore, ok := rt.windowDeadline(capb)
@@ -234,7 +234,7 @@ func TestAutoStop_ClockRollbackGrantsNoExtraAuthority(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
 	nowP := start
 	swapCanaryClockVar(t, &nowP)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), start); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), start); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Roll the clock back before the activation instant and try to reserve.
@@ -295,7 +295,7 @@ func TestAutoStop_FirstCausePreservedAcrossLaterBreaches(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	rt.tripCanaryAbort(capb, "scope_escape", now)
@@ -315,7 +315,7 @@ func TestAutoStop_RequestScopedRefusalsNeverStopTheCanary(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	for _, code := range []string{"policy_deny", "stale_decision", "credential_not_ready",
@@ -336,7 +336,7 @@ func TestAutoStop_ElevatedErrorRateAbortsWithinTheCorpus(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	f := &canarySafetyFunnel{rt: rt, capb: capb}
@@ -358,7 +358,7 @@ func TestAutoStop_LatencyPathologyAbortsWithinTheCorpus(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	f := &canarySafetyFunnel{rt: rt, capb: capb}
@@ -377,7 +377,7 @@ func TestAutoStop_HealthyPopulationNeverStopsTheCanary(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(9), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(9), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	f := &canarySafetyFunnel{rt: rt, capb: capb}
@@ -393,7 +393,7 @@ func TestAutoStop_HealthyPopulationNeverStopsTheCanary(t *testing.T) {
 func TestAutoStop_BreachIsCapabilityIsolated(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(rollout.CapabilityGateway, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, rollout.CapabilityGateway, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin gateway: %v", err)
 	}
 	f := &canarySafetyFunnel{rt: rt, capb: rollout.CapabilityGateway}
@@ -409,7 +409,7 @@ func TestAutoStop_UnknownBreachCodeFailsClosed(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	f := &canarySafetyFunnel{rt: rt, capb: capb}
@@ -438,7 +438,7 @@ func TestAutoStop_WitnessConflictAbortsTheWholeCanary(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	ex := newReconcileTestExecutor(t, &canarySafetyFunnel{rt: rt, capb: capb})
@@ -516,7 +516,7 @@ func TestAutoStop_DeniedReservationItselfTripsBudgetExhausted(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(1), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(1), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if o, _ := rt.reserveCanaryExecution(capb, now, rtIdent); o != canary.BudgetGranted {
@@ -545,7 +545,7 @@ func TestAutoStop_CorruptPersistedStateNeverLoadsAsExecutable(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Corrupt the durable record.
@@ -571,7 +571,7 @@ func TestAutoStop_StatusReportsRevokedAuthorityWhileStillModeCanary(t *testing.T
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if st := canaryAbortStatusFor(capb); st.ExecutionAuthority != "granted" || st.Aborted {
@@ -631,7 +631,23 @@ func armDriftFixture(t *testing.T, rt *canaryRuntime, capb rollout.Capability) (
 	_, clkFn := liveFakeClock()
 	composeToolTrust(t, clkFn)
 	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), canaryRuntimeTestNow); err != nil {
+	// Arm the activation against the target that was actually seeded and approved: an activation
+	// carries the exact reviewed set, so a fixture that armed against a synthetic target would be
+	// refused as out-of-scope before any drift could be observed.
+	live := mcpLiveTrustPrecheck(ttTenant, sid, tool, fpHex)
+	if !live.Eligible {
+		t.Fatalf("fixture: the seeded target must be eligible, got %+v", live)
+	}
+	reviewed := canary.ReviewedTarget{
+		Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
+		Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
+		ServerIdentity: live.ServerIdentity,
+	}
+	if _, err := rt.beginCanaryActivation(capb, canaryActivationSpec{
+		Budget:          runtimeTestBudget(5),
+		ReviewedTargets: []canary.ReviewedTarget{reviewed},
+		StartedAt:       canaryRuntimeTestNow,
+	}); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	return realAdmissionGate(t, capb), sid, tool, fpHex, mcpToolTrust.now()
@@ -740,7 +756,7 @@ func TestAutoStop_MerelyUnauthorizedRequestDoesNotStopTheCanary(t *testing.T) {
 	_, _, sid, tool, fpHex := seedToolTrustInventory(t)
 	_, clkFn := liveFakeClock()
 	composeToolTrust(t, clkFn) // NO approval is ever requested or granted
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	g := realAdmissionGate(t, capb)
@@ -763,7 +779,7 @@ func TestAutoStop_MerelyUnauthorizedRequestDoesNotStopTheCanary(t *testing.T) {
 func TestAutoStop_CredentialSafetyFailureAbortsTheWholeCanary(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	f := &canarySafetyFunnel{rt: rt, capb: capb}
@@ -787,7 +803,7 @@ func TestCanaryRuntime_ScopeEscapeTripsWholeCanaryAbort(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(9), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(9), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Consume the enumerated identities, then present one beyond them.
@@ -822,14 +838,14 @@ func TestAutoStop_StaleBreachNeverStopsTheNextActivation(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	oldGen, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now)
+	oldGen, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := rt.demoteCanary(capb); err != nil {
 		t.Fatalf("demote: %v", err)
 	}
-	newGen, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now)
+	newGen, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now)
 	if err != nil {
 		t.Fatalf("re-begin: %v", err)
 	}
@@ -857,14 +873,14 @@ func TestAutoStop_StaleSettledAttemptNeverCountsAgainstTheNextActivation(t *test
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	oldGen, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now)
+	oldGen, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := rt.demoteCanary(capb); err != nil {
 		t.Fatalf("demote: %v", err)
 	}
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("re-begin: %v", err)
 	}
 	f := &canarySafetyFunnel{rt: rt, capb: capb}
@@ -889,7 +905,7 @@ func TestAutoStop_EarlyWatchdogFireReArmsInsteadOfDisarming(t *testing.T) {
 	nowP := canaryRuntimeTestNow
 	swapCanaryClockVar(t, &nowP)
 	fireIndex, _, armedCount := swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if armedCount() != 1 {
@@ -927,7 +943,7 @@ func TestAutoStop_ExhaustionLatchesWhenTheFinalSlotNeverSends(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(1), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(1), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	gen := rt.currentGeneration(capb)
@@ -955,7 +971,7 @@ func TestAutoStop_RestoreReDerivesABreachTheCountersAlreadyProve(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	gen := rt.currentGeneration(capb)
@@ -970,8 +986,9 @@ func TestAutoStop_RestoreReDerivesABreachTheCountersAlreadyProve(t *testing.T) {
 		Budget:        runtimeTestBudget(3),
 		BudgetSnapshot: canary.BudgetSnapshot{Generation: gen, StartUnixNano: now.UnixNano(), TotalReserved: 2,
 			Principals: []string{"p1"}, Tools: []string{"t1"}, Servers: []string{"s1"}},
-		AbortSnapshot:  canary.AbortSnapshot{Generation: gen},
-		HealthSnapshot: canary.HealthSnapshot{Generation: gen, Samples: 2, Failures: 2, LatencySumNs: int64(2 * time.Second)},
+		AbortSnapshot:   canary.AbortSnapshot{Generation: gen},
+		HealthSnapshot:  canary.HealthSnapshot{Generation: gen, Samples: 2, Failures: 2, LatencySumNs: int64(2 * time.Second)},
+		ReviewedTargets: []canary.ReviewedTarget{testReviewedTarget()},
 	}
 	raw, err := json.Marshal(st)
 	if err != nil {
@@ -1046,7 +1063,7 @@ func TestAutoStop_HealthPersistFailureFailsClosed(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	gen := rt.currentGeneration(capb)
@@ -1089,7 +1106,7 @@ func TestAutoStop_ExpiredWindowStopsAnAlreadyAdmittedRequestAtTheBoundary(t *tes
 	// The watchdog is captured and never fired: this gate is about the BOUNDARY, and firing the
 	// timer would prove the watchdog instead.
 	_, _, armedCount := swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	gen := rt.currentGeneration(capb)
@@ -1121,7 +1138,7 @@ func TestAutoStop_InflatedSampleCountNeverRestoresAsExecutable(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	gen := rt.currentGeneration(capb)
@@ -1138,7 +1155,8 @@ func TestAutoStop_InflatedSampleCountNeverRestoresAsExecutable(t *testing.T) {
 		AbortSnapshot: canary.AbortSnapshot{Generation: gen},
 		// …but the detector claims a hundred clean samples, which would dilute the next two
 		// failures to 2/102 instead of the 1/2 that must stop the experiment.
-		HealthSnapshot: canary.HealthSnapshot{Generation: gen, Samples: 100},
+		HealthSnapshot:  canary.HealthSnapshot{Generation: gen, Samples: 100},
+		ReviewedTargets: []canary.ReviewedTarget{testReviewedTarget()},
 	}
 	raw, err := json.Marshal(st)
 	if err != nil {
@@ -1172,7 +1190,7 @@ func TestAutoStop_HonestSampleCountsStillRestore(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
-			if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(9), now); err != nil {
+			if _, err := testBeginActivation(rt, capb, runtimeTestBudget(9), now); err != nil {
 				t.Fatalf("begin: %v", err)
 			}
 			gen := rt.currentGeneration(capb)
@@ -1185,8 +1203,9 @@ func TestAutoStop_HonestSampleCountsStillRestore(t *testing.T) {
 				Budget:        runtimeTestBudget(9),
 				BudgetSnapshot: canary.BudgetSnapshot{Generation: gen, StartUnixNano: now.UnixNano(), TotalReserved: sn.reserved,
 					Principals: []string{"p1"}, Tools: []string{"t1"}, Servers: []string{"s1"}},
-				AbortSnapshot:  canary.AbortSnapshot{Generation: gen},
-				HealthSnapshot: canary.HealthSnapshot{Generation: gen, Samples: sn.samples},
+				AbortSnapshot:   canary.AbortSnapshot{Generation: gen},
+				HealthSnapshot:  canary.HealthSnapshot{Generation: gen, Samples: sn.samples},
+				ReviewedTargets: []canary.ReviewedTarget{testReviewedTarget()},
 			}
 			raw, err := json.Marshal(st)
 			if err != nil {
@@ -1214,7 +1233,7 @@ func TestAutoStop_HealthBreachLatchesUnderTheSameLockAsTheObservation(t *testing
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	gen := rt.currentGeneration(capb)
@@ -1245,7 +1264,7 @@ func TestAutoStop_ClockRollbackBehindActivationClosesTheBoundary(t *testing.T) {
 	nowP := canaryRuntimeTestNow
 	swapCanaryClockVar(t, &nowP)
 	_, _, _ = swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	gen := rt.currentGeneration(capb)
@@ -1274,7 +1293,7 @@ func TestAutoStop_ClockBehindActivationLatchesAtRestoreInsteadOfArming(t *testin
 	nowP := canaryRuntimeTestNow
 	swapCanaryClockVar(t, &nowP)
 	_, _, armedCount := swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if armedCount() != 1 {
@@ -1314,7 +1333,7 @@ func TestAutoStop_WatchdogFiringUnderRollbackLatchesInsteadOfReArming(t *testing
 	nowP := canaryRuntimeTestNow
 	swapCanaryClockVar(t, &nowP)
 	fireIndex, _, armedCount := swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if armedCount() != 1 {
@@ -1343,7 +1362,7 @@ func TestAutoStop_ClockInsideTheWindowStillArmsNormally(t *testing.T) {
 	nowP := canaryRuntimeTestNow
 	swapCanaryClockVar(t, &nowP)
 	_, _, armedCount := swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	nowP = canaryRuntimeTestNow.Add(time.Minute) // inside the 1h window
@@ -1374,7 +1393,7 @@ func TestAutoStop_WindowDenialAtAdmissionRecordsWindowExpired(t *testing.T) {
 	// The watchdog is captured and never fired: this gate is about the ADMISSION path naming the
 	// cause, and firing the timer would let the watchdog name it instead.
 	_, _, _ = swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(9), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(9), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Plenty of allowance remains — only the time box has closed.
@@ -1398,7 +1417,7 @@ func TestAutoStop_TotalExhaustionStillRecordsBudgetExhausted(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(1), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(1), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if o, _ := rt.reserveCanaryExecution(capb, now, rtIdent); o != canary.BudgetGranted {
@@ -1432,7 +1451,7 @@ func TestAutoStop_StatusIsNeverMoreOptimisticThanAdmission(t *testing.T) {
 	nowP := canaryRuntimeTestNow
 	swapCanaryClockVar(t, &nowP)
 	_, _, armedCount := swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if armedCount() != 1 {
@@ -1507,7 +1526,7 @@ func TestAutoStop_WatchdogDecidesEveryBranchFromOneClockSample(t *testing.T) {
 	nowP := start
 	swapCanaryClockVar(t, &nowP)
 	fireIndex, armedFor, armedCount := swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, budget, start); err != nil {
+	if _, err := testBeginActivation(rt, capb, budget, start); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if armedCount() != 1 {
@@ -1554,7 +1573,7 @@ func TestAutoStop_ActivationGenerationIsStrictlyMonotonic(t *testing.T) {
 
 	// Several activate/demote cycles: every generation must be new AND strictly greater.
 	for i := range 6 {
-		if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
+		if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), canaryRuntimeTestNow); err != nil {
 			t.Fatalf("begin %d: %v", i, err)
 		}
 		g := rt.currentGeneration(capb)

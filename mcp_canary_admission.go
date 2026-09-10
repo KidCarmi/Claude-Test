@@ -70,7 +70,32 @@ import (
 // layering stays where it is. The contract on any implementation is narrow and is the reason the
 // lock can be held across it — LOCAL CONTROL-PLANE STATE ONLY. No network I/O, no credential
 // materialization, no DNS, no upstream call, no unbounded or blocking work.
-type canaryTrustProbe func() (trusted bool, driftCode string)
+type canaryTrustProbe func() canaryTrustObservation
+
+// canaryTrustObservation is one probe's report of the CURRENT authoritative state of the target a
+// request names. The transaction, not the probe, decides what it means for the activation: the
+// probe reports observations, the transaction compares them against what the activation was
+// reviewed against and owns every latch.
+//
+// That division is the point. A probe that decided drift on its own would have to know what was
+// reviewed, and the only record of that it could reach without the lock is the approval store —
+// which is exactly the conflation this change exists to remove (see reviewed.go).
+type canaryTrustObservation struct {
+	// DriftCode is an authoritative whole-Canary breach the PROBE itself established from
+	// pointer-published inventory state — today, the reviewed server no longer being usable.
+	// Non-empty short-circuits the transaction straight to the latch.
+	DriftCode string
+	// Found reports that a current authoritative target was resolvable for this request. False is
+	// request-scoped: a request naming a target that does not resolve is a malformed or
+	// wrong-tenant request, never evidence that the reviewed target moved.
+	Found bool
+	// Current is the CURRENT authoritative target — fingerprint, format and pinned server identity
+	// as observed now. It is what the transaction compares against the activation's reviewed set.
+	Current canary.ReviewedTarget
+	// Trusted is the request-scoped authorization verdict (a valid live approval covers this exact
+	// request). It is consulted only AFTER the reviewed comparison passes.
+	Trusted bool
+}
 
 // canaryAdmissionDenial is the bounded reason class a denied transaction reports.
 //
@@ -87,6 +112,7 @@ const (
 	canaryAdmitAborted                                   // the Canary is already stopped
 	canaryAdmitDrift                                     // authoritative drift; latched against Generation
 	canaryAdmitUntrusted                                 // request-scoped: this request is not authorized
+	canaryAdmitNotReviewed                               // request-scoped: not a target THIS activation was reviewed for
 	canaryAdmitBudget                                    // budget / blast-radius denial
 )
 
@@ -155,29 +181,56 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 		return canaryAdmission{Denial: canaryAdmitAborted, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
 	}
 
-	// (3) Live trust, under the lock, against the activation captured above.
-	trusted, driftCode := false, ""
+	// (3) Observe the CURRENT authoritative target, under the lock, against the activation captured
+	// above. The probe reads local control-plane state only (§5).
+	var obs canaryTrustObservation
 	if trust != nil {
-		trusted, driftCode = trust()
+		obs = trust()
 	}
 
-	// (4) An authoritative drift is a whole-Canary breach: latch it against G, durably, fail-closed.
-	if driftCode != "" {
-		res := rt.tripLockedForGeneration(cr, capb, driftCode, gen, now)
-		return canaryAdmission{
-			Denial: canaryAdmitDrift, Active: true, Generation: gen, DriftCode: driftCode,
-			Outcome: canary.BudgetDeniedInvalid,
-			Latched: res == canary.TripCanaryLatched,
-		}
+	// (4) An authoritative drift the probe itself established is a whole-Canary breach: latch it
+	// against G, durably, fail-closed.
+	if obs.DriftCode != "" {
+		return rt.latchDriftLocked(cr, capb, obs.DriftCode, gen, now)
 	}
 
-	// (5) Untrusted without drift is request-scoped: the target still matches what was reviewed,
-	// this request simply is not authorized. Nothing is latched and nothing is persisted.
-	if !trusted {
+	// (5) THE REVIEWED COMPARISON — the fact this transaction exists to decide.
+	//
+	// It is made against the activation's OWN immutable record, never against an approval, so it
+	// stays decidable for the whole activation window even after every approval that recorded the
+	// review has expired. That independence is the entire Round-24 fix: an activation may run for
+	// FirstCanaryMaxWindowCeiling (7 days) while an approval may live for at most
+	// MaxInitialCanaryApprovalTTL (24 hours), so for most of its life the approval store can no
+	// longer say what this activation was reviewed against — and a later approval for a DIFFERENT
+	// fingerprint must never be able to say it either.
+	//
+	// A request naming a target that does not resolve is request-scoped: no evidence the reviewed
+	// target moved, so nothing is latched.
+	if !obs.Found {
+		return canaryAdmission{Denial: canaryAdmitUntrusted, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
+	}
+	switch v := cr.reviewed.Compare(obs.Current); v {
+	case canary.ReviewedMatches:
+		// The current target IS the reviewed one. Proceed to authorization.
+	case canary.ReviewedOutOfScope:
+		// This activation was never reviewed for this target. REQUEST-SCOPED by design: an
+		// activation correctly refusing a target outside its review is the Canary working, and
+		// latching the whole experiment for it would let any unrelated request stop it.
+		return canaryAdmission{Denial: canaryAdmitNotReviewed, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
+	default:
+		// The reviewed target MOVED — a different fingerprint, or a different pinned server
+		// identity. Whole-Canary breach, latched against G inside this same transaction.
+		return rt.latchDriftLocked(cr, capb, string(v), gen, now)
+	}
+
+	// (6) Untrusted without drift is request-scoped: the target still matches what was reviewed,
+	// this request simply is not authorized (expired, revoked, never granted). Nothing is latched
+	// and nothing is persisted.
+	if !obs.Trusted {
 		return canaryAdmission{Denial: canaryAdmitUntrusted, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
 	}
 
-	// (6) Budget, under the same generation the trust verdict was computed against.
+	// (7) Budget, under the same generation the trust verdict was computed against.
 	outcome := rt.reserveLocked(cr, capb, gen, now, ident)
 	denial := canaryAdmitGranted
 	if !outcome.Granted() {
@@ -186,6 +239,18 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 	return canaryAdmission{
 		Denial: denial, Active: true, Generation: gen, Trusted: true, Outcome: outcome,
 		Latched: !cr.aborter.ExecutionEligible(gen),
+	}
+}
+
+// latchDriftLocked latches an authoritative drift against gen and returns the denial, with cr.mu
+// ALREADY HELD. It exists so every drift exit from the transaction is the same exit: one latch
+// site, one shape of result, no path that denies a drifted request without latching it.
+func (rt *canaryRuntime) latchDriftLocked(cr *canaryCapRuntime, capb rollout.Capability, code string, gen uint64, now time.Time) canaryAdmission {
+	res := rt.tripLockedForGeneration(cr, capb, code, gen, now)
+	return canaryAdmission{
+		Denial: canaryAdmitDrift, Active: true, Generation: gen, DriftCode: code,
+		Outcome: canary.BudgetDeniedInvalid,
+		Latched: res == canary.TripCanaryLatched,
 	}
 }
 
@@ -325,7 +390,7 @@ func (rt *canaryRuntime) latchDriftUnderActivation(capb rollout.Capability, want
 	gen := cr.generation
 	code := ""
 	if trust != nil {
-		_, code = trust()
+		code = trust().DriftCode
 	}
 	if code == "" {
 		// The drift did not reproduce against live state under the lock. It may have been repaired,
@@ -361,13 +426,13 @@ func canaryPreAdmissionDrift(capability string, obs mcpruntime.CanaryDriftTarget
 		return
 	}
 	now := time.Now()
-	globalCanaryRuntime.latchDriftUnderActivation(capb, obs.Generation, now, func() (bool, string) {
+	globalCanaryRuntime.latchDriftUnderActivation(capb, obs.Generation, now, func() canaryTrustObservation {
 		// DRIFT-ONLY. The latch's sole output is a drift code, so consulting the approval store
 		// here would be work whose answer is discarded — and it would drag the durable store into
 		// the activation critical section for nothing (Codex round 22). The precheck reads only
 		// pointer-published inventory.
 		live := mcpLiveTrustPrecheck(obs.Tenant, obs.ServerID, obs.ToolName, obs.DecisionFP)
-		return false, live.DriftCode
+		return canaryTrustObservation{DriftCode: live.DriftCode}
 	})
 }
 

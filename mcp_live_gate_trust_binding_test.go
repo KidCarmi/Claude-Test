@@ -106,13 +106,21 @@ func TestLiveTrustRevalidate_RejectsUnusableServer(t *testing.T) {
 	}
 }
 
-// TestLiveTrustRevalidate_RugPullReportsDriftNotMissingApproval drives the round-20/23 scenario
-// through the REAL approval store: a live approval is granted for the reviewed fingerprint, then
-// the tool is republished with a DIFFERENT one. Every later request is decided against the new
-// fingerprint, so the precheck sees no drift — the only evidence that the reviewed tool moved is
-// the approval still pinned to the old one, and it must be classified as an authoritative
-// whole-Canary drift rather than an ordinary missing-approval denial.
-func TestLiveTrustRevalidate_RugPullReportsDriftNotMissingApproval(t *testing.T) {
+// TestLiveTrustRevalidate_RugPullIsRequestScopedNotDriftInference is the INVERSION of the test this
+// replaced, and the inversion is the point.
+//
+// The superseded gate inferred whole-Canary drift inside the approval half: a live approval still
+// pinned to the reviewed fingerprint, against a request decided under a NEW one, was read as
+// "the reviewed tool moved". That inference used approval LIFETIME as drift memory, so it evaporated
+// the moment the approval expired — the exact window a patient attacker waits for, and the reason
+// the activation now carries its own immutable reviewed-target snapshot instead.
+//
+// So the approval half must NOT classify this any more. A rug-pulled target is still DENIED here
+// (nothing approves F2), request-scoped and with no drift code; the authoritative drift verdict is
+// produced by comparing the activation's reviewed snapshot against the current target under the
+// activation lock, and is proven in the reviewed-binding matrix
+// (mcp_canary_reviewed_binding_test.go), where it survives approval expiry.
+func TestLiveTrustRevalidate_RugPullIsRequestScopedNotDriftInference(t *testing.T) {
 	resetInventory(t)
 	resetExecDeps(t)
 	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
@@ -150,15 +158,23 @@ func TestLiveTrustRevalidate_RugPullReportsDriftNotMissingApproval(t *testing.T)
 		t.Fatal("premise: the republished tool must carry a DIFFERENT fingerprint")
 	}
 
-	// A request decided against the NEW fingerprint: the precheck cannot see drift (F2 == F2).
+	// A request decided against the NEW fingerprint is denied — nothing approves F2.
 	gotOK, gotCode := liveTrustVerdict(ttTenant, sid, tool, newFP, now)
 	if gotOK {
 		t.Fatal("a rug-pulled target must not be trusted")
 	}
-	if gotCode != "tool_fingerprint_drift" {
-		t.Fatalf("drift code = %q, want tool_fingerprint_drift — the approval pinned to the "+
-			"superseded fingerprint is the ONLY evidence the reviewed tool moved, and reading it "+
-			"as an ordinary missing approval lets a rug-pull stop nothing", gotCode)
+	if gotCode != "" {
+		t.Fatalf("drift code = %q, want empty: the approval half must not infer drift from an "+
+			"approval still pinned to the superseded fingerprint. Inferring it here makes drift "+
+			"detection expire with the approval, which is the defect the activation-bound "+
+			"reviewed-target snapshot exists to close", gotCode)
+	}
+
+	// And the inference must not reappear once the approval is gone: an EXPIRED approval leaves
+	// the approval half with nothing to read, yet the drift is real. Only the activation snapshot
+	// can still see it — the matrix proves it does.
+	if ok, code := liveTrustVerdict(ttTenant, sid, tool, newFP, now.Add(48*time.Hour)); ok || code != "" {
+		t.Fatalf("after approval expiry the approval half must stay a plain denial, got ok=%v code=%q", ok, code)
 	}
 }
 

@@ -55,7 +55,7 @@ func TestLiveCommit_BeginActivationFailureRejectsAndRollsBack(t *testing.T) {
 		countTransition:  func() {},
 		reconcileRuntime: true,
 	}
-	err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevMode, prevCfg, prevEvidence, runtimeTestBudget(10), "test", time.Unix(0, 1))
+	err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevMode, prevCfg, prevEvidence, testActivationSpec(runtimeTestBudget(10), canaryRuntimeTestNow), "test", time.Unix(0, 1))
 	if !errors.Is(err, errRolloutCanaryActivationFailed) {
 		t.Fatalf("a failed begin must reject the transition with errRolloutCanaryActivationFailed, got %v", err)
 	}
@@ -76,7 +76,7 @@ func TestLiveCommit_BeginActivationFailureRejectsAndRollsBack(t *testing.T) {
 	if err := st.SetConfig(*cfg, "retry", time.Unix(0, 2).UnixNano()); err != nil {
 		t.Fatalf("retry install: %v", err)
 	}
-	if err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevMode, prevCfg, prevEvidence, runtimeTestBudget(10), "retry", time.Unix(0, 2)); err != nil {
+	if err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevMode, prevCfg, prevEvidence, testActivationSpec(runtimeTestBudget(10), canaryRuntimeTestNow), "retry", time.Unix(0, 2)); err != nil {
 		t.Fatalf("retry after rollback must succeed, got %v", err)
 	}
 	if !globalCanaryRuntime.armed(capb) {
@@ -115,7 +115,7 @@ func TestLiveCommit_ActivationFailureStatusReflectsPersistOutcome(t *testing.T) 
 			countTransition:  func() {},
 			reconcileRuntime: true,
 		}
-		err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevCfg.Mode, prevCfg, st.Evidence(), runtimeTestBudget(10), "test", time.Unix(0, 1))
+		err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevCfg.Mode, prevCfg, st.Evidence(), testActivationSpec(runtimeTestBudget(10), canaryRuntimeTestNow), "test", time.Unix(0, 1))
 		if !errors.Is(err, errRolloutCanaryActivationFailed) {
 			t.Fatalf("a failed begin must reject the transition, got %v", err)
 		}
@@ -137,7 +137,7 @@ func TestLiveCommit_SameModeLiveBudgetChangeIsRejected(t *testing.T) {
 	setDataDirForTest(t, t.TempDir())
 	capb := rollout.CapabilityGateway
 	// Arm a canary generation with budget B1.
-	if _, err := globalCanaryRuntime.beginCanaryActivation(capb, runtimeTestBudget(10), time.Unix(0, 1)); err != nil {
+	if _, err := testBeginActivation(globalCanaryRuntime, capb, runtimeTestBudget(10), time.Unix(0, 1)); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	r := newTestRollout()
@@ -158,7 +158,7 @@ func TestLiveCommit_SameModeLiveBudgetChangeIsRejected(t *testing.T) {
 		reconcileRuntime: true,
 	}
 	// A DIFFERENT budget (B2) than the active generation's B1 ⇒ reject + roll back.
-	err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevCfg.Mode, prevCfg, st.Evidence(), runtimeTestBudget(20), "new", time.Unix(0, 2))
+	err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevCfg.Mode, prevCfg, st.Evidence(), testActivationSpec(runtimeTestBudget(20), canaryRuntimeTestNow), "new", time.Unix(0, 2))
 	if !errors.Is(err, errRolloutCanaryActivationFailed) || !errors.Is(err, errRolloutCanaryBudgetChanged) {
 		t.Fatalf("a same-mode live update with a changed budget must be rejected, got %v", err)
 	}
@@ -167,7 +167,7 @@ func TestLiveCommit_SameModeLiveBudgetChangeIsRejected(t *testing.T) {
 	}
 
 	// The SAME budget (B1) ⇒ no reject; the scope update proceeds.
-	if err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevCfg.Mode, prevCfg, st.Evidence(), runtimeTestBudget(10), "same", time.Unix(0, 3)); err != nil {
+	if err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevCfg.Mode, prevCfg, st.Evidence(), testActivationSpec(runtimeTestBudget(10), canaryRuntimeTestNow), "same", time.Unix(0, 3)); err != nil {
 		t.Fatalf("a same-mode live update with the SAME budget must proceed, got %v", err)
 	}
 }
@@ -317,7 +317,7 @@ func TestLiveCommit_LeavingLiveUnarmsAndDemotes(t *testing.T) {
 		countTransition:  func() {},
 		reconcileRuntime: true,
 	}
-	if err := r.reconcileCanaryRuntimeAfterCommit(tgt, gwObserveCfg(), prevCfg.Mode, prevCfg, r.gateway.Evidence(), canary.Budget{}, "test", time.Unix(0, 2)); err != nil {
+	if err := r.reconcileCanaryRuntimeAfterCommit(tgt, gwObserveCfg(), prevCfg.Mode, prevCfg, r.gateway.Evidence(), testActivationSpec(canary.Budget{}, canaryRuntimeTestNow), "test", time.Unix(0, 2)); err != nil {
 		t.Fatalf("leaving-live reconcile must succeed, got %v", err)
 	}
 	if lt.armed() {
@@ -361,7 +361,7 @@ func TestLiveCommit_LeavingLiveDemoteDoesNotBlockOnInflight(t *testing.T) {
 	}
 	reconcileDone := make(chan error, 1)
 	go func() {
-		reconcileDone <- r.reconcileCanaryRuntimeAfterCommit(tgt, gwObserveCfg(), prevCfg.Mode, prevCfg, r.gateway.Evidence(), canary.Budget{}, "test", time.Unix(0, 2))
+		reconcileDone <- r.reconcileCanaryRuntimeAfterCommit(tgt, gwObserveCfg(), prevCfg.Mode, prevCfg, r.gateway.Evidence(), testActivationSpec(canary.Budget{}, canaryRuntimeTestNow), "test", time.Unix(0, 2))
 	}()
 	select {
 	case err := <-reconcileDone:
