@@ -5162,6 +5162,17 @@ Firefox (all platforms):
           </div>
 
           <div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+              <span style="font-weight:600">Maintenance Agent</span>
+              <button class="btn ghost sm" data-click="loadMaintAgentStatus" title="Re-check the maintenance agent's own health">
+                <svg class="ico" aria-hidden="true"><use href="#i-refresh"/></svg> Refresh
+              </button>
+            </div>
+            <p class="hint">Version and health of the host-root agent that applies updates and runs backups - the same detail <code>systemctl status culvert-maint</code> shows, without SSH.</p>
+            <div id="support-maint-agent" role="status" aria-live="polite"><p class="hint">Loading…</p></div>
+          </div>
+
+          <div>
             <div style="font-weight:600;margin-bottom:6px">Capture level</div>
             <p class="hint">Elevate the default bundle capture depth for a bounded window. A TTL is <strong>mandatory</strong> - the level auto-reverts to baseline when it expires (even across a restart).</p>
             <div id="support-debug-level" role="status" aria-live="polite" style="margin:6px 0"><p class="hint">Loading…</p></div>
@@ -5768,6 +5779,7 @@ document.addEventListener('click', e => {
     case 'loadReleases':           loadReleases(); break;
     case 'loadSupport':            loadSupport(); break;
     case 'loadBackups':            loadBackups(); break;
+    case 'loadMaintAgentStatus':    loadMaintAgentStatus(); break;
     case 'supportCreateBundle':    supportCreateBundle(); break;
     case 'supportSetDebugLevel':   supportSetDebugLevel(); break;
     case 'supportClearDebugLevel': supportClearDebugLevel(); break;
@@ -15635,6 +15647,7 @@ async function loadSupport() {
   loadTelemetryConfig();
   loadSupportTelemetryPreview();
   loadBackups();
+  loadMaintAgentStatus();
 }
 
 // Backup archive visibility: read-only pass-through of the CP-local
@@ -15686,6 +15699,50 @@ function renderBackups(data) {
       '<td>' + (b.modified_at ? escHtml(timeAgo(new Date(b.modified_at))) : '-') + '</td>' +
       '<td>' + (b.encrypted ? 'yes' : 'no') + '</td>' +
     '</tr>').join('') + '</tbody></table></div>';
+}
+
+// Maintenance-agent health visibility: read-only pass-through of the
+// CP-local maintenance agent's GET /v1/status (see maint_agent_status_api.go).
+// Answers "is my host-root agent healthy, what version, is the compose stack
+// really up" from the GUI - no SSH/systemctl.
+async function loadMaintAgentStatus() {
+  const el = document.getElementById('support-maint-agent');
+  if (!el) return;
+  el.innerHTML = '<p class="hint">Loading…</p>';
+  el.setAttribute('aria-busy', 'true');
+  try {
+    const data = await api('/api/maintenance-agent');
+    renderMaintAgentStatus(data);
+  } catch (e) {
+    el.innerHTML = '<p class="hint">Failed to load agent status: ' + escHtml(e.message) + '</p>';
+  } finally {
+    el.removeAttribute('aria-busy');
+  }
+}
+
+function renderMaintAgentStatus(data) {
+  const el = document.getElementById('support-maint-agent');
+  if (!el) return;
+  data = data || {};
+  if (!data.available) {
+    el.innerHTML = '<p class="hint">Not available' + (data.reason ? ': ' + escHtml(String(data.reason)) : '') + '.</p>';
+    return;
+  }
+  const rows = [];
+  if (data.agent_version) rows.push(['Version', escHtml(String(data.agent_version))]);
+  if (data.privilege_mode) rows.push(['Privilege mode', escHtml(String(data.privilege_mode))]);
+  rows.push(['Compose stack', data.compose_stack_up
+    ? '<span style="color:var(--green)">up</span>'
+    : '<span style="color:var(--red);font-weight:600">down' + (data.compose_error ? ' - ' + escHtml(String(data.compose_error)) : '') + '</span>']);
+  if (data.last_operation_kind) {
+    rows.push(['Last operation', escHtml(String(data.last_operation_kind)) + (data.last_operation_state ? ' (' + escHtml(String(data.last_operation_state)) + ')' : '')]);
+  }
+  let warning = '';
+  if (data.privilege_warning) {
+    warning = '<p class="hint" style="color:var(--red);font-weight:600">' + escHtml(String(data.privilege_warning)) + '</p>';
+  }
+  el.innerHTML = warning + '<table class="tbl" style="width:100%">' +
+    rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('') + '</table>';
 }
 
 // M7 Slice 1: read-only preview only — GET /api/support/telemetry/preview
