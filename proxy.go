@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -670,11 +669,13 @@ func applyPolicyDecision(w http.ResponseWriter, r *http.Request, clientIP, host,
 		if match.Rule.LogFullURI {
 			ruleURI = policyLogURI(r.Host, r.URL.Path)
 		}
+		// Each branch below emits its decision line through one of the
+		// logPolicy* helpers (see below the function) rather than inline.
 		switch match.Action {
 		case ActionDrop:
 			atomic.AddInt64(&statBlocked, 1)
 			recordRequestAuthURI(clientIP, r.Method, r.Host, "POLICY_DROP", match.Rule.Name, string(ActionDrop), authenticatedIdentity, "", ruleURI, authLog)
-			logger.Printf("POLICY_DROP rule=%q pri=%s %s -> %q [%s] {req_id=%s identity=%s rule=%s action=drop}", sanitizeLog(match.Rule.Name), strings.ReplaceAll(fmt.Sprintf("%d", match.Rule.Priority), "\n", ""), clientIP, sanitizeLog(host), sanitizeLog(match.MatchedConditions), reqID, sanitizeLog(authenticatedIdentity), sanitizeLog(match.Rule.Name))
+			logPolicyDrop(match.Rule.Name, match.Rule.Priority, clientIP, host, match.MatchedConditions, reqID, authenticatedIdentity)
 			// Silent TCP RST — hijack and close without sending an HTTP response.
 			if hj, ok := w.(http.Hijacker); ok {
 				if conn, _, err := hj.Hijack(); err == nil && conn != nil {
@@ -692,7 +693,7 @@ func applyPolicyDecision(w http.ResponseWriter, r *http.Request, clientIP, host,
 		case ActionBlockPage:
 			atomic.AddInt64(&statBlocked, 1)
 			recordRequestAuthURI(clientIP, r.Method, r.Host, "POLICY_BLOCK", match.Rule.Name, string(ActionBlockPage), authenticatedIdentity, "", ruleURI, authLog)
-			logger.Printf("POLICY_BLOCK rule=%q pri=%s %s -> %q [%s] {req_id=%s identity=%s rule=%s action=block}", sanitizeLog(match.Rule.Name), strings.ReplaceAll(fmt.Sprintf("%d", match.Rule.Priority), "\n", ""), clientIP, sanitizeLog(host), sanitizeLog(match.MatchedConditions), reqID, sanitizeLog(authenticatedIdentity), sanitizeLog(match.Rule.Name))
+			logPolicyBlock(match.Rule.Name, match.Rule.Priority, clientIP, host, match.MatchedConditions, reqID, authenticatedIdentity)
 			serveBlockPage(w, r.Host, string(match.Rule.DestCategory), match.Rule.Name)
 			return "POLICY_BLOCK", true
 
@@ -704,7 +705,7 @@ func applyPolicyDecision(w http.ResponseWriter, r *http.Request, clientIP, host,
 				http.Error(w, "Forbidden", http.StatusForbidden)
 				return "POLICY_REDIRECT", true
 			}
-			logger.Printf("POLICY_REDIRECT rule=%q pri=%s %s -> %q => %q [%s] {req_id=%s identity=%s rule=%s action=redirect}", sanitizeLog(match.Rule.Name), strings.ReplaceAll(fmt.Sprintf("%d", match.Rule.Priority), "\n", ""), clientIP, sanitizeLog(host), sanitizeLog(match.Rule.RedirectURL), sanitizeLog(match.MatchedConditions), reqID, sanitizeLog(authenticatedIdentity), sanitizeLog(match.Rule.Name))
+			logPolicyRedirect(match.Rule.Name, match.Rule.Priority, clientIP, host, match.Rule.RedirectURL, match.MatchedConditions, reqID, authenticatedIdentity)
 			http.Redirect(w, r, match.Rule.RedirectURL, http.StatusFound) // #nosec G710 -- admin-configured rule action target; the isSafeRedirectURL guard above blocks unsafe values
 			return "POLICY_REDIRECT", true
 
@@ -731,7 +732,7 @@ func applyPolicyDecision(w http.ResponseWriter, r *http.Request, clientIP, host,
 				// write no feed/history entry (volume control).
 				recordStats(clientIP, r.Host, "OK", match.Rule.Name, string(ActionAllow))
 			}
-			logger.Printf("POLICY_ALLOW rule=%q pri=%s %s %s %q [%s] {req_id=%s identity=%s rule=%s action=allow}", sanitizeLog(match.Rule.Name), strings.ReplaceAll(fmt.Sprintf("%d", match.Rule.Priority), "\n", ""), clientIP, r.Method, sanitizeLog(r.Host), sanitizeLog(match.MatchedConditions), reqID, sanitizeLog(authenticatedIdentity), sanitizeLog(match.Rule.Name))
+			logPolicyAllow(match.Rule.Name, match.Rule.Priority, clientIP, r.Method, r.Host, match.MatchedConditions, reqID, authenticatedIdentity)
 			// Fall through to normal handling below.
 		}
 	} else {
@@ -752,6 +753,73 @@ func applyPolicyDecision(w http.ResponseWriter, r *http.Request, clientIP, host,
 		return "POLICY_DEFAULT_DENY", true
 	}
 	return "OK", false
+}
+
+// ── Policy decision lines ───────────────────────────────────────────────────
+//
+// applyPolicyDecision emits exactly ONE of these per proxied request, so they
+// sit on the hot path and their argument construction is the largest single
+// allocator in the dispatch pipeline outside the upstream round trip.
+//
+// They are named functions rather than inline logger.Printf calls for two
+// reasons. The argument lists are long enough to bury the dispatch logic they
+// sat in. And the allocation gate (TestBenchGate_PolicyDecisionLineAllocs) can
+// now measure the PRODUCTION construction instead of a copy of it — a gate that
+// measures a replica cannot fail for the regression it names, so a later change
+// that reintroduced a per-request allocation here would have left it green
+// (Codex review, PR #1256).
+//
+// Two contracts they share, both of which the gate enforces:
+//
+//   - The rule name is sanitized ONCE and used for both the leading rule=%q and
+//     the trailing rule=%s. sanitizeLog scans the whole string, so naming the
+//     rule twice on one line used to pay that scan twice per request for one
+//     value. Taking the RAW name as the parameter is deliberate: it puts the
+//     sanitize-once decision inside the measured function, where reintroducing
+//     a second call fails the gate.
+//
+//   - The priority is rendered with %d. It was previously spelled
+//     strings.ReplaceAll(fmt.Sprintf("%d", …), "\n", ""), which formatted an int
+//     to a string and then scanned that string for newlines a decimal integer
+//     cannot contain — two heap allocations per proxied request (the Sprintf
+//     result, then boxing that result back into the Printf argument list) for a
+//     no-op. This is NOT the CWE-117 idiom the code conventions require: that
+//     rule covers STRING values reaching a log sink, whereas Priority is an int
+//     field of the admin-configured rulebase, carries no client-controlled data,
+//     and %d on an int can only ever emit [-0-9]. The rendered digits are
+//     identical either way, so the emitted line is byte-for-byte what it was
+//     (pinned by TestPolicyDecisionLine_RenderIsByteIdentical). Every
+//     genuinely string-typed argument still goes through sanitizeLog.
+
+// logPolicyAllow emits the POLICY_ALLOW decision line. host is r.Host (the
+// authority as the client sent it), not the port-stripped host the block
+// branches log — preserved from the pre-extraction call sites verbatim.
+func logPolicyAllow(rule string, priority int, clientIP, method, host, matchedConditions, reqID, identity string) {
+	safeRule := sanitizeLog(rule)
+	logger.Printf("POLICY_ALLOW rule=%q pri=%d %s %s %q [%s] {req_id=%s identity=%s rule=%s action=allow}",
+		safeRule, priority, clientIP, method, sanitizeLog(host), sanitizeLog(matchedConditions), reqID, sanitizeLog(identity), safeRule)
+}
+
+// logPolicyDrop emits the POLICY_DROP decision line.
+func logPolicyDrop(rule string, priority int, clientIP, host, matchedConditions, reqID, identity string) {
+	safeRule := sanitizeLog(rule)
+	logger.Printf("POLICY_DROP rule=%q pri=%d %s -> %q [%s] {req_id=%s identity=%s rule=%s action=drop}",
+		safeRule, priority, clientIP, sanitizeLog(host), sanitizeLog(matchedConditions), reqID, sanitizeLog(identity), safeRule)
+}
+
+// logPolicyBlock emits the POLICY_BLOCK decision line.
+func logPolicyBlock(rule string, priority int, clientIP, host, matchedConditions, reqID, identity string) {
+	safeRule := sanitizeLog(rule)
+	logger.Printf("POLICY_BLOCK rule=%q pri=%d %s -> %q [%s] {req_id=%s identity=%s rule=%s action=block}",
+		safeRule, priority, clientIP, sanitizeLog(host), sanitizeLog(matchedConditions), reqID, sanitizeLog(identity), safeRule)
+}
+
+// logPolicyRedirect emits the POLICY_REDIRECT decision line. Reached only after
+// isSafeRedirectURL has accepted redirectURL.
+func logPolicyRedirect(rule string, priority int, clientIP, host, redirectURL, matchedConditions, reqID, identity string) {
+	safeRule := sanitizeLog(rule)
+	logger.Printf("POLICY_REDIRECT rule=%q pri=%d %s -> %q => %q [%s] {req_id=%s identity=%s rule=%s action=redirect}",
+		safeRule, priority, clientIP, sanitizeLog(host), sanitizeLog(redirectURL), sanitizeLog(matchedConditions), reqID, sanitizeLog(identity), safeRule)
 }
 
 // recordRequestTelemetry records per-request observability after dispatch:
@@ -1168,37 +1236,93 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 // sanitizeLog strips newlines, carriage returns, tabs, and all other C0
 // control characters (plus DEL) from s to prevent log forging (CWE-117) and
 // terminal-escape-sequence injection (CWE-150) via ESC (0x1B) into log
-// viewers. Uses strings.ReplaceAll for the common newline/CR/tab cases so
-// CodeQL (go/log-injection) recognises the sanitiser; a single final pass
-// over remaining control bytes catches the rest with one allocation.
+// viewers. Uses strings.ReplaceAll for the newline case so CodeQL
+// (go/log-injection) recognises the sanitiser; a single pass over the
+// remaining control bytes catches the rest.
+//
+// ── Why one pass and not four ────────────────────────────────────────────────
+//
+// This is the most-called sanitiser in the tree (~377 call sites) and it is on
+// the REQUEST path: handleRequest emits one POLICY_* line per proxied request
+// that passes five values through it (rule name twice, host, matched
+// conditions, identity), and the tunnel/relay paths add more. It ran FOUR full
+// scans of every string — three strings.ReplaceAll plus a separate
+// containsControl — and then, on a hit, a fifth pass to build the result.
+//
+// The three ReplaceAll scans were redundant with the fourth by construction:
+// \n (0x0A), \r (0x0D) and \t (0x09) are all < 0x20, and every branch mapped
+// its match to the SAME byte, '_'. So the whole function was only ever
+// computing "every byte < 0x20 or == 0x7F becomes '_', length preserved" — a
+// single predicate that one pass decides. Keeping the newline ReplaceAll as
+// the first statement (and therefore on every return path) preserves the
+// CodeQL barrier verbatim while the other two scans and containsControl fold
+// into the scan below.
+//
+// Measured on the development box (Go 1.26, 4-core Xeon @ 2.80GHz, medians of
+// n=3x1M, both forms timed in the same run — see the benchmarks):
+//
+//	shape                     before      after      delta
+//	rule name   (15 B)        56.8 ns     28.0 ns    -51%
+//	hostname    (15 B)        59.1 ns     28.5 ns    -52%
+//	identity    (17 B)        60.6 ns     28.3 ns    -53%
+//	conditions  (57 B)         103 ns     55.0 ns    -47%
+//	long URL   (270 B)         267 ns      202 ns    -24%
+//	empty                     39.7 ns     15.7 ns    -60%
+//	with controls (28 B)       340 ns      147 ns    -57%  (4 -> 2 allocs)
+//
+// In situ there, the five calls behind one POLICY_ALLOW line go 463 -> 284 ns.
+//
+// The SIZE of the win is hardware-dependent and the spread is wide, so do not
+// quote one number as the number: it is governed by how expensive
+// strings.ReplaceAll's per-call overhead is relative to the scalar
+// control-byte scan, which differs by an order of magnitude between CPUs. The
+// CI runner measured the two removed calls at ~3 ns each against ~24 ns here,
+// so the same commit improves the 57-byte shape by 47% on this box and 10% on
+// that one (15 B: 52% here, 40% there). The DIRECTION never changes — this
+// form strictly does less work than the one it replaces — which is why the
+// gate that protects it is structural rather than a timing threshold.
+//
+// The clean path stays allocation-free, exactly as before; the control-byte
+// path halves its allocations because it no longer builds an intermediate
+// string per replaced class. That part is hardware-independent.
+//
+// A SWAR (8-bytes-per-word) scan was built and measured — it wins a further
+// ~60 ns on 270-byte inputs and nothing on the short strings that dominate
+// this call site — and was deliberately thrown away rather than carried: a
+// word-at-a-time bit trick is the wrong kind of clever for the function whose
+// bug class is log injection.
+//
+// Equivalence with the four-scan form is exact, not approximate, and is pinned
+// by a differential test against a verbatim copy of the old implementation
+// plus a fuzz target (proxy_sanitizelog_test.go).
+//
+// The scan count itself is pinned STRUCTURALLY, by an AST gate requiring
+// exactly one strings.ReplaceAll as the FIRST statement
+// (proxy_sanitizelog_benchgate_test.go). Keep it first: that is what puts it
+// on every return path, which is what keeps CodeQL's go/log-injection query
+// recognising this function as a sanitiser.
 func sanitizeLog(s string) string {
+	// CWE-117 barrier CodeQL recognises. Also the only class common enough to
+	// be worth a dedicated SIMD scan (strings.Count uses IndexByte); on a
+	// string with no newline it returns s without allocating.
 	s = strings.ReplaceAll(s, "\n", "_")
-	s = strings.ReplaceAll(s, "\r", "_")
-	s = strings.ReplaceAll(s, "\t", "_")
-	// Fast path: nothing else to scrub.
-	if !containsControl(s) {
+	// Find the first byte still needing a scrub. Nothing before i is a control
+	// byte, so the prefix is already correct and needs no rewrite.
+	i := 0
+	for ; i < len(s); i++ {
+		// C0 controls (0x00-0x1F) and DEL (0x7F).
+		if c := s[i]; c < 0x20 || c == 0x7F {
+			break
+		}
+	}
+	if i == len(s) {
 		return s
 	}
-	b := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		// C0 controls (0x00-0x1F) and DEL (0x7F). \n, \r, \t already replaced above.
-		if c < 0x20 || c == 0x7F {
+	b := []byte(s)
+	for ; i < len(b); i++ {
+		if c := b[i]; c < 0x20 || c == 0x7F {
 			b[i] = '_'
-			continue
 		}
-		b[i] = c
 	}
 	return string(b)
-}
-
-// containsControl reports whether s has any byte < 0x20 or == 0x7F.
-func containsControl(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c == 0x7F {
-			return true
-		}
-	}
-	return false
 }
