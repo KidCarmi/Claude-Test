@@ -69,9 +69,14 @@ func viewMatchesRules(rw *Rewriter) error {
 			len(got), len(want))
 	}
 	for i := range want {
-		if got[i].ID != want[i].ID || got[i].Host != want[i].Host {
-			return fmt.Errorf("view rule %d = {id:%d host:%q}, want {id:%d host:%q} — "+
-				"a mutator did not republish", i, got[i].ID, got[i].Host, want[i].ID, want[i].Host)
+		// StableID is compared too: it is the DURABLE identity the v2 management
+		// surface addresses rules by, so a view still carrying a superseded one
+		// is the same class of drift as a stale host pattern.
+		if got[i].ID != want[i].ID || got[i].Host != want[i].Host || got[i].StableID != want[i].StableID {
+			return fmt.Errorf("view rule %d = {id:%d stable:%q host:%q}, want {id:%d stable:%q host:%q} — "+
+				"a mutator did not republish", i,
+				got[i].ID, got[i].StableID, got[i].Host,
+				want[i].ID, want[i].StableID, want[i].Host)
 		}
 	}
 	return nil
@@ -103,6 +108,19 @@ func TestRuleView_EveryMutatorRepublishes(t *testing.T) {
 			added := rw.Add(Rule{Host: "f.example.com"})
 			if !rw.RemoveByID(added.ID) {
 				t.Fatal("RemoveByID reported not-found for a rule it had just added")
+			}
+		}},
+		{"RemoveByStableID", func(rw *Rewriter) {
+			added := rw.Add(Rule{Host: "j.example.com"})
+			rw.Add(Rule{Host: "k.example.com"})
+			if !rw.RemoveByStableID(added.StableID) {
+				t.Fatal("RemoveByStableID reported not-found for a rule it had just added")
+			}
+		}},
+		{"RemoveByStableID_toEmpty", func(rw *Rewriter) {
+			added := rw.Add(Rule{Host: "l.example.com"})
+			if !rw.RemoveByStableID(added.StableID) {
+				t.Fatal("RemoveByStableID reported not-found for a rule it had just added")
 			}
 		}},
 		{"Snapshot_restore", func(rw *Rewriter) {
@@ -162,6 +180,22 @@ func TestRuleView_MutationIsVisibleImmediately(t *testing.T) {
 			t.Fatal("rule never applied before removal")
 		}
 		rw.RemoveByID(added.ID)
+		if applied(rw) {
+			t.Fatal("removed rule kept applying — the view was not republished")
+		}
+	})
+
+	// The v2 management surface deletes by StableID, so this path carries the
+	// same contract as RemoveByID and is exercised the same way.
+	t.Run("RemoveByStableID_stopsApplying", func(t *testing.T) {
+		rw := NewRewriter()
+		added := rw.Add(Rule{Host: "", ReqSet: map[string]string{hdr: val}})
+		if !applied(rw) {
+			t.Fatal("rule never applied before removal")
+		}
+		if !rw.RemoveByStableID(added.StableID) {
+			t.Fatal("RemoveByStableID reported not-found for a rule it had just added")
+		}
 		if applied(rw) {
 			t.Fatal("removed rule kept applying — the view was not republished")
 		}
