@@ -394,6 +394,19 @@ run_mutation M27 \
   ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
   's/caller-owned records keeps that contract exactly \(Codex round 23\)\.\n\t\t\tout = append\(out, a\.clone\(\)\)/caller-owned records keeps that contract exactly (Codex round 23).\n\t\t\tout = append(out, a)/'
 
+# ── (11) THE REVIEWED-TARGET OBSERVATION IS ABOVE EVERY EARLY RETURN ───────
+# Round 24: dispatchPolicy returns from three places above the executor, and the F1→F2
+# republish this mechanism exists to catch is commonly a schema change — which hard-fails
+# inspection for every request still sending the old argument shape. Emitting below that
+# return means the change hides its own evidence.
+
+run_mutation M28 \
+  'the reviewed-target observation is emitted below the inspection hard-fail return' \
+  'TestCanaryReviewedTarget_(ReportedWhenInspectionHardFails|EmissionIsAboveEveryReturnInDispatchPolicy)' \
+  ./internal/mcp/runtime/ internal/mcp/runtime/policy.go \
+  's/\tobsServerID, obsToolName := p\.canaryObservedTarget\(req, msg\)\n\tp\.deps\.noteCanaryTargetObserved\(.*?\n\t\}\)\n//s' \
+  's/\td, _, _ := p\.policyEngine\.Evaluate/\tobsServerID, obsToolName := p.canaryObservedTarget(req, msg)\n\tp.deps.noteCanaryTargetObserved(p.capability.String(), CanaryTargetObservation{Generation: p.deps.canaryGenerationAt(p.capability.String()), ServerID: obsServerID, ToolName: obsToolName})\n\td, _, _ := p.policyEngine.Evaluate/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then
