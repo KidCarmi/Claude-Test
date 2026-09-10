@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/KidCarmi/Culvert/internal/alerts"
+	"github.com/KidCarmi/Culvert/internal/fileblock"
+	"github.com/KidCarmi/Culvert/internal/fileutil"
 	"github.com/KidCarmi/Culvert/internal/geoip"
 )
 
@@ -346,14 +349,28 @@ func apiCertsUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := persistCustomUITLS(certPEM, keyPEM); err != nil {
 		logger.Printf("certs upload UI: persist failed: %v", err)
+		warning := "The uploaded certificate is valid but could not be saved — it will NOT " +
+			"be active after a restart, and the current UI certificate is unchanged. Restore " +
+			"write access to the data directory, then upload again."
+		if errors.Is(err, errUITLSRollbackFailed) {
+			// persistCustomUITLS could not restore the previously-persisted
+			// cert after the key write failed — the on-disk state is now
+			// indeterminate (possibly the rejected upload, possibly paired
+			// with neither the old nor the new key). Telling the admin
+			// "unchanged" here would be false and could mask a broken pair
+			// until the next restart.
+			warning = "The uploaded certificate is valid but could not be saved, AND the " +
+				"previous certificate could not be restored — the on-disk UI certificate may " +
+				"now be in an inconsistent state. Do not restart the proxy until this is " +
+				"resolved: check disk space/permissions on the data directory, then re-upload " +
+				"a known-good certificate pair."
+		}
 		auditEvent(r, "certs.upload_ui", "custom UI cert", "NOT PERSISTED — validation only")
 		jsonOK(w, map[string]any{
 			"status":    "ok",
 			"target":    "ui",
 			"persisted": false,
-			"warning": "The uploaded certificate is valid but could not be saved — it will NOT " +
-				"be active after a restart, and the current UI certificate is unchanged. Restore " +
-				"write access to the data directory, then upload again.",
+			"warning":   warning,
 		})
 		return
 	}
@@ -378,10 +395,23 @@ func apiContentScan(w http.ResponseWriter, r *http.Request) {
 			"patterns":      patterns,
 			"count":         len(patterns),
 			"blocked_total": statDPIBlocked,
+			// 2E-A-2 §4: DPI patterns are CLUSTER-SYNCED (config_surfaces
+			// content_scan_patterns — CurrentConfigSnapshot captures
+			// dpiScanner.List(), the DP apply path installs it), so on a
+			// managed DP the CP is the single writer. The established
+			// ownership signal (F3a-2, same as the SaaS feed surfaces).
+			"editable": !isManagedDataPlane(),
 		})
 
 	case http.MethodPost:
 		if !requireRole(w, r, RoleOperator) {
+			return
+		}
+		// 2E-A-2 §4: refused BEFORE mutation on a managed DP — a local edit
+		// would be silently overwritten by the next config sync or diverge
+		// the node from the fleet (the established F3a-2 posture).
+		if isManagedDataPlane() {
+			http.Error(w, "DPI patterns are control-plane managed on this data-plane node", http.StatusConflict)
 			return
 		}
 		var body struct {
@@ -408,14 +438,39 @@ func apiContentScan(w http.ResponseWriter, r *http.Request) {
 			logger.Printf("UI: DPI pattern added %q", p)
 			added++
 		}
-		dpiScanner.Save()
+		if err := dpiScanner.Save(); err != nil {
+			// 2E-A durability truth: the patterns are live in memory (more
+			// scanning — the safe direction) but the 200 must not claim a
+			// durable configuration that reverts on restart.
+			logger.Printf("DPI: pattern persist error: %v", err)
+			auditEvent(r, "dpi.add.unpersisted",
+				fmt.Sprintf("%d pattern(s) applied in memory; persist failed", added), "")
+			http.Error(w, "DPI pattern(s) applied in memory but failed to persist", http.StatusInternalServerError)
+			return
+		}
 		auditEvent(r, "dpi.add", fmt.Sprintf("%d pattern(s)", added),
 			strings.Join(body.Patterns, ", "))
 		saveConfigVersion(sessionAdmin(r), "dpi.add")
-		jsonOK(w, map[string]any{"added": added})
+		// 2E-A-2 §4: DPI patterns are cluster-synced, so a successful
+		// mutation publishes a fresh snapshot NOW — without the version bump
+		// DPs keep enforcing the OLD pattern set until an unrelated admin
+		// action publishes one. A rejected publish is reported inline as the
+		// established cluster_publish_rejected fact (the local durable
+		// mutation is kept — the fleet stays on the last valid snapshot).
+		pubErr := publishCurrentConfigSnapshot()
+		resp := map[string]any{"added": added}
+		if pubErr != nil {
+			resp["cluster_publish_rejected"] = pubErr.Error()
+		}
+		jsonOK(w, resp)
 
 	case http.MethodDelete:
 		if !requireRole(w, r, RoleOperator) {
+			return
+		}
+		// 2E-A-2 §4: same managed-DP ownership refusal as the add path.
+		if isManagedDataPlane() {
+			http.Error(w, "DPI patterns are control-plane managed on this data-plane node", http.StatusConflict)
 			return
 		}
 		pattern := strings.TrimSpace(r.URL.Query().Get("pattern"))
@@ -424,10 +479,28 @@ func apiContentScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dpiScanner.Remove(pattern)
-		dpiScanner.Save()
+		if err := dpiScanner.Save(); err != nil {
+			// 2E-A durability truth: the removal is live in memory but would
+			// silently return on restart — never a 2xx over that.
+			logger.Printf("DPI: pattern persist error: %v", err)
+			auditEvent(r, "dpi.remove.unpersisted", pattern, "removed in memory; persist failed")
+			http.Error(w, "DPI pattern removed in memory but failed to persist", http.StatusInternalServerError)
+			return
+		}
 		logger.Printf("UI: DPI pattern removed %q", pattern)
 		auditEvent(r, "dpi.remove", pattern, "")
 		saveConfigVersion(sessionAdmin(r), "dpi.remove")
+		// 2E-A-2 §4: publish so DPs converge on the removal now. The accepted
+		// 204 stays the full-success response; a rejected publish must be
+		// visible to the caller, so that case alone returns 200 with the
+		// established cluster_publish_rejected fact (a 204 cannot carry it).
+		if pubErr := publishCurrentConfigSnapshot(); pubErr != nil {
+			jsonOK(w, map[string]any{
+				"removed":                  pattern,
+				"cluster_publish_rejected": pubErr.Error(),
+			})
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 
 	default:
@@ -493,10 +566,56 @@ func apiFileblock(w http.ResponseWriter, r *http.Request) {
 
 // ── File Extension Profiles API ───────────────────────────────────────────────
 //
-// GET    /api/fileblock/profiles          → list all profiles
+// GET    /api/fileblock/profiles          → list all profiles (legacy shape)
+// GET    /api/fileblock/profiles/state    → {profiles, revision} — ONE coherent
+//	committed snapshot (v2 fenced-read contract)
 // POST   /api/fileblock/profiles          → create profile {name, extensions[]}
-// PUT    /api/fileblock/profiles?id=X     → update profile
-// DELETE /api/fileblock/profiles?id=X     → delete profile
+// PUT    /api/fileblock/profiles?id=X     → update profile (rename cascades by ID)
+// DELETE /api/fileblock/profiles?id=X     → delete profile (reference-gated)
+//
+// Mutations accept an optional ?ifRevision= (the content-derived revision from
+// /state): the comparison, the mutation, and the durable publish share the
+// store's single critical section — never a detached handler check. A conflict
+// is the structured 409 the v2 editor refreshes from.
+
+// apiFileblockProfilesState — GET the v2 coherent management snapshot.
+func apiFileblockProfilesState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !requireRole(w, r, RoleViewer) {
+		return
+	}
+	profiles, revision := globalProfileStore.SnapshotWithRevision()
+	jsonOK(w, map[string]any{"profiles": profiles, "revision": revision, "count": len(profiles)})
+}
+
+// writeFileProfileMutationError maps store errors to truthful HTTP outcomes:
+// revision conflict → the SHARED 2D-B structured revision 409 ({error,
+// currentRevision, yourRevision} — one dialect across every fenced surface);
+// landed-content degraded durability → treated as success by the caller
+// (returns false); not-found/name-taken → 4xx. Returns true when the response
+// has been written.
+func writeFileProfileMutationError(w http.ResponseWriter, r *http.Request, err error, notFoundStatus int) bool {
+	if err == nil || errors.Is(err, fileutil.ErrReplacedNotSynced) {
+		return false // success (possibly with the landed-content degradation, logged by storage health)
+	}
+	var conflict *fileblock.ErrRevisionConflict
+	if errors.As(err, &conflict) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck // response write
+			"error":           conflict.Error(),
+			"currentRevision": conflict.Current,
+			"yourRevision":    strings.TrimSpace(r.URL.Query().Get("ifRevision")),
+		})
+		return true
+	}
+	http.Error(w, err.Error(), notFoundStatus)
+	return true
+}
+
 func apiFileblockProfiles(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -517,9 +636,9 @@ func apiFileblockProfiles(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		prof, err := globalProfileStore.Create(body.Name, body.Extensions)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusConflict)
+		prof, err := globalProfileStore.CreateFenced(
+			strings.TrimSpace(r.URL.Query().Get("ifRevision")), body.Name, body.Extensions)
+		if writeFileProfileMutationError(w, r, err, http.StatusConflict) {
 			return
 		}
 		auditEvent(r, "fileprofile.create", prof.Name, fmt.Sprintf("%d extensions", len(prof.Extensions)))
@@ -529,61 +648,107 @@ func apiFileblockProfiles(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		id := strings.TrimSpace(r.URL.Query().Get("id"))
-		if id == "" {
-			http.Error(w, "missing id param", http.StatusBadRequest)
-			return
-		}
-		var body struct {
-			Name       string   `json:"name"`
-			Extensions []string `json:"extensions"`
-		}
-		if err := decodeJSON(r, &body); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if err := globalProfileStore.Update(id, body.Name, body.Extensions); err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-		auditEvent(r, "fileprofile.update", body.Name, fmt.Sprintf("%d extensions", len(body.Extensions)))
-		jsonOK(w, map[string]any{"ok": true})
+		apiFileblockProfileUpdate(w, r)
 
 	case http.MethodDelete:
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		id := strings.TrimSpace(r.URL.Query().Get("id"))
-		if id == "" {
-			http.Error(w, "missing id param", http.StatusBadRequest)
-			return
-		}
-		// The DELETE addresses a profile by id, but rules reference it by
-		// NAME. Resolve the name under the store lock (NameByID copies it —
-		// reading GetByID().Name outside the lock races a concurrent rename).
-		// A bad/stale id falls through to Delete's own 404 (never a spurious
-		// 409). Then block via the shared walk if any rule still references
-		// the profile — deleting a referenced profile was fail-open for the
-		// file-control dimension.
-		// NOTE: this closes DELETE only. A profile RENAME still dangles every
-		// rule holding the old name (profiles are id-keyed with a mutable
-		// name) — an open fail-open the object-ID work (P3) closes; see
-		// roadmap/POLICY-REFS-PLAN.md.
-		if profName, ok := globalProfileStore.NameByID(id); ok {
-			if deleteBlockedByReferences(w, r, "file-profile", profName, "fileprofile.delete.blocked") {
-				return
-			}
-		}
-		if err := globalProfileStore.Delete(id); err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-		auditEvent(r, "fileprofile.delete", id, "")
-		w.WriteHeader(http.StatusNoContent)
+		apiFileblockProfileDelete(w, r)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// apiFileblockProfileDelete is the DELETE branch of apiFileblockProfiles (the
+// caller has already enforced the operator role): the reference scan and the
+// fenced durable delete as one atomic decision under the exclusive side of
+// the reference-integrity gate.
+func apiFileblockProfileDelete(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		http.Error(w, "missing id param", http.StatusBadRequest)
+		return
+	}
+	// Blocker B: reference scan + delete as one atomic decision under the
+	// exclusive side of the reference-integrity gate.
+	refScanDeleteLock()
+	defer refScanDeleteUnlock()
+	// The DELETE addresses a profile by id, but rules reference it by
+	// NAME. Resolve the name under the store lock (NameByID copies it —
+	// reading GetByID().Name outside the lock races a concurrent rename).
+	// A bad/stale id falls through to Delete's own 404 (never a spurious
+	// 409). Then block via the shared walk if any rule still references
+	// the profile — deleting a referenced profile was fail-open for the
+	// file-control dimension.
+	// NOTE: this closes DELETE only. A profile RENAME still dangles every
+	// rule holding the old name (profiles are id-keyed with a mutable
+	// name) — an open fail-open the object-ID work (P3) closes; see
+	// roadmap/POLICY-REFS-PLAN.md.
+	if profName, ok := globalProfileStore.NameByID(id); ok {
+		if deleteBlockedByReferences(w, r, "file-profile", profName, "fileprofile.delete.blocked") {
+			return
+		}
+	}
+	if err := globalProfileStore.DeleteFenced(
+		strings.TrimSpace(r.URL.Query().Get("ifRevision")), id); writeFileProfileMutationError(w, r, err, http.StatusNotFound) {
+		return
+	}
+	auditEvent(r, "fileprofile.delete", id, "")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// apiFileblockProfileUpdate is the PUT branch of apiFileblockProfiles (the
+// caller has already enforced the operator role): the
+// fenced durable update by stable id, rename detection BEFORE the update, and
+// the rename cascade onto running policy and the open draft candidate.
+func apiFileblockProfileUpdate(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		http.Error(w, "missing id param", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Name       string   `json:"name"`
+		Extensions []string `json:"extensions"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	// Rename detection BEFORE the durable update, by stable ID (2D-C §8): a
+	// true rename keeps the object ID and every referencing rule's identity;
+	// only the display name changes and cascades.
+	beforeName, existed := globalProfileStore.NameByID(id)
+	newName := strings.TrimSpace(body.Name)
+	renamed := existed && newName != "" && !strings.EqualFold(beforeName, newName)
+	if err := globalProfileStore.UpdateFenced(
+		strings.TrimSpace(r.URL.Query().Get("ifRevision")), id, body.Name, body.Extensions); writeFileProfileMutationError(w, r, err, http.StatusNotFound) {
+		return
+	}
+	detail := fmt.Sprintf("%d extensions", len(body.Extensions))
+	// Rename cascade onto RUNNING policy and the open draft candidate —
+	// same composed cross-store operation as the category-group /
+	// decryption-profile renames (2D-A §6/§7): each is a real policy
+	// mutation that must survive a restart, so both persists are
+	// error-aware; a failure after the durable object rename keeps the
+	// (correct) in-memory cascade, is surfaced as a truthful 500 — never a
+	// 2xx over a known-failed durable domain — and converges at the next
+	// restart via reconcileObjectRefNames.
+	var cascadeErr error
+	if renamed {
+		cascadeErr = cascadeFileProfileRenameDurable(id, beforeName, newName)
+		detail += ", renamed from " + sanitizeLog(beforeName)
+	}
+	if cascadeErr != nil {
+		auditEvent(r, "fileprofile.update", newName,
+			detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error())
+		writeRenameCascadePersistFailure(w, "file profile", cascadeErr)
+		return
+	}
+	auditEvent(r, "fileprofile.update", body.Name, detail)
+	jsonOK(w, map[string]any{"ok": true, "revision": globalProfileStore.Revision()})
 }
 
 func apiSecScanStatus(w http.ResponseWriter, r *http.Request) {
@@ -638,17 +803,49 @@ func apiDomainAllowlist(w http.ResponseWriter, r *http.Request) {
 		if list == nil {
 			list = []string{}
 		}
-		jsonOK(w, map[string]any{"domains": list})
+		contentSecGETPause("allowlist")
+		// Revision derived from the SAME snapshot returned (2E-A-2 §1) — a
+		// second store read could interleave with a writer and mint a token
+		// for a state this response does not show.
+		jsonOK(w, map[string]any{
+			"domains":  list,
+			"revision": domainAllowlistRevisionOf(list),
+			// 2E-A-2 §4: the allowlist is CLUSTER-SYNCED (config_surfaces
+			// threat_domain_allowlist — captured by CurrentConfigSnapshot,
+			// applied by the DP snapshot path), so on a managed DP the CP is
+			// the single writer. The established ownership signal (F3a-2).
+			"editable": !isManagedDataPlane(),
+		})
 	case http.MethodPut:
 		if !requireRole(w, r, RoleAdmin) {
 			return
 		}
+		// 2E-A-2 §4: refused BEFORE mutation on a managed DP (established
+		// F3a-2 posture) — the DP snapshot apply path is this surface's only
+		// writer there, and a local edit would be silently overwritten on the
+		// next sync or diverge the node from the fleet.
+		if isManagedDataPlane() {
+			http.Error(w, "threat-feed domain allowlist is control-plane managed on this data-plane node", http.StatusConflict)
+			return
+		}
 		var body struct {
-			Domains []string `json:"domains"`
+			Domains    []string `json:"domains"`
+			IfRevision string   `json:"ifRevision"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
+		}
+		// 2E-A stale-writer fence (see ui_security_fence.go): the compare and
+		// the replace are one serialized section, so two racing fenced admins
+		// cannot both pass. An absent fence keeps the legacy contract.
+		contentSecMu.Lock()
+		defer contentSecMu.Unlock()
+		if body.IfRevision != "" {
+			if cur := domainAllowlistRevision(); cur != body.IfRevision {
+				writeContentSecRevisionConflict(w, "threat-feed domain allowlist", cur, body.IfRevision)
+				return
+			}
 		}
 		if err := globalThreatFeed.SetDomainAllowlist(body.Domains); err != nil {
 			// The allowlist is already live in memory (fail-safe apply,
@@ -667,8 +864,15 @@ func apiDomainAllowlist(w http.ResponseWriter, r *http.Request) {
 		// ui_auth.go). Without a version bump DPs keep enforcing the OLD
 		// allowlist until some unrelated admin action publishes a
 		// snapshot — the exact "unblock this false positive NOW" latency
-		// this control exists to remove. No-op when not running as CP.
-		_ = publishCurrentConfigSnapshot()
+		// this control exists to remove.
+		//
+		// 2E-A-2 §4: the publish outcome is a FACT the caller must see — a
+		// rejected publish means the fleet stays on the old allowlist while
+		// this node enforces the new one. Reported inline as the established
+		// cluster_publish_rejected response fact (saas_feed_api.go /
+		// ui_config.go import); the valid local mutation is kept per the
+		// same doctrine (the fleet keeps the last valid snapshot).
+		pubErr := publishCurrentConfigSnapshot()
 		// Closes the audit gap flagged by
 		// roadmap/DOMAIN-ALLOWLIST-ROLLBACK-CLASSIFICATION.md §3.5 and
 		// ui_routes_meta.go:291 ("no direct auditEvent observed"). The
@@ -685,9 +889,15 @@ func apiDomainAllowlist(w http.ResponseWriter, r *http.Request) {
 		// empty, dedupes via map), so the audit reflects what was actually
 		// stored — raw len(body.Domains) over-reports when clients send
 		// blanks, duplicates, or case/whitespace variants (Codex P2 on PR #284).
-		count := len(globalThreatFeed.DomainAllowlist())
+		stored := globalThreatFeed.DomainAllowlist()
+		count := len(stored)
 		auditEvent(r, "threatfeed.allowlist.update", fmt.Sprintf("%d domain(s)", count), "")
-		jsonOK(w, map[string]any{"ok": true, "count": count})
+		// Count and revision from ONE committed snapshot (2E-A-2 §1).
+		resp := map[string]any{"ok": true, "count": count, "revision": domainAllowlistRevisionOf(stored)}
+		if pubErr != nil {
+			resp["cluster_publish_rejected"] = pubErr.Error()
+		}
+		jsonOK(w, resp)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -708,6 +918,13 @@ func apiSecYARAReload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no YARA rules directory configured", http.StatusServiceUnavailable)
 		return
 	}
+	// 2E-A-2 §3: serialized with the rule CRUD (contentSecMu). LoadDir reads
+	// the rules directory OUTSIDE y.mu and installs the result under it, so an
+	// unserialized reload racing a WriteRule/DeleteRule (each of which ends in
+	// its own LoadDir) could install a STALE directory read last — a compiled
+	// rule set that silently does not match the files on disk.
+	contentSecMu.Lock()
+	defer contentSecMu.Unlock()
 	if err := globalYARA.LoadDir(dir); err != nil {
 		http.Error(w, "YARA reload failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -735,6 +952,11 @@ func apiSecYARAReload(w http.ResponseWriter, r *http.Request) {
 //
 // yaraSettingsMap returns the current YARA engine runtime config as a map
 // suitable for JSON serialisation.
+// yaraSettingsMap renders the live values. ONLY safe where the caller already
+// holds adminSettingsMu (the settings PUT precondition) — response and audit
+// sites use a coherent yaraSettingsTarget snapshot via yaraSettingsMapOf
+// instead (2E-A-2 §1: the six values are installed together under
+// adminSettingsMu, so a lock-free multi-read can observe a torn mix).
 func yaraSettingsMap() map[string]any {
 	return map[string]any{
 		"enabled":        yaraGetEnabled(),
@@ -764,15 +986,39 @@ func validateYARASettings(timeoutSecs, maxInflight int64, onTimeout, onSaturatio
 	return nil
 }
 
+// yaraSettingsTarget is the TARGET engine posture a persist-before-apply
+// settings PUT hands to saveAdminSettingsWithOverrides (2E-A).
+type yaraSettingsTarget struct {
+	Enabled       bool
+	TimeoutSecs   int64
+	MaxInflight   int64
+	OnTimeout     string
+	OnSaturation  string
+	AlertDegraded bool
+}
+
 // GET /api/security-scan/yara/settings — read YARA engine runtime config.
 // PUT /api/security-scan/yara/settings — update YARA engine runtime config.
+//
+// The PUT is persist-before-apply (2E-A durability truth): the settings file
+// records the TARGET posture first, and only a successful write applies it to
+// the live engine — a persist failure is a truthful 500 with the running
+// posture untouched. The optional ifRevision fence is evaluated inside the
+// same adminSettingsMu critical section (that mutex is this surface's writer
+// domain), so two racing fenced admins cannot both pass the compare.
 func apiSecYARASettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		if !requireRole(w, r, RoleViewer) {
 			return
 		}
-		jsonOK(w, yaraSettingsMap())
+		// One coherent posture snapshot under the writer domain; the revision
+		// fingerprints exactly the returned state (2E-A-2 §1).
+		snap := yaraSettingsSnapshot()
+		contentSecGETPause("yara-settings")
+		m := yaraSettingsMapOf(snap)
+		m["revision"] = yaraSettingsRevisionOf(snap)
+		jsonOK(w, m)
 
 	case http.MethodPut:
 		if !requireRole(w, r, RoleAdmin) {
@@ -785,6 +1031,7 @@ func apiSecYARASettings(w http.ResponseWriter, r *http.Request) {
 			OnTimeout     string `json:"on_timeout"`
 			OnSaturation  string `json:"on_saturation"`
 			AlertDegraded bool   `json:"alert_degraded"`
+			IfRevision    string `json:"ifRevision"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -794,22 +1041,55 @@ func apiSecYARASettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		prev := yaraSettingsMap()
-		yaraSetEnabled(body.Enabled)
-		yaraSetTimeoutSecs(body.TimeoutSecs)
-		yaraSetMaxInflight(body.MaxInflight)
-		yaraSetOnTimeout(body.OnTimeout)
-		yaraSetOnSaturation(body.OnSaturation)
-		yaraSetAlertDegraded(body.AlertDegraded)
-		auditEventDiff(r, "security.yara_settings", "yara_engine", "", prev, yaraSettingsMap())
-		adminSettingsSave()
+		target := yaraSettingsTarget{
+			Enabled: body.Enabled, TimeoutSecs: body.TimeoutSecs, MaxInflight: body.MaxInflight,
+			OnTimeout: body.OnTimeout, OnSaturation: body.OnSaturation, AlertDegraded: body.AlertDegraded,
+		}
+		var prev map[string]any
+		err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+			yaraSettings: &target,
+			precondition: func() error {
+				if body.IfRevision != "" {
+					if cur := yaraSettingsRevision(); cur != body.IfRevision {
+						return errContentSecRevisionConflict{current: cur, asserted: body.IfRevision}
+					}
+				}
+				prev = yaraSettingsMap()
+				return nil
+			},
+			applyOnSuccess: func() {
+				yaraSetEnabled(target.Enabled)
+				yaraSetTimeoutSecs(target.TimeoutSecs)
+				yaraSetMaxInflight(target.MaxInflight)
+				yaraSetOnTimeout(target.OnTimeout)
+				yaraSetOnSaturation(target.OnSaturation)
+				yaraSetAlertDegraded(target.AlertDegraded)
+			},
+		})
+		var conflict errContentSecRevisionConflict
+		if errors.As(err, &conflict) {
+			writeContentSecRevisionConflict(w, "YARA engine settings", conflict.current, conflict.asserted)
+			return
+		}
+		if err != nil {
+			logger.Printf("YARA: settings persist error: %v", err)
+			http.Error(w, "YARA settings could not be persisted; the live engine posture is unchanged", http.StatusInternalServerError)
+			return
+		}
+		auditEventDiff(r, "security.yara_settings", "yara_engine", "", prev, yaraSettingsMapOf(target))
 		// Intentionally NOT calling saveConfigVersion: YARA engine
 		// settings are out of the rollback surface by design (D-sec,
 		// CONFIG-VERSIONING-TRIAGE.md §4.2). Rolling back could
 		// un-harden yara_on_timeout / yara_on_saturation / yara_enabled
 		// — silently relaxing a scanner posture the operator chose to
 		// tighten.
-		jsonOK(w, yaraSettingsMap())
+		//
+		// The response is the posture THIS PUT installed (coherent by
+		// construction — never a re-read that could interleave with a
+		// concurrent writer, 2E-A-2 §1).
+		m := yaraSettingsMapOf(target)
+		m["revision"] = yaraSettingsRevisionOf(target)
+		jsonOK(w, m)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -853,8 +1133,9 @@ func apiSecYARARules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, map[string]any{
-			"name":   name,
-			"source": src,
+			"name":     name,
+			"source":   src,
+			"revision": yaraRuleRevision(src),
 		})
 
 	case http.MethodPost, http.MethodPut:
@@ -862,8 +1143,9 @@ func apiSecYARARules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Name   string `json:"name"`
-			Source string `json:"source"`
+			Name       string `json:"name"`
+			Source     string `json:"source"`
+			IfRevision string `json:"ifRevision"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&req); err != nil {
 			http.Error(w, "bad JSON body: "+err.Error(), http.StatusBadRequest)
@@ -877,6 +1159,29 @@ func apiSecYARARules(w http.ResponseWriter, r *http.Request) {
 		if req.Name == "" {
 			http.Error(w, "missing rule name", http.StatusBadRequest)
 			return
+		}
+		// 2E-A stale-writer fence: a fenced CREATE asserts the "new" sentinel
+		// (refused when the file already exists — never a silent replace of
+		// another admin's rule); a fenced UPDATE asserts the content revision
+		// of the source it edited. The compare and the write share one
+		// serialized section. An absent fence keeps the legacy contract.
+		contentSecMu.Lock()
+		defer contentSecMu.Unlock()
+		if req.IfRevision != "" {
+			cur, readErr := globalYARA.ReadRule(req.Name)
+			switch {
+			case req.IfRevision == yaraRuleCreateSentinel:
+				if readErr == nil {
+					writeContentSecRevisionConflict(w, "YARA rule "+req.Name, yaraRuleRevision(cur), req.IfRevision)
+					return
+				}
+			case readErr != nil:
+				writeContentSecRevisionConflict(w, "YARA rule "+req.Name, yaraRuleCreateSentinel, req.IfRevision)
+				return
+			case yaraRuleRevision(cur) != req.IfRevision:
+				writeContentSecRevisionConflict(w, "YARA rule "+req.Name, yaraRuleRevision(cur), req.IfRevision)
+				return
+			}
 		}
 		warnings, err := globalYARA.WriteRule(req.Name, req.Source)
 		if err != nil {
@@ -910,8 +1215,31 @@ func apiSecYARARules(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "missing rule name", http.StatusBadRequest)
 			return
 		}
+		// 2E-A-2 §3: DELETE is a destructive write and joins the same
+		// optimistic-concurrency contract as POST/PUT — an OPTIONAL
+		// ifRevision assertion (legacy callers without it keep replacement
+		// semantics; the v2 client always asserts), compared and acted on
+		// inside the same serialized rule-mutation domain. A delete reviewed
+		// against v1 must never destroy another admin's v2.
+		contentSecMu.Lock()
+		defer contentSecMu.Unlock()
+		cur, readErr := globalYARA.ReadRule(name)
+		if readErr != nil {
+			// Truthful 404: the target does not exist (it may have been
+			// deleted by another admin already).
+			http.Error(w, "rule not found: "+sanitizeLog(name), http.StatusNotFound)
+			return
+		}
+		if ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision")); ifRev != "" {
+			if curRev := yaraRuleRevision(cur); curRev != ifRev {
+				writeContentSecRevisionConflict(w, "YARA rule "+name, curRev, ifRev)
+				return
+			}
+		}
 		if err := globalYARA.DeleteRule(name); err != nil {
-			http.Error(w, "delete rule: "+err.Error(), http.StatusBadRequest)
+			// Existence was just verified, so a failure here is an I/O
+			// fault, not a client error.
+			http.Error(w, "delete rule: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		globalSecScanner.CacheClear()
@@ -985,25 +1313,47 @@ func apiSecScanExclusions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		hashes, hosts := globalScanExclusions.Lists()
+		contentSecGETPause("exclusions")
+		// Revision derived from the SAME snapshot returned (2E-A-2 §1).
 		jsonOK(w, map[string]any{
-			"hashes": hashes,
-			"hosts":  hosts,
+			"hashes":   hashes,
+			"hosts":    hosts,
+			"revision": scanExclusionsRevisionOf(hashes, hosts),
 		})
 	case http.MethodPut:
 		if !requireRole(w, r, RoleAdmin) {
 			return
 		}
 		var req struct {
-			Hashes []string `json:"hashes"`
-			Hosts  []string `json:"hosts"`
+			Hashes     []string `json:"hashes"`
+			Hosts      []string `json:"hosts"`
+			IfRevision string   `json:"ifRevision"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 			http.Error(w, "bad JSON body: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		// 2E-A stale-writer fence (ui_security_fence.go).
+		contentSecMu.Lock()
+		defer contentSecMu.Unlock()
+		if req.IfRevision != "" {
+			if cur := scanExclusionsRevision(); cur != req.IfRevision {
+				writeContentSecRevisionConflict(w, "scan exclusions", cur, req.IfRevision)
+				return
+			}
+		}
 		globalScanExclusions.Replace(req.Hashes, req.Hosts)
 		if err := globalScanExclusions.Save(); err != nil {
+			// 2E-A durability truth: the exclusions are already live in memory
+			// (fail-safe replace — the same posture as the domain allowlist),
+			// but excluded hashes/hosts SKIP scanning, so an unpersisted
+			// trust-elevation state must stay attributable and the client must
+			// not see a 200 for a change that reverts on restart.
 			logger.Printf("ScanExclusions: save error: %v", err)
+			auditEvent(r, "security.scan_exclusions.update_unpersisted",
+				fmt.Sprintf("%d hash(es), %d host(s) applied in memory; persist failed", len(req.Hashes), len(req.Hosts)), "")
+			http.Error(w, "scan exclusions applied in memory but failed to persist", http.StatusInternalServerError)
+			return
 		}
 		auditEvent(r, "security.scan_exclusions", "update", fmt.Sprintf("%d hash(es), %d host(s)", len(req.Hashes), len(req.Hosts)))
 		// Intentionally NOT calling saveConfigVersion: scan exclusions
@@ -1014,9 +1364,11 @@ func apiSecScanExclusions(w http.ResponseWriter, r *http.Request) {
 		// binary/host the operator just chose to scan. Same shape as
 		// auth.password_change.
 		hashes, hosts := globalScanExclusions.Lists()
+		// Revision from the SAME committed snapshot returned (2E-A-2 §1).
 		jsonOK(w, map[string]any{
-			"hashes": hashes,
-			"hosts":  hosts,
+			"hashes":   hashes,
+			"hosts":    hosts,
+			"revision": scanExclusionsRevisionOf(hashes, hosts),
 		})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1035,26 +1387,50 @@ func apiContentScanBypass(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleViewer) {
 			return
 		}
-		jsonOK(w, map[string]any{"hosts": dpiScanner.BypassHosts()})
+		hosts := dpiScanner.BypassHosts()
+		contentSecGETPause("dpi-bypass")
+		// Revision derived from the SAME snapshot returned (2E-A-2 §1).
+		jsonOK(w, map[string]any{"hosts": hosts, "revision": dpiBypassRevisionOf(hosts)})
 	case http.MethodPut:
 		if !requireRole(w, r, RoleAdmin) {
 			return
 		}
 		var req struct {
-			Hosts []string `json:"hosts"`
+			Hosts      []string `json:"hosts"`
+			IfRevision string   `json:"ifRevision"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&req); err != nil {
 			http.Error(w, "bad JSON body: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		// 2E-A stale-writer fence (ui_security_fence.go).
+		contentSecMu.Lock()
+		defer contentSecMu.Unlock()
+		if req.IfRevision != "" {
+			if cur := dpiBypassRevision(); cur != req.IfRevision {
+				writeContentSecRevisionConflict(w, "DPI bypass hosts", cur, req.IfRevision)
+				return
+			}
+		}
 		dpiScanner.SetBypassHosts(req.Hosts)
-		dpiScanner.Save()
+		if err := dpiScanner.Save(); err != nil {
+			// 2E-A durability truth: applied in memory (a bypass host SKIPS
+			// DPI, so the transient trust-elevation must stay attributable),
+			// never a 200 over a change that reverts on restart.
+			logger.Printf("DPI: bypass persist error: %v", err)
+			auditEvent(r, "security.dpi_bypass.update_unpersisted",
+				fmt.Sprintf("%d host(s) applied in memory; persist failed", len(req.Hosts)), "")
+			http.Error(w, "DPI bypass hosts applied in memory but failed to persist", http.StatusInternalServerError)
+			return
+		}
 		auditEvent(r, "security.dpi_bypass", "update", fmt.Sprintf("%d host(s)", len(req.Hosts)))
 		// Bypass hosts are in the rollback surface as of
 		// roadmap/SCANNER-ROLLBACK-EXTENSION-SPEC.md (configBackup
 		// .ContentScanBypassHosts); snapshot so rollback restores them.
 		saveConfigVersion(sessionAdmin(r), "security.dpi_bypass")
-		jsonOK(w, map[string]any{"hosts": dpiScanner.BypassHosts()})
+		// Revision from the SAME committed snapshot returned (2E-A-2 §1).
+		storedHosts := dpiScanner.BypassHosts()
+		jsonOK(w, map[string]any{"hosts": storedHosts, "revision": dpiBypassRevisionOf(storedHosts)})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -1071,7 +1447,9 @@ func apiScanSvcConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]interface{}{
 		"remote_enabled": globalRemoteScanner.Enabled(),
-		"remote_url":     globalRemoteScanner.URL(),
+		// Userinfo-redacted (2E-A secret boundary): an operator URL carrying
+		// embedded credentials must never echo them to a viewer surface.
+		"remote_url": redactURLUserinfo(globalRemoteScanner.URL()),
 	}
 	if globalRemoteScanner.Enabled() {
 		if err := globalRemoteScanner.Health(); err != nil {
@@ -1553,4 +1931,24 @@ func registerSecurityRoutes(mux *http.ServeMux) {
 
 	// ── GeoIP status ────────────────────────────────────────────────────
 	mux.HandleFunc("/api/geoip", apiGeoIPConfig)
+}
+
+// cascadeFileProfileRenameDurable cascades a file-profile rename onto the
+// RUNNING policy and the open draft candidate and reports the first
+// persistence failure of either domain (the in-memory cascade is kept; the
+// caller surfaces a truthful 500 and the next restart converges).
+func cascadeFileProfileRenameDurable(id, beforeName, newName string) error {
+	var cascadeErr error
+	if n := policyStore.CascadeFileProfileRename(id, beforeName, newName); n > 0 {
+		if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
+			cascadeErr = fmt.Errorf("running policy: %w", perr)
+		}
+	}
+	if derr := policyDraft.cascadeFileProfileRename(id, beforeName, newName); derr != nil {
+		if cascadeErr != nil {
+			return fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
+		}
+		return fmt.Errorf("draft candidate: %w", derr)
+	}
+	return cascadeErr
 }
