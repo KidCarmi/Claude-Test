@@ -32,6 +32,11 @@ package main
 //	recordStats      before │ 142.9  │ 275.8  │
 //	recordStats       after │ 130.0  │ 131.2  │
 //
+// Those recordStats rows are TIGHT-LOOP figures and are kept only because the
+// tsRecordResult rows beside them are the component measurement. For the
+// fan-out as a whole, read the marginal-cost table further down instead — the
+// methodology note explains why the tight-loop total is the wrong number.
+//
 // Follow-up (4-core, 2026-09): that 2.9x was real but measured only against
 // the plain mutex at ONE concurrency, and the RLock version turned out not to
 // SCALE — RLock/RUnlock are two atomic read-modify-writes on one shared word,
@@ -42,9 +47,28 @@ package main
 //	RLock+atomic    │ 35.8 ns │ 92.6 ns │ 96.8 ns │ 0.37x (cores SUBTRACTED it)
 //	sync.Map        │ 42.0 ns │ 26.1 ns │ 16.1 ns │ 2.6x
 //
-// The tsRecordResult half was re-tested in the same pass and the 2026-07
-// conclusion HELD — see the timeSeries doc comment in store.go, which records
-// the lock-free and sharded shapes that were measured and rejected.
+// The tsRecordResult half was re-tested in that same pass and the 2026-07
+// conclusion was recorded as HOLDING. It did not: the sharded shape is what
+// this file's table above measures and what store.go now ships. The two
+// findings were developed in parallel and met at a merge, so read the table
+// above and the timeSeries doc comment in store.go as the current record for
+// tsRecordResult, and this section as the current record for topHosts.
+//
+// Under the marginal-cost method below — the one this file argues for — the
+// two changes COMPOSE, and that pairing is the number a gateway actually pays.
+// BenchmarkRequestCycle, isolated processes, n=5, medians, ns of stats fan-out
+// per request (WithStats minus WithoutStats):
+//
+//	                          │ -cpu=1 │ -cpu=4 │
+//	sharded topHosts only     │  129   │  490   │  cores made it WORSE
+//	+ sharded tsRecordResult  │  111   │   87   │
+//
+// Sharding topHosts alone left the fan-out's marginal cost rising 3.8x from
+// one core to four — the ceiling simply moved to the other component. With
+// both sharded it FALLS with core count, 5.6x cheaper at four cores. The
+// contended arm's bimodality warned about below is visible in exactly the
+// arm that still has a contended component: main's 4-core WithStats spread
+// 755-784 ns across five runs, this branch's 364-371.
 //
 // A METHODOLOGY NOTE, because it changed the conclusion twice. A tight
 // recordStats loop is not the production duty cycle: with every core
