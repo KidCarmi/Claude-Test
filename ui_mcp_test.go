@@ -108,6 +108,16 @@ func TestMCP_TenantRequired(t *testing.T) {
 // is unwired so the page is empty; the assertion is that the params are accepted
 // (200), not rejected, and that tenant is still mandatory.
 func TestMCP_DecisionFilterParamsAccepted(t *testing.T) {
+	// Order-independence (test-isolation hardening), for the same reason spelled out in
+	// TestMCP_DisabledDefaults below: this test asserts the DORMANT default, where no
+	// decision source is wired and the handler answers an empty 200. A prior test that
+	// leaves telemetry published binds the process-wide admin singleton to a real
+	// EventReader, and a read against that source answers 400 — so the assertion would
+	// be measuring test order rather than the handler. Establish the precondition here
+	// rather than depend on -shuffle.
+	publishMCPTelemetry(mcpTelemNotConfigured, "", nil)
+	resetMCPAdminSingleton()
+	t.Cleanup(resetMCPAdminSingleton)
 	q := "/api/mcp/decisions?tenant=acme&client_id=app-desktop&tool_fingerprint=fp-1&execution_state=executed&policy_snapshot_hash=sha256:ab&credential_profile_ref=cp-1&server_id=s1&tool_name=t1&principal_id=u&agent_id=a1&rule_id=R1&reason_code=x&action=DENY"
 	if got := mcpReq(http.MethodGet, q, RoleViewer, "").Code; got != http.StatusOK {
 		t.Fatalf("decisions with additive filters = %d, want 200", got)
@@ -124,6 +134,14 @@ func TestMCP_DecisionFilterParamsAccepted(t *testing.T) {
 // inventory/decision sources are wired (empty results), and durable
 // approval/publication commit fails closed rather than fabricating evidence.
 func TestMCP_DisabledDefaults(t *testing.T) {
+	// Order-independence (test-isolation hardening): this test asserts the DORMANT default, so it must
+	// establish that precondition itself rather than depend on -shuffle order. A prior test may have
+	// published inventory/telemetry and eagerly built the process-wide admin singleton with sources
+	// wired; un-publish them and reset the singleton so getMCPAdmin() rebuilds against the nil sources.
+	publishMCPInventory(mcpInvNotConfigured, "", nil, nil)
+	publishMCPTelemetry(mcpTelemNotConfigured, "", nil)
+	resetMCPAdminSingleton()
+	t.Cleanup(resetMCPAdminSingleton)
 	m := getMCPAdmin()
 	if m.svc.Inventory != nil || m.svc.Decisions != nil {
 		t.Fatal("disabled default must not wire inventory/decision sources")

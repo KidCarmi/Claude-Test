@@ -91,7 +91,8 @@ delta, and the two TLS probes. Every scenario's full admin-API request/response 
 
 ## 3. Isolation model
 
-Culvert hardcodes `dataDir = /data` (no `-data-dir` flag), so filesystem isolation is achieved
+Culvert's persisted-state root defaults to `/data` (overridable only by the startup-scoped
+`CULVERT_DATA_DIR` env, no `-data-dir` flag), so filesystem isolation is achieved
 by **wiping `/data` and restarting the process before every scenario**. This guarantees:
 * no policy/object/config leakage across scenarios,
 * no shared cert-cache / adaptive-decryption auto-learn / session reuse,

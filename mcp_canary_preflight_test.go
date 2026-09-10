@@ -153,7 +153,8 @@ func TestCanaryActivationPreflight_WiresScopeApprovalBudget(t *testing.T) {
 // rehearsal evidence as one consistent snapshot under durableMu (no torn read of an in-flight
 // rehearsal). The concurrent half is a race-detector gate.
 func TestRollbackPathHealthy_DurableRehearsalAndRace(t *testing.T) {
-	_ = getMCPRollout() // fire the sync.Once before swapping
+	pinTestBuildVersion(t) // a valid rehearsal record requires a non-placeholder build stamp
+	_ = getMCPRollout()    // fire the sync.Once before swapping
 	prevR := globalMCPRollout
 	globalMCPRollout = &mcpRollout{
 		gateway:    rollout.NewState(rollout.CapabilityGateway, rollout.DefaultLimits()),
@@ -192,6 +193,7 @@ func TestRollbackPathHealthy_DurableRehearsalAndRace(t *testing.T) {
 // rehearsal clears a prior write_failed persistence status, so the rollback path is not stuck
 // reporting unhealthy forever after one transient write failure.
 func TestRollbackPathHealthy_ClearsStaleWriteFailed(t *testing.T) {
+	pinTestBuildVersion(t) // a valid rehearsal record requires a non-placeholder build stamp
 	_ = getMCPRollout()
 	prevR := globalMCPRollout
 	globalMCPRollout = &mcpRollout{
@@ -215,6 +217,75 @@ func TestRollbackPathHealthy_ClearsStaleWriteFailed(t *testing.T) {
 	}
 	if !rollbackPathHealthy(capb) {
 		t.Fatal("rollback path must be healthy after a durable rehearsal cleared the stale failure")
+	}
+}
+
+// TestCanaryRollbackCoordinatorRehearsal_OpenPrerequisiteBlocksReadiness is the owner-directed proof
+// for finding CANARY-ROLLBACK-COORDINATOR-REHEARSAL: the executable persist/restore rehearsal proves
+// rollback MECHANICS only, so a node that has satisfied EVERY OTHER node prerequisite — including the
+// mechanics rehearsal (rollback_path_healthy) — is STILL not Canary-ready while the authoritative
+// coordinator-routed rollback rehearsal is OPEN. No transition can become READY merely because the
+// mechanics rehearsal passed; it fails closed with rollback_coordinator_rehearsal_pending.
+func TestCanaryRollbackCoordinatorRehearsal_OpenPrerequisiteBlocksReadiness(t *testing.T) {
+	withTempDataDir(t)
+	withCanaryReadyNode(t) // arms EVERYTHING, including the coordinator-rehearsal seam
+	// Sanity (non-vacuity): with the seam armed the node IS Canary-ready.
+	if rd := evaluateCanaryNodeReadiness(rollout.CapabilityGateway); !rd.Ready {
+		t.Fatalf("precondition: a fully-armed node must be node-ready, unmet=%v", rd.Unmet)
+	}
+	// Now restore the PRODUCTION posture for the coordinator-rehearsal seam only — the authoritative
+	// rollback rehearsal is OPEN. Everything else (incl. the mechanics rehearsal) stays satisfied.
+	prev := coordinatorRollbackRehearsedFn
+	coordinatorRollbackRehearsedFn = productionCoordinatorRollbackRehearsed
+	t.Cleanup(func() { coordinatorRollbackRehearsedFn = prev })
+
+	rd := evaluateCanaryNodeReadiness(rollout.CapabilityGateway)
+	if rd.Ready {
+		t.Fatal("SECURITY: a node whose MECHANICS rehearsal passed must NOT be Canary-ready while the authoritative coordinator-routed rehearsal is open")
+	}
+	if !canaryUnmetHas(rd, canary.ReasonRollbackCoordinatorRehearsalPending) {
+		t.Fatalf("the open prerequisite must surface rollback_coordinator_rehearsal_pending, got %v", rd.Unmet)
+	}
+	// The mechanics rehearsal stays satisfied — proving this is a SEPARATE hard prerequisite, not a
+	// regression of rollback_path_healthy.
+	if canaryUnmetHas(rd, canary.ReasonRollbackPathUnhealthy) {
+		t.Fatalf("rollback_path_healthy (mechanics) must remain satisfied; the sole rollback block is the coordinator rehearsal, got %v", rd.Unmet)
+	}
+}
+
+// TestCanaryRollbackCoordinatorRehearsal_ProductionFailsClosed proves the production seam certifies the
+// authoritative rollback rehearsal ONLY from durable coordinator-routed evidence: with no such evidence
+// (a fresh node — the shipped default, where no coordinator drill has run) it returns false for every
+// capability, so the mechanics rehearsal can never substitute for it. Both the locked and locking
+// accessors agree.
+func TestCanaryRollbackCoordinatorRehearsal_ProductionFailsClosed(t *testing.T) {
+	withTempDataDir(t) // no coordinator-rehearsal record on disk
+	_ = getMCPRollout()
+	prevR := globalMCPRollout
+	globalMCPRollout = &mcpRollout{
+		gateway:    rollout.NewState(rollout.CapabilityGateway, rollout.DefaultLimits()),
+		management: rollout.NewState(rollout.CapabilityManagement, rollout.DefaultLimits()),
+	}
+	t.Cleanup(func() { globalMCPRollout = prevR })
+	for _, capb := range []rollout.Capability{rollout.CapabilityGateway, rollout.CapabilityManagement} {
+		if productionCoordinatorRollbackRehearsed(globalMCPRollout, capb, false) {
+			t.Fatalf("production (locking) must not certify the rehearsal for %s with no durable evidence", capb)
+		}
+		if productionCoordinatorRollbackRehearsed(globalMCPRollout, capb, true) {
+			t.Fatalf("production (locked) must not certify the rehearsal for %s with no durable evidence", capb)
+		}
+	}
+	// The node dry-run must advertise the prerequisite in its full vocabulary even when everything is unmet.
+	all := canary.AllReasons()
+	found := false
+	for _, r := range all {
+		if r == canary.ReasonRollbackCoordinatorRehearsalPending {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("rollback_coordinator_rehearsal_pending must be in the advertised prerequisite vocabulary")
 	}
 }
 
