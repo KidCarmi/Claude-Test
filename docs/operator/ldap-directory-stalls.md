@@ -8,13 +8,13 @@ Culvert's identity backends already had a posture for a directory that is
 **down**: fail closed, arm a short provider-wide cooldown, deny without dialing,
 and clear the moment the directory answers again (CHAOS-47). This page is about
 the other fault — the directory that is **up enough to accept your connection
-and then stops answering** — and what CHAOS-57 changed about it.
+and then stops answering** — and what CHAOS-58 changed about it.
 
 ---
 
 ## The two faults, and why they behaved differently
 
-| Fault | What the directory does | Before CHAOS-57 | Now |
+| Fault | What the directory does | Before CHAOS-58 | Now |
 |---|---|---|---|
 | **Down** | Refuses the connection, or DNS fails | Detected on the first request, cooldown arms, subsequent requests denied without a dial | Unchanged |
 | **Stalled** | Completes the TCP handshake, then goes silent | **Never detected.** The request goroutine blocked forever | Bounded at 10 s, then treated exactly like *down* |

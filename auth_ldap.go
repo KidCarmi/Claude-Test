@@ -29,7 +29,7 @@ func ldapTLSConfig(rawURL string, skipVerify bool) *tls.Config {
 	return cfg
 }
 
-// ── Directory round-trip bounds (CHAOS-57) ───────────────────────────────────
+// ── Directory round-trip bounds (CHAOS-58) ───────────────────────────────────
 //
 // ldapRoundTripBudget bounds ONE directory round trip END TO END — dial,
 // optional StartTLS, service bind, search, user bind — as a single envelope
@@ -68,7 +68,7 @@ const ldapCloseTimeout = time.Second
 // `tls.Conn.Handshake()` that `Conn.StartTLS` runs on the RAW socket, outside
 // the message loop. A directory that ACKs StartTLS and then never negotiates
 // TLS therefore hangs forever with SetTimeout armed — proven directly against
-// the library by TestChaos57_SetTimeoutDoesNotBoundStartTLSHandshake, so a
+// the library by TestChaos58_SetTimeoutDoesNotBoundStartTLSHandshake, so a
 // go-ldap upgrade that changed this would fail the build rather than silently
 // leave the backstop guarding nothing.
 //
@@ -396,7 +396,7 @@ func (a *LDAPAuth) noteVerifyError(err error) {
 // dialBounded dials the directory and arms BOTH round-trip bounds, returning
 // the connection and the watchdog canceller (which the caller must defer).
 //
-// The whole round trip runs under ONE envelope (CHAOS-57). A directory that
+// The whole round trip runs under ONE envelope (CHAOS-58). A directory that
 // ACCEPTS the connection and then stops answering — an overloaded server, a
 // firewall that drops after the handshake, a half-open socket after a peer
 // reboot — used to block in the REQUEST goroutine, forever: go-ldap's default

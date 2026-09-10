@@ -13,7 +13,7 @@ import (
 	ldap "github.com/go-ldap/ldap/v3"
 )
 
-// CHAOS-57 — the directory that ACCEPTS and then STOPS ANSWERING.
+// CHAOS-58 — the directory that ACCEPTS and then STOPS ANSWERING.
 //
 // CHAOS-47 gave the identity backends a fail-closed posture and a provider-wide
 // cooldown so a DOWN directory costs one probe per cooldown instead of a full
@@ -162,7 +162,7 @@ func verifyWithin(t *testing.T, a *LDAPAuth, limit time.Duration) (bool, time.Du
 // A directory that accepts and then goes silent must not hold the request
 // goroutine. Verified failing against the pre-fix tree, where Verify was still
 // blocked when the test gave up.
-func TestChaos57_StalledDirectoryReleasesTheRequestGoroutine(t *testing.T) {
+func TestChaos58_StalledDirectoryReleasesTheRequestGoroutine(t *testing.T) {
 	withLDAPBudget(t, 1500*time.Millisecond)
 	resetAuthBackendHealthForTest()
 	t.Cleanup(resetAuthBackendHealthForTest)
@@ -182,7 +182,7 @@ func TestChaos57_StalledDirectoryReleasesTheRequestGoroutine(t *testing.T) {
 // never returned, CHAOS-47's provider-wide cooldown could never arm. The
 // mitigation designed for an unreachable directory was structurally blind to
 // the fault class that hangs. Bounding the round trip is what makes it visible.
-func TestChaos57_StalledDirectoryArmsTheUnreachableCooldown(t *testing.T) {
+func TestChaos58_StalledDirectoryArmsTheUnreachableCooldown(t *testing.T) {
 	withLDAPBudget(t, 1500*time.Millisecond)
 	resetAuthBackendHealthForTest()
 	t.Cleanup(resetAuthBackendHealthForTest)
@@ -202,7 +202,7 @@ func TestChaos57_StalledDirectoryArmsTheUnreachableCooldown(t *testing.T) {
 // Once armed, the cooldown must deny WITHOUT dialing — otherwise a stalled
 // directory still costs a full budget per request. This is what turns an
 // unbounded leak into a bounded, self-limiting outage.
-func TestChaos57_ArmedCooldownDeniesAStalledDirectoryWithoutDialing(t *testing.T) {
+func TestChaos58_ArmedCooldownDeniesAStalledDirectoryWithoutDialing(t *testing.T) {
 	withLDAPBudget(t, 1500*time.Millisecond)
 	resetAuthBackendHealthForTest()
 	t.Cleanup(resetAuthBackendHealthForTest)
@@ -226,7 +226,7 @@ func TestChaos57_ArmedCooldownDeniesAStalledDirectoryWithoutDialing(t *testing.T
 // The StartTLS handshake is the fault the per-message timer cannot reach, so
 // this gate is what proves the second layer (the connection watchdog) is
 // load-bearing. Remove armLDAPConnWatchdog and this test hangs.
-func TestChaos57_StartTLSHandshakeStallIsBounded(t *testing.T) {
+func TestChaos58_StartTLSHandshakeStallIsBounded(t *testing.T) {
 	withLDAPBudget(t, 1500*time.Millisecond)
 	resetAuthBackendHealthForTest()
 	t.Cleanup(resetAuthBackendHealthForTest)
@@ -246,7 +246,7 @@ func TestChaos57_StartTLSHandshakeStallIsBounded(t *testing.T) {
 // per-message timeout, which is exactly why the gap was easy to miss: the one
 // stage that timer cannot bound is the one this endpoint runs on demand against
 // an admin-supplied address.
-func TestChaos57_AdminDirectoryTestIsBoundedOnAStartTLSStall(t *testing.T) {
+func TestChaos58_AdminDirectoryTestIsBoundedOnAStartTLSStall(t *testing.T) {
 	prev := ldapTestTotalBudget
 	ldapTestTotalBudget = 1500 * time.Millisecond
 	t.Cleanup(func() { ldapTestTotalBudget = prev })
@@ -276,7 +276,7 @@ func TestChaos57_AdminDirectoryTestIsBoundedOnAStartTLSStall(t *testing.T) {
 // Concurrency is where the pre-fix behaviour became an outage rather than a
 // slow request: N authenticating clients meant N permanently blocked
 // goroutines and N leaked sockets. The bound has to reclaim all of them.
-func TestChaos57_ConcurrentStallsDoNotAccumulateGoroutines(t *testing.T) {
+func TestChaos58_ConcurrentStallsDoNotAccumulateGoroutines(t *testing.T) {
 	withLDAPBudget(t, 1500*time.Millisecond)
 	resetAuthBackendHealthForTest()
 	t.Cleanup(resetAuthBackendHealthForTest)
@@ -332,7 +332,7 @@ func TestChaos57_ConcurrentStallsDoNotAccumulateGoroutines(t *testing.T) {
 // because of it, so if a future go-ldap release fixes this, the build says so
 // rather than leaving a backstop that silently guards nothing — the same role
 // BareGracefulStopIsUnboundedOnAWedgedStream plays for CHAOS-56.
-func TestChaos57_SetTimeoutDoesNotBoundStartTLSHandshake(t *testing.T) {
+func TestChaos58_SetTimeoutDoesNotBoundStartTLSHandshake(t *testing.T) {
 	url := startTLSAckThenStallDirectory(t)
 	conn, err := ldap.DialURL(url, ldap.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}))
 	if err != nil {
@@ -393,7 +393,7 @@ func promptDirectory(t *testing.T) string {
 // or armed the cooldown on one, would pass every defect gate above while
 // denying valid credentials against a working directory — strictly worse than
 // the defect it replaced.
-func TestChaos57_PromptDirectoryIsNeitherClippedNorGated(t *testing.T) {
+func TestChaos58_PromptDirectoryIsNeitherClippedNorGated(t *testing.T) {
 	withLDAPBudget(t, 3*time.Second)
 	resetAuthBackendHealthForTest()
 	t.Cleanup(resetAuthBackendHealthForTest)
@@ -418,7 +418,7 @@ func TestChaos57_PromptDirectoryIsNeitherClippedNorGated(t *testing.T) {
 
 // The watchdog must not close a connection whose operations completed. If it
 // did, the gates above would pass while every real authentication broke.
-func TestChaos57_WatchdogStopsWhenTheRoundTripCompletes(t *testing.T) {
+func TestChaos58_WatchdogStopsWhenTheRoundTripCompletes(t *testing.T) {
 	url := blackHoleDirectory(t)
 	conn, err := ldap.DialURL(url, ldap.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}))
 	if err != nil {

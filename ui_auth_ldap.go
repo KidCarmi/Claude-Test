@@ -192,7 +192,7 @@ const (
 	ldapTestMaxGroupSample = 8
 )
 
-// ldapTestTotalBudget is the whole-test envelope (CHAOS-57). ldapTestOpTimeout
+// ldapTestTotalBudget is the whole-test envelope (CHAOS-58). ldapTestOpTimeout
 // bounds each LDAP MESSAGE round trip, but go-ldap runs the post-StartTLS
 // tls.Handshake() on the raw socket outside its request timer, so a directory
 // that ACKs StartTLS and then never negotiates TLS hangs with SetTimeout armed.
@@ -359,7 +359,7 @@ func runLDAPDirectoryTest(pc *LDAPProfileConfig, testUsername, testPassword stri
 // It returns the connection AND the canceller for the whole-test watchdog; the
 // caller must defer the canceller. The watchdog is armed here rather than in
 // runLDAPDirectoryTest because the StartTLS stage — the one stage no per-message
-// timer can bound — runs inside this function (CHAOS-57).
+// timer can bound — runs inside this function (CHAOS-58).
 func ldapTestConnect(rep *ldapTestReport, pc *LDAPProfileConfig) (*ldap.Conn, func(), bool) {
 	isLDAPS := strings.HasPrefix(strings.ToLower(pc.URL), "ldaps://")
 	tlsCfg := ldapTLSConfig(pc.URL, pc.TLSSkipVerify)
@@ -378,7 +378,7 @@ func ldapTestConnect(rep *ldapTestReport, pc *LDAPProfileConfig) (*ldap.Conn, fu
 	}
 	conn.SetTimeout(ldapTestOpTimeout)
 	// Armed BEFORE StartTLS: the handshake below is the one stage SetTimeout
-	// cannot bound (CHAOS-57, armLDAPConnWatchdog).
+	// cannot bound (CHAOS-58, armLDAPConnWatchdog).
 	stopWatchdog := armLDAPConnWatchdog(conn, ldapTestTotalBudget, "ldap-directory-test")
 	rep.Steps = append(rep.Steps, ldapTestStep{Name: "reachable", Label: "Server reachable", OK: true, DurationMs: durMs})
 

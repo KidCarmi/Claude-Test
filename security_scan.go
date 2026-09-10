@@ -290,8 +290,13 @@ func secScanStatusMap() map[string]interface{} {
 			m["scan_svc_url"] = redactURLUserinfo(globalRemoteScanner.URL())
 			m["scan_svc_degraded"] = false
 		} else {
-			m["scan_svc_status"] = fmt.Sprintf("unreachable: %v", err)
+			// BOUNDED class only — see apiScanSvcConfig: the raw error can
+			// carry the configured URL's userinfo onto this viewer surface.
+			reason := secscan.ProbeFailureReason(err)
+			m["scan_svc_status"] = "unreachable: " + reason
 			m["scan_svc_degraded"] = true
+			logger.Printf("ScanSvc: status probe failed for %q: reason=%s",
+				sanitizeLog(redactURLUserinfo(globalRemoteScanner.URL())), sanitizeLog(reason))
 		}
 		// Always include local threat feed stats (feeds run locally even with remote scanning).
 		feedTotal, feedLastSync, feedInterval := globalThreatFeed.Stats()
