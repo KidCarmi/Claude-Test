@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -105,13 +106,6 @@ func (c *policyDraftCoordinator) active() bool {
 	return c.state.Active
 }
 
-// snapshotState returns a copy of the draft metadata.
-func (c *policyDraftCoordinator) snapshotState() draftState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state
-}
-
 // stageTarget returns the candidate store for a policy WRITE, opening the draft
 // (seeding it from running) on the first write of a new draft. Only called when
 // RequireCommit is on.
@@ -119,17 +113,28 @@ func (c *policyDraftCoordinator) stageTarget(actor string) *PolicyStore {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.state.Active {
-		// Fork the candidate from the current running rulebase.
-		baseGen, _ := policyStore.policyVersion()
-		c.cand.ReplaceAll(policyStore.List())
-		c.state = draftState{
-			Active:         true,
-			Actor:          actor,
-			StartedAt:      time.Now().UTC().Format(time.RFC3339),
-			BaseGeneration: baseGen,
-		}
+		c.openDraftLocked(actor)
 	}
 	return c.cand
+}
+
+// openDraftLocked forks the candidate from the current running rulebase.
+// Caller holds c.mu. The candidate's generation counter is SEEDED from the
+// running generation (2B.0a version-stream continuity): the first staged
+// mutation lands at baseGen+1, so a second writer still holding the pre-fork
+// running token baseGen conflicts deterministically instead of colliding with
+// a candidate counter that restarted from zero (running v2 vs a fork+add
+// landing the old candidate counter at exactly 2 used to pass the fence).
+func (c *policyDraftCoordinator) openDraftLocked(actor string) {
+	baseGen, baseUpdated := policyStore.policyVersion()
+	c.cand.ReplaceAll(policyStore.List())
+	c.cand.seedVersion(baseGen, baseUpdated)
+	c.state = draftState{
+		Active:         true,
+		Actor:          actor,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339),
+		BaseGeneration: baseGen,
+	}
 }
 
 // candidateList / candidateVersion expose the candidate for the effective-read
@@ -292,14 +297,7 @@ func (c *policyDraftCoordinator) stageDurableAppendLocked(actor string, expected
 	}
 	opened := false
 	if !c.state.Active {
-		baseGen, _ := policyStore.policyVersion()
-		c.cand.ReplaceAll(policyStore.List())
-		c.state = draftState{
-			Active:         true,
-			Actor:          actor,
-			StartedAt:      time.Now().UTC().Format(time.RFC3339),
-			BaseGeneration: baseGen,
-		}
+		c.openDraftLocked(actor)
 		opened = true
 	}
 	added := c.cand.Add(rule)
@@ -497,7 +495,13 @@ func (c *policyDraftCoordinator) commitActivate(ifVersion *int64) (policyDraftDi
 	// home). On persist failure the in-memory activation is reverted and the
 	// draft retained, so the operator can retry once the volume recovers.
 	prevRunning := policyStore.List()
+	candVer, _ := c.cand.policyVersion()
 	policyStore.ReplaceAll(cand)
+	// Candidate retirement (2B.0a): advance running strictly past every
+	// generation the candidate exposed, so a stale candidate-era ifVersion
+	// token can never numerically collide with a later running generation.
+	// Runs BEFORE SaveErr so the persisted .meta carries the final version.
+	policyStore.ensureVersionAbove(candVer)
 	if err := policyStore.SaveErr(); err != nil && errors.Is(err, fileutil.ErrReplacedNotSynced) {
 		// Post-rename failure (Codex fix): the policy file already CARRIES the
 		// candidate — rolling back memory would contradict the visible file
@@ -543,11 +547,19 @@ func (c *policyDraftCoordinator) clearLocked() string {
 	return c.path
 }
 
-// clear discards the candidate and marks the draft inactive.
+// clear discards the candidate and marks the draft inactive (the revert path).
+// Candidate retirement (2B.0a): running's generation is advanced past every
+// generation the discarded candidate exposed, so a client still holding a
+// stale candidate-era ifVersion token conflicts instead of numerically
+// colliding with a later running generation. The .meta sidecar is refreshed so
+// the advanced counter survives a restart.
 func (c *policyDraftCoordinator) clear() {
 	c.mu.Lock()
+	candVer, _ := c.cand.policyVersion()
 	path := c.clearLocked()
+	policyStore.ensureVersionAbove(candVer)
 	c.mu.Unlock()
+	policyStore.saveMeta()
 	if path != "" {
 		_ = os.Remove(path)
 	}
@@ -557,65 +569,72 @@ func (c *policyDraftCoordinator) clear() {
 // onto the open candidate so a profile rename keeps the DRAFT's denormalized names
 // honest too — otherwise a rename during an active draft would refresh running but
 // leave the candidate carrying stale names that a later commit would write back.
-// No-op when no draft is open. Persists only when a rule was actually touched.
-// Lock order c.mu → PolicyStore.mu (as in stageTarget); persist() takes c.mu
-// itself, so it runs after the unlock.
-func (c *policyDraftCoordinator) cascadeDecryptionProfileRename(id, oldName, newName string) {
+// No-op when no draft is open. Persists only when a rule was actually touched —
+// DURABLY (2D-A rename hardening): the persist runs under the SAME c.mu as the
+// cascade (persistLocked) and its failure is RETURNED so the rename handler can
+// refuse a 2xx while a required durable domain is known-failed. The in-memory
+// candidate keeps the cascaded (correct) names either way; boot reconciliation
+// (reconcileObjectRefNames) converges the durable copy at the next restart.
+// Lock order c.mu → PolicyStore.mu (as in stageTarget).
+func (c *policyDraftCoordinator) cascadeDecryptionProfileRename(id, oldName, newName string) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.state.Active {
-		c.mu.Unlock()
-		return
+		return nil
 	}
-	n := c.cand.CascadeDecryptionProfileRename(id, oldName, newName)
-	c.mu.Unlock()
-	if n > 0 {
-		c.persist()
+	if n := c.cand.CascadeDecryptionProfileRename(id, oldName, newName); n == 0 {
+		return nil
 	}
+	return c.persistLocked()
 }
 
 // cascadeDestCategoryGroupRename mirrors PolicyStore.CascadeDestCategoryGroupRename
 // onto the open candidate (references-by-id S2), so a group rename keeps the
-// DRAFT's denormalized names honest too. No-op when no draft is open; persists
-// only when a rule was actually touched. Lock order c.mu → PolicyStore.mu.
-func (c *policyDraftCoordinator) cascadeDestCategoryGroupRename(id, oldName, newName string) {
+// DRAFT's denormalized names honest too. Same durable contract as
+// cascadeDecryptionProfileRename above. Lock order c.mu → PolicyStore.mu.
+func (c *policyDraftCoordinator) cascadeDestCategoryGroupRename(id, oldName, newName string) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.state.Active {
-		c.mu.Unlock()
-		return
+		return nil
 	}
-	n := c.cand.CascadeDestCategoryGroupRename(id, oldName, newName)
-	c.mu.Unlock()
-	if n > 0 {
-		c.persist()
+	if n := c.cand.CascadeDestCategoryGroupRename(id, oldName, newName); n == 0 {
+		return nil
 	}
+	return c.persistLocked()
 }
 
-// reconcile auto-discards the draft when its candidate has become identical to
-// running — i.e. the last edit was a NO-OP (re-save with no change, drag-in-place,
-// bulk-delete of absent priorities) or FAILED (TOCTOU mutation returned false
-// after the draft was opened). Without this, such an edit would leave a
-// zero-diff "active" draft that blocks commit-mode disarm and makes reads render
-// the (identical) candidate — undermining the byte-identical-when-nothing-changed
-// promise. A draft carrying REAL prior staged changes is never cleared (its diff
-// is non-zero). Returns true if it cleared. No-op (returns false) when no draft
-// is open, so callers can invoke it unconditionally, including in live-write mode.
-func (c *policyDraftCoordinator) reconcile() bool {
+// cascadeFileProfileRename mirrors PolicyStore.CascadeFileProfileRename onto
+// the open candidate (2D-C references-by-id), so a file-profile rename keeps
+// the DRAFT's denormalized names honest too. Same durable contract as
+// cascadeDecryptionProfileRename above. Lock order c.mu → PolicyStore.mu.
+func (c *policyDraftCoordinator) cascadeFileProfileRename(id, oldName, newName string) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.state.Active {
-		c.mu.Unlock()
-		return false
+		return nil
 	}
-	// Compare under c.mu (lock order c.mu → PolicyStore.mu, as in stageTarget).
-	if !sameRuleSet(policyStore.List(), c.cand.List()) {
-		c.mu.Unlock()
-		return false
+	if n := c.cand.CascadeFileProfileRename(id, oldName, newName); n == 0 {
+		return nil
 	}
-	path := c.clearLocked()
-	c.mu.Unlock()
-	if path != "" {
-		_ = os.Remove(path)
+	return c.persistLocked()
+}
+
+// refreshObjectRefNames mirrors PolicyStore.RefreshObjectRefNames onto the open
+// candidate (boot reconciliation for the 2D-A rename model). Returns the number
+// of candidate rules touched plus the persist outcome; (0, nil) when no draft
+// is open or nothing was stale. Lock order c.mu → PolicyStore.mu.
+func (c *policyDraftCoordinator) refreshObjectRefNames(groupNames, profileNames, fileProfileNames map[string]string) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.state.Active {
+		return 0, nil
 	}
-	return true
+	n := c.cand.RefreshObjectRefNames(groupNames, profileNames, fileProfileNames)
+	if n == 0 {
+		return 0, nil
+	}
+	return n, c.persistLocked()
 }
 
 // sameRuleSet reports whether two rule sets are content-identical (by stable ID,
@@ -648,6 +667,46 @@ func (c *policyDraftCoordinator) baseGenerationStale() bool {
 	return cur != base
 }
 
+// draftReviewSnapshot is ONE coherent capture of everything GET
+// /api/policy/draft renders (§§10–12 draft-review correction): draft
+// metadata, the candidate rules WITH the version that identifies exactly
+// them, the running baseline, and the baseStale verdict — all under one
+// coordinator lock. The previous handler assembled state, diff, candidate
+// version, shadows, and baseStale from independent reads, so a staged edit
+// landing mid-assembly let an operator review the diff of candidate
+// generation C(N) while receiving commit token N+1 — the token then
+// committed a candidate containing a rule the operator never saw, and the
+// ?ifVersion= fence (whose whole job is "commit exactly what was reviewed")
+// was structurally bypassed. Diff, pendingCount, and shadows are derived
+// FROM the captured slices by pure functions, never from a second live read.
+// Lock order c.mu → PolicyStore.mu (the stageTarget convention); each store
+// pair is itself one SnapshotWithVersion read.
+type draftReviewSnapshot struct {
+	RequireCommit bool
+	State         draftState
+	Candidate     PolicyStoreSnapshot // valid only when State.Active
+	Running       PolicyStoreSnapshot
+	BaseStale     bool // Running.Version != State.BaseGeneration; only while active
+}
+
+// reviewSnapshot captures the coherent draft-review state. The diff/shadow
+// derivations are left to the caller (pure functions over the captured
+// slices) so the lock hold stays a capture, not a computation.
+func (c *policyDraftCoordinator) reviewSnapshot() draftReviewSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := draftReviewSnapshot{
+		RequireCommit: requireCommitEnabled(),
+		State:         c.state,
+		Running:       policyStore.SnapshotWithVersion(),
+	}
+	if c.state.Active {
+		s.Candidate = c.cand.SnapshotWithVersion()
+		s.BaseStale = s.Running.Version != c.state.BaseGeneration
+	}
+	return s
+}
+
 // policyDraftDiff summarizes the candidate against running (by stable ID).
 type policyDraftDiff struct {
 	Added    []string `json:"added"`    // rule names present in candidate, not running
@@ -661,8 +720,14 @@ func (d policyDraftDiff) total() int { return len(d.Added) + len(d.Removed) + le
 // (backfilled on load, so always present); content equality via JSON so every
 // field participates without a hand-maintained comparator.
 func (c *policyDraftCoordinator) diffVsRunning() policyDraftDiff {
-	run := policyStore.List()
-	cand := c.candidateList()
+	return diffRuleSets(policyStore.List(), c.candidateList())
+}
+
+// diffRuleSets is the PURE candidate-vs-running comparator over two
+// already-captured rule lists, so a coherent reader (reviewSnapshot) can
+// derive the diff from exactly the slices its version fence identifies
+// instead of re-reading live stores (§§10–11).
+func diffRuleSets(run, cand []PolicyRule) policyDraftDiff {
 	runByID := make(map[string]PolicyRule, len(run))
 	for i := range run {
 		runByID[run[i].ID] = run[i]
@@ -706,6 +771,7 @@ func sameRuleContent(a, b PolicyRule) bool {
 	// Precomputed unexported hot-path caches are derived, not content.
 	a.normFQDN, b.normFQDN = "", ""
 	a.srcIPNet, b.srcIPNet = nil, nil
+	a.srcPrefix, b.srcPrefix = netip.Prefix{}, netip.Prefix{}
 	a.matchedConds, b.matchedConds = "", ""
 	// Provenance stamps are a denormalized cache of audit truth, not definition.
 	a.CreatedAt, b.CreatedAt = "", ""
@@ -795,24 +861,33 @@ func effectivePolicyVersion() (version int64, updatedAt string) {
 	return policyStore.policyVersion()
 }
 
-// afterPolicyWrite finalizes a successful policy mutation. Live-write mode
-// persists running and writes a per-edit config version (today's behavior).
-// Draft mode persists the candidate and SKIPS config-versioning — the version
-// is captured once at commit, so per-edit snapshots of the unchanged running
-// config would be misleading no-ops.
-func afterPolicyWrite(r *http.Request, action string) {
-	if policyDraftEngaged() {
-		// A no-op edit (candidate == running) auto-discards the draft rather
-		// than leaving a zero-diff pending draft; otherwise persist the change.
-		if policyDraft.reconcile() {
-			return
-		}
-		policyDraft.persist()
-		return
+// effectiveManagementSnapshot is the FENCED read behind GET /api/policy
+// (§§6–8 fenced-read correction): the candidate-vs-running choice, the rule
+// list, the version fence, and the draft fact all come from ONE coordinator-
+// locked capture. The previous shape — effectivePolicyList() then
+// effectivePolicyVersion() as independent calls — let a staged edit land
+// between them, so a client rendered generation-P rules yet held a
+// generation-P+1 token and its stale later edit passed the optimistic fence.
+// Same engaged predicate + lock order as effectivePolicySnapshot
+// (c.mu → PolicyStore.mu, the stageTarget convention); the per-store pair is
+// itself one PolicyStore.SnapshotWithVersion read so rules/version cannot
+// tear inside the selected store either.
+func effectiveManagementSnapshot() (snap PolicyStoreSnapshot, draft bool) {
+	policyDraft.mu.Lock()
+	defer policyDraft.mu.Unlock()
+	if requireCommitEnabled() && policyDraft.state.Active {
+		return policyDraft.cand.SnapshotWithVersion(), true
 	}
-	policyStore.Save()
-	saveConfigVersion(sessionAdmin(r), action)
+	return policyStore.SnapshotWithVersion(), false
 }
+
+// afterPolicyWrite is RETIRED (2B.0b): ordinary policy mutations run their
+// persist durable-or-nothing INSIDE fencedMutate's critical section (see
+// policy_mutation.go), and the handler-side finalize —
+// finalizeFencedPolicyWrite — only records the per-edit config version for
+// live-mode writes. Draft mode still skips config-versioning (the version is
+// captured once at commit), and the no-op auto-discard (reconcile contract)
+// now runs inside the same critical section as the mutation it reconciles.
 
 // ── Commit-time shadow detection (G4, advisory) ──────────────────────────────
 
@@ -920,22 +995,35 @@ func apiPolicyDraft(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleViewer) {
 			return
 		}
-		st := policyDraft.snapshotState()
+		// ONE coordinator-locked review snapshot (§§10–12): diff, version,
+		// shadows, and baseStale are all derived from the SAME captured
+		// candidate/running pair, so the version returned identifies exactly
+		// the candidate whose diff the operator is reviewing — a commit with
+		// this token can never activate a rule the review response did not
+		// show (the ?ifVersion= fence 409s any later staged edit).
+		snap := policyDraft.reviewSnapshot()
 		resp := map[string]any{
-			"requireCommit": requireCommitEnabled(),
-			"active":        st.Active,
-			"actor":         st.Actor,
-			"startedAt":     st.StartedAt,
+			"requireCommit": snap.RequireCommit,
+			"active":        snap.State.Active,
+			"actor":         snap.State.Actor,
+			"startedAt":     snap.State.StartedAt,
 		}
-		if st.Active {
-			d := policyDraft.diffVsRunning()
-			ver, _ := policyDraft.candidateVersion()
+		if snap.State.Active {
+			d := diffRuleSets(snap.Running.Rules, snap.Candidate.Rules)
 			resp["diff"] = d
 			resp["pendingCount"] = d.total()
-			resp["version"] = ver
+			resp["version"] = snap.Candidate.Version
 			// Advisory shadow warnings over the CANDIDATE (what will go live),
-			// so the operator sees them before committing (G4).
-			resp["shadows"] = detectShadowedRules(policyDraft.candidateList())
+			// so the operator sees them before committing (G4) — derived from
+			// the same captured candidate the diff and version describe.
+			resp["shadows"] = detectShadowedRules(snap.Candidate.Rules)
+			// baseStale: running advanced past the generation this draft forked
+			// from (an import, rollback, or a Stage-1 auth-policy mutation — auth
+			// rules write the running domain immediately). The SAME truth the
+			// commit's fail-closed guard reads (baseGenerationStale), computed
+			// from the captured running version (2C §8). Only meaningful — and
+			// only present — while a draft is active.
+			resp["baseStale"] = snap.BaseStale
 		}
 		jsonOK(w, resp)
 

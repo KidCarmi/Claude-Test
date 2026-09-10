@@ -122,7 +122,52 @@ as the policy engine actually classified it. Pinned by `operation_test.go`.
 **Whole-Canary breach (single occurrence stops the Canary):** out_of_scope_execution,
 scope_escape, tool_fingerprint_drift, server_identity_drift, outcome_evidence_loss,
 credential_safety_failure, budget_exhausted, elevated_error_rate, latency_pathology,
-unexpected_upstream_response.
+unexpected_upstream_response, independent_witness_mismatch, window_expired.
+
+**AUTOMATIC (review §16, blocker 7 REOPENED; closure pending a clean review round — see the
+ledger).** The whole-Canary latch for `tool_fingerprint_drift` / `server_identity_drift` is taken
+in TWO places, and both are activation-bound under one acquisition of the activation lock, charging
+an exact non-zero generation:
+
+- the ATOMIC admission transaction (`admitLiveExecution`), which evaluates live trust in full —
+  including the approval, so a revocation racing the lock cannot be missed — and latches an
+  authoritative drift before reserving budget; and
+- the PRE-EXECUTOR refusal, which happens before any reservation. It is fail-closed and records
+  bounded evidence as before, and it also reports the drift WITH its target so the root can
+  re-derive it live inside the critical section. It latches only when the activation in force is
+  still the one the request resolved under (generations are monotonic, so a mismatch means an
+  activation intervened) and never during the publication gap. Leaving this path evidence-only was
+  tried and was wrong: after a rug-pull no later request presents as drift, so the breach condition
+  stopped nothing at all.
+
+Every code above has a wired trip path onto the
+ONE `canary.AbortController`; the latch revokes EXECUTION AUTHORITY (no new reservation, and an
+already-admitted request fails the final live revalidation before `Upstream.Call`). Two of them —
+`window_expired` and `budget_exhausted` — stop the experiment with NO further request arriving:
+the window deadline is absolute (derived from the persisted activation instant, so a restart never
+extends it) and exhaustion latches when the final authorized attempt SETTLES. Rate thresholds:
+`sample_floor = 2`, error rate trips at ≥ 50%, hard per-attempt latency ≥ 15s trips with no floor,
+mean latency ≥ 10s trips at the floor — all reachable within `MaxTotalExecutions = 3`. The latch does
+NOT demote the node: demotion stays governed by review blockers 10 and 12, so `ModeCanary + ABORTED`
+is the truthful state and `activation_runtime.auto_stop` reports `execution_authority` separately
+from mode. That surface derives `execution_authority` and `window_expired` from the SAME two-ended
+window predicate admission uses, so it can never be more optimistic than the gate it describes — a
+report, never a second authority: nothing in the admission path reads it. An "ordinary execution
+failure", for the error-rate detector, is the UPSTREAM LEG's verdict (`upstreamLegFailed`): a
+transport error, a nil response, or a decoded JSON-RPC error object. Culvert's own response-DLP
+block after a successful peer answer is deliberately NOT a failure — a Canary must not abort itself
+for its own controls firing. The sample is counted, and the latch it may prove decided, BEFORE the
+reservation is released — and so is every OTHER step that decides authority: the ordered sequence
+is trust-breach → settle → terminal outcome → release, because a threshold that is merely reachable
+does not stop anything if the next request can take the freed slot first. Two entries in the
+classifier are deliberate and go in opposite directions: a pinned-identity mismatch
+(`ReasonUpstreamTLSIdentity`) is the single-occurrence `server_identity_drift` breach rather than a
+sample, and a caller cancellation (`context.Canceled`, matched by REASON before the answer and by wrapped
+CAUSE during the body read — the transport reclassifies everything past the headers) is not evidence
+about the target at all, so it is
+excluded from the POPULATION rather than counted as a success — recording it would pad the
+denominator and dilute a real failure below the threshold. A DEADLINE overrun is evidence, and is
+still a charged sample.
 
 **Per-request fail-closed (Canary survives):** policy_deny, stale_decision,
 credential_not_ready, response_inspection_block, emergency_kill_for_request, allowance_consumed.
@@ -232,12 +277,15 @@ Every one is a **separately-reviewed activation**, not a config change:
    (f) a
    **per-physical-invocation budget (CODE CHANGE)** — an idempotent read retries up to `MaxReadRetries`
    times outside the single budget reservation, so one budgeted request can send the POST ~3×, and a
-   retry POST can land after an emergency kill engaged mid-flight (blocker 6). Retry-disablement is NOT
-   representable today (`NewLimits` coerces `MaxReadRetries==0`→2 and rejects negatives;
-   `newProductionUpstreamClient` hard-codes `DefaultLimits()`), so closing this needs code. **An
-   explicitly RETRY-FREE execution path is the ONLY accepted closure for the first Canary** — one
-   logical reservation must produce at most one side-effect-bearing physical tool invocation — and it
-   closes BOTH the count and the kill-authority gap. **Charging each attempt to the budget is NOT an
+   retry POST can land after an emergency kill engaged mid-flight (blocker 6). **CLOSED.**
+   Retry-disablement is now representable (`upstreamclient.RetryMode`/`RetryDisabled`; `NewLimits`
+   rejects a retry budget combined with `RetryDisabled` instead of coercing it) and
+   `newProductionUpstreamClient` builds from `RetryFreeLimits`, so the ONLY production upstream client
+   — the one serving the live tier — performs exactly one physical send per Call. **An explicitly
+   RETRY-FREE execution path is the ONLY accepted closure for the first Canary** — one logical
+   reservation must produce at most one side-effect-bearing physical tool invocation — and it closes
+   BOTH the count and the kill-authority gap. The bound is proven AT THE WIRE against a controlled
+   local HTTPS peer (see review §25a). **Charging each attempt to the budget is NOT an
    accepted alternative** (with or without per-attempt kill revalidation): it can spend all three
    execution slots on a single logical reservation and so destroys the exactly-three-invocations witness
    invariant (review §9/§14/§26). A per-reservation key is not a bound at all (it enables
@@ -245,15 +293,12 @@ Every one is a **separately-reviewed activation**, not a config change:
    invariant counts only the side-effect-bearing tool invocations: auxiliary MCP lifecycle/discovery
    traffic (`initialize`, `notifications/initialized`, `tools/list`) consumes no reservation and must be
    separately counted and attributable, never folded into the three; and (g)
-   two **product-defect prerequisites** — the whole-Canary auto-abort is unwired for the eight
-   declared breaches beyond `budget_exhausted`/`scope_escape`, and the durable outcome record is
-   success-only with an unclosable post-send crash window (review §14–§16, §18). Wiring a tripper is
-   not sufficient for the two RATE-based breaches: for `elevated_error_rate` and `latency_pathology`
-   the reviewed minimum sample floor MUST be REACHABLE within the exact corpus
-   (`MaxTotalExecutions=3`), or the below-floor behavior MUST stop fail-closed — a floor above three
-   with a below-floor `no-trip` leaves both detectors unable to evaluate for the whole experiment while
-   the prerequisite reads as closed (review §16/§26). The same reachability rule governs the
-   witness-reconciliation trip; and (h) a
+   one remaining **product-defect prerequisite** — the durable outcome record's authoritative
+   production witness adapter (review §18; the auto-abort half is CLOSED, see the abort taxonomy above
+   and review §25a). The reachability rule that governed the two RATE-based breaches is satisfied:
+   `sample_floor = 2` is reachable within the exact corpus (`MaxTotalExecutions=3`) and the
+   hard-latency rule needs no floor at all, pinned against drift by
+   `TestHealth_SampleFloorFitsTheFirstCanaryCorpus`; and (h) a
    **governed operator-reachable graceful rollback** — only the emergency kill is reachable today
    (`quiesceLiveTier` has no caller; `apiMCPRolloutTransition` returns `distribution_not_configured`
    for a Canary→Shadow/Observe target), yet the review contract requires rollback AND kill (review §17);
