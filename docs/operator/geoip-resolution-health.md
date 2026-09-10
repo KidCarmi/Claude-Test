@@ -107,7 +107,7 @@ put a label with operator-controlled cardinality on an unauthenticated
 
 ## See also
 
-- `roadmap/CHAOS-ENGINEERING-REVIEW.md` §25 — the failure analysis this design
+- `roadmap/CHAOS-ENGINEERING-REVIEW.md` §26 — the failure analysis this design
   came from, including why the bound is a semaphore and not a deadline.
 - `docs/operator/socks5-listener-health.md` — the same logging and
   recovery-on-evidence discipline on a different subsystem.

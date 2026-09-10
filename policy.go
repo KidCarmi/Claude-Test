@@ -1425,7 +1425,7 @@ func (ps *PolicyStore) Evaluate(clientIP, identity, authSource, host string, gro
 	// txn per domain label), so the lock must NOT be held across it — otherwise
 	// a config-plane List()/Save() (exclusive Lock) waiting on a blocked scan
 	// would stall all policy evaluation. The geo half no longer blocks at all
-	// (CHAOS-57: geo.LookupCached is cache-only and warms off-path), but the
+	// (CHAOS-58: geo.LookupCached is cache-only and warms off-path), but the
 	// release stays load-bearing for the category half.
 	rules := ps.evaluationSnapshot()
 
@@ -1900,7 +1900,7 @@ func matchDestNorm(rule *PolicyRule, host, normHost string, sc *hostCatScratch) 
 	}
 	// Geo-IP country check — cache-only, so it never blocks the request
 	// goroutine: LookupCached answers from the host→IP and IP→country caches
-	// and arms an off-path warm on a miss (CHAOS-57, geoip_resolve_health.go).
+	// and arms an off-path warm on a miss (CHAOS-58, geoip_resolve_health.go).
 	// Fail-closed: on a cache miss the country is unknown and the rule does NOT
 	// match, preventing unclassified traffic from matching geo-restricted rules.
 	// The miss is COUNTED — for an allow-rule it is a user-visible block and for

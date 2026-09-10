@@ -73,7 +73,7 @@ var (
 // across goroutines and must be treated as READ-ONLY by callers (all current
 // callers only read: isPrivateIP, ip.String()).
 //
-// CHAOS-57: a cache MISS used to be resolved by whichever goroutine observed
+// CHAOS-58: a cache MISS used to be resolved by whichever goroutine observed
 // it, so N concurrent requests for the same uncached host fired N blocking
 // resolutions, and the negative entry that would have stopped the next one is
 // only written when a lookup RETURNS. During a resolver brownout — the window
@@ -341,7 +341,7 @@ func (geoResolver) LookupFull(host string) (code, name string) {
 // chain — host→IP and IP→country — are already cached. It never resolves and
 // never touches the geo DB, so it is safe on the per-request policy path.
 //
-// CHAOS-57: this used to be true of the geo half only. The host half called
+// CHAOS-58: this used to be true of the geo half only. The host half called
 // the blocking resolveHost, so on an uncached hostname the request goroutine
 // sat in an uncancellable net.LookupHost inside policy evaluation — the exact
 // thing the call site in matchDestNorm says it avoids, and the thing register
