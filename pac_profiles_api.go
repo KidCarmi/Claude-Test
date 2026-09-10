@@ -15,8 +15,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -75,6 +77,37 @@ func writePACIssues(w http.ResponseWriter, msg string, issues []pac.ValidationIs
 // revisions. Mirrors the saveConfigVersionMu precedent (configversion.go).
 var pacProfilesAPIMu sync.Mutex
 
+// pacProfilesWriterLock enters the SHARED PAC writer transaction boundary
+// for a bulk writer of the active profile store — the config import
+// (apiConfigImport), the config-version rollback (applyConfigBackup) and the
+// CP→DP snapshot apply (applyConfigSnapshot). Every writer of pacProfiles
+// now builds its candidate AND commits it under pacProfilesAPIMu, the same
+// mutex the lifecycle publish/rollback and the CRUD handlers hold from their
+// validation to their commit, so a publish parked between its intent and its
+// commit can never be interleaved with — and can never overwrite — a bulk
+// writer's completed change (2F-E correction round 4, blocker 1).
+//
+// LOCK ORDER (acyclic; reviewed): objectReferenceMutationGate →
+// configRollbackMu → pacProfilesAPIMu. The three bulk writers hold the gate
+// (and the rollback additionally configRollbackMu) OUTERMOST and take
+// pacProfilesAPIMu LAST, around exactly their PAC read-modify-write. Nothing
+// reachable under pacProfilesAPIMu acquires the gate or configRollbackMu:
+// the post-commit effects (pacAfterActiveCommit, pacCompleteCommittedLocked)
+// reach only saveConfigVersionMu (captureConfigBackup is read-only w.r.t.
+// the gate) and ConfigStore.mu (Update releases it before notifying
+// subscribers), the audit ring and the alert latch. Behind the mutex, the
+// lifecycle commit ALSO carries a store-generation compare-and-swap
+// (ProfileStore.SetIfGeneration): a writer outside this boundary is detected
+// atomically at the commit and the publish refuses instead of overwriting.
+//
+// The returned func releases the boundary. The stage seam lets a proof
+// observe a writer WAITING here.
+func pacProfilesWriterLock() func() {
+	pacLifecycleStage("pac_writer_waiting")
+	pacProfilesAPIMu.Lock()
+	return pacProfilesAPIMu.Unlock
+}
+
 // pacProfilesMutationAllowed gates mutations to CP/standalone nodes: a
 // data-plane node's profile store is CP-managed (snapshot-synced) — a local
 // edit would silently diverge until the next CP version bump, then be
@@ -98,17 +131,110 @@ func pacApplyProfilesMutation(w http.ResponseWriter, r *http.Request, action, ob
 		writePACIssues(w, "validation failed", issues)
 		return false
 	}
+	if err := pacSettlePendingBeforeWrite(before, candidate); err != nil {
+		logger.Printf("PAC: %q of %q refused: %q", sanitizeLog(action), sanitizeLog(object), sanitizeLog(err.Error()))
+		writePACFenceRefusal(w, http.StatusServiceUnavailable, "lifecycle_unsettled",
+			"the profile has an unresolved lifecycle operation whose outcome could not be recorded durably; nothing was changed — retry once the node-local history is writable",
+			map[string]any{"detail": err.Error()})
+		return false
+	}
 	if err := pacProfiles.Set(candidate); err != nil {
 		http.Error(w, "save error: "+err.Error(), http.StatusInternalServerError)
 		return false
 	}
+	pacAfterActiveCommit(r, action, object, before, candidate)
+	return true
+}
+
+// errPACLifecycleUnsettled is the pre-write settlement refusal (round 7).
+var errPACLifecycleUnsettled = errors.New("pac lifecycle: unresolved operation could not be settled durably")
+
+// pacSettlePendingBeforeWrite is the writer boundary's HISTORICAL-EVIDENCE
+// rule (2F-E correction round 7). Every writer of the active profile store
+// calls it under pacProfilesAPIMu, immediately before its own write, with
+// the content it is replacing and the content it is about to install: for
+// every profile whose content it CHANGES or removes, a pending lifecycle
+// intent of that profile is settled DURABLY first — a genuine commit whose
+// committed marker could not be persisted (the truthful published:true /
+// pending_reconciliation answer) becomes a durable COMMITTED record with its
+// history revision, an intent that never wrote becomes a durable aborted /
+// refused / ambiguous decision — so the outcome of that intent is never
+// inferred later from content or provenance the writer is about to replace.
+// If the settled record cannot be persisted, the writer is REFUSED (CRUD) or
+// DEFERRED (import / rollback / CP→DP snapshot: the section is skipped and
+// reported, retried by the next attempt) with nothing written. Profiles the
+// writer leaves untouched, and pools, are never settled here — an unrelated
+// write is never blocked. The node-local effects only (committed marker +
+// history) run inside the writer's transaction; config version, cluster
+// publication and the success audit complete at the next full
+// reconciliation from the durable markers, as for any recovered commit.
+func pacSettlePendingBeforeWrite(before, candidate pac.ProfilesConfig) error {
+	for _, id := range pacChangedProfileIDs(before, candidate) {
+		lc, ok := pacLifecycle.Get(id)
+		if !ok || lc.PendingOp == nil {
+			continue
+		}
+		pacReconcileLocked(lc, pacEffectsNodeLocal)
+		// The durable truth decides, never the reconciler's return value: an
+		// intent that is still pending and not committed in the store was
+		// not settled (its record could not be persisted).
+		if lc, _ = pacLifecycle.Get(id); lc.PendingOp != nil && !lc.PendingOp.Committed() {
+			return fmt.Errorf("%w: profile %q, operation %s", errPACLifecycleUnsettled, id, lc.PendingOp.OperationID)
+		}
+	}
+	return nil
+}
+
+// pacChangedProfileIDs lists, in deterministic (sorted) order, every profile
+// whose PRESENCE or CONTENT differs between before and candidate: a profile
+// candidate drops, a profile whose content changes
+// (pac.ProfileContentEqual — the store's own change test), and — 2F-E
+// correction round 8 — a profile candidate ADDS. An absent profile can still
+// carry a durable pending first-publish lifecycle intent (the publish died
+// after its intent was persisted), so a candidate-only addition must settle
+// it exactly like a change of an existing profile; iterating over the before
+// profiles only silently exempted every addition (the POST create, a
+// merge/replace import, a rollback and a CP→DP snapshot). Untouched profiles
+// are excluded, and pools are never listed.
+func pacChangedProfileIDs(before, candidate pac.ProfilesConfig) []string {
+	prev := make(map[string]pac.Profile, len(before.Profiles))
+	for i := range before.Profiles {
+		prev[before.Profiles[i].ID] = before.Profiles[i]
+	}
+	next := make(map[string]pac.Profile, len(candidate.Profiles))
+	for i := range candidate.Profiles {
+		next[candidate.Profiles[i].ID] = candidate.Profiles[i]
+	}
+	changed := make(map[string]struct{})
+	for i := range before.Profiles {
+		id := before.Profiles[i].ID
+		if n, ok := next[id]; !ok || !pac.ProfileContentEqual(before.Profiles[i], n) {
+			changed[id] = struct{}{}
+		}
+	}
+	for id := range next {
+		if _, existed := prev[id]; !existed {
+			changed[id] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(changed))
+	for id := range changed {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// pacAfterActiveCommit runs the post-commit side effects of a PROVEN active
+// store mutation: audit, config version, cluster republish, alert reset.
+// Nothing here may run before the durable write succeeded (2F-B, C1).
+func pacAfterActiveCommit(r *http.Request, action, object string, before, candidate pac.ProfilesConfig) {
 	auditEventDiff(r, action, object,
 		fmt.Sprintf("profiles=%d pools=%d", len(candidate.Profiles), len(candidate.Pools)),
 		before, candidate)
 	saveConfigVersion(sessionAdmin(r), action)
 	_ = publishCurrentConfigSnapshot()
 	pacResetProfileAlert(object)
-	return true
 }
 
 // pacGuardDirectCRUD enforces the SAME safe-publish guardrail on the direct
@@ -122,7 +248,7 @@ func pacApplyProfilesMutation(w http.ResponseWriter, r *http.Request, action, ob
 // could-emit-DIRECT, compile/digest) block with 400 regardless of confirmation.
 // Returns true if the mutation may proceed. Must be called under
 // pacProfilesAPIMu, on the candidate being committed.
-func pacGuardDirectCRUD(w http.ResponseWriter, r *http.Request, candidate pac.ProfilesConfig, p, active pac.Profile, hasActive bool) bool {
+func pacGuardDirectCRUD(w http.ResponseWriter, candidate pac.ProfilesConfig, p, active pac.Profile, hasActive bool, action string, confirm *pacConfirm) bool {
 	// Structural validation runs first so an invalid candidate (e.g. unknown
 	// pool) returns the canonical validation issues rather than a spurious
 	// DIRECT-confirmation prompt. pacApplyProfilesMutation validates again
@@ -149,18 +275,22 @@ func pacGuardDirectCRUD(w http.ResponseWriter, r *http.Request, candidate pac.Pr
 		pools[candidate.Pools[i].ID] = candidate.Pools[i]
 	}
 	chk := pac.EvaluatePublish(p, pools, active, hasActive)
-	if chk.RequiresConfirmation && r.URL.Query().Get("confirmDirect") != p.ID {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck // best-effort body
-			"error":          "this change introduces new DIRECT (full security-path bypass) paths; retype the profile ID in the confirmDirect query parameter to proceed",
-			"newDirectPaths": chk.NewDirectPaths,
-			"confirmField":   "confirmDirect",
-			"confirmValue":   p.ID,
-		})
-		return false
+	if !chk.RequiresConfirmation {
+		return true
 	}
-	return true
+	// 2F-B (C2): the SAME candidate-bound challenge as the lifecycle —
+	// the legacy ?confirmDirect=<profile id> query parameter no longer
+	// authorizes anything.
+	expectedSpec := ""
+	if hasActive {
+		expectedSpec = pac.ProfileSpecDigest(active)
+	}
+	binding := pacChallengeBinding{
+		ProfileID: p.ID, Action: action, CandidateSpecDigest: pac.ProfileSpecDigest(p),
+		ExpectedActiveRevision: active.Revision, ExpectedActiveSpecDigest: expectedSpec,
+		PoolDigest: pac.PoolDigest(pac.ReferencedPools(p, pools)), ArtifactDigest: chk.Digest, NewDirectPaths: chk.NewDirectPaths,
+	}
+	return pacVerifyConfirm(w, binding, confirm, nil)
 }
 
 // apiPACProfiles handles GET (list) and POST (create) /api/pac/profiles.
@@ -172,18 +302,36 @@ func apiPACProfiles(w http.ResponseWriter, r *http.Request) {
 			"defaultProfile": pacDefaultView(),
 			"profiles":       cfg.Profiles,
 			"pools":          cfg.Pools,
+			// 2F-A tokens: the collection token every CREATE must echo, and
+			// the per-pool token every pool PUT/DELETE must echo.
+			"collectionEtag": pac.ConfigETag(cfg),
+			"poolEtags":      pacPoolEtags(cfg),
 		})
 	case http.MethodPost:
 		if !requireRole(w, r, RoleAdmin) || !pacProfilesMutationAllowed(w) {
 			return
 		}
-		var p pac.Profile
-		if err := decodeJSON(r, &p); err != nil {
+		var in struct {
+			pac.Profile
+			CollectionEtag string      `json:"collectionEtag"`
+			Confirm        *pacConfirm `json:"confirm"`
+		}
+		if err := decodeJSON(r, &in); err != nil {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		p := in.Profile
+		token := pacFenceStr(r, "collectionEtag", in.CollectionEtag)
+		pacWriteStateDecision(r, "resolved")
 		pacProfilesAPIMu.Lock()
 		defer pacProfilesAPIMu.Unlock()
+		// 2F-A fence, decided inside the mutex against the authoritative
+		// collection: a create issued from a stale listing is refused.
+		if !pacCheckEtag(w, "collectionEtag", token, pac.ConfigETag(pacProfiles.Get())) {
+			pacWriteStateDecision(r, "fence")
+			return
+		}
+		pacWriteStateDecision(r, "fence")
 		if _, exists := pacProfiles.ProfileByID(p.ID); exists {
 			http.Error(w, "profile already exists: "+sanitizeLog(p.ID), http.StatusConflict)
 			return
@@ -194,12 +342,37 @@ func apiPACProfiles(w http.ResponseWriter, r *http.Request) {
 		candidate.Profiles = append(candidate.Profiles, p)
 		// A brand-new profile has no active spec, so any DIRECT capability is
 		// "new" and requires the typed confirmation — same gate as publish.
-		if !pacGuardDirectCRUD(w, r, candidate, p, pac.Profile{}, false) {
+		if !pacGuardDirectCRUD(w, candidate, p, pac.Profile{}, false, "create", in.Confirm) {
 			return
 		}
-		if pacApplyProfilesMutation(w, r, "pac.profile_create", p.ID, before, candidate) {
-			jsonOK(w, p)
+		// 2F-E correction round 2/3/4: a (re)created profile starts a NEW
+		// node-local history epoch, and the transition is RECOVERABLE across
+		// both writes. The new identity is PREPARED durably before the active
+		// create while the prior identity and evidence (a draft saved before
+		// a first publication, the history of a profile a rollback removed)
+		// stay untouched; the active create is committed; then the prepared
+		// identity is FINALIZED. A refused active create withdraws the
+		// preparation (evidence intact, truthful failure, no audit, no config
+		// version); a crash between the writes is finished by the next
+		// access/boot from the durable transition (profile present ⇒
+		// finalize, absent ⇒ withdraw); an access that cannot finalize
+		// durably reports no identity, never the old epoch.
+		if _, err := pacLifecycle.PrepareCreate(p.ID); err != nil {
+			logger.Printf("PAC: create transition for %q could not be recorded: %v", sanitizeLog(p.ID), err)
+			http.Error(w, "the profile's history epoch could not be prepared; nothing was changed: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
+		pacLifecycleStage("create_prepared")
+		if !pacApplyProfilesMutation(w, r, "pac.profile_create", p.ID, before, candidate) {
+			if err := pacLifecycle.WithdrawCreate(p.ID); err != nil {
+				logger.Printf("PAC: create transition for %q could not be withdrawn after the refused create: %v (withdrawn at the next access)", sanitizeLog(p.ID), err)
+			}
+			return
+		}
+		if _, err := pacLifecycle.FinalizeCreate(p.ID, p.Revision, pac.ProfileSpecDigest(p)); err != nil {
+			logger.Printf("PAC: create transition for %q could not be finalized: %v (finalized at the next access)", sanitizeLog(p.ID), err)
+		}
+		jsonOK(w, p)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -252,43 +425,80 @@ func apiPACProfileItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func pacProfileDelete(w http.ResponseWriter, r *http.Request, id string) {
+	token := pacFenceInt(r, "revision", 0)
 	pacProfilesAPIMu.Lock()
 	defer pacProfilesAPIMu.Unlock()
 	before := pacProfiles.Get()
+	existing, ok := pacProfiles.ProfileByID(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	// 2F-A fence: a DELETE must echo the revision it loaded.
+	if !pacCheckRevision(w, "revision", token, existing.Revision) {
+		return
+	}
 	candidate, removed := pacRemoveProfile(pacProfiles.Get(), id)
 	if !removed {
 		http.NotFound(w, r)
 		return
 	}
-	if pacApplyProfilesMutation(w, r, "pac.profile_delete", id, before, candidate) {
-		// Drop the node-local lifecycle history for the deleted profile.
-		if err := pacLifecycle.Delete(id); err != nil {
-			logger.Printf("PAC: lifecycle delete for %s: %v", sanitizeLog(id), err)
-		}
-		// Drop the node-local DIRECT-exception governance too, so a later
-		// profile recreated under the SAME id cannot silently inherit the old
-		// owner/reason/expiry and show a newly introduced bypass as governed
-		// without fresh attestation.
-		pacExceptionsMu.Lock()
-		if err := pacExceptions.Delete(id); err != nil {
-			logger.Printf("PAC: exception delete for %s: %v", sanitizeLog(id), err)
-		}
-		pacExceptionsMu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
+	// 2F-E correction round 3: the delete transition is recorded DURABLY
+	// before the active profile is removed. A crash or a failed record
+	// removal after the active delete then leaves a record that the next
+	// access (or boot) finishes — never one whose old epoch looks valid for
+	// a profile recreated under the same id. A failed first write refuses
+	// the delete with nothing changed.
+	if err := pacLifecycle.MarkDeletePending(id); err != nil {
+		logger.Printf("PAC: delete transition for %s could not be recorded: %v", sanitizeLog(id), err)
+		http.Error(w, "the delete could not be recorded in the node-local history; nothing was changed: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
+	if !pacApplyProfilesMutation(w, r, "pac.profile_delete", id, before, candidate) {
+		// The active delete was PROVABLY refused (validation, or a
+		// persist-before-swap write that returned an error): withdraw the
+		// transition so the unchanged profile keeps its epoch. If even this
+		// write fails, the flag stays and the next access rotates the epoch
+		// conservatively — never the other way round.
+		if err := pacLifecycle.ClearDeletePending(id); err != nil {
+			logger.Printf("PAC: delete transition for %s could not be withdrawn after the refused delete: %v (the epoch rotates at the next access)", sanitizeLog(id), err)
+		}
+		return
+	}
+	// Drop the node-local lifecycle history for the deleted profile. A
+	// failure here is finished by the next access/boot (the flag above);
+	// the active mutation is committed and is reported as such.
+	if err := pacLifecycle.Delete(id); err != nil {
+		logger.Printf("PAC: lifecycle delete for %s: %v (finished at the next access)", sanitizeLog(id), err)
+	}
+	// Drop the node-local DIRECT-exception governance too, so a later
+	// profile recreated under the SAME id cannot silently inherit the old
+	// owner/reason/expiry and show a newly introduced bypass as governed
+	// without fresh attestation.
+	pacExceptionsMu.Lock()
+	if err := pacExceptions.Delete(id); err != nil {
+		logger.Printf("PAC: exception delete for %s: %v", sanitizeLog(id), err)
+	}
+	pacExceptionsMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func pacProfilePut(w http.ResponseWriter, r *http.Request, id string) {
-	var p pac.Profile
-	if err := decodeJSON(r, &p); err != nil {
+	var in struct {
+		pac.Profile
+		Confirm *pacConfirm `json:"confirm"`
+	}
+	if err := decodeJSON(r, &in); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	p := in.Profile
 	if p.ID != "" && p.ID != id {
 		http.Error(w, "profile ID in body must match URL", http.StatusBadRequest)
 		return
 	}
 	p.ID = id
+	token := pacFenceInt(r, "revision", p.Revision)
 	pacProfilesAPIMu.Lock()
 	defer pacProfilesAPIMu.Unlock()
 	before := pacProfiles.Get()
@@ -299,11 +509,11 @@ func pacProfilePut(w http.ResponseWriter, r *http.Request, id string) {
 		if candidate.Profiles[i].ID != id {
 			continue
 		}
-		// Optimistic concurrency: a client that echoes the revision it
-		// loaded gets reject-on-stale instead of silent last-writer-wins.
-		// Revision 0 (older clients) skips the check — additive contract.
-		if p.Revision != 0 && p.Revision != candidate.Profiles[i].Revision {
-			http.Error(w, fmt.Sprintf("stale revision %d (current %d) — reload and retry", p.Revision, candidate.Profiles[i].Revision), http.StatusConflict)
+		// 2F-A fence: the client MUST echo the revision it loaded — an
+		// absent/zero token is 428 and a stale one a structured 409, never
+		// silent last-writer-wins (the pre-2F-A "revision 0 skips the
+		// check" path is gone; stored profiles never carry 0 any more).
+		if !pacCheckRevision(w, "revision", token, candidate.Profiles[i].Revision) {
 			return
 		}
 		activeSpec = candidate.Profiles[i] // the spec being replaced, for the DIRECT-delta guardrail
@@ -318,7 +528,7 @@ func pacProfilePut(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	// Same guardrail as publish: an update that introduces a new DIRECT path
 	// vs the spec it replaces requires the typed confirmation.
-	if !pacGuardDirectCRUD(w, r, candidate, p, activeSpec, true) {
+	if !pacGuardDirectCRUD(w, candidate, p, activeSpec, true, "update", in.Confirm) {
 		return
 	}
 	if pacApplyProfilesMutation(w, r, "pac.profile_update", id, before, candidate) {
@@ -340,18 +550,29 @@ func pacRemoveProfile(cfg pac.ProfilesConfig, id string) (pac.ProfilesConfig, bo
 func apiPACPools(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		jsonOK(w, pacProfiles.Get().Pools)
+		jsonOK(w, pacPoolViews(pacProfiles.Get().Pools))
 	case http.MethodPost:
 		if !requireRole(w, r, RoleAdmin) || !pacProfilesMutationAllowed(w) {
 			return
 		}
-		var p pac.Pool
-		if err := decodeJSON(r, &p); err != nil {
+		var in struct {
+			pac.Pool
+			CollectionEtag string `json:"collectionEtag"`
+		}
+		if err := decodeJSON(r, &in); err != nil {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		p := in.Pool
+		token := pacFenceStr(r, "collectionEtag", in.CollectionEtag)
+		pacWriteStateDecision(r, "resolved")
 		pacProfilesAPIMu.Lock()
 		defer pacProfilesAPIMu.Unlock()
+		if !pacCheckEtag(w, "collectionEtag", token, pac.ConfigETag(pacProfiles.Get())) {
+			pacWriteStateDecision(r, "fence")
+			return
+		}
+		pacWriteStateDecision(r, "fence")
 		if _, exists := pacProfiles.PoolByID(p.ID); exists {
 			http.Error(w, "pool already exists: "+sanitizeLog(p.ID), http.StatusConflict)
 			return
@@ -381,7 +602,7 @@ func apiPACPoolItem(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		jsonOK(w, p)
+		jsonOK(w, pacPoolView{Pool: p, ETag: pac.PoolETag(p)})
 	case http.MethodPut:
 		if !requireRole(w, r, RoleAdmin) || !pacProfilesMutationAllowed(w) {
 			return
@@ -398,16 +619,21 @@ func apiPACPoolItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func pacPoolPut(w http.ResponseWriter, r *http.Request, id string) {
-	var p pac.Pool
-	if err := decodeJSON(r, &p); err != nil {
+	var in struct {
+		pac.Pool
+		ETag string `json:"etag"`
+	}
+	if err := decodeJSON(r, &in); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	p := in.Pool
 	if p.ID != "" && p.ID != id {
 		http.Error(w, "pool ID in body must match URL", http.StatusBadRequest)
 		return
 	}
 	p.ID = id
+	token := pacFenceStr(r, "etag", in.ETag)
 	pacProfilesAPIMu.Lock()
 	defer pacProfilesAPIMu.Unlock()
 	before := pacProfiles.Get()
@@ -416,6 +642,10 @@ func pacPoolPut(w http.ResponseWriter, r *http.Request, id string) {
 	for i := range candidate.Pools {
 		if candidate.Pools[i].ID != id {
 			continue
+		}
+		// 2F-A fence: a pool PUT must echo the etag of the pool it loaded.
+		if !pacCheckEtag(w, "etag", token, pac.PoolETag(candidate.Pools[i])) {
+			return
 		}
 		candidate.Pools[i] = p
 		found = true
@@ -431,9 +661,21 @@ func pacPoolPut(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func pacPoolDelete(w http.ResponseWriter, r *http.Request, id string) {
+	token := pacFenceStr(r, "etag", "")
 	pacProfilesAPIMu.Lock()
 	defer pacProfilesAPIMu.Unlock()
 	before := pacProfiles.Get()
+	existing, ok := pacProfiles.PoolByID(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	// 2F-A fence: a DELETE must echo the etag of the pool it loaded. The
+	// vanished (404) and stale/missing-token (409/428) decisions precede the
+	// referenced-by-profile refusal so the caller learns the truthful reason.
+	if !pacCheckEtag(w, "etag", token, pac.PoolETag(existing)) {
+		return
+	}
 	for i := range before.Profiles {
 		if before.Profiles[i].PoolID == id {
 			http.Error(w, "pool is referenced by profile "+sanitizeLog(before.Profiles[i].ID), http.StatusConflict)
@@ -462,4 +704,28 @@ func pacPoolDelete(w http.ResponseWriter, r *http.Request, id string) {
 	if pacApplyProfilesMutation(w, r, "pac.pool_delete", id, before, candidate) {
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// pacPoolView is a pool as read through the API: the stored pool plus its
+// 2F-A optimistic-concurrency token. The token is computed on read and is
+// never part of the persisted or cluster-synced Pool.
+type pacPoolView struct {
+	pac.Pool
+	ETag string `json:"etag"`
+}
+
+func pacPoolViews(pools []pac.Pool) []pacPoolView {
+	out := make([]pacPoolView, 0, len(pools))
+	for i := range pools {
+		out = append(out, pacPoolView{Pool: pools[i], ETag: pac.PoolETag(pools[i])})
+	}
+	return out
+}
+
+func pacPoolEtags(cfg pac.ProfilesConfig) map[string]string {
+	m := make(map[string]string, len(cfg.Pools))
+	for i := range cfg.Pools {
+		m[cfg.Pools[i].ID] = pac.PoolETag(cfg.Pools[i])
+	}
+	return m
 }

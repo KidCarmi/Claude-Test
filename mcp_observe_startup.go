@@ -272,6 +272,13 @@ func assembleGatewayConfig(sc mcpObserveStartupConfig, modes gatewayModes, tlsCf
 		// authorization — with no executor an ALLOW returns execution_state=not_implemented
 		// and no credential/upstream/broker/side-effect runs. Still Observe-only.
 		Policy: pol,
+		// The pipeline refuses a drifted decision BEFORE the executor is reached. That refusal is
+		// fail-closed and unchanged; this seam counts it and then takes the whole-Canary latch
+		// where the latch can actually be attributed — see canaryPreAdmissionDrift.
+		CanaryDriftObserved: canaryPreAdmissionDrift,
+		// Read BEFORE the rollout resolution and compared under the activation lock at latch
+		// time. It narrows which activation an observation may stop; it never proves one.
+		CanaryGeneration: canaryGenerationForCapability,
 	}
 	if modes.senderProfile.RequiresDPoP() {
 		deps.Replay = senderconstraint.NewReplayCache(limits.DefaultAuth(), nil)

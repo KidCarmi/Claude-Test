@@ -56,7 +56,7 @@ func pacAPIReq(t *testing.T, method, path, body string, role UIRole, remoteIP st
 	} else {
 		rd = bytes.NewReader([]byte(body))
 	}
-	req := httptest.NewRequest(method, path, rd)
+	req := httptest.NewRequest(method, pacTestWithTokens(method, path, body), rd)
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = remoteIP
 	req = req.WithContext(context.WithValue(req.Context(), uiRoleKey{}, role))
@@ -118,17 +118,19 @@ func TestPACProfilesAPI_CRUDAndAudit(t *testing.T) {
 	// Create profile referencing it. private-networks=direct is a new DIRECT
 	// (full security-path bypass) path, so the unified guardrail requires the
 	// typed ?confirmDirect= confirmation — same gate as the publish lifecycle.
-	rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles?confirmDirect=hq",
-		`{"id":"hq","name":"HQ","enabled":true,"poolId":"il-prod","privateNetworks":"direct","availabilityMode":"balanced"}`,
-		RoleAdmin, "198.51.100.72:0")
+	// 2F-B: the typed confirmation is the server's candidate-bound challenge
+	// (issued on the first attempt), echoed with the typed confirmValue.
+	create := `{"id":"hq","name":"HQ","enabled":true,"poolId":"il-prod","privateNetworks":"direct","availabilityMode":"balanced"}`
+	rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles", create, RoleAdmin, "198.51.100.72:0")
+	rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles", pacTestWithConfirm(create, pacTestConfirmFragment(t, rec)), RoleAdmin, "198.51.100.72:0")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create profile: %d (%s)", rec.Code, rec.Body.String())
 	}
 
 	// Update bumps revision (availability mode also introduces DIRECT → confirm).
-	rec = pacAPIReq(t, http.MethodPut, "/api/pac/profiles/hq?confirmDirect=hq",
-		`{"name":"HQ v2","enabled":true,"poolId":"il-prod","privateNetworks":"direct","availabilityMode":"availability"}`,
-		RoleAdmin, "198.51.100.72:0")
+	update := `{"name":"HQ v2","enabled":true,"poolId":"il-prod","privateNetworks":"direct","availabilityMode":"availability"}`
+	rec = pacAPIReq(t, http.MethodPut, "/api/pac/profiles/hq", update, RoleAdmin, "198.51.100.72:0")
+	rec = pacAPIReq(t, http.MethodPut, "/api/pac/profiles/hq", pacTestWithConfirm(update, pacTestConfirmFragment(t, rec)), RoleAdmin, "198.51.100.72:0")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("update profile: %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -213,21 +215,27 @@ func TestPACProfilesAPI_DirectGuardrail(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("DIRECT create without confirmation must be 409, got %d (%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "newDirectPaths") || !strings.Contains(rec.Body.String(), "confirmDirect") {
-		t.Errorf("409 body must carry newDirectPaths + confirmDirect: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "newDirectPaths") || !strings.Contains(rec.Body.String(), `"challenge"`) {
+		t.Errorf("409 body must carry newDirectPaths + the bound challenge: %s", rec.Body.String())
 	}
 	if _, exists := pacProfiles.ProfileByID("byp"); exists {
 		t.Error("unconfirmed DIRECT create must not mutate the store")
 	}
+	confirm := pacTestConfirmFragment(t, rec)
 
-	// A WRONG confirmDirect value does not satisfy the gate.
-	rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles?confirmDirect=wrong", body, RoleAdmin, "198.51.100.80:0")
+	// The retired profile-id query parameter does not satisfy the gate, and
+	// neither does a wrong typed value.
+	rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles?confirmDirect=byp", body, RoleAdmin, "198.51.100.80:0")
 	if rec.Code != http.StatusConflict {
-		t.Errorf("wrong confirmDirect must still 409, got %d", rec.Code)
+		t.Errorf("legacy confirmDirect must still 409, got %d", rec.Code)
+	}
+	rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles", pacTestWithConfirm(body, strings.Replace(confirm, `"value":"byp:`, `"value":"byp:wrong-`, 1)), RoleAdmin, "198.51.100.80:0")
+	if rec.Code != http.StatusConflict {
+		t.Errorf("wrong typed value must still 409, got %d", rec.Code)
 	}
 
 	// The correct typed confirmation publishes.
-	rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles?confirmDirect=byp", body, RoleAdmin, "198.51.100.80:0")
+	rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles", pacTestWithConfirm(body, confirm), RoleAdmin, "198.51.100.80:0")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("confirmed DIRECT create: %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -249,7 +257,7 @@ func TestPACProfilesAPI_DirectGuardrail(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("enabling a dormant DIRECT profile must require confirmation (409), got %d (%s)", rec.Code, rec.Body.String())
 	}
-	rec = pacAPIReq(t, http.MethodPut, "/api/pac/profiles/dorm?confirmDirect=dorm", enable, RoleAdmin, "198.51.100.82:0")
+	rec = pacAPIReq(t, http.MethodPut, "/api/pac/profiles/dorm", pacTestWithConfirm(enable, pacTestConfirmFragment(t, rec)), RoleAdmin, "198.51.100.82:0")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("confirmed dormant-enable: %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -578,7 +586,18 @@ func TestPACProfilesAPI_ConcurrentMutationsNoLostUpdate(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			body := fmt.Sprintf(`{"id":"prof-%02d","name":"P%02d","enabled":true,"poolId":"p","privateNetworks":"proxy","availabilityMode":"balanced"}`, i, i)
-			rec := pacAPIReq(t, http.MethodPost, "/api/pac/profiles", body, RoleAdmin, fmt.Sprintf("198.51.100.%d:0", 100+i))
+			// 2F-A: every create echoes the collection token it loaded, so
+			// concurrent creates are serialized by the fence — a loser gets a
+			// structured 409 and, like any well-formed client, reloads and
+			// retries. The property under test is unchanged: no create that
+			// was ACCEPTED is ever lost.
+			var rec *httptest.ResponseRecorder
+			for attempt := 0; attempt < 200; attempt++ {
+				rec = pacAPIReq(t, http.MethodPost, "/api/pac/profiles", body, RoleAdmin, fmt.Sprintf("198.51.100.%d:0", 100+i))
+				if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"stale"`) {
+					break
+				}
+			}
 			if rec.Code != http.StatusOK {
 				t.Errorf("concurrent create %d: %d (%s)", i, rec.Code, rec.Body.String())
 			}
@@ -620,12 +639,16 @@ func TestPACProfilesAPI_StaleRevisionRejected(t *testing.T) {
 	if p, _ := pacProfiles.ProfileByID("hq"); p.Revision != 6 {
 		t.Errorf("revision must bump to 6, got %d", p.Revision)
 	}
-	// Revision 0 (older client) skips the check → OK.
+	// 2F-A: revision 0 no longer skips the check — an explicit zero token is
+	// refused with 428 carrying the current revision, and nothing changes.
 	rec = pacAPIReq(t, http.MethodPut, "/api/pac/profiles/hq",
-		`{"name":"HQ3","enabled":true,"poolId":"p","privateNetworks":"proxy","availabilityMode":"balanced"}`,
+		`{"name":"HQ3","enabled":true,"poolId":"p","privateNetworks":"proxy","availabilityMode":"balanced","revision":0}`,
 		RoleAdmin, "198.51.100.80:0")
-	if rec.Code != http.StatusOK {
-		t.Errorf("revision 0 must skip the precondition, got %d", rec.Code)
+	if rec.Code != http.StatusPreconditionRequired || !strings.Contains(rec.Body.String(), `"revision":6`) {
+		t.Errorf("revision 0 must be refused with 428 + current revision, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if p, _ := pacProfiles.ProfileByID("hq"); p.Name != "HQ2" {
+		t.Errorf("refused zero-token PUT must not mutate: name=%q", p.Name)
 	}
 }
 
