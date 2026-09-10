@@ -20,6 +20,7 @@ import (
 func TestLoadAdminSettings_CorruptFileQuarantinedNotOverwritten(t *testing.T) {
 	captured := captureStartupAlerts(t)
 	isolateStateCorruption(t)
+	isolateRewriterForTest(t)
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "admin_settings.json")
@@ -92,6 +93,7 @@ func TestLoadAdminSettings_MissingFile_NoQuarantineNoAlert(t *testing.T) {
 // fresh clean file, so on the next boot the current file parses — but the unreconciled
 // .corrupt.* sibling must still re-surface the alert + /readyz row until repaired.
 func TestLoadAdminSettings_ResidualQuarantineResurfacedAcrossRestart(t *testing.T) {
+	isolateRewriterForTest(t)
 	captured := captureStartupAlerts(t)
 	isolateStateCorruption(t)
 
@@ -115,4 +117,17 @@ func TestLoadAdminSettings_ResidualQuarantineResurfacedAcrossRestart(t *testing.
 	if _, ok := stateCorruptionSnapshot()["admin_settings"]; !ok {
 		t.Fatal("residual admin_settings quarantine not recorded for /readyz")
 	}
+}
+
+// isolateRewriterForTest gives the test an EMPTY global rewriter and restores
+// the predecessor's rules afterwards. LoadAdminSettings finalizes the
+// YAML-seeded rewrite identities on every load path — after a quarantine it
+// deliberately writes a fresh minimal ledger at the settings path whenever
+// rules are live — so an assertion about the settings file's absence holds
+// only against a rewriter this test owns (PR-C7 order dependency, pinned by
+// test_order_isolation_red_test.go).
+func isolateRewriterForTest(t *testing.T) {
+	t.Helper()
+	t.Cleanup(rewriter.Snapshot())
+	publishRewriteRules(nil)
 }
