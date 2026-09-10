@@ -36,7 +36,7 @@ export function TLSFallbackWarning({
       over plain HTTP. Credentials submitted on this page may travel
       unencrypted. The cause is in the server log, and on Settings → Network
       &amp; TLS once signed in. Complete this task over a trusted network only,
-      then restart the appliance to retry TLS.
+      then restart the node to retry TLS.
     </Callout>
   );
 }
@@ -69,7 +69,7 @@ export function AuthScreen({
           <div className={styles.railHeading}>Management plane</div>
           <dl className={styles.railList}>
             <div className={styles.railItem}>
-              <dt>Appliance</dt>
+              <dt>Node</dt>
               <dd>{window.location.host}</dd>
             </div>
             <div className={styles.railItem}>

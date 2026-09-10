@@ -493,7 +493,8 @@ function ProfileRow({
                   Sessions matched to this profile that cannot be inspected can
                   LEARN a temporary decryption exclusion: subsequent connections
                   to the learned host bypass inspection until the entry expires.
-                  Review the Decryption Exclusions surface for the live cache.
+                  Review the Auto-Exclusions tab (Decryption page) for the live
+                  cache.
                 </Callout>
               )}
               <WhereUsed type="decryption-profile" name={p.name} />
