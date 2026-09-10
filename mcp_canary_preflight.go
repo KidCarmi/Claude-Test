@@ -387,6 +387,12 @@ func mcpCanaryStatus() map[string]any {
 			// keeps saying Canary after an abort. auto_stop names the first cause and reports
 			// execution AUTHORITY separately, so a stopped experiment is never read as healthy.
 			"auto_stop": canaryAbortStatusFor(rollout.CapabilityGateway),
+			// Bounded pre-admission drift evidence (§6). The runtime pipeline refuses a decision
+			// whose tool drifted before the executor is reached; that refusal binds to no
+			// activation, so it deliberately latches nothing. Counting it by reason code is the
+			// only way an operator learns the catalog moved under a decision — and a counter with
+			// no reader is not evidence, so it is reported here. Read-only: nothing consults it.
+			"pre_admission_drift": canaryPreAdmissionDriftCounts(rollout.CapabilityGateway.String()),
 		},
 		"first_canary_bounds": map[string]any{
 			"max_servers":            canary.MaxCanaryServers,
