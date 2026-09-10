@@ -15,7 +15,8 @@
 //     error state for the viewer.
 //   * ZERO /api/events traffic anywhere (§16), zero external requests, zero
 //     unexpected console/page errors, strict CSP untouched.
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test } from "./test";
 import type { Page } from "@playwright/test";
 import { AUTH_URL, EMPTY_STATE, FRESH_URL, USERS } from "./fixtures";
 
@@ -168,7 +169,9 @@ test("traffic: bounded default query over seeded history, cursor paging with dis
   await expect(page.getByText("(page 2)")).toBeVisible();
   await expect(page.getByText("fe4-seed-49.test")).toBeVisible();
   await expect(page.getByText("fe4-seed-149.test")).toBeHidden();
-  await expect(page.locator("tbody tr")).toHaveCount(50);
+  // 151 seeded entries since 2A (150 default-deny + the rule-hit block that
+  // backs the Traffic → Policy deep-link proof): page 2 carries the tail 51.
+  await expect(page.locator("tbody tr")).toHaveCount(51);
   // End of history: Next disables instead of inventing a page count.
   await expect(page.getByRole("button", { name: "Next" })).toBeDisabled();
 
@@ -351,6 +354,20 @@ test.describe("history-disabled appliance", () => {
     await page.goto(`${FRESH_URL}/app/monitor/traffic`);
     await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
     await login(page, "root-admin", "StrongPass123");
+    await expect(page.getByRole("heading", { name: "Traffic" })).toBeVisible();
+
+    // Enforce this test's premise through the supported admin API: dataDir
+    // is the fixed absolute /data shared by every harness instance on the
+    // machine, so an admin-settings save from ANY instance in a PREVIOUS
+    // run (e.g. the 2A draft fixture on the AUTH appliance, whose store is
+    // enabled) can persist log_store_enabled=true and silently re-enable a
+    // history store on this "store-less" appliance at boot. CI runners are
+    // ephemeral and never see this; a long-lived dev machine does.
+    const off = await page.request.put(`${FRESH_URL}/api/logs/retention`, {
+      data: { enabled: false },
+    });
+    expect(off.ok()).toBe(true);
+    await page.goto(`${FRESH_URL}/app/monitor/traffic`);
     await expect(page.getByRole("heading", { name: "Traffic" })).toBeVisible();
 
     // Degraded ≠ error ≠ empty: the disabled store is a first-class state.

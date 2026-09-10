@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,6 +131,11 @@ type CDRPolicyStore struct {
 	version   int64  // monotonic, bumped on every mutation
 	updatedAt string // RFC3339
 	epoch     int64  // monotonic, bumped on every mutation (lock-free read via atomic)
+
+	// integrity is the identity truth computed at Load / Replace / RemoveAt
+	// (2E-C R10). A nil Issues slice means "never evaluated" (in-memory
+	// store built by Add alone), which is OK by construction.
+	integrity CDRPolicyIntegrity
 }
 
 // cdrPolicyStore is the process-wide store, loaded from disk at init.
@@ -175,26 +181,161 @@ func (s *CDRPolicyStore) Load(path string) error {
 	if err := json.Unmarshal(data, &rules); err != nil {
 		return fmt.Errorf("cdr policies: parse %q: %w", sanitizeLog(path), err)
 	}
+	// 2E-C R10: the name is the rule's identity. A durable file written
+	// before identity was enforced (or edited by hand) may carry duplicate
+	// or empty names; it is loaded VERBATIM (nothing is silently chosen or
+	// dropped) and the store is marked DEGRADED — the read surface says so
+	// and the operator repairs it by position (RemoveAt). Add is refused
+	// while degraded; DELETE by an ambiguous name is refused.
 	s.rules = rules
+	s.integrity = computeCDRPolicyIntegrity(rules)
+	s.bumpVersion()
+	return nil
+}
+
+// cdrPolicyIdentity is the normalised identity key: names that differ
+// only by surrounding whitespace are the SAME rule.
+func cdrPolicyIdentity(name string) string { return strings.TrimSpace(name) }
+
+// CDRPolicyIntegrityIssue names one identity defect in the loaded store.
+type CDRPolicyIntegrityIssue struct {
+	Kind      string `json:"kind"` // duplicate_name | empty_name
+	Name      string `json:"name"`
+	Positions []int  `json:"positions"`
+}
+
+// CDRPolicyIntegrity is the read-surface truth about the store's identity
+// invariants. OK=false ⇒ degraded (see Load).
+type CDRPolicyIntegrity struct {
+	OK     bool                      `json:"ok"`
+	Issues []CDRPolicyIntegrityIssue `json:"issues"`
+}
+
+func computeCDRPolicyIntegrity(rules []*CDRPolicyRule) CDRPolicyIntegrity {
+	out := CDRPolicyIntegrity{OK: true, Issues: []CDRPolicyIntegrityIssue{}}
+	byName := map[string][]int{}
+	var empty []int
+	for i, r := range rules {
+		if r == nil {
+			empty = append(empty, i)
+			continue
+		}
+		id := cdrPolicyIdentity(r.Name)
+		if id == "" {
+			empty = append(empty, i)
+			continue
+		}
+		byName[id] = append(byName[id], i)
+	}
+	if len(empty) > 0 {
+		out.OK = false
+		out.Issues = append(out.Issues, CDRPolicyIntegrityIssue{Kind: "empty_name", Positions: empty})
+	}
+	names := make([]string, 0, len(byName))
+	for n, pos := range byName {
+		if len(pos) > 1 {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		out.OK = false
+		out.Issues = append(out.Issues, CDRPolicyIntegrityIssue{Kind: "duplicate_name", Name: n, Positions: byName[n]})
+	}
+	return out
+}
+
+// Integrity returns the current identity truth (always well-formed).
+func (s *CDRPolicyStore) Integrity() CDRPolicyIntegrity {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.integrity.Issues == nil {
+		return CDRPolicyIntegrity{OK: true, Issues: []CDRPolicyIntegrityIssue{}}
+	}
+	return s.integrity
+}
+
+var (
+	errCDRPolicyStoreDegraded = fmt.Errorf("the CDR policy store is degraded (duplicate or empty rule names on disk); repair it before adding rules")
+	errCDRPolicyAmbiguousName = fmt.Errorf("more than one CDR policy rule carries that name; delete by position")
+	errCDRPolicyEmptyName     = fmt.Errorf("cdr policies: rule name is required")
+)
+
+// validateIdentities enforces unique, non-empty normalised names.
+func validateCDRPolicyIdentities(rules []*CDRPolicyRule) error {
+	seen := map[string]int{}
+	for i, r := range rules {
+		id := cdrPolicyIdentity(r.Name)
+		if id == "" {
+			return fmt.Errorf("%w (rule %d)", errCDRPolicyEmptyName, i)
+		}
+		if j, dup := seen[id]; dup {
+			return fmt.Errorf("%w: %q (rules %d and %d)", errCDRPolicyDuplicateName,
+				strings.ReplaceAll(strings.ReplaceAll(id, "\n", "_"), "\r", "_"), j, i)
+		}
+		seen[id] = i
+	}
+	return nil
+}
+
+// RemoveAt deletes the rule at `position` (0-based, current order) ONLY
+// when the store is degraded and the rule there carries `expectedName`
+// (verbatim) — the operator's fenced repair path for duplicate/empty
+// identities. Durable-or-nothing.
+func (s *CDRPolicyStore) RemoveAt(position int, expectedName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.integrity.OK || s.integrity.Issues == nil {
+		return fmt.Errorf("cdr policies: positional delete is only available while the store is degraded")
+	}
+	if position < 0 || position >= len(s.rules) || s.rules[position] == nil {
+		return fmt.Errorf("cdr policies: no rule at position %d", position)
+	}
+	if s.rules[position].Name != expectedName {
+		return fmt.Errorf("cdr policies: rule at position %d is not named as expected", position)
+	}
+	prev := s.rules
+	prevIntegrity := s.integrity
+	next := make([]*CDRPolicyRule, 0, len(prev)-1)
+	next = append(next, prev[:position]...)
+	next = append(next, prev[position+1:]...)
+	s.rules = next
+	s.integrity = computeCDRPolicyIntegrity(next)
+	if err := s.saveLocked(); err != nil {
+		s.rules = prev
+		s.integrity = prevIntegrity
+		return err
+	}
 	s.bumpVersion()
 	return nil
 }
 
 // Save atomically writes the current ruleset to s.path (if set).  Returns
 // nil without writing when path is empty (in-memory-only mode).
+//
+// 2E-C commit boundary: Save takes the WRITE lock and persists while
+// holding it, and Add/RemoveByName persist inside their own critical
+// sections (saveLocked) — the pre-2E-C snapshot-under-RLock/write-unlocked
+// shape let two concurrent mutations land their file writes out of order,
+// so the durable file could lose the later mutation (same class as the
+// instance registry; see cdrstore.go Save).
 func (s *CDRPolicyStore) Save() error {
-	s.mu.RLock()
-	path := s.path
-	rules := append([]*CDRPolicyRule(nil), s.rules...) // shallow copy
-	s.mu.RUnlock()
-	if path == "" {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+// saveLocked persists the current ruleset.  MUST be called with s.mu
+// held (write mode).  No-op when path is empty.
+func (s *CDRPolicyStore) saveLocked() error {
+	if s.path == "" {
 		return nil
 	}
-	data, err := json.MarshalIndent(rules, "", "  ")
+	data, err := json.MarshalIndent(s.rules, "", "  ")
 	if err != nil {
 		return fmt.Errorf("cdr policies: marshal: %w", err)
 	}
-	if err := fileutil.AtomicWrite(path, data, 0o600); err != nil {
+	if err := fileutil.AtomicWrite(s.path, data, 0o600); err != nil {
 		return fmt.Errorf("cdr policies: %w", err)
 	}
 	return nil
@@ -224,53 +365,98 @@ func (s *CDRPolicyStore) Replace(rules []*CDRPolicyRule) error {
 			return fmt.Errorf("cdr policies: rule %d has invalid mode %q", i, safe)
 		}
 	}
+	if err := validateCDRPolicyIdentities(rules); err != nil {
+		return err
+	}
 	sortCDRRulesByPriority(rules)
 	s.mu.Lock()
 	s.rules = rules
+	s.integrity = computeCDRPolicyIntegrity(rules)
 	s.bumpVersion()
 	s.mu.Unlock()
 	return nil
 }
 
+// errCDRPolicyDuplicateName rejects a second rule under an existing
+// name (2E-C): the name is the only key RemoveByName / the admin DELETE
+// accepts, so duplicates would make the deletion target ambiguous.
+var errCDRPolicyDuplicateName = fmt.Errorf("a CDR policy rule with that name already exists")
+
 // Add appends a rule, keeps the list priority-sorted, and persists.
+// The name must be unique (it is the rule's identity — see
+// errCDRPolicyDuplicateName). Durable-or-nothing: a failed persist
+// reverts the in-memory append.
 func (s *CDRPolicyStore) Add(r CDRPolicyRule) (CDRPolicyRule, error) {
 	if !validateMode(r.Mode) {
 		safe := strings.ReplaceAll(strings.ReplaceAll(r.Mode, "\n", "_"), "\r", "_")
 		return CDRPolicyRule{}, fmt.Errorf("invalid mode %q", safe)
 	}
+	id := cdrPolicyIdentity(r.Name)
+	if id == "" {
+		return CDRPolicyRule{}, errCDRPolicyEmptyName
+	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.integrity.Issues != nil && !s.integrity.OK {
+		return CDRPolicyRule{}, errCDRPolicyStoreDegraded
+	}
+	for i := range s.rules {
+		if cdrPolicyIdentity(s.rules[i].Name) == id {
+			return CDRPolicyRule{}, fmt.Errorf("%w: %q", errCDRPolicyDuplicateName,
+				strings.ReplaceAll(strings.ReplaceAll(id, "\n", "_"), "\r", "_"))
+		}
+	}
+	prev := s.rules
 	rule := r
-	s.rules = append(s.rules, &rule)
-	sortCDRRulesByPriority(s.rules)
-	s.bumpVersion()
-	s.mu.Unlock()
-	if err := s.Save(); err != nil {
+	next := append(append([]*CDRPolicyRule(nil), prev...), &rule)
+	sortCDRRulesByPriority(next)
+	s.rules = next
+	if err := s.saveLocked(); err != nil {
+		s.rules = prev
 		return CDRPolicyRule{}, err
 	}
+	s.bumpVersion()
 	return rule, nil
 }
 
-// RemoveByName removes the first rule with the matching name; returns
-// false if no such rule exists.
+// RemoveByName removes the rule with the matching name; returns false
+// if no such rule exists. Durable-or-nothing: a failed persist restores
+// the rule and reports (false, err).
 func (s *CDRPolicyStore) RemoveByName(name string) (bool, error) {
+	id := cdrPolicyIdentity(name)
+	if id == "" {
+		return false, nil
+	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	found := -1
 	for i := range s.rules {
-		if s.rules[i].Name == name {
+		if s.rules[i] != nil && cdrPolicyIdentity(s.rules[i].Name) == id {
+			if found >= 0 {
+				// 2E-C R10: never silently choose which duplicate dies.
+				return false, errCDRPolicyAmbiguousName
+			}
 			found = i
-			break
 		}
 	}
 	if found < 0 {
-		s.mu.Unlock()
 		return false, nil
 	}
-	s.rules = append(s.rules[:found], s.rules[found+1:]...)
-	s.bumpVersion()
-	s.mu.Unlock()
-	if err := s.Save(); err != nil {
-		return true, err
+	prev := s.rules
+	prevIntegrity := s.integrity
+	next := make([]*CDRPolicyRule, 0, len(prev)-1)
+	next = append(next, prev[:found]...)
+	next = append(next, prev[found+1:]...)
+	s.rules = next
+	if s.integrity.Issues != nil {
+		s.integrity = computeCDRPolicyIntegrity(next)
 	}
+	if err := s.saveLocked(); err != nil {
+		s.rules = prev
+		s.integrity = prevIntegrity
+		return false, err
+	}
+	s.bumpVersion()
 	return true, nil
 }
 

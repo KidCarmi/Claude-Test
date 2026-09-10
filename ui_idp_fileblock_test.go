@@ -153,6 +153,10 @@ func TestAPIPolicyReorder_Post_Mismatch(_ *testing.T) {
 }
 
 func TestAPIPolicyReorder_Post_Success(t *testing.T) {
+	// The reorder contract (2E-C) refuses any list that does not cover the
+	// whole access set, so the test must own the store it permutes (PR-C7
+	// order dependency, pinned by test_order_isolation_red_test.go).
+	withFreshPolicyStore(t)
 	// Add two rules and reorder them
 	r1 := policyStore.Add(PolicyRule{Priority: 7701, Name: "reorder-a", Action: "allow"})
 	r2 := policyStore.Add(PolicyRule{Priority: 7702, Name: "reorder-b", Action: "deny"})
