@@ -1,6 +1,12 @@
 # Frontend Current State — Repository-Grounded Audit
 
-- **Status**: Current (measured 2026-08-21 against the working tree at the head of `main`)
+- **Status**: Current (measured 2026-08-21 against the working tree at the head of `main`).
+  2F-G closure note (2026-09-08): the route pin is **243** `uiRoutes` entries since 2F-C
+  (`ui_routes_meta_test.go` / `d0_helpers_test.go`); the Network surfaces (`/app/network/pac`,
+  `/app/network/upstream`) and the CDR surface (`/app/security/cdr`) have since migrated with
+  admin-only mutations (see the parity matrix rows FE-V31/FE-V32 and the security contract
+  D15); the "§7 accounting table" pointer in the Routes bullet below is historical — the
+  generated per-method inventory is `api/route-classification.yaml`.
 - **Companions**: `ADR-FE-001-frontend-platform.md` (decision), `FRONTEND-FEATURE-PARITY.md`
   (per-feature matrix), `FRONTEND-SECURITY-CONTRACT.md` (invariants),
   `FRONTEND-MIGRATION-PLAN.md` (program)
@@ -192,7 +198,7 @@ dependencies, current test coverage, and migration risk — lives in
 
 ## 6. Backend contracts the frontend consumes (keep — authoritative)
 
-- **Routes**: 232 `uiRoutes` entries / **346** method rows (GET 146, POST 114, PUT 35,
+- **Routes** (as measured 2026-08-22; the pin is 243 routes since 2F-C): 232 `uiRoutes` entries / **346** method rows (GET 146, POST 114, PUT 35,
   DELETE 32, MethodAny 19; viewer 147, admin 115, operator 66, public 18; mutating 182;
   audit-expected 162), count-locked by C1 + D0 tests — regenerated 2026-08-22 after FE-1B
   added the three v2 static routes (`/app`, `/app/`, `/assets/`: MethodAny, public, exempt
