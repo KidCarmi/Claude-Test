@@ -44,6 +44,17 @@ type RuntimeStateHealth struct {
 	// ExecutionEnabled reports whether upstream tool execution is composed. QUAL-1
 	// ships NO executor, so a bound Gateway observe listener always reports false.
 	ExecutionEnabled bool `json:"execution_enabled"`
+	// The fields below are the listener's own security-defense trip counters —
+	// already computed and Prometheus-exported (culvert_mcp_*_total) but, before
+	// this, visible nowhere on the admin API/GUI an operator actually watches.
+	RequestsTotal      uint64 `json:"requests_total"`
+	RequestsRejected   uint64 `json:"requests_rejected"`
+	Queued             uint64 `json:"queued"`
+	Timeouts           uint64 `json:"timeouts"`
+	AuthFailures       uint64 `json:"auth_failures"`
+	AmbiguousHeaders   uint64 `json:"ambiguous_headers"`
+	HostOriginFailures uint64 `json:"host_origin_failures"`
+	ObserveDrops       uint64 `json:"observe_drops"`
 }
 
 // CapabilityHealth is the composed safe health of one MCP capability.

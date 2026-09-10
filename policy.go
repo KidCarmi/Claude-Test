@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"sort"
 	"strings"
@@ -104,16 +105,30 @@ type PolicyRule struct {
 	// above is a denormalized display cache kept honest by the rename cascade.
 	// Stamped name→id on write; omitempty so pre-migration rules are byte-unchanged.
 	DestCategoryGroupID string          `json:"destCategoryGroupId,omitempty"`
-	DestCountry         []string        `json:"destCountry"`                 // ISO 3166-1 alpha-2 country codes; empty = any
-	Schedule            *PolicySchedule `json:"schedule,omitempty"`          // nil = always active
-	SSLAction           SSLAction       `json:"sslAction"`                   // Inspect | Bypass
-	FileFiltering       bool            `json:"fileFiltering"`               // enable file-type scanning
-	FileProfile         FileProfileName `json:"fileProfile"`                 // named file-extension block profile
-	LogFullURI          bool            `json:"logFullUri"`                  // log the full request URL (path, no query) for traffic matching this rule; HTTPS requires SSLAction=Inspect
-	LogTraffic          *bool           `json:"logTraffic,omitempty"`        // log allowed traffic matching this rule (nil/true = log; false = count stats only, no feed entry). Blocks/threats are always logged.
-	TLSSkipVerify       bool            `json:"tlsSkipVerify"`               // skip upstream cert verification (use with caution)
-	StripALPN           *bool           `json:"stripAlpn,omitempty"`         // SSL-inspect only: nil (absent, pre-feature) or true => downgrade the inspected tunnel to HTTP/1.1 (today's behavior); false => native HTTP/2 inspection. Ignored when SSLAction==Bypass. Presence-aware so an upgrade never silently switches existing rules to H2 (resolveStripALPN). Superseded by DecryptionProfile.InspectHTTP2 when a profile is bound.
-	DecryptionProfile   string          `json:"decryptionProfile,omitempty"` // SSL-inspect only: name of a DecryptionProfile that governs HOW this tunnel is decrypted (InspectHTTP2, cert-verification, TLS floor/cap, stall). Empty = none. A dangling ref falls back to the inline StripALPN/TLSSkipVerify (fail-safe at eval).
+	DestCountry         []string        `json:"destCountry"`        // ISO 3166-1 alpha-2 country codes; empty = any
+	Schedule            *PolicySchedule `json:"schedule,omitempty"` // nil = always active
+	SSLAction           SSLAction       `json:"sslAction"`          // Inspect | Bypass
+	FileFiltering       bool            `json:"fileFiltering"`      // enable file-type scanning
+	FileProfile         FileProfileName `json:"fileProfile"`        // named file-extension block profile (denormalized display cache once FileProfileID is stamped; legacy-fallback input for un-migrated rules)
+	// FileProfileID is the AUTHORITATIVE, rename-safe link to the file profile
+	// (references-by-id, 2D-C promotion — same doctrine as DecryptionProfileID).
+	// Resolution is ID-FIRST; a rule with NO ID (legacy/un-migrated) resolves by
+	// name through the store and then the compiled legacy fileProfileExts map,
+	// byte-identical to the pre-promotion behavior. A NON-EMPTY ID that no longer
+	// resolves FAILS CLOSED for the file-control dimension (every
+	// extension-bearing transaction on the rule is blocked — 2D-C final §2)
+	// and deliberately does NOT retarget by name — an authoritative identity must
+	// never silently rebind to a different object that happens to carry the same
+	// name (2D-C anti-rebinding doctrine, stricter here than the group shape
+	// because the legacy built-in name space is compiled-in and collision-prone).
+	// Stamped name→id server-side on every interactive/import write; omitempty so
+	// pre-promotion rules are byte-unchanged.
+	FileProfileID     string `json:"fileProfileId,omitempty"`
+	LogFullURI        bool   `json:"logFullUri"`                  // log the full request URL (path, no query) for traffic matching this rule; HTTPS requires SSLAction=Inspect
+	LogTraffic        *bool  `json:"logTraffic,omitempty"`        // log allowed traffic matching this rule (nil/true = log; false = count stats only, no feed entry). Blocks/threats are always logged.
+	TLSSkipVerify     bool   `json:"tlsSkipVerify"`               // skip upstream cert verification (use with caution)
+	StripALPN         *bool  `json:"stripAlpn,omitempty"`         // SSL-inspect only: nil (absent, pre-feature) or true => downgrade the inspected tunnel to HTTP/1.1 (today's behavior); false => native HTTP/2 inspection. Ignored when SSLAction==Bypass. Presence-aware so an upgrade never silently switches existing rules to H2 (resolveStripALPN). Superseded by DecryptionProfile.InspectHTTP2 when a profile is bound.
+	DecryptionProfile string `json:"decryptionProfile,omitempty"` // SSL-inspect only: name of a DecryptionProfile that governs HOW this tunnel is decrypted (InspectHTTP2, cert-verification, TLS floor/cap, stall). Empty = none. A dangling ref falls back to the inline StripALPN/TLSSkipVerify (fail-safe at eval).
 	// DecryptionProfileID is the AUTHORITATIVE, rename-safe link to the profile
 	// (references-by-id, OBJECT-REFERENCES-BY-ID.md). Resolution prefers the ID
 	// and falls back to the name for un-migrated/dangling rules; the name above is
@@ -179,6 +194,31 @@ type PolicyRule struct {
 	// mutators — those fall back to the allocating matchIPOrCIDR path.
 	srcIPNet *net.IPNet
 
+	// srcPrefix is srcIPNet expressed as a netip.Prefix, precomputed by
+	// sortLocked() from the SAME *net.IPNet via prefixFromIPNet (security.go) —
+	// the helper the IP filter already uses, so both matchers inherit one
+	// pinned conversion (including the 4-in-6 subtlety its differential test
+	// covers) instead of two hand-rolled ones.
+	//
+	// It exists purely to make the per-rule source check cheaper. net.IPNet
+	// stores its address and mask as byte SLICES of unspecified length, so
+	// Contains re-derives their shape on EVERY call: networkNumberAndMask runs
+	// To4 on both, and To4 runs isZeros over the 16-byte form. That work is
+	// identical for every request and every rule, yet it was paid per rule per
+	// request — and it dominated. Profiling BenchmarkPolicyEvaluate_CIDRRules
+	// (1000 source-scoped rules) attributed 34.4% of the ENTIRE evaluation to
+	// net.(*IPNet).Contains: 13.8% Contains itself, 10.1% net.isZeros, 5.3%
+	// net.IP.To4, 5.3% net.networkNumberAndMask.
+	//
+	// netip.Prefix is a fixed-size value with the family already decided, so
+	// Contains is a masked comparison and nothing is re-derived. Both fields
+	// are kept: an IPNet whose mask is non-contiguous has no Prefix form, and
+	// prefixFromIPNet reports that rather than guessing, so srcIPNet remains
+	// the authority whenever srcPrefix is invalid. Same fallback discipline as
+	// normFQDN/srcIPNet — a rule that bypassed the mutators simply takes the
+	// slower path, so correctness never depends on this being populated.
+	srcPrefix netip.Prefix
+
 	// matchedConds is the buildMatchedConditions summary, precomputed by
 	// sortLocked(): it depends only on the rule's configured fields, never on
 	// the request, so rebuilding it on every match was pure per-request
@@ -242,6 +282,36 @@ func (ps *PolicyStore) policyVersion() (int64, string) {
 func (ps *PolicyStore) bumpVersion() {
 	ps.version++
 	ps.updatedAt = time.Now().UTC().Format(time.RFC3339)
+}
+
+// seedVersion pins the version counter and timestamp — the draft-fork
+// continuity seam (2B.0a): the candidate's generation stream CONTINUES the
+// running stream it forked from, so a stale pre-fork running token can never
+// numerically collide with a post-fork candidate generation (the first staged
+// mutation lands at baseGen+1). Only the fork path may call this.
+func (ps *PolicyStore) seedVersion(v int64, updatedAt string) {
+	ps.mu.Lock()
+	ps.version = v
+	if updatedAt != "" {
+		ps.updatedAt = updatedAt
+	}
+	ps.mu.Unlock()
+}
+
+// ensureVersionAbove advances the version counter strictly past floor — the
+// candidate-RETIREMENT seam (2B.0a): when a draft is committed, reverted, or
+// reconciled away, the running counter jumps past every generation the
+// candidate ever exposed, so a stale candidate-era ?ifVersion= token can never
+// numerically equal a later running generation and silently pass the fence.
+// The only cost is a conservative false conflict for clients holding the
+// pre-draft running token after a revert (they reload; content unchanged).
+func (ps *PolicyStore) ensureVersionAbove(floor int64) {
+	ps.mu.Lock()
+	if ps.version <= floor {
+		ps.version = floor + 1
+		ps.updatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	ps.mu.Unlock()
 }
 
 var policyStore = &PolicyStore{}
@@ -439,6 +509,38 @@ func (ps *PolicyStore) SaveErr() error {
 func (ps *PolicyStore) List() []PolicyRule {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
+	return ps.listLocked()
+}
+
+// PolicyStoreSnapshot is one coherent read of a policy store: the published
+// rule copies plus the version fence that identifies EXACTLY that rulebase.
+// Captured under a single read lock so a concurrent staged/committed mutation
+// can never tear rules from version (fenced-read correction §§6–8: List() then
+// policyVersion() as two calls let an edit land in between, handing a client
+// generation-P rules with a generation-P+1 token — a stale later edit would
+// pass the optimistic fence).
+type PolicyStoreSnapshot struct {
+	Rules     []PolicyRule
+	Version   int64
+	UpdatedAt string
+}
+
+// SnapshotWithVersion captures rules + version + updatedAt under ONE
+// PolicyStore read lock. This is the only sanctioned way to pair a rule list
+// with its version fence; do not call List() and policyVersion() separately
+// for any surface that returns both.
+func (ps *PolicyStore) SnapshotWithVersion() PolicyStoreSnapshot {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return PolicyStoreSnapshot{
+		Rules:     ps.listLocked(),
+		Version:   ps.version,
+		UpdatedAt: ps.updatedAt,
+	}
+}
+
+// listLocked is List's body; the caller must hold ps.mu (read or write).
+func (ps *PolicyStore) listLocked() []PolicyRule {
 	out := make([]PolicyRule, len(ps.rules))
 	for i, r := range ps.rules {
 		out[i] = *clonePolicyRuleForPublication(r)
@@ -725,6 +827,97 @@ func (ps *PolicyStore) CascadeDestCategoryGroupRename(id, oldName, newName strin
 	return n
 }
 
+// CascadeFileProfileRename refreshes the denormalized FileProfile name on
+// every rule that references the renamed file profile — by its stable ID
+// (migrated rules) or, for un-migrated name-only rules, by its OLD name
+// (which also stamps the ID, migrating them so the reference is ID-stable
+// henceforth). References-by-id (2D-C): the enforcement path resolves by ID,
+// so file blocking survives the rename regardless; this keeps the
+// human-readable denormalized copy honest for display/export/DP-sync.
+// Returns the number of rules touched; the caller persists via SaveErr.
+// Race-safe by pointer swap, like the other Cascade*Rename methods.
+func (ps *PolicyStore) CascadeFileProfileRename(id, oldName, newName string) int {
+	if id == "" {
+		return 0
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	next := append([]*PolicyRule(nil), ps.rules...)
+	n := 0
+	for i, rule := range next {
+		byID := rule.FileProfileID == id && string(rule.FileProfile) != newName
+		byName := rule.FileProfileID == "" && strings.EqualFold(string(rule.FileProfile), oldName)
+		if !byID && !byName {
+			continue
+		}
+		nr := *rule
+		nr.FileProfile = FileProfileName(newName)
+		nr.FileProfileID = id // stamp/keep the authoritative link
+		next[i] = &nr
+		n++
+	}
+	if n > 0 {
+		ps.rules = next
+		ps.sortLocked()
+		ps.bumpVersion()
+	}
+	return n
+}
+
+// RefreshObjectRefNames re-derives every rule's denormalized object display
+// names from the ID-authoritative object stores (boot reconciliation — the
+// deterministic recovery half of the 2D-A rename model; see
+// reconcileObjectRefNames). Only rules whose object-link ID resolves to a live
+// object AND whose cached name differs are touched; a dangling ID is left
+// alone (its stale name is the documented legacy/name-fallback input, so
+// rewriting it would change match semantics). Returns the number of rules
+// touched; the caller persists via SaveErr. Race-safe by pointer swap, like
+// the Cascade*Rename methods.
+func (ps *PolicyStore) RefreshObjectRefNames(groupNames, profileNames, fileProfileNames map[string]string) int {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	next := append([]*PolicyRule(nil), ps.rules...)
+	n := 0
+	for i, rule := range next {
+		nr, changed := refreshedObjectRefNames(rule, groupNames, profileNames, fileProfileNames)
+		if !changed {
+			continue
+		}
+		next[i] = &nr
+		n++
+	}
+	if n > 0 {
+		ps.rules = next
+		ps.sortLocked()
+		ps.bumpVersion()
+	}
+	return n
+}
+
+// refreshedObjectRefNames returns a copy of rule with every cached object
+// display name refreshed from the ID→name maps, and whether anything
+// changed. A dangling ID (absent from its map) is left alone.
+func refreshedObjectRefNames(rule *PolicyRule, groupNames, profileNames, fileProfileNames map[string]string) (PolicyRule, bool) {
+	nr := *rule
+	changed := false
+	if rule.DestCategoryGroupID != "" {
+		if cur, ok := groupNames[rule.DestCategoryGroupID]; ok && rule.DestCategoryGroup != cur {
+			nr.DestCategoryGroup, changed = cur, true
+		}
+	}
+	if rule.DecryptionProfileID != "" {
+		if cur, ok := profileNames[rule.DecryptionProfileID]; ok && rule.DecryptionProfile != cur {
+			nr.DecryptionProfile, changed = cur, true
+		}
+	}
+	if rule.FileProfileID != "" {
+		if cur, ok := fileProfileNames[rule.FileProfileID]; ok && string(rule.FileProfile) != cur {
+			nr.FileProfile, changed = FileProfileName(cur), true
+		}
+	}
+	return nr, changed
+}
+
 // DeleteByID removes the rule with the given stable ULID. Rename/reorder-safe
 // counterpart to Delete. Returns false if not found.
 func (ps *PolicyStore) DeleteByID(id string) bool {
@@ -951,10 +1144,16 @@ func (ps *PolicyStore) sortLocked() {
 		} else {
 			r.normFQDN = ""
 		}
-		r.srcIPNet = nil
+		r.srcIPNet, r.srcPrefix = nil, netip.Prefix{}
 		if strings.Contains(r.SourceIP, "/") {
 			if _, ipNet, err := net.ParseCIDR(r.SourceIP); err == nil {
 				r.srcIPNet = ipNet
+				// Derived from the SAME IPNet, so the two forms can never
+				// describe different networks. An unconvertible mask leaves
+				// srcPrefix invalid and the hot path falls back to srcIPNet.
+				if p, ok := prefixFromIPNet(ipNet); ok {
+					r.srcPrefix = p
+				}
 			}
 		}
 		r.matchedConds = buildMatchedConditions(r)
@@ -1014,6 +1213,7 @@ func copyPolicyRuleForPublication(nr, rule *PolicyRule) {
 		nr.Auth = &auth
 	}
 	nr.srcIPNet = nil
+	nr.srcPrefix = netip.Prefix{}
 	nr.normFQDN = ""
 	nr.matchedConds = ""
 }
@@ -1145,9 +1345,12 @@ const (
 // enforcement hot path: the nil branch allocates nothing (the skip strings are
 // static literals), preserving the zero-per-rule-allocation contract.
 func evalAccessRules(rules []*PolicyRule, in *accessEvalInput, now func() time.Time, trace func(rule *PolicyRule, skip string)) *PolicyRule { //nolint:gocognit // one explicit skip-reason branch per rule condition; the zero-alloc contract forbids extraction on this hot path
-	// Parse the client IP ONCE into a local (stays on the stack — matchSourceAddr
-	// never retains it), reused across every rule's precomputed srcIPNet.
-	clientAddr := net.ParseIP(in.clientIP)
+	// The client address is parsed at most ONCE for the whole scan, lazily on
+	// the first rule that actually carries a SourceIP, and reused across every
+	// rule's precomputed srcPrefix/srcIPNet. A scan with no source-scoped rule
+	// never parses at all. The local stays on the stack — matchSourceAddr reads
+	// and memoises through the pointer but never retains it.
+	clientSrc := newClientSource(in.clientIP)
 	// Resolve the destination's CATEGORY at most ONCE for the whole scan, lazily
 	// on the first category-scoped rule reached (see policy_hostcat.go): the
 	// host→category fusion depends only on the host, so running it per rule
@@ -1179,7 +1382,7 @@ func evalAccessRules(rules []*PolicyRule, in *accessEvalInput, now func() time.T
 			}
 			continue
 		}
-		if !matchSourceAddr(rule, in.clientIP, clientAddr, in.identity, in.authSource, in.groups) {
+		if !matchSourceAddr(rule, &clientSrc, in.identity, in.authSource, in.groups) {
 			if trace != nil {
 				trace(rule, accessSkipSource)
 			}
@@ -1459,23 +1662,113 @@ func parseClockMinutes(s string) (int, bool) {
 // ─── Source matching ──────────────────────────────────────────────────────────
 
 func matchSource(rule *PolicyRule, clientIP, identity, authSource string, groups []string) bool {
-	return matchSourceAddr(rule, clientIP, net.ParseIP(clientIP), identity, authSource, groups)
+	src := newClientSource(clientIP)
+	return matchSourceAddr(rule, &src, identity, authSource, groups)
 }
 
-// matchSourceAddr is matchSource's core. clientAddr MUST be
-// net.ParseIP(clientIP) (nil when clientIP is not a valid IP); the hot path
-// (Evaluate) parses it ONCE per request and reuses it across every rule's
-// precomputed srcIPNet — eliminating the per-rule ParseCIDR+ParseIP
-// allocations. Rules without a precomputed srcIPNet (non-CIDR SourceIP, or a
-// rule that bypassed the mutators) fall back to the allocating matchIPOrCIDR,
-// so correctness never depends on the precompute.
-func matchSourceAddr(rule *PolicyRule, clientIP string, clientAddr net.IP, identity, authSource string, groups []string) bool {
+// clientSource carries the request's client address for the per-rule source
+// check. One is built per EVALUATION and shared by every rule, replacing work
+// that used to be redone per RULE.
+//
+// It is passed by POINTER and its parse is LAZY, and both of those are load
+// bearing:
+//
+//   - Lazy, because the address is needed only by a rule that actually carries
+//     a SourceIP. Parsing eagerly at the top of the scan — which is what the
+//     pre-change code did, with net.ParseIP — charges every deployment for a
+//     feature only some use. Measured on a 500-rule rulebase with NO source
+//     CIDRs, an eager parse cost 2-8% depending on where the match landed; a
+//     cost change should not be a trade.
+//   - By pointer, so the memoised parse is visible to the NEXT rule rather
+//     than being thrown away with a by-value copy. The pointer is read and
+//     written only by matchSourceAddr, never retained, so it stays on
+//     evalAccessRules' stack and the scan keeps its zero-allocation contract
+//     (pinned by TestBenchGate_PolicySourceCIDRAllocFree).
+//
+// A clientSource belongs to ONE evaluation and must not be shared across
+// goroutines; evalAccessRules keeps it as a local for exactly that reason.
+type clientSource struct {
+	// raw is the address verbatim, for a rule whose SourceIP is a literal
+	// rather than a CIDR (a plain string compare).
+	raw string
+	// addr is raw parsed and Unmapped; invalid exactly when raw is not a valid
+	// IP address — the condition the pre-change code spelled as
+	// net.ParseIP(clientIP) != nil. Valid only once parsed is true.
+	//
+	// The Unmap mirrors net.IPNet.Contains, which folds a 4-in-6 address to
+	// IPv4 via To4 before comparing — the same pairing prefixFromIPNet applies
+	// to the network side.
+	addr   netip.Addr
+	parsed bool
+}
+
+func newClientSource(clientIP string) clientSource {
+	return clientSource{raw: clientIP}
+}
+
+// address parses raw on first use and memoises the result — including the
+// failure, so an unparseable address is not re-parsed once per rule.
+//
+// It uses netip.ParseAddr rather than the net.ParseIP this path used before:
+// net.ParseIP builds a 16-byte slice (53 ns, 1 alloc on this machine) where
+// netip.ParseAddr fills a value (26 ns, 0 allocs), and a slice field would
+// also make the struct's contents escape.
+//
+// The one place the two parsers disagree is a ZONED address: net.ParseIP
+// rejects "fe80::1%eth0" outright, netip.ParseAddr accepts it. Rejecting the
+// zone here restores net.ParseIP's verdict exactly, so a zoned address still
+// matches no source-scoped rule rather than newly matching one. This is the
+// same parser swap, with the same explicit zone rejection, that the IP filter
+// already makes (ipFilterView.contains, security.go); the equivalence is
+// pinned here by TestSrcPrefix_DifferentialAgainstLegacyMatcher, whose oracle
+// is still net.ParseIP.
+//
+// The parse itself is OUTLINED into parseAddr so that address() — which runs
+// once per source-scoped rule — stays inside the inliner's budget. Inlined,
+// the warm case is a load and a predicted-not-taken branch; with the parse
+// spliced in it costs 147 against a budget of 80 and every rule pays a call.
+func (s *clientSource) address() netip.Addr {
+	if !s.parsed {
+		s.parseAddr()
+	}
+	return s.addr
+}
+
+func (s *clientSource) parseAddr() {
+	s.parsed = true
+	if addr, err := netip.ParseAddr(s.raw); err == nil && addr.Zone() == "" {
+		s.addr = addr.Unmap()
+	}
+}
+
+// matchSourceAddr is matchSource's core, taking the client address pre-parsed:
+// the hot path (Evaluate) builds it ONCE per request and reuses it across every
+// rule's precomputed srcPrefix/srcIPNet, eliminating the per-rule
+// ParseCIDR+ParseIP allocations.
+//
+// The three source-IP arms are ordered cheapest-first and are equivalent, not
+// alternative, policies — each is a strictly narrower encoding of the same
+// network. srcPrefix is preferred because netip.Prefix.Contains re-derives
+// nothing (see the srcPrefix field doc); srcIPNet covers the masks that have no
+// Prefix form; matchIPOrCIDR covers rules that never reached the mutators.
+func matchSourceAddr(rule *PolicyRule, src *clientSource, identity, authSource string, groups []string) bool {
 	ipOK := true
 	if rule.SourceIP != "" {
-		if rule.srcIPNet != nil {
-			ipOK = clientAddr != nil && rule.srcIPNet.Contains(clientAddr)
-		} else {
-			ipOK = matchIPOrCIDR(rule.SourceIP, clientIP)
+		switch {
+		case rule.srcPrefix.IsValid():
+			addr := src.address()
+			ipOK = addr.IsValid() && rule.srcPrefix.Contains(addr)
+		case rule.srcIPNet != nil:
+			// Reached only for a mask prefixFromIPNet cannot express, which
+			// net.ParseCIDR cannot produce — so this arm is a guard against a
+			// future srcIPNet source, not a live path, and the AsSlice
+			// allocation it costs is never paid in practice. AsSlice returns
+			// the 4-byte form for an unmapped IPv4 address; Contains folds its
+			// argument through To4 anyway, so the verdict is unchanged.
+			addr := src.address()
+			ipOK = addr.IsValid() && rule.srcIPNet.Contains(net.IP(addr.AsSlice()))
+		default:
+			ipOK = matchIPOrCIDR(rule.SourceIP, src.raw)
 		}
 	}
 	idOK := rule.SourceIdentity == "" || strings.EqualFold(rule.SourceIdentity, identity)
@@ -1640,14 +1933,30 @@ func matchCountry(countries []string, code string) bool {
 }
 
 // FileProfileBlocked returns true if the file extension of urlPath is blocked
-// by the rule's FileProfile, and FileFiltering is enabled.
-// Dynamic profiles from globalProfileStore take precedence over the legacy
-// hardcoded fileProfileExts map (backward-compatible fallback).
+// by the rule's file profile, and FileFiltering is enabled.
+//
+// Resolution (2D-C references-by-id): the STABLE ID is authoritative when
+// present — a stamped rule resolves via GetByID, so a profile rename never
+// changes which extensions this rule enforces. A non-empty ID that no longer
+// resolves FAILS CLOSED (2D-C final §2): the configured file control cannot
+// silently disappear, and it deliberately does NOT fall back to the name —
+// retargeting an authoritative identity to a same-named store or compiled
+// legacy profile is the rebinding hazard the promotion closes. The
+// fail-closed scope is exactly the set of transactions ANY profile could
+// block: paths carrying a file extension (an extension set can never match an
+// extension-less path, so blocking those would invent semantics, not restrict
+// them). Each unresolved-ID block is counted
+// (culvert_fileprofile_unresolved_block_total) and logged rate-limited so the
+// degradation is operator-visible.
+// Legacy rules with NO ID keep the exact pre-promotion resolution: dynamic
+// store by name first, then the compiled fileProfileExts map.
 func (r *PolicyRule) FileProfileBlocked(urlPath string) bool {
 	if !r.FileFiltering || r.FileProfile == FileProfileNone {
 		return false
 	}
-	// Resolve extension list: check dynamic store first, then legacy map.
+	if r.FileProfileID != "" {
+		return r.fileProfileBlockedByID(urlPath)
+	}
 	var exts []string
 	if p := globalProfileStore.GetByName(string(r.FileProfile)); p != nil {
 		exts = p.Extensions
@@ -1659,15 +1968,59 @@ func (r *PolicyRule) FileProfileBlocked(urlPath string) bool {
 	return matchFileExt(urlPath, exts)
 }
 
-// matchFileExt returns true if urlPath ends with one of the given extensions.
-func matchFileExt(urlPath string, exts []string) bool {
-	ext := ""
+// fileProfileBlockedByID is the authoritative-ID arm of FileProfileBlocked:
+// the profile is resolved by ID only (never by name — the anti-rebinding
+// doctrine), and a dangling ID fails CLOSED for file transactions.
+func (r *PolicyRule) fileProfileBlockedByID(urlPath string) bool {
+	p := globalProfileStore.GetByID(r.FileProfileID)
+	if p != nil {
+		return matchFileExt(urlPath, p.Extensions)
+	}
+	if pathFileExt(urlPath) == "" {
+		return false // no profile could ever block an extension-less path
+	}
+	noteFileProfileUnresolvedBlock(r.FileProfileID, string(r.FileProfile))
+	return true
+}
+
+// statFileProfileUnresolvedBlocked counts file transactions blocked because a
+// rule's authoritative FileProfileID no longer resolves (the fail-closed
+// branch above). Exported on /metrics; a non-zero value means a policy rule
+// references a file profile the store does not carry — restore the profile
+// store or re-point the rule.
+var (
+	statFileProfileUnresolvedBlocked int64
+	fileProfileUnresolvedLastLog     int64 // unix seconds, rate-limits the log line
+)
+
+// noteFileProfileUnresolvedBlock records the fail-closed degradation: always
+// counted, logged at most once per 5 minutes (this sits on the request path
+// of every transaction the broken rule matches).
+func noteFileProfileUnresolvedBlock(id, name string) {
+	atomic.AddInt64(&statFileProfileUnresolvedBlocked, 1)
+	now := time.Now().Unix()
+	last := atomic.LoadInt64(&fileProfileUnresolvedLastLog)
+	if now-last >= 300 && atomic.CompareAndSwapInt64(&fileProfileUnresolvedLastLog, last, now) {
+		logger.Printf("WARN Policy: file profile id=%q (cached name %q) is referenced by a rule but does not resolve — file-bearing transactions on that rule are BLOCKED (fail-closed) until the profile store is restored or the rule is re-pointed (%d blocked since boot)",
+			sanitizeLog(id), sanitizeLog(name), atomic.LoadInt64(&statFileProfileUnresolvedBlocked))
+	}
+}
+
+// pathFileExt extracts the lowercase file extension of the last path segment
+// ("" when the segment carries none) — the shared scope test for file-control
+// decisions.
+func pathFileExt(urlPath string) string {
 	for i := len(urlPath) - 1; i >= 0 && urlPath[i] != '/'; i-- {
 		if urlPath[i] == '.' {
-			ext = strings.ToLower(urlPath[i:])
-			break
+			return strings.ToLower(urlPath[i:])
 		}
 	}
+	return ""
+}
+
+// matchFileExt returns true if urlPath ends with one of the given extensions.
+func matchFileExt(urlPath string, exts []string) bool {
+	ext := pathFileExt(urlPath)
 	if ext == "" {
 		return false
 	}

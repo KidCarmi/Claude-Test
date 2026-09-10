@@ -91,10 +91,14 @@ func TestMatchSchedule_Timezone(t *testing.T) {
 }
 
 func TestMatchSchedule_InvalidTimezone(t *testing.T) {
+	// "24:00", not "23:59": the matcher is half-open, so a 23:59 end bound
+	// excludes the final minute of the day and this wall-clock assertion was
+	// false for one minute in every 1440 (PR-C30; the sibling tests were
+	// corrected the same way in 08545fa5).
 	s := &PolicySchedule{
 		Timezone:  "Invalid/Timezone",
 		TimeStart: "00:00",
-		TimeEnd:   "23:59",
+		TimeEnd:   "24:00",
 	}
 	// Should fall back to UTC and not panic
 	if !matchSchedule(s) {

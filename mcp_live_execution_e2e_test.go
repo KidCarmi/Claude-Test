@@ -27,12 +27,13 @@ import (
 // lifecycle admission, and read-first are all REAL.
 func liveRealGate(capb rollout.Capability, trustOK bool) *mcpLiveSideEffectGate {
 	return &mcpLiveSideEffectGate{
-		capb:      capb,
-		admit:     mcpLiveTierFor(capb).admitExecution,
-		readFirst: canary.IsReadFirstOperation,
-		trustOK:   func(string, string, string, string, time.Time) (bool, string) { return trustOK, "" },
-		reserve: func(now time.Time, ident canary.ExecutionIdentity) (canary.BudgetOutcome, uint64) {
-			return globalCanaryRuntime.reserveCanaryExecution(capb, now, ident)
+		capb:          capb,
+		admit:         mcpLiveTierFor(capb).admitExecution,
+		readFirst:     canary.IsReadFirstOperation,
+		trustPrecheck: stubTrustPrecheckEligible,
+		approvalOK:    func(canary.LiveTarget, time.Time) (bool, string) { return trustOK, "" },
+		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return globalCanaryRuntime.admitLiveExecution(capb, now, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
@@ -154,4 +155,11 @@ func TestLiveE2E_ControlOperationRejectedByReadFirst(t *testing.T) {
 	if out.Reason != mcperr.ReasonRolloutOutOfScope {
 		t.Fatalf("read-first refusal reason=%s want rollout_out_of_scope", out.Reason.Code())
 	}
+}
+
+// stubTrustPrecheckEligible is the LOCK-FREE trust half for tests that control trust through the
+// approval seam alone: the target is present, this tenant's, usable and fingerprint-matched, so no
+// authoritative drift is reported. Tests that exercise DRIFT supply their own precheck.
+func stubTrustPrecheckEligible(string, string, string, string) liveTrustPrecheck {
+	return liveTrustPrecheck{Eligible: true}
 }
