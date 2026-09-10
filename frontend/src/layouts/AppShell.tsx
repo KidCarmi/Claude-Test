@@ -59,6 +59,7 @@ const NAV: readonly NavSection[] = [
     entries: [
       { label: "Traffic", to: "/monitor/traffic", minRole: "viewer" },
       { label: "Audit Log", to: "/monitor/audit", minRole: "viewer" },
+      { label: "History & Storage", to: "/monitor/history", minRole: "viewer" },
       { label: "Diagnostics", to: "/diagnostics", minRole: "viewer" },
     ],
   },
@@ -66,16 +67,83 @@ const NAV: readonly NavSection[] = [
     heading: "Policies",
     icon: <IconPolicy />,
     entries: [
-      { label: "Access Rules", minRole: "viewer" },
-      { label: "Authentication Rules", minRole: "viewer" },
+      {
+        label: "Access Rules",
+        to: "/policies/access-rules",
+        minRole: "viewer",
+      },
+      {
+        label: "Authentication Rules",
+        to: "/policies/authentication-rules",
+        minRole: "viewer",
+      },
+      { label: "Policy Tester", to: "/policies/tester", minRole: "viewer" },
+      {
+        label: "Header Rewrite",
+        to: "/policies/header-rewrite",
+        minRole: "viewer",
+      },
+      {
+        label: "Policy Learning",
+        to: "/policies/learning",
+        minRole: "viewer",
+      },
+    ],
+  },
+  {
+    heading: "Objects",
+    icon: <IconPolicy />,
+    entries: [
+      {
+        label: "URL Categories",
+        to: "/objects/url-categories",
+        minRole: "viewer",
+      },
+      {
+        label: "Category Groups",
+        to: "/objects/category-groups",
+        minRole: "viewer",
+      },
+      {
+        label: "Decryption Profiles",
+        to: "/objects/decryption-profiles",
+        minRole: "viewer",
+      },
+      {
+        label: "File Profiles",
+        to: "/objects/file-profiles",
+        minRole: "viewer",
+      },
     ],
   },
   {
     heading: "Security",
     icon: <IconShield />,
     entries: [
-      { label: "Content & Scanning", minRole: "viewer" },
+      {
+        label: "Content Security",
+        to: "/security/content-security",
+        minRole: "viewer",
+      },
+      {
+        label: "Decryption",
+        to: "/security/decryption",
+        minRole: "viewer",
+      },
+      {
+        label: "CDR Integration",
+        to: "/security/cdr",
+        minRole: "viewer",
+      },
       { label: "Certificates", minRole: "viewer" },
+    ],
+  },
+  {
+    heading: "Network",
+    icon: <IconActivity />,
+    entries: [
+      { label: "PAC", to: "/network/pac", minRole: "viewer" },
+      { label: "Upstream Proxies", to: "/network/upstream", minRole: "viewer" },
     ],
   },
   {

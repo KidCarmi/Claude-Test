@@ -39,16 +39,9 @@ var errKilledAtBoundary = errors.New("mcp: emergency kill engaged before upstrea
 // gate or CommitThenAct), then the upstream call inside the materialization
 // callback, then response inspection + DLP, then the result. A failure at any step
 // leaves NO downstream side effect.
-func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollout.Subject, res rollout.Resolution, admKillGen uint64) runtime.ExecOutput {
-	if e.cfg.Events == nil {
-		// No durability seam ⇒ fail closed (commit-before-side-effect is mandatory).
-		return e.blocked(in, mcperr.ReasonEventDurabilityDegraded, false)
-	}
-	if in.Server == nil {
-		return e.blocked(in, mcperr.ReasonUpstreamServerUnusable, false)
-	}
-	if !in.Server.Usable() {
-		return e.blocked(in, mcperr.ReasonUpstreamServerUnusable, false)
+func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollout.Subject, res rollout.Resolution, admKillGen uint64) (out runtime.ExecOutput) {
+	if reason, ok := executePreconditionFailure(e, in); !ok {
+		return e.blocked(in, reason, false)
 	}
 	target := upstreamclient.Target{
 		ServerID:       string(in.Server.ID),
@@ -57,8 +50,71 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 	}
 	idempotent := in.Input.Operation.Class == policy.OpRead || in.Input.Operation.Class == policy.OpDiscovery
 
+	// PHYSICAL-EFFECT ACCOUNTING (review blockers #6/#8).
+	//
+	// attempt is non-nil once a durable send intent has been committed for a
+	// side-effect-bearing invocation; sendState is the conservative truth about
+	// whether the peer could have acted. The terminal outcome is emitted from ONE
+	// deferred commit rather than at each return, because this function has seven
+	// exit paths and the previous code recorded an outcome on exactly one of them
+	// (the success path) — upstream errors, DLP blocks and boundary refusals left no
+	// post-call evidence at all.
+	var attempt *attemptRecord
+	sendState := model.SendStateUnset
+	// Declared BEFORE the deferred commit so that commit can read the upstream leg's own verdict.
 	var upResp *upstreamclient.Response
 	var upErr error
+	// releaseSlot is the budget reservation's release, captured from the admit below so the SLOT
+	// GOES BACK LAST — after the settle and after the terminal outcome commit. See the ordering
+	// note on that defer.
+	var releaseSlot func()
+	defer func() {
+		if attempt == nil {
+			// No durable intent ⇒ no physical attempt to account for. The slot may still be held
+			// (openAttempt can fail after the reservation), so the release below still runs.
+			releaseReservation(releaseSlot)
+			return
+		}
+		// The UPSTREAM LEG's own verdict, computed here because this is where it is
+		// known. "Did the peer give us a usable answer?" is a different question from
+		// "did Culvert return a result?", and a different question again from "did the
+		// invocation reach the peer?" — the health detector needs the first, and only
+		// this scope has it (Codex round 5 P1).
+		//
+		// A JSON-RPC `error` object is the THIRD shape a failure arrives in, and it is the
+		// most ordinary one: the transport succeeded, the body decoded, and the peer is
+		// telling us the tool did not work. Client.Call returns it as a non-nil Response with
+		// a nil Go error, so a transport-only predicate read it as a SUCCESS — while
+		// finishUpstream, two hundred lines down, already classifies exactly that response as
+		// ReasonUpstreamCallFailed. The detector disagreed with the code beside it, and two
+		// such tool failures produced zero failures, never reached the 1-of-2 threshold, and
+		// admitted a third execution against a target that had just failed twice (Codex round
+		// 6 P1 — the same defect class as round 5, one shape further in).
+		// THE ORDER OF THESE FOUR STEPS IS THE SECURITY PROPERTY, and each was learned separately.
+		//
+		//  1. A TLS/workload identity mismatch is a whole-Canary breach in its OWN right, not one
+		//     ordinary bad sample. server_identity_drift is single-occurrence in the taxonomy, and
+		//     the request-scoped live-trust check runs against the CATALOG before the dial — so a
+		//     peer that no longer matches its pin is discovered only here. Reduced to a sample it
+		//     needed a second one to matter, and another invocation could be admitted against a
+		//     server we can no longer identify (Codex round 8 P1). It is reported FIRST so it wins
+		//     the immutable first cause over any threshold the same attempt might also cross.
+		//  2. The settle, which may latch a rate breach (round 3, round 7).
+		//  3. The terminal outcome, whose FAILURE is itself the outcome_evidence_loss breach — and
+		//     the sample must be durable before it (round 3).
+		//  4. Only then the slot goes back.
+		//
+		// Steps 1-3 all decide whether the Canary keeps its authority; step 4 is what admits the
+		// next request. Releasing before any of them reopens the same window three times over: at
+		// MaxConcurrentExecutions of 1 a waiting request reserves and crosses Upstream.Call while
+		// the breach that should have stopped the experiment is still being recorded (round 7 for
+		// the sample, round 8 for the outcome commit).
+		e.reportUpstreamTrustBreach(in, attempt, upErr)
+		e.reportAttemptSettled(in, attempt, sendState, upResp, upErr)
+		e.commitAttemptOutcome(in, attempt, sendState, out)
+		releaseReservation(releaseSlot)
+	}()
+
 	// OVN-09 (residual window). callUpstream is the ONE place either branch performs
 	// the irreversible side effect, so the last-moment drift re-check belongs here
 	// rather than at each call site: a later branch added above this line inherits it.
@@ -69,10 +125,10 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 	// concurrent catalog ingest during that time would otherwise let the upstream
 	// call run under a decision made about a tool that no longer exists or has been
 	// redefined. Re-checking here makes the refusal precede the side effect.
-	staleAtCall := false
-	killedAtCall := false
-	gateRefused := false
-	var gateReason mcperr.Reason
+	bf := &boundaryRefusal{}
+	// decisionRef is the committed decision's EventID, captured from CommitThenAct's
+	// receipt and required on the terminal outcome event.
+	var decisionRef string
 	callUpstream := func(authHeader string) error {
 		// (1) Composition-layer LIVE side-effect gate — budget reservation, runtime live-trust
 		// revalidation, read-first — runs BEFORE preCallGuard so the emergency-kill re-read
@@ -80,37 +136,122 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 		// fails closed with the gate's bounded reason and Upstream.Call is never reached. On an
 		// admit, Release runs after the upstream leg (deferred) so a reserved slot is never
 		// leaked even if the freshness/kill guard below then aborts (§11). nil gate ⇒ unchanged.
-		var release func()
-		var revalidate func() bool
-		if e.cfg.LiveGate != nil {
-			d := e.cfg.LiveGate.AdmitSideEffect(e.liveGateInput(in))
-			if !d.Admit {
-				gateRefused = true
-				gateReason = d.Reason
-				return errLiveGateRefused
-			}
-			release = d.Release
-			revalidate = d.Revalidate
+		adm, admErr := e.admitSideEffect(in)
+		if admErr != nil {
+			bf.gateRefused, bf.gateReason = true, adm.reason
+			return admErr
 		}
-		if release != nil {
-			defer release()
+		release, revalidate := adm.release, adm.revalidate
+		reservationID, activationGen := adm.reservationID, adm.activationGen
+		// The release is handed to the OUTER defer rather than deferred here, because everything
+		// that decides whether the Canary keeps its authority — the trust breach, the health
+		// sample, the terminal outcome commit — happens out there, and the slot must not go back
+		// before all of it. Deferred here it necessarily ran first: an inner closure's defers run
+		// when the closure returns. It stays release-on-every-path (§11) because the outer defer
+		// runs on every path too, including a boundary refusal after the reservation was taken.
+		releaseSlot = release
+		// DURABLE SEND INTENT (§6) — committed AFTER the budget reservation (so it can
+		// name the slot) and BEFORE the final boundary guards, because its purpose is
+		// to survive a crash that happens after the peer receives bytes. Only a
+		// side-effect-bearing method gets one: lifecycle/discovery traffic invokes no
+		// tool and must never consume an execution reservation or inflate the
+		// physical-effect count (§4).
+		//
+		// Failing to persist the intent means the send MUST NOT happen: an
+		// unattributable physical invocation is precisely what this mechanism exists
+		// to prevent, so this fails CLOSED.
+		rec, ierr := e.openAttempt(in, attemptBinding{
+			reservationID: reservationID,
+			activationGen: activationGen,
+			decisionRef:   decisionRef,
+		})
+		if ierr != nil {
+			bf.gateRefused, bf.gateReason = true, mcperr.ReasonOf(ierr)
+			return errLiveGateRefused
 		}
+		attempt = rec
 		// (2) Last-moment boundary re-checks (tool drift, then the composition-layer live-generation
 		// revalidation, then the emergency kill) run inside preCallGuard so nothing sits between them and
 		// Upstream.Call. The kill re-read stays LAST (PREREQ-MCP-KILL-1). A demoted-generation refusal is
 		// mapped to the gate-refusal classification path with a bounded rollout reason.
-		if gerr := e.preCallGuard(in, admKillGen, revalidate); gerr != nil {
-			staleAtCall = errors.Is(gerr, errToolDriftedBeforeCall)
-			killedAtCall = errors.Is(gerr, errKilledAtBoundary)
-			if errors.Is(gerr, errLiveGenerationDemotedAtBoundary) {
-				gateRefused = true
-				gateReason = mcperr.ReasonRolloutModeInvalid
+		gerr, driftObserved := e.preCallGuard(in, admKillGen, revalidate)
+		if gerr != nil {
+			// The physical call never began, so this is the ONE case where
+			// definitely_not_sent is mechanically provable rather than inferred.
+			sendState = model.SendDefinitelyNotSent
+			cls := classifyBoundaryError(gerr)
+			// A DRIFT REFUSAL AT THE BOUNDARY IS THE SAME BREACH THE ADMISSION GATE REPORTS.
+			//
+			// Tool drift is detectable at three points — before the executor, at admission, and
+			// here — and only the middle one used to route anywhere. A rug-pull landing AFTER
+			// admission was refused as an ordinary stale decision, so the experiment kept its
+			// authority and every later request merely failed approval validation, which reads as
+			// routine denial rather than proof the reviewed target is gone (Codex round 14).
+			//
+			// It is reported with the ATTEMPT's generation, not the current one: this request was
+			// admitted under that activation, and a demote-and-reactivate in between must not
+			// charge a stale observation to a fresh experiment.
+			// THE BREACH IS KEYED ON THE OBSERVATION, NOT ON WHICH REFUSAL WON.
+			//
+			// Reading cls.stale meant a pass where BOTH the tool drifted and the emergency kill
+			// advanced reported only the kill — the drift was seen and then dropped. Since a kill
+			// can be cleared, the activation would resume unlatched against the new fingerprint,
+			// and later requests would merely fail approval validation (Codex round 15). The
+			// client is still told the kill is the reason; the Canary is told the truth.
+			if driftObserved && attempt != nil {
+				e.cfg.Safety.Breach(in.Capability.String(), attempt.generation, "tool_fingerprint_drift")
+			}
+			bf.stale, bf.killed = cls.stale, cls.killed
+			if cls.demoted {
+				bf.gateRefused, bf.gateReason = true, mcperr.ReasonRolloutModeInvalid
 			}
 			return gerr
 		}
+		// Once the call BEGINS, request bytes may already be on the wire. Assume the
+		// conservative state up front so any panic, cancellation or transport fault
+		// from here on is recorded as may_have_been_sent rather than silently
+		// defaulting to "not sent" (§6). NOTHING blocking is introduced between the
+		// final kill re-read above and this call.
+		//
+		// The two adjustments below only ever move this state on POSITIVE evidence,
+		// one in each direction: proof the peer answered, or proof no bytes were ever
+		// sent. Absent either, the conservative assumption stands.
+		sendState = model.SendMayHaveBeenSent
 		r, err := e.cfg.Upstream.Call(ctx, target, in.Method, json.RawMessage(in.RawParams), upstreamclient.CallOptions{
 			Idempotent: idempotent, AuthHeader: authHeader, WireID: "u-" + target.ServerID,
+			AttemptID: attemptIDOf(attempt),
 		})
+		if upstreamclient.SendNeverStarted(err) {
+			// The call was refused before any request bytes existed — method not
+			// admitted, an invalid target, pool admission refused, an endpoint that
+			// would not canonicalize, a resolve failure, a request that would not
+			// build. Recording may_have_been_sent there is conservative but FALSE, and
+			// it costs twice: the outcome claims Executed for an invocation that never
+			// happened, and the attempt is sent to witness reconciliation with nothing
+			// to establish (Codex round 14).
+			//
+			// This is the only way definitely_not_sent becomes reachable from inside
+			// the call, and the fact is absent by default: an unmarked error — from a
+			// path nobody classified, or a test double — keeps the conservative state.
+			sendState = model.SendDefinitelyNotSent
+		}
+		if r != nil || upstreamclient.ResponseObserved(err) {
+			// The peer answered, so the invocation demonstrably reached it. This says
+			// nothing about whether the response is USABLE — a non-200, an unreadable
+			// body or undecodable bytes all land here with a nil response and an error —
+			// and nothing about whether the response is later blocked by inspection.
+			//
+			// Inferring receipt from a successfully DECODED response alone was too
+			// narrow: a peer that answers badly has still run the tool, and recording
+			// that as may_have_been_sent sent a known-executed attempt to witness
+			// reconciliation with nothing left to establish. This only ever moves
+			// uncertainty DOWN a step that real evidence supports; it can never reach
+			// definitely_not_sent, which is reachable only from POSITIVE evidence that
+			// no request bytes ever existed — the boundary refusal above, or the
+			// never-started fact the client marks on a leg that failed before
+			// client.Do.
+			sendState = model.SendPeerResponseReceived
+		}
 		upResp, upErr = r, err
 		return err
 	}
@@ -126,46 +267,18 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 	// pre-materialization gate still adds its own commit before any provider or
 	// cache is touched (defense in depth, not a substitute).
 	profileRef := in.Decision.Obligations.CredentialProfile
-	if profileRef != "" && e.cfg.Broker == nil {
-		// A credential is REQUIRED (the decision carries a CredentialProfile obligation) but no broker is
-		// composed to plan/materialize it. Fail CLOSED: reaching the upstream with an empty Authorization
-		// header would let a credential-required operation hit an upstream that accepts ambient/
-		// unauthenticated access, bypassing the required credential planning (Codex P2 round-6, PR #1290).
-		// The nil-broker composition is valid ONLY for tools that need no credential.
-		return e.blocked(in, mcperr.ReasonCredentialProfileMissing, false)
+	if out, done := e.commitThenCall(ctx, in, profileRef, callUpstream, &decisionRef, bf); done {
+		return out
 	}
-	useBroker := e.cfg.Broker != nil && profileRef != ""
-	var blockedOut runtime.ExecOutput
-	var didBlock bool
-	if err := e.cfg.Events.CommitThenAct(decisionFacts(in), func(spool.CommitReceipt) error {
-		if !useBroker {
-			return callUpstream("")
-		}
-		blockedOut, didBlock = e.materializeAndCall(ctx, in, profileRef, callUpstream)
-		return nil
-	}); err != nil {
-		// A boundary drift/kill/gate refusal outranks the generic error mapping and must read as
-		// its own reason, never as a transport/durability fault. This branch carries the
-		// NO-credential path, whose callUpstream error escapes CommitThenAct verbatim.
-		if out, ok := e.classifyBoundaryRefusal(in, killedAtCall, staleAtCall, gateRefused, gateReason); ok {
-			return out
-		}
-		return e.blocked(in, mcperr.ReasonOf(err), false)
-	}
-	if didBlock {
-		// The CREDENTIAL path never lets callUpstream's error escape CommitThenAct:
-		// materializeAndCall swallows it into a blocked ExecOutput whose reason is
-		// ReasonOf(errToolDriftedBeforeCall)/ReasonOf(errKilledAtBoundary) == ReasonNone (both
-		// sentinels are package-private and unregistered). A drift or emergency-kill refusal
-		// detected inside the broker callback must therefore be reclassified HERE too, or
-		// clients and block telemetry would read `none` where the no-credential path reads the
-		// correct reason.
-		if out, ok := e.classifyBoundaryRefusal(in, killedAtCall, staleAtCall, gateRefused, gateReason); ok {
-			return out
-		}
-		return blockedOut
-	}
+	return e.finishUpstreamLeg(ctx, in, upResp, upErr, res)
+}
 
+// finishUpstreamLeg maps the upstream leg's result to the terminal output.
+//
+// A nil response with a nil error is treated as a FAILURE, not a success: the
+// guarded path has no meaning for "the call returned nothing", and reading it as
+// success would let an unexecuted request report as executed.
+func (e *Executor) finishUpstreamLeg(ctx context.Context, in runtime.ExecInput, upResp *upstreamclient.Response, upErr error, res rollout.Resolution) runtime.ExecOutput {
 	if upErr != nil {
 		e.cfg.Metrics.ObserveUpstream(in.Capability.String(), "error")
 		return e.blocked(in, mcperr.ReasonOf(upErr), false)
@@ -197,7 +310,14 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 // makes the outcome MORE restrictive. This is the ONE side-effect boundary shared by both the
 // credential and no-credential paths, so the check lives here and nowhere else, and callUpstream
 // places NOTHING between this guard and Upstream.Call.
-func (e *Executor) preCallGuard(in runtime.ExecInput, admKillGen uint64, liveRevalidate func() bool) error {
+// It returns the refusal error AND the drift OBSERVATION separately, because the two answer
+// different questions. The error is what the CLIENT is told, and there the emergency kill
+// deliberately wins; driftObserved is what the CANARY is told, and a rug-pull that happened is a
+// fact about the world whether or not an operator's kill switch also fired in the same pass.
+// Folding them together lost the breach exactly when two things went wrong at once — and since a
+// kill can later be CLEARED, the activation would resume unlatched against the new fingerprint
+// (Codex round 15).
+func (e *Executor) preCallGuard(in runtime.ExecInput, admKillGen uint64, liveRevalidate func() bool) (err error, driftObserved bool) {
 	drifted := in.ToolStillCurrent != nil && !in.ToolStillCurrent()
 	// The composition-layer live-generation revalidation is evaluated BEFORE the kill re-read (like the
 	// freshness callback), so the kill generation stays the LAST authoritative state read before
@@ -205,15 +325,17 @@ func (e *Executor) preCallGuard(in runtime.ExecInput, admKillGen uint64, liveRev
 	// nil predicate (no gate, or Shadow) leaves this byte-identical to the pre-gate boundary.
 	liveDemoted := liveRevalidate != nil && !liveRevalidate()
 	if e.cfg.State.KillGeneration() != admKillGen {
-		return errKilledAtBoundary // emergency stop is paramount, even if the tool also drifted or demoted
+		// Emergency stop is paramount in the REASON reported to the client, even if the tool also
+		// drifted or demoted — but the drift is still returned, so the Canary hears about it.
+		return errKilledAtBoundary, drifted
 	}
 	if drifted {
-		return errToolDriftedBeforeCall
+		return errToolDriftedBeforeCall, true
 	}
 	if liveDemoted {
-		return errLiveGenerationDemotedAtBoundary // the reserved Canary generation was demoted mid-flight
+		return errLiveGenerationDemotedAtBoundary, false // the reserved Canary generation was demoted mid-flight
 	}
-	return nil
+	return nil, false
 }
 
 // classifyBoundaryRefusal maps a boundary drift/kill refusal detected by callUpstream to its
@@ -245,6 +367,98 @@ func (e *Executor) classifyBoundaryRefusal(in runtime.ExecInput, killedAtCall, s
 	}
 }
 
+// upstreamLegFailed is the health detector's failure predicate: did the UPSTREAM LEG fail?
+//
+// Three shapes, and all three are the TARGET failing rather than Culvert refusing:
+//
+//   - a transport or protocol error (err) — no answer, or an unusable one;
+//   - a nil response with no error, a defensive impossibility treated as a failure because
+//     "no answer and no reason" is not evidence of health;
+//   - a decoded JSON-RPC error object — the peer answered and said the tool failed.
+//
+// It is deliberately NOT out.Executed. A response-DLP block AFTER a successful peer answer is
+// Culvert's own policy working, not the target misbehaving, and counting it would let a healthy
+// Canary abort itself for its own controls firing. The question this predicate answers is "is the
+// target misbehaving", never "did the client get a result".
+func upstreamLegFailed(resp *upstreamclient.Response, err error) bool {
+	return err != nil || resp == nil || resp.Error != nil
+}
+
+// callerCancelled reports whether the upstream leg ended because the CLIENT went away.
+//
+// Such an attempt is NOT EVIDENCE ABOUT THE TARGET IN EITHER DIRECTION, which is why it is excluded
+// from the population entirely rather than recorded as a success. Round 8 marked it non-failing and
+// still counted it, so it silently padded the DENOMINATOR: with a budget above three calls, a
+// cancellation plus one good response plus one real failure is 1-of-3, under the 1-of-2 threshold,
+// and the Canary stayed active and admitted another invocation (Codex round 9). "Not a failure" and
+// "not a sample" are different statements, and only the second one is true here. Its duration is
+// excluded from the latency detector for the same reason — the client's patience is not the peer's
+// speed.
+//
+// Deliberately NARROW, and the same rule the upstream pool's circuit breaker follows (CHAOS-11): a
+// DEADLINE overrun is ReasonUpstreamTimeout, not this reason, and it IS charged — a target too slow
+// to answer inside the budget is a target misbehaving.
+func callerCancelled(err error) bool {
+	if err == nil {
+		return false
+	}
+	// TWO SHAPES, because cancellation arrives differently depending on WHEN the caller goes away.
+	//
+	// Before or during client.Do, the transport classifies it and the REASON says so. But once
+	// response headers are in hand, the transport's own comment is emphatic that everything after
+	// is "a failure of the ANSWER, never of delivery" — so a cancellation during the BODY read is
+	// wrapped as ReasonUpstreamCallFailed, and a reason-only test reads it as the target failing.
+	// Two such client hang-ups would trip elevated_error_rate on a peer that answered both times
+	// (Codex round 10).
+	//
+	// errors.Is reaches the cause because mcperr.Error implements Unwrap. It is exact rather than
+	// broad: context.DeadlineExceeded is a DIFFERENT sentinel and does not match here, so a target
+	// too slow to answer inside the budget is still a charged sample.
+	return mcperr.ReasonOf(err) == mcperr.ReasonUpstreamCancelled || errors.Is(err, context.Canceled)
+}
+
+// releaseReservation returns the budget slot, nil-safe so the ordered defer above reads as one
+// sequence rather than a chain of guards.
+func releaseReservation(release func()) {
+	if release != nil {
+		release()
+	}
+}
+
+// upstreamBreachCode returns the whole-Canary breach code an upstream-leg error carries IN ITS OWN
+// RIGHT, or "" when the error is an ordinary failure for the population detectors to judge.
+//
+// It is the single source of truth for that question, and it has two readers by design: the breach
+// reporter below raises the code, and reportAttemptSettled uses the same answer to keep the attempt
+// OUT of the rate population. Splitting them let the two disagree — round 8 added the breach and
+// left the settle unconditional, so an identity mismatch was reported as a whole-Canary breach AND
+// counted as an ordinary target failure, which is exactly the laundering HealthMonitor's own
+// contract forbids: a condition with its own immediate classification must not also arrive through
+// a rate (Codex round 13). One function means a code added here is excluded from the population by
+// construction rather than by remembering.
+func upstreamBreachCode(err error) string {
+	if err != nil && mcperr.ReasonOf(err) == mcperr.ReasonUpstreamTLSIdentity {
+		return "server_identity_drift"
+	}
+	return ""
+}
+
+// reportUpstreamTrustBreach latches server_identity_drift when the connected peer's TLS/workload
+// identity did not match the pin.
+//
+// The request-scoped live-trust revalidation checks the CATALOG record before the dial; this is the
+// only place the ACTUAL peer's identity is judged, and a mismatch is a single-occurrence
+// whole-Canary breach rather than an ordinary failed attempt. Treating it as a sample meant the
+// first mismatch stopped nothing and a further invocation could be admitted against a server we can
+// no longer identify.
+func (e *Executor) reportUpstreamTrustBreach(in runtime.ExecInput, rec *attemptRecord, err error) {
+	code := upstreamBreachCode(err)
+	if rec == nil || code == "" {
+		return
+	}
+	e.cfg.Safety.Breach(in.Capability.String(), rec.generation, code)
+}
+
 // finishUpstream processes a successful upstream response: it forwards a sanitized
 // JSON-RPC error, runs response DLP before egress (failing closed on any hard block
 // OR a redact/block disposition the guarded path cannot transform), records the
@@ -273,14 +487,10 @@ func (e *Executor) finishUpstream(ctx context.Context, in runtime.ExecInput, upR
 		return e.blocked(in, mcperr.ReasonRedactionFailed, false)
 	}
 
-	// Best-effort outcome event (ordinary criticality; never blocks the response).
-	// Best-effort means the RESPONSE is not blocked — it does not mean the loss is
-	// invisible. Discarding this error is how an outcome event that failed validation
-	// went unnoticed for every mutating execution; a rejected commit here is a defect
-	// in the facts, not a transient, so it must be able to reach a human.
-	if _, cerr := e.cfg.Events.CommitDecision(outcomeFacts(in)); cerr != nil {
-		e.cfg.Metrics.ObserveOutcomeEvidenceLoss(in.Capability.String())
-	}
+	// The terminal outcome event is emitted by runExecute's single deferred commit,
+	// which covers EVERY exit path (success, upstream error, DLP block, boundary
+	// refusal) rather than this one. Committing here too would double-record the
+	// success path and still leave the others silent.
 	e.cfg.Metrics.ObserveExecution(in.Capability.String(), true)
 
 	effective := "execute"
@@ -484,4 +694,211 @@ func criticalityFor(c policy.OperationClass) (model.Criticality, model.ActionCla
 	default:
 		return model.CritOrdinary, model.ActionClassRead
 	}
+}
+
+// attemptBinding is the authorization identity a physical attempt must carry. It is
+// a struct rather than three parameters so a future field cannot be silently dropped
+// at one call site.
+type attemptBinding struct {
+	reservationID string
+	activationGen uint64
+	decisionRef   string
+}
+
+// openAttempt commits the DURABLE SEND INTENT for a side-effect-bearing invocation,
+// or returns (nil, nil) when this method invokes no tool.
+//
+// It is committed AFTER the budget reservation (so it can name the slot) and BEFORE
+// the final boundary guards, because its purpose is to survive a crash that happens
+// after the peer receives bytes. Only a side-effect-bearing method gets one:
+// lifecycle/discovery traffic invokes no tool and must never consume an execution
+// reservation or inflate the physical-effect count (§4).
+//
+// Every failure here is FAIL-CLOSED — the caller must not send. An unattributable
+// physical invocation is precisely what this mechanism exists to prevent.
+func (e *Executor) openAttempt(in runtime.ExecInput, b attemptBinding) (*attemptRecord, error) {
+	if !upstreamclient.ClassifyMethod(in.Method).SideEffectBearing() {
+		return nil, nil
+	}
+	// METERED-EXECUTION IDENTITY GATE. A gate being wired at all means this is a
+	// metered Canary execution, and such an execution MUST be attributable: an effect
+	// with no reservation identity cannot be tied to the slot that paid for it, and
+	// one with no activation generation cannot be recognized as an orphan of a
+	// superseded generation after a restart. Either omission would silently degrade
+	// the physical-effect ledger to the pre-#6/#8 state.
+	//
+	// Zero values remain legitimate ONLY for a nil gate (legacy/non-metered paths),
+	// which never reaches this branch.
+	if e.cfg.LiveGate != nil && (b.reservationID == "" || b.activationGen == 0) {
+		return nil, mcperr.New(mcperr.ReasonEventEvidenceMissing, "execution.attempt",
+			"metered execution without reservation identity")
+	}
+	// The decision ref must already exist: this runs INSIDE CommitThenAct's callback,
+	// after the decision commit. A missing ref means the terminal outcome could never
+	// be persisted, so it fails closed here rather than sending and losing the record.
+	if b.decisionRef == "" {
+		return nil, mcperr.New(mcperr.ReasonEventEvidenceMissing, "execution.attempt",
+			"no committed decision to reference")
+	}
+	return e.commitSendIntent(in, b.reservationID, b.activationGen, b.decisionRef)
+}
+
+// executePreconditionFailure reports the block reason when the guarded path cannot
+// run at all, and ok=true when every precondition holds.
+//
+// A nil Events seam fails closed because commit-before-side-effect is mandatory; an
+// absent or unusable server record means there is no approved destination to reach;
+// and a credential-required decision with no broker has no way to satisfy its own
+// obligation. Every case is checked BEFORE any attempt accounting is armed, so a
+// refusal here can never leave a half-formed physical-effect record.
+func executePreconditionFailure(e *Executor, in runtime.ExecInput) (mcperr.Reason, bool) {
+	switch {
+	case e.cfg.Events == nil:
+		return mcperr.ReasonEventDurabilityDegraded, false
+	case in.Server == nil, !in.Server.Usable():
+		return mcperr.ReasonUpstreamServerUnusable, false
+	case in.Decision.Obligations.CredentialProfile != "" && e.cfg.Broker == nil:
+		// A credential is REQUIRED (the decision carries a CredentialProfile
+		// obligation) but no broker is composed to plan/materialize it. Fail CLOSED:
+		// reaching the upstream with an empty Authorization header would let a
+		// credential-required operation hit an upstream that accepts ambient or
+		// unauthenticated access, bypassing the required credential planning (Codex P2
+		// round-6, PR #1290). The nil-broker composition is valid ONLY for tools that
+		// need no credential.
+		return mcperr.ReasonCredentialProfileMissing, false
+	}
+	return mcperr.ReasonNone, true
+}
+
+// boundaryRefusal names which final guard refused, so the caller can map it to a
+// bounded reason without repeating the errors.Is chain.
+type boundaryRefusal struct {
+	stale   bool
+	killed  bool
+	demoted bool
+	// gateRefused/gateReason carry a composition-layer gate denial, which reaches the
+	// same classification path as a boundary guard refusal but names its own reason.
+	gateRefused bool
+	gateReason  mcperr.Reason
+}
+
+// classifyBoundaryError decodes a preCallGuard refusal. The three causes are
+// mutually exclusive by construction (preCallGuard returns on the first), so this
+// only fixes which named reason each refusal carries.
+func classifyBoundaryError(err error) boundaryRefusal {
+	return boundaryRefusal{
+		stale:   errors.Is(err, errToolDriftedBeforeCall),
+		killed:  errors.Is(err, errKilledAtBoundary),
+		demoted: errors.Is(err, errLiveGenerationDemotedAtBoundary),
+	}
+}
+
+// commitThenCall performs the durable decision commit and the guarded upstream leg,
+// returning (out, true) when the request is terminal here and (zero, false) when the
+// caller should go on to map the upstream result.
+//
+// SEC-MCP-09. The DECISION event commits durably BEFORE anything that can have a
+// side effect, on BOTH paths and through the SAME primitive. Previously only the
+// no-credential branch went through CommitThenAct; the credential branch relied
+// solely on the broker's own CREDENTIAL_SELECT gate, so an executed
+// write/destructive tools/call with a credential profile — the ordinary enterprise
+// shape — left NO critical decision event on record naming the policy action,
+// matched rule, snapshot hash or action class. A commit failure blocks the side
+// effect identically on both paths, and the broker's pre-materialization gate still
+// adds its own commit before any provider or cache is touched (defense in depth, not
+// a substitute).
+func (e *Executor) commitThenCall(ctx context.Context, in runtime.ExecInput, profileRef string,
+	callUpstream func(string) error, decisionRef *string, bf *boundaryRefusal,
+) (runtime.ExecOutput, bool) {
+	useBroker := e.cfg.Broker != nil && profileRef != ""
+	var blockedOut runtime.ExecOutput
+	var didBlock bool
+	err := e.cfg.Events.CommitThenAct(decisionFacts(in), func(rcpt spool.CommitReceipt) error {
+		*decisionRef = rcpt.EventID()
+		if !useBroker {
+			return callUpstream("")
+		}
+		blockedOut, didBlock = e.materializeAndCall(ctx, in, profileRef, callUpstream)
+		return nil
+	})
+	if err != nil {
+		// A boundary drift/kill/gate refusal outranks the generic error mapping and
+		// must read as its own reason, never as a transport/durability fault. This
+		// branch carries the NO-credential path, whose callUpstream error escapes
+		// CommitThenAct verbatim.
+		if out, ok := e.classifyBoundaryRefusal(in, bf.killed, bf.stale, bf.gateRefused, bf.gateReason); ok {
+			return out, true
+		}
+		return e.blocked(in, mcperr.ReasonOf(err), false), true
+	}
+	if didBlock {
+		// The CREDENTIAL path never lets callUpstream's error escape CommitThenAct:
+		// materializeAndCall swallows it into a blocked ExecOutput whose reason is
+		// ReasonOf(errToolDriftedBeforeCall)/ReasonOf(errKilledAtBoundary) ==
+		// ReasonNone (both sentinels are package-private and unregistered). A drift or
+		// emergency-kill refusal detected inside the broker callback must therefore be
+		// reclassified HERE too, or clients and block telemetry would read `none` where
+		// the no-credential path reads the correct reason.
+		if out, ok := e.classifyBoundaryRefusal(in, bf.killed, bf.stale, bf.gateRefused, bf.gateReason); ok {
+			return out, true
+		}
+		return blockedOut, true
+	}
+	return runtime.ExecOutput{}, false
+}
+
+// sideEffectAdmission is the composition-layer gate's grant: what to release, how to
+// revalidate at the boundary, and the identity the physical effect is charged to.
+type sideEffectAdmission struct {
+	release       func()
+	revalidate    func() bool
+	reservationID string
+	activationGen uint64
+	reason        mcperr.Reason
+}
+
+// admitSideEffect runs the composition-layer LIVE side-effect gate — budget
+// reservation, runtime live-trust revalidation, read-first.
+//
+// It runs BEFORE preCallGuard so the emergency-kill re-read stays the LAST
+// authoritative check before Upstream.Call (PREREQ-MCP-KILL-1). A denial fails
+// closed with the gate's bounded reason and Upstream.Call is never reached. On an
+// admit the caller defers Release after the upstream leg, so a reserved slot is
+// never leaked even if the freshness/kill guard then aborts (§11). A nil gate leaves
+// this byte-identical to the pre-gate boundary.
+func (e *Executor) admitSideEffect(in runtime.ExecInput) (sideEffectAdmission, error) {
+	if e.cfg.LiveGate == nil {
+		return sideEffectAdmission{}, nil
+	}
+	// AUXILIARY TRAFFIC IS NOT ADMITTED, because it has nothing to admit. Lifecycle
+	// and discovery methods invoke no tool, so §4's contract — stated on openAttempt
+	// and previously enforced only there — is that they must never consume an
+	// execution reservation or inflate the physical-effect count. Running the gate
+	// for them contradicted that contract in both directions: the production gate
+	// validates tool trust against an empty tool binding and REFUSES, so an armed
+	// Canary node could not complete a session handshake or list tools; a gate that
+	// admitted instead would permanently spend a Canary slot on a call that can cause
+	// no side effect, and MaxTotalExecutions would stop measuring physical
+	// invocations — the accounting blocker #6 exists to make true.
+	//
+	// The classifier is the SAME fail-closed one openAttempt uses, and its default is
+	// side-effect-bearing: exemption is granted only to classes positively known to
+	// invoke no tool, so an unclassified method is metered, never exempted. Skipping
+	// the gate does not weaken the boundary — preCallGuard's tool-freshness check and
+	// the FINAL emergency-kill re-read read authoritative state directly
+	// (e.cfg.State.KillGeneration() against the admission generation passed in by the
+	// runtime), not through the gate, so they still run for every method.
+	if !upstreamclient.ClassifyMethod(in.Method).SideEffectBearing() {
+		return sideEffectAdmission{}, nil
+	}
+	d := e.cfg.LiveGate.AdmitSideEffect(e.liveGateInput(in))
+	if !d.Admit {
+		return sideEffectAdmission{reason: d.Reason}, errLiveGateRefused
+	}
+	return sideEffectAdmission{
+		release:       d.Release,
+		revalidate:    d.Revalidate,
+		reservationID: d.ReservationID,
+		activationGen: d.ActivationGeneration,
+	}, nil
 }
