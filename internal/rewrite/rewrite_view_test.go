@@ -20,7 +20,7 @@ import (
 
 // mutator names the exported methods that change the rule set. Every one of
 // them must leave the view consistent with List().
-var viewMutators = []string{"SetRules", "Add", "RemoveByID", "Snapshot"}
+var viewMutators = []string{"SetRules", "Add", "RemoveByID", "RemoveByStableID", "Snapshot"}
 
 // TestRuleView_MutatorInventoryIsComplete fails when a mutator is added to the
 // type without being brought under the republish test below. Reflection is the
@@ -32,6 +32,10 @@ func TestRuleView_MutatorInventoryIsComplete(t *testing.T) {
 		"List":          true,
 		"ApplyRequest":  true,
 		"ApplyResponse": true,
+		// StateSnapshot is the v2 coherent read (rules + revision under one
+		// RLock). It takes no write lock and changes nothing, so it needs no
+		// publish.
+		"StateSnapshot": true,
 	}
 	known := make(map[string]bool, len(viewMutators))
 	for _, m := range viewMutators {

@@ -12,7 +12,7 @@ func TestResolveCDRStartupConfig_FlagsWinOverConfig(t *testing.T) {
 	fc.CDR.FailMode = "fail-open"
 	fc.CDR.TimeoutSec = 10
 
-	got := resolveCDRStartupConfig(fc, cdrCLIFlags{
+	got := resolveCDRStartupConfig(fc, defaultDataDir, cdrCLIFlags{
 		Enabled:    true,
 		Endpoint:   "cli:9000",
 		TimeoutSec: 30,
@@ -36,7 +36,7 @@ func TestResolveCDRStartupConfig_ConfigFallthroughAndPaths(t *testing.T) {
 	fc.CDR.Enabled = true
 	fc.CDR.DefaultProfile = "strict"
 
-	got := resolveCDRStartupConfig(fc, cdrCLIFlags{})
+	got := resolveCDRStartupConfig(fc, defaultDataDir, cdrCLIFlags{})
 	if !got.CDR.Enabled || got.CDR.DefaultProfile != "strict" {
 		t.Errorf("config values must fall through: %+v", got.CDR)
 	}
@@ -48,7 +48,7 @@ func TestResolveCDRStartupConfig_ConfigFallthroughAndPaths(t *testing.T) {
 func TestResolveCDRStartupConfig_DoesNotMutateFileConfig(t *testing.T) {
 	fc := &FileConfig{}
 	fc.CDR.Endpoint = "config:9000"
-	_ = resolveCDRStartupConfig(fc, cdrCLIFlags{Endpoint: "cli:9000", Enabled: true})
+	_ = resolveCDRStartupConfig(fc, defaultDataDir, cdrCLIFlags{Endpoint: "cli:9000", Enabled: true})
 	if fc.CDR.Endpoint != "config:9000" || fc.CDR.Enabled {
 		t.Errorf("resolver mutated the caller's FileConfig: %+v", fc.CDR)
 	}

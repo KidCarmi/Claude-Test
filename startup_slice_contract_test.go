@@ -40,12 +40,12 @@ func TestStartupSliceContract_PureAndDeterministic(t *testing.T) {
 		call func(fc *FileConfig) any
 	}{
 		{"auth", func(_ *FileConfig) any { return resolveAuthStartupConfig(0, 0, "", "", "") }},
-		{"fileblock", func(fc *FileConfig) any { return resolveFileBlockStartupConfig(fc, "") }},
+		{"fileblock", func(fc *FileConfig) any { return resolveFileBlockStartupConfig(fc, "", "") }},
 		{"background_services", func(fc *FileConfig) any {
 			return resolveBackgroundServicesStartupConfig(fc)
 		}},
 		{"blocklist", func(fc *FileConfig) any { return resolveBlocklistStartupConfig(fc, "") }},
-		{"cdr", func(fc *FileConfig) any { return resolveCDRStartupConfig(fc, cdrCLIFlags{}) }},
+		{"cdr", func(fc *FileConfig) any { return resolveCDRStartupConfig(fc, defaultDataDir, cdrCLIFlags{}) }},
 		{"cluster", func(fc *FileConfig) any { return resolveClusterStartupConfig(fc, clusterCLIFlags{}) }},
 		{"conn_and_rate_limit", func(fc *FileConfig) any { return resolveConnAndRateLimitStartupConfig(fc, "", 0) }},
 		{"geoip", func(fc *FileConfig) any { return resolveGeoIPStartupConfig(fc, "") }},

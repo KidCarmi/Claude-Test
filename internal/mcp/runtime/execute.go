@@ -142,7 +142,7 @@ func (p *pipeline) buildExecInput(req Request, msg jsonrpc.Message, ident *ident
 // (dispatchPolicy), so a composed evaluator never displaces the decision-event commit.
 // It receives the resolution the runtime already resolved and passes it to Execute, so
 // the disposition is never re-resolved.
-func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, ei ExecInput, res rollout.Resolution, canaryGen uint64) Outcome {
+func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, ei ExecInput, res rollout.Resolution, genAtResolve uint64) Outcome {
 	// OVN-09 — decision/execution TOCTOU. The policy decision was computed against
 	// a catalog SNAPSHOT. Between then and the irreversible upstream call there is a
 	// real window (inspection, durable commit, credential planning, provider fetch)
@@ -153,7 +153,7 @@ func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, ei ExecI
 	// prevent, and the executor never re-checked it.
 	// canaryScoped: only the ENFORCING execute disposition is the Canary's own reviewed traffic. A
 	// shadow evaluation (including the Canary-mode out-of-scope fallback) is not.
-	if out, stale := p.refuseOnToolDrift(rb, ei.Input, ei.MessageID, res.Disposition == rollout.EffectExecute, canaryGen); stale {
+	if out, stale := p.refuseOnToolDrift(rb, ei.Input, ei.MessageID, res.Disposition == rollout.EffectExecute, genAtResolve); stale {
 		return out
 	}
 	// SEC-MCP-03. The executor performs the REAL upstream side effect and must
@@ -254,7 +254,7 @@ func (p *pipeline) toolDriftClass(in policy.DecisionInput) string {
 	return ""
 }
 
-func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id jsonrpc.ID, canaryScoped bool, canaryGen uint64) (Outcome, bool) {
+func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id jsonrpc.ID, canaryScoped bool, genAtResolve uint64) (Outcome, bool) {
 	code := p.toolDriftClass(in)
 	if code == "" {
 		return Outcome{}, false
@@ -276,10 +276,30 @@ func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id
 	// to an operator, from the control being wrong. The seam is nil in every non-Canary composition,
 	// so this is a no-op there as well.
 	if canaryScoped {
-		// canaryGen is the generation that RESOLVED this request, snapshotted beside the rollout
-		// resolution, never re-read here — a request that outlived its activation must not stop
-		// whatever replaced it (Codex round 16).
-		p.deps.reportCanaryBreach(p.capability.String(), canaryGen, code)
+		// REPORTED WITH ITS TARGET, so the latch can be taken where it can be attributed.
+		//
+		// No reservation exists yet, so nothing here binds this request to an activation, and an
+		// observation that cannot be attributed must not latch one: charging it to whatever is
+		// current stops an experiment that may never have seen the drift.
+		//
+		// But the answer to that is to GIVE the observation a binding, not to drop the latch. A
+		// rug-pull that lands before policy resolution is refused right here, and every later
+		// request then resolves cleanly against the NEW fingerprint and fails approval validation
+		// instead — request-scoped, not drift — so nothing downstream would ever latch it and an
+		// authoritative whole-Canary breach would stop nothing (Codex round 20; the round-14
+		// finding rebuilt). "Self-heals on the next request" was simply not true.
+		//
+		// So the TARGET goes with the observation and the root re-derives the drift live inside the
+		// activation critical section, latching against the exact generation active for that
+		// evaluation — and latching nothing at all when no activation is live (§6).
+		p.deps.noteCanaryDriftObserved(p.capability.String(), CanaryDriftTarget{
+			Generation: genAtResolve,
+			Code:       code,
+			Tenant:     in.Principal.Tenant,
+			ServerID:   toolServerID(in),
+			ToolName:   toolName(in),
+			DecisionFP: toolFingerprint(in),
+		})
 	}
 	p.ctr.requestsRejected.Add(1)
 	rb.rec.PolicyAction = "BLOCKED_BY_DECISION_STALE"
@@ -289,4 +309,28 @@ func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id
 		Status: 200, Disposition: DispRejected, Reason: mcperr.ReasonDecisionSnapshotStale,
 		ResponseBody: inspectionError(id, mcperr.ReasonDecisionSnapshotStale),
 	}), true
+}
+
+// toolServerID / toolName / toolFingerprint read the drift target off the decision input without
+// assuming a tool is present. A malformed input yields empty strings, which the root's live
+// re-derivation treats as a target it cannot match — request-scoped, never a latch.
+func toolServerID(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.ServerID
+}
+
+func toolName(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.Name
+}
+
+func toolFingerprint(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.FingerprintHash
 }

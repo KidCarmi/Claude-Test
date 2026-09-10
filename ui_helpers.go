@@ -24,18 +24,35 @@ func auditEvent(r *http.Request, action, object, detail string) {
 // accountability; the username adds readability. Callers that drive a backend
 // service (which audits via the headless auditAdd) use this to pass the same
 // actor string the audit ring would record.
+//
+// It resolves the SAME identity family as sessionAdmin, in the same precedence
+// order (UI session cookie Sub → Email → the HTTP Basic username the auth
+// middleware authenticated into context). Keeping the two in step is the point:
+// one admin action writes an actor to BOTH the audit ring (here) and the
+// config-version store (sessionAdmin), so if only one of them learned the Basic
+// fallback the same action would be attributed to two different identities —
+// a bare IP in the audit trail next to a username in config history. The Basic
+// username is only ever present after cfg.VerifyUIUser succeeded
+// (uiAuthMiddleware), so it is authenticated, never request-asserted.
 func auditActor(r *http.Request) string {
 	// RISK-019: attribute to the real client behind a configured trusted proxy
 	// so audit lines don't all name the reverse proxy (falls back to the peer).
 	actor := realClientIP(r)
+	name := ""
 	if sess, err := readUISessionCookie(r); err == nil && sess != nil {
-		name := sess.Sub
+		name = sess.Sub
 		if name == "" {
 			name = sess.Email
 		}
-		if name != "" {
-			actor = name + "@" + actor
-		}
+	}
+	if name == "" {
+		// Basic-auth fallback: programmatic/CLI admin access carries no session
+		// cookie, so without this the audit ring records the bare IP for an
+		// action whose actor the middleware already authenticated.
+		name = uiUser(r)
+	}
+	if name != "" {
+		actor = name + "@" + actor
 	}
 	return actor
 }
@@ -113,6 +130,19 @@ func isValidBlocklistWildcard(h string) bool {
 // being edited (use -1 when adding a new rule) so its own name is not flagged as
 // a duplicate.
 func validatePolicyRule(rule PolicyRule, existingRules []PolicyRule, editPriority int) error {
+	if err := validateRuleUniqueness(rule, existingRules, editPriority); err != nil {
+		return err
+	}
+	return validateRuleShape(rule)
+}
+
+// validateRuleUniqueness is the STATE-DEPENDENT half of validatePolicyRule:
+// the duplicate-name and duplicate-priority checks against an existing rule
+// list. The API handlers run it INSIDE the coordinator fence against the
+// authoritative snapshot (2E-C concurrency-status correction) — run outside
+// it, a concurrent reorder or create between resolution and validation made
+// a request that had merely lost a state race look malformed.
+func validateRuleUniqueness(rule PolicyRule, existingRules []PolicyRule, editPriority int) error {
 	if rule.Name == "" {
 		return fmt.Errorf("name is required")
 	}
@@ -132,6 +162,16 @@ func validatePolicyRule(rule PolicyRule, existingRules []PolicyRule, editPriorit
 				return fmt.Errorf("priority %d is already in use", rule.Priority)
 			}
 		}
+	}
+	return nil
+}
+
+// validateRuleShape is the STATE-INDEPENDENT half of validatePolicyRule: the
+// structural checks a request fails on its own, whatever the rulebase holds.
+// The API handlers run it BEFORE the fence (a 400 that no refresh can fix).
+func validateRuleShape(rule PolicyRule) error {
+	if rule.Name == "" {
+		return fmt.Errorf("name is required")
 	}
 	// Schedule timezone is validated for both rule types.
 	if rule.Schedule != nil && rule.Schedule.Timezone != "" {
