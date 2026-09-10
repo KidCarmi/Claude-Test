@@ -36,6 +36,66 @@ everything else is triaged below with a suggested PR and required tests for foll
 > rewriting identifiers three merged PRs already reference, so it is an OWNER
 > decision, not a unilateral edit — recorded here rather than silently "fixed".
 
+**2026-09-02 — CHAOS-58 sweep (the directory that accepts and then stops answering).**
+CHAOS-47 solved the *unreachable* directory: fail closed, arm a provider-wide cooldown, deny
+without dialing, recover on evidence. This sweep asked which faults can actually ARM that
+machinery, and the answer is the finding: **the cooldown is armed by an error that RETURNS**, so
+every mitigation it built sits downstream of a value a hung call never produces. `LDAPAuth.verify`
+dialed with a 10 s dialer timeout and then ran up to four blocking operations with no deadline of
+any kind — go-ldap defaults to `requestTimeout: 0`, which arms no timer at all, so `Bind` and
+`Search` wait on a bare channel receive. A directory that completes the TCP handshake and then goes
+silent (overloaded server, firewall dropping established flows, half-open socket after a peer
+reboot, hung VM) blocked the **request goroutine forever** — no error, no counter, no log, no health
+movement — pinning a goroutine, a socket, an FD and a per-IP connection slot per authenticating
+request, permanently. FD exhaustion is the recorded terminal state of PX-6/WK-11 and the entry point
+to CHAOS-54's SOCKS5 findings, so the fault feeds an amplifier this register already documents. The
+asymmetry that hid it: the ADMIN directory-test endpoint already called `conn.SetTimeout`; the
+per-request production path did not — the bounded path is the one clicked occasionally, the
+unbounded one is the one every request takes. Shipped: ONE 10 s end-to-end envelope, deliberately
+the same budget this process already gives one OIDC introspection (the CHAOS-53 "both back ends
+share one budget" rule, applied to the credential back ends), enforced in two NON-redundant layers —
+a per-message timeout, plus a connection watchdog for the post-StartTLS `tls.Handshake()` that
+go-ldap runs on the raw socket outside its own timer, verified against the library and kept as a
+permanent defect proof. No new metric, no new alert, no new operator vocabulary: a stall now
+produces exactly what a down directory produces. 9 gates; all six defect gates verified failing
+against the pre-fix tree. See rows AU-5 (re-scored M→H) and AU-14, §25, and
+`docs/operator/ldap-directory-stalls.md`.
+**2026-09-01 — CHAOS-57 sweep (the hijacked-tunnel plane on the way out).** CHAOS-56 bounded
+the shutdown sequence end to end and made the drain honour its phase deadline. It did not ask the
+prior question: **does the drain see what it is draining?** It does not. `drainActiveTunnels` waits
+on ONE number, `activeConns`, and **four of Culvert's seven hijacked-tunnel classes never touched
+it** — both non-TLS inspect fallbacks (strip and native), WebSocket, and SOCKS5. A hijacked conn is
+invisible to `http.Server.Shutdown` by construction, and `socks5Server.Stop` waits only for the
+ACCEPT LOOP while every session runs in a detached `go handleSOCKS5(conn)` — a deferral that file's
+own header records ("In-flight SOCKS5 tunnels are NOT drained… tracked for Phase 2"). So for those
+four classes nothing waited and nothing closed them: they ran until process exit and the kernel
+reset them. **PX-8**, registered since the first sweep. Three consequences, all silent. (1) **One
+fault, two postures** — a CONNECT tunnel gets 15 s of grace on SIGTERM; a WebSocket or an
+SSH-over-SOCKS5 session on the same node at the same instant gets none, decided by which
+`recordActiveConn` call site the code path happened to pass. (2) **The accounting for every severed
+tunnel is lost** — `recordTunnelClose*` runs only after both relay goroutines drain, so every
+graceful shutdown dropped the bytes and duration of every in-flight raw tunnel from the request log,
+the JSONL export, the SIEM feed and the dashboard totals; across a rolling fleet upgrade that is
+systematic, not incidental. (3) **The drain's own log line undercounts** — "Draining 0 active
+tunnel(s)" on a node severing hundreds of sessions, and `activeConns` is the dashboard field an
+operator sizes FD budgets from. **The finding inside the finding is why counting alone would have
+been the WRONG fix**: long-lived is what WebSocket and SOCKS5 are FOR, so a drain that waits on them
+with no way to END the wait hits its deadline on every shutdown, turning an instant restart into a
+guaranteed 15 s one across a fleet — and severs them anyway. The wait only earns its cost if it ends
+in a deterministic teardown, which is the argument PR3d already made for inspected H2. Shipped: a
+per-class registry holding both legs of every hijacked tunnel, a drain-deadline force-close backstop
+covering all five classes (so each relay's `io.Copy` returns and its accounting is written), a
+bounded settle clamped to the phase budget that keeps that accounting ahead of the FLUSH hooks
+instead of leaving the ordering to luck, and `culvert_tunnels_active{class}` +
+`culvert_tunnel_drain_forced_total`. A **PX-4 residual** was found alongside and closed:
+`relayPlaintextInspectFallback` was the ONE relay goroutine in the tree with no panic guard, so a
+panic there killed an in-line security appliance and dropped every other in-flight tunnel with it.
+15 gates; every defect gate verified failing against its reintroduced pre-fix shape, plus controls
+for the two cheapest wrong fixes (force-close at drain START — which passes every defect gate while
+being strictly worse than the defect — and a non-idempotent release, whose negative gauge restores
+the original blindness by accident). See rows PX-4/PX-8, §25 and
+`docs/operator/tunnel-drain-on-shutdown.md`.
+
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
 built was the way BACK. The lease has three exits from write authority — denied on promotion,
@@ -412,7 +472,7 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | PX-1 | HTTPS CONNECT, WebSocket, and SOCKS5 dial the origin **directly** — the upstream parent-proxy pool is only wired into the plain-HTTP transport. Parent-proxy chaining silently applies to HTTP only. | GAP | H | `proxy.go:1374,1466`, `socks5.go:320`; pool only via `applyUpstreamProxy`→`getUpstreamTransport()` in `handleHTTP` `proxy.go:928` |
 | PX-2 | Circuit breaker / all-upstreams-down **fails open to direct** egress, bypassing the parent-proxy control. | GAP → **PARTLY CLOSED** (CHAOS-11: still fail-open by design, now counted + alerted + surfaced) | H | `internal/upstream/upstream.go:240,267` (`// all upstreams down — fall back to direct`) |
 | PX-3 | Raw relays (CONNECT bypass, WebSocket, non-TLS fallback) have **no idle/read deadline** — a half-open peer leaks a goroutine + FD + 128KB pooled buffer indefinitely. Only the SSL-inspect *request loop* arms a deadline. | GAP → **CLOSED** (CHAOS-03 `idleCopyCounted`, `proxy_tunnel.go`) | H | `bidiRelayCounted` `proxy.go:1431,1262`; contrast deadline at `proxy.go:1621` |
-| PX-4 | Spawned relay/async goroutines have **no `recover()`** — a panic in any propagates to the runtime and kills the process, dropping every in-flight tunnel. | GAP | M | `go relayCounted(...)` `proxy.go:1290`, inline relays `proxy.go:1565,1747`, `go trackDestinationCountry` `proxy.go:696` |
+| PX-4 | Spawned relay/async goroutines have **no `recover()`** — a panic in any propagates to the runtime and kills the process, dropping every in-flight tunnel. **CHAOS-57 found the last one:** `relayPlaintextInspectFallback` (the native-ALPN non-TLS fallback) was the ONE relay goroutine in the tree still unguarded — every other raw relay had carried a guard since CHAOS-24, so this branch was the odd one out rather than a known gap. Containing it is strictly fail-closed (a relay goroutine holds no authority the recovery could extend — the CHAOS-24 objection does not apply) and it closes BOTH legs, since the peer relay may be parked in a deadline-less Write that only a close can end. | GAP → **relays CLOSED** (CHAOS-24 + CHAOS-57); `go trackDestinationCountry` remains an unguarded async spawn | M | `relayCounted` + the strip-path/`rawRelay`/`socks5Relay` inline relays; last gap `proxy_tunnel_h2.go` `relayPlaintextInspectFallback`; residual `go trackDestinationCountry` `proxy.go:951` |
 | PX-5 | SOCKS5 connections **bypass the per-IP connection limiter** entirely. | GAP | M | `handleSOCKS5` `socks5.go:251` never calls `connLimiter.Acquire`; HTTP path does at `proxy.go:627` |
 | PX-16 | **The SOCKS5 accept loop retried a failed `Accept` with NO delay, forever.** `net/http.Server.Serve` (every other listener in the process) backs off 5 ms→1 s and stops on a non-temporary error; this loop logged and `continue`d on anything that was not `net.ErrClosed`. EMFILE/ENFILE come straight out of `FD.Accept` without blocking, so a descriptor incident produced **7.68 M attempts / 300 ms**, one log line each — a pinned core, ~40 MB/s into a 50 MB rotating log that erased its own diagnostic history in seconds, and (via `logsink`'s blocking backpressure) added latency to the HTTP data path on a node not using SOCKS5. Self-amplifying: FD exhaustion is the terminal state of WK-11 and PX-6. | NEW → **CLOSED** (CHAOS-54: backoff + errno classification + rate-limited logging; interruptible sleep keeps shutdown prompt) | **H** | was: `socks5.go` `serve`; see §22 |
 | PX-17 | **An unrecoverable listener error was retried identically to a transient one.** EBADF/ENOTSOCK on the listening descriptor return instantly and forever, so the "retry" was a pure spin that could never accept anything, on a port that stayed BOUND — clients hung against a black hole instead of getting connection-refused. | NEW → **CLOSED** (CHAOS-54: the loop stops, closes the listener so clients fail fast, and records the service DOWN; transient/unknown errors still retry, which is the fail-safe direction) | M/H | was: `socks5.go` `serve`; now `socks5AcceptFatal` — see §22 |
@@ -421,7 +481,7 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | PX-19 | **The SOCKS5 accept loop had no panic guard.** `handleSOCKS5` carries `recoverGoroutine`, but a panic in `serve` itself propagated to the runtime and killed the whole proxy process (the PX-4 class, one level up). | NEW → **CLOSED** (CHAOS-54: contained and reported as listener DOWN — the CHAOS-24 objection to recovering in a worker goroutine does not apply when the recovery path is the loudest state the subsystem can produce) | M | was: `socks5.go` `serve`; see §22 |
 | PX-6 | **No global connection cap**; per-IP map is unbounded in cardinality; limiter ships **disabled by default**. Distributed flood → FD/memory exhaustion. | GAP | H | `internal/connlimit/connlimit.go:12,67` (default disabled, `Acquire`→true when off) |
 | PX-7 | Bandwidth/QoS token buckets are **never enforced on the data path** — `AllowBytes` has no call site in the relays. Configured QoS silently does nothing. | GAP (feature dead) | M | `internal/bandwidth` `AllowBytes` `bandwidth.go:261` — no caller in `proxy.go`/`socks5.go` |
-| PX-8 | Shutdown drain only accounts for CONNECT tunnels — WebSocket, non-TLS-fallback, and SOCKS5 relays are invisible to `drainActiveTunnels`, so SIGTERM hard-kills them. | GAP | M | `recordActiveConn` only at `proxy.go:1410,1599`; `drainActiveTunnels` `main.go:1131` |
+| PX-8 | Shutdown drain only accounts for CONNECT tunnels — WebSocket, both non-TLS inspect fallbacks, and SOCKS5 relays are invisible to `drainActiveTunnels`, so SIGTERM hard-kills them. **Re-scoped by CHAOS-57 and larger than recorded:** the invisibility also silently DESTROYED each severed tunnel's `TUNNEL_CLOSED` byte/duration accounting (written only after both relays drain), and `activeConns` — the drain's log line and the dashboard's `activeConns` field — undercounted by four whole classes. Counting alone would have been the wrong fix: the classes are long-lived by design, so a drain that waits with no way to END the wait costs a guaranteed 15 s per node and severs them anyway. | GAP → **CLOSED** (CHAOS-57: per-class registry owning the `activeConns` accounting, drain-deadline force-close backstop across all five classes, budget-clamped settle so the accounting lands ahead of the FLUSH hooks, `culvert_tunnels_active{class}` + `culvert_tunnel_drain_forced_total`) | M | was: `recordActiveConn` at the CONNECT sites only; now `proxy_tunnel_drain.go`, `drainActiveTunnels` `main_shutdown.go` — see §25 |
 | PX-9 | Half-open circuit admits **all** concurrent requests, not a single probe → thundering herd on a recovering upstream. | GAP | L/M | `internal/upstream/upstream.go:83` (no single-flight gate) |
 | PX-10 | Plain-HTTP `WriteTimeout: 30s` can truncate large/slow legitimate downloads (absolute deadline over `io.Copy`). | GAP | M | `main.go:894`, stream at `proxy.go:1045` |
 | PX-11 | SSL-inspect slowloris protection: 60s read deadline + per-`Read` re-arming body-stall detector. | ✓ | — | `proxy.go:1621`, `stallDetectReadCloser` `proxy.go:884`; test `proxy_slowloris_body_test.go` |
@@ -507,7 +567,8 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | AU-2 | In-flight SSO sessions **survive IdP deletion** — no `RevokeProvider`; cookies are self-contained and keep full access up to TTL (default 8h). User-delete *does* revoke. | GAP | H | `auth_idp.go:319-330`, `ui_auth.go:517-529` vs `ui_auth.go:245` |
 | AU-3 | Proxy-path Basic-auth bcrypt is **not rate-limited** — correct-username + N wrong-passwords is a cache miss every time → full ~100ms bcrypt per request → CPU starvation. The `loginLimiter` guards only the admin UI. | GAP | M | `store.go:440-444`, limiter only at `ui_auth.go:48,116`, proxy call `proxy.go:223` |
 | AU-4 | Lockout store is bounded + fail-closed, and TOTP failures now feed it. But it is **not persisted** (resets on restart) and **per-node** (attacker gets MaxAttempts per node in a cluster). | ✓ (+2 gaps) | M | `lockout.go:111-126,102-110`; per-node note `roadmap/edge-case-audit.md:138` |
-| AU-5 | LDAP proxy auth fails closed, but the 10s timeout covers only the **dial** — `Bind`/`Search` have no per-op deadline, so a server that accepts then stalls hangs the request goroutine. | GAP | M | `auth_ldap.go:128-180` |
+| AU-5 | LDAP proxy auth fails closed, but the 10s timeout covers only the **dial** — `Bind`/`Search` have no per-op deadline, so a server that accepts then stalls hangs the request goroutine. | GAP → **CLOSED** (CHAOS-58 §26: one 10s round-trip envelope, two non-redundant layers; re-scored **H** on discovery — the stall is unbounded, not slow, and it made the CHAOS-47 cooldown structurally unreachable) | ~~M~~ H | `auth_ldap.go` `verify`; gates `auth_ldap_stall_chaos_test.go` (9) |
+| AU-14 | The CHAOS-47 provider-wide cooldown is armed only by an error that RETURNS, so any identity-backend fault that HANGS is invisible to it by construction. Closed for LDAP by CHAOS-58; the OIDC leg is bounded by `http.Client{Timeout}` on every call, and SAML is browser-mediated. Recorded so the next backend added to the credential chain inherits the rule rather than rediscovering it. | GAP → **CLOSED for the shipped backends** (CHAOS-58 §26) | M | `auth_backend_health.go` `authProbeGate`; `noteVerifyError` `auth_ldap.go` |
 | AU-6 | SAML metadata & OIDC discovery fetched **once** at compile — no periodic refresh. IdP SAML signing-cert rotation breaks assertion validation until re-save/restart. (OIDC JWKs *do* auto-refresh every 15 min + serve-stale.) | GAP | M | `auth_saml.go:54-57,249-294`; JWKs OK `auth_oidc_flow.go:129-157` |
 | AU-7 | IdP 5xx / network error / expired token all collapse to fail-closed "auth fail" — correct posture, but an IdP outage is indistinguishable from a brute-force spike (no distinct `idp.unreachable` metric). | ✓ (obs gap) | L | `auth_oidc.go:152-162`, `auth_oidc_flow.go:623-636` |
 | AU-8 | Auth caches bounded at 5000 with eviction; HMAC-keyed keys (heap-dump safe); cached OK TTL capped at token `exp`. | ✓ | — | `store.go:236,241-258,268-285`, `auth_oidc.go:219-227` |
@@ -1122,7 +1183,7 @@ binary terminated).
   semantics and is deliberately **not** bundled into a panic-containment change (§12.2's own lesson).
 - **Still unguarded: the MCP runtime listener** (`internal/mcp/runtime`). Left open on purpose: it
   is disabled-by-default with a different blast radius (its own listener, not the SWG request path),
-  it spans 25 subpackages, and ADR-0024's rollout ladder means "contain and continue" has to be
+  it spans 27 subpackages, and ADR-0024's rollout ladder means "contain and continue" has to be
   reconciled with the Observe/Shadow/Canary semantics before a guard is correct. Tracked as
   **CHAOS-26**.
 - The `crashThrottleEvery` (1s per component) flood guard still means a tight panic loop reports a
@@ -2768,3 +2829,452 @@ first draft of the fix as its rationale, and it was wrong — the idle case is
 bounded at 6s. Measuring it, rather than shipping the plausible story, is what
 surfaced the active-stream case, which is both unbounded and reachable by
 faults this codebase already has runbooks for.
+
+---
+
+## 25. CHAOS-57 — The hijacked-tunnel plane on the way out
+
+**Sweep date:** 2026-09-01 · **Register rows:** PX-8 (closed), PX-4 (relays closed)
+· **Runbook:** `docs/operator/tunnel-drain-on-shutdown.md`
+
+### 25.1 Why this domain
+
+§24 (CHAOS-56) bounded the shutdown sequence end to end and made the tunnel
+drain honour its phase deadline instead of adding a private 15 s window on top
+of it. It answered *how long may the drain take?* It never asked the prior
+question:
+
+> **Does the drain see what it is draining?**
+
+It does not. `drainActiveTunnels` waits on ONE number — `activeConns`
+(geoip.go) — and Culvert has seven hijacked-tunnel classes. Four of them never
+touched that number:
+
+| class | counted before? | force-closed before? |
+|---|---|---|
+| CONNECT bypass | yes | no |
+| CONNECT inspect (strip, H1) | yes | no |
+| CONNECT inspect (native ALPN) | yes | only if it negotiated h2 |
+| CONNECT inspect non-TLS fallback (strip) | **no** | no |
+| CONNECT inspect non-TLS fallback (native) | **no** | no |
+| WebSocket | **no** | no |
+| SOCKS5 | **no** | no |
+
+Two mechanisms produce the blind spots, and neither is a bug in isolation. A
+hijacked conn is invisible to `http.Server.Shutdown` **by construction** —
+net/http stops tracking a conn the moment it is hijacked, which is the whole
+point of hijacking. And `socks5Server.Stop` waits only for the ACCEPT LOOP,
+because every session runs in a detached `go handleSOCKS5(conn)`; that file's
+own header records the deferral verbatim:
+
+> *"In-flight SOCKS5 tunnels are NOT drained — that is explicitly out of scope
+> for P1.5 (tracked for Phase 2)."* — `socks5_shutdown_test.go`
+
+Phase 2 never came. So for four classes **nothing in the shutdown sequence
+waited, and nothing closed them**: they ran until the process exited and the
+kernel reset them.
+
+### 25.2 Three consequences, all silent
+
+**(1) One fault, two postures.** A CONNECT tunnel gets a 15 s grace on SIGTERM.
+A WebSocket or an SSH-over-SOCKS5 session on the same node, at the same instant,
+under the same signal, gets none. Nothing decides this deliberately — it is
+decided by which `recordActiveConn` call site the code path happened to pass
+through. That is the §16.3 theme (opposite postures for one fault class,
+decided by an incidental predicate) reappearing in the data plane.
+
+**(2) The accounting for every severed tunnel is destroyed.**
+`recordTunnelClose*` — the `TUNNEL_CLOSED` request-log entry carrying
+`BytesSent`/`BytesRecv`/`DurationMs`, and the `recordTunnelBytes` fold into the
+global byte counters — runs **after** both relay goroutines drain. A tunnel
+killed by process exit never reaches it. So every graceful shutdown dropped the
+bytes and duration of every in-flight WebSocket and SOCKS5 session from the
+request log, the JSONL export, the SIEM feed and the dashboard totals, with no
+counter saying so. On a rolling fleet upgrade this is systematic, not
+incidental: the loss is proportional to how many long-lived sessions the fleet
+carries, which is exactly the deployments that care about the numbers.
+
+**(3) The drain's own evidence undercounts.** `Draining %d active tunnel(s)` is
+what an operator reads to confirm a node left cleanly; with four classes
+uncounted it reports 0 — and returns immediately — on a node severing hundreds
+of live sessions. `activeConns` is also the dashboard's `activeConns` field, so
+an operator sizing FD or connection budgets from it was reading a number that
+excluded SOCKS5 and WebSocket entirely.
+
+### 25.3 The finding inside the finding: counting alone is the WRONG fix
+
+The obvious change is four `recordActiveConn` calls. It is wrong, and it is
+wrong in a way the defect gates would not have caught.
+
+Adding the calls makes the drain **wait** on those classes — but nothing would
+END that wait. Long-lived is what WebSocket and SOCKS5 are FOR: SSH sessions,
+IMAP IDLE, push channels, database tunnels. They do not go quiet inside 15 s. So
+the drain would hit its deadline on **every** shutdown of a node carrying any
+such session, converting an instant restart into a guaranteed 15 s one across a
+rolling fleet upgrade — and then sever them anyway, because nothing closed them.
+The operator would have paid `N × 15 s` of maintenance window and received
+nothing.
+
+The wait is only worth its cost if it ends in a **deterministic teardown**. That
+is the same argument PR3d already made for inspected H2, which is why the fix
+mirrors `forceCloseH2InspectTunnels` rather than inventing a second mechanism:
+the registry holds both legs of every hijacked tunnel, and the drain deadline
+hard-closes them. Each relay's `io.Copy` returns, its parent runs
+`recordTunnelClose*`, and the accounting lands in the request-log queue while
+the FLUSH hooks (order ≥ 110) are still ahead of us. **Force-closing is never
+worse than the SIGKILL it replaces** — that abandons the same conns AND the
+accounting.
+
+### 25.4 What shipped
+
+1. **`proxy_tunnel_drain.go` — a per-class registry.**
+   `registerDrainableTunnel(class, conns...) func()` OWNS the `activeConns`
+   accounting for its class (a caller must not also call `recordActiveConn`, or
+   the drain would wait on a count that never reaches zero). Release is
+   idempotent via `sync.Once`.
+
+2. **The map key is the ENTRY pointer, never a conn.** Two tunnels can
+   legitimately hold the same conn value — the strip-path fallback registers
+   `rawClient` while the inspect path registers the `tls.Conn` wrapping it — and
+   a conn-keyed registry lets one release evict the other's registration, so the
+   surviving tunnel would never be force-closed. Verified: the conn-keyed shape
+   evicts *both*.
+
+3. **All five classes wired**, including the two the drain could already see
+   (`connect_bypass`, `connect_inspect`) which were counted but held by no
+   registry, so the drain waited on them with no way to end the wait. A native
+   tunnel that negotiates h2 appears in both registries; that is deliberate and
+   not double-counting — this registry owns the single `activeConns` increment
+   while `culvert_h2_inspect_active` measures the GOAWAY-capable subset, both
+   backstops fire at the same deadline, and a second `Close` is a no-op.
+
+4. **The backstop closes conns, not contexts.** `idleCopyCounted` sits in
+   `io.CopyBuffer`, which returns only on a read/write error, and the peer
+   direction may be parked in a deadline-less Write that nothing but a close can
+   end — the same reason every relay's panic path closes BOTH legs. Entries are
+   left in the map: the relay's own release removes them, and deleting here
+   would race a concurrent release into double-decrementing the gauge.
+
+5. **A budget-clamped settle** (`tunnelForceCloseSettle`, 2 s ceiling). Without
+   it the ordering between "the relay writes its entry" and "the flush hooks
+   run" is only probabilistic — the relays need microseconds and the intervening
+   hooks take milliseconds, so it *works* — and this section exists because
+   probabilistic shutdown ordering is what CHAOS-56 removed everywhere else. It
+   is a CEILING clamped to whatever the phase has left, so it can never overrun
+   the deadline or borrow from the flush reserve. **On the `ctx.Done()` branch
+   the settle is SKIPPED**: the budget is already spent, and lingering would
+   take time from the hooks behind us. Losing the accounting there is exactly
+   the pre-change behaviour — never worse.
+
+6. **PX-4 residual closed.** `relayPlaintextInspectFallback` was the ONE relay
+   goroutine in the tree with no panic guard; every other raw relay
+   (`relayCounted`, the strip-path fallback, `rawRelay`, `socks5Relay`) has
+   carried one since CHAOS-24, so this branch was the odd one out rather than a
+   known gap. A panic there propagated to the runtime and killed an in-line
+   security appliance, dropping every OTHER in-flight tunnel with it.
+
+7. **Observability.** `culvert_tunnels_active{class}` (five classes) and
+   `culvert_tunnel_drain_forced_total`. The class label matters at exactly the
+   moment it is read: when the drain times out, WHICH kind of session is holding
+   the node decides the remedy. The class names are a monitoring contract and
+   are pinned by test.
+
+### 25.5 Gates
+
+`proxy_tunnel_drain_chaos_test.go` — 15. Every DEFECT gate was verified failing
+against its reintroduced pre-fix shape:
+
+| gate | pre-fix failure |
+|---|---|
+| `SOCKS5TunnelIsVisibleToTheDrain` | `activeConns = 0` with a live relay |
+| `WebSocketTunnelIsVisibleToTheDrain` | `activeConns = 0` on a real 101 through the real proxy |
+| `SeveredTunnelStillRecordsItsAccounting` | no `TUNNEL_CLOSED` entry; relay still parked in `io.Copy` |
+| `DrainWaitsForAHijackedTunnel` | drain returns instantly |
+| `DrainDeadlineForceClosesEveryClass` | `forced_total = 0`, want 5 |
+| `NativeInspectFallbackRelayContainsAPanic` | the test binary itself panics — the production failure mode |
+| `RegistryKeysOnTheEntryNotTheConn` | conn-keyed registry evicts both registrations |
+| `SettleIsClampedToTheBudget` | settle runs its full 2 s past a spent deadline |
+| `ReleaseIsIdempotent` | `activeConns = -2` |
+
+Plus CONTROLS, because the two cheapest wrong fixes pass every defect gate:
+`ControlGraceIsRealNotImmediateForceClose` (force-closing at drain START
+satisfies all of them while being **strictly worse than the defect** — a session
+that would have finished inside the window is killed; verified failing against
+that shape) and `ControlDrainStillReturnsImmediatelyWithNoTunnels` (seeing four
+more classes must not make a quiet node pay the window on every restart). A
+non-idempotent release is its own control: a negative gauge makes
+`active <= 0` true forever, restoring the original blindness by accident.
+
+### 25.6 What is deliberately left
+
+- ~~**New tunnels are not fenced during the drain.**~~ **This was recorded as a
+  residual and the reasoning given for it was WRONG.** The original note claimed
+  the raw classes need no fence "because their listeners are already closed by
+  the time the drain runs and the drain's per-tick loop picks up any late
+  registrant." Codex review of PR #1288 showed that is false for SOCKS5, and
+  §25.8 records it — the fence shipped in the same PR.
+- **`go trackDestinationCountry` remains an unguarded async spawn** (PX-4
+  residual). It is not a relay and holds no conn; recorded rather than swept in
+  with a tunnel change.
+- **Tunnels are still cut, not migrated.** Draining a node before a restart
+  remains the operator's job — CHAOS-57 makes the cut deterministic, accounted
+  and observable, not avoidable.
+- **The settle can legitimately time out.** `activeConns` is a SUPERSET of what
+  either backstop can force-close (a native-ALPN tunnel mid-handshake is counted
+  but held by neither registry), so it is best-effort by construction and
+  bounded by its own ceiling.
+
+### 25.7 The process lesson
+
+§24 was about documented residuals whose named mitigation had silently acquired
+a correctness requirement. This sweep adds one about **counters as interfaces**:
+
+> A drain, a health check and a dashboard that all read one counter have all
+> inherited that counter's blind spots — and a blind spot in a counter is
+> invisible in exactly the way a blind spot in a check is not. Nobody audits a
+> number for what it is *not* counting. `activeConns` was correct for every
+> call site that incremented it; the defect lived entirely in the sites that
+> did not, and it reached three consumers with three different consequences
+> (no grace, lost accounting, a false gauge) without any of them being wrong.
+
+### 25.8 Review follow-up — the defect surviving inside its own fix
+
+Raised by Codex review against PR #1288 and fixed in the same PR. It is the
+sharpest kind of finding this series produces: **the fix was correct for every
+tunnel the drain could see, and PX-8 survived in the window where the drain
+could not see one yet.**
+
+`handleSOCKS5` sets a 30 s negotiation deadline, dials with a 10 s timeout, and
+only then calls `socks5Relay` — which is where CHAOS-57 registers the tunnel. So
+a connection accepted moments before `Stop` can register **up to ~40 s after the
+listener closed.** And `socks5Server.Stop` waits only for the ACCEPT LOOP,
+because each session is a detached `go handleSOCKS5(conn)`, so nothing in the
+sequence is waiting for that handler.
+
+The consequence is not a race the drain narrowly loses — it is a drain that has
+already finished. `drainActiveTunnels` returns IMMEDIATELY when
+`activeConns <= 0`, and that is exactly the state of a node whose SOCKS5 sessions
+are all still negotiating. So the drain returns instantly, the force-close
+backstop runs against an empty registry, the flush hooks complete — and only
+*then* does the handler send `0x00 success` and establish a long-lived tunnel
+that nothing will close and nothing will account for. PX-8, inside the change
+that closed PX-8.
+
+**Why SOCKS5 and not the HTTP classes.** This is the distinction the original
+residual note missed:
+
+> `proxySrv.Shutdown` (order 90) waits for every in-flight request, so a CONNECT
+> or WebSocket either completes or hijacks-and-registers before the drain at
+> order 100 looks. **The HTTP paths have a synchronization barrier before the
+> drain. SOCKS5 has none at all.**
+
+**The fix is to refuse, not to register earlier.** Codex offered both. Registering
+at handler entry would make the drain wait on sessions that may never become
+tunnels, and would redefine `culvert_tunnels_active` from *live tunnels* to
+*attempts* — a monitoring contract change to fix a shutdown bug. Refusing is
+protocol-correct (SOCKS5 reply `0x01`, general server failure) and strictly
+kinder to the client: it learns the request failed and retries, on a fleet
+against another node, instead of being handed a success reply and a tunnel that
+dies seconds later with no record it existed. A node that is shutting down should
+not be minting new long-lived tunnels.
+
+`fenceTunnelEstablishment` is a shutdown hook at **order 94**, and the ordering is
+the correctness argument, not a detail: after the listeners stop (80/90) so a
+session that can still be drained is never refused needlessly, and before the
+drain (100) so nothing establishes behind its back. The check sits after the dial
+and immediately before the success reply, so the unavoidable check-to-register
+window is microseconds rather than spanning a 10 s dial. Pinned by
+`TestChaos57_FenceIsOrderedBetweenTheListenersAndTheDrain`, which fails if the
+fence is moved to either side of its bracket.
+
+The control matters as much as the gate here: a fence stuck raised refuses every
+SOCKS5 session on a healthy node — a total protocol outage, far worse than the
+window it closes — so `ControlFenceIsDownDuringNormalOperation` pins that it is
+down in normal operation and that the test reset clears it (the PR3d
+fence-pollution class), and `ControlFencedSOCKS5StillEstablishesWhenNotDraining`
+drives the real establishment path to prove an unfenced session still relays and
+still records its accounting.
+
+**The process lesson**, and it is the second time this sweep produced one about
+documentation rather than code: §25.6 recorded this as a deliberate residual
+*with a stated reason*, and the reason was false. A "deliberately left" entry
+carries more authority than an unexamined gap — it tells the next reader the
+question was asked and answered — so a wrong one is worse than silence. The
+entry has been struck rather than quietly deleted, so the record shows the claim
+was made and refuted.
+## 26. CHAOS-58 — The directory that accepts and then stops answering
+
+**Date:** 2026-09-02 · **Domain:** authentication / LDAP + Active Directory ·
+**Status:** shipped · **Gates:** `auth_ldap_stall_chaos_test.go` (9) ·
+**Closes:** AU-5 (re-scored M→H), AU-14 (new)
+
+### 26.1 Why this domain
+
+CHAOS-47 gave the identity backends a posture for an unreachable directory and
+built the machinery to make it cheap: fail closed, arm a provider-wide cooldown,
+deny without dialing, recover on observed evidence. CHAOS-49 extended the same
+primitives to the IdP registry rather than inventing a second dialect. Between
+them the *unreachable directory* is a solved problem in this codebase, with one
+health row, one metric family and one alert.
+
+This sweep asked a narrower question: **which faults can arm that machinery?**
+
+The answer is one sentence, and it is the finding. `authProbeGate` is armed from
+`noteVerifyError`, which runs on the error `verify()` returns. So the cooldown
+can only see a fault that **returns**. Every mitigation CHAOS-47 built is
+downstream of a value that a hung call never produces.
+
+### 26.2 The fault
+
+`LDAPAuth.verify` dialed with a 10 s dialer timeout and then ran up to four
+blocking operations — StartTLS, service bind, user search, user bind — with no
+deadline of any kind. go-ldap's `Conn` defaults to `requestTimeout: 0`, and its
+message loop arms a timer only `if requestTimeout > 0`, so **no timer existed at
+all**. `Bind` and `Search` wait on `<-msgCtx.responses`, a bare channel receive.
+
+A directory that completes the TCP handshake and then goes silent therefore
+blocked the **request goroutine forever**. Not slowly — permanently, with no
+error, no counter, no log line and no health-surface movement.
+
+That fault is ordinary, not exotic: an overloaded directory, a firewall that
+drops established flows without a reset, a half-open socket after a peer reboot,
+a hung VM, a storage stall on the directory host. In every one of them the dial
+**succeeds**, which is precisely why bounding the dial answered the wrong
+question.
+
+The blast radius is per request, not per outage. `verify()` is reached from the
+proxy's per-request credential loop (`proxy.go`, via
+`LDAPIdPProvider.ResolveIdentity` and `Config.VerifyAuth`), so every
+cache-missing authentication pinned a goroutine, a socket, an FD, the client's
+connection and a per-IP connection-limiter slot, permanently. FD exhaustion is
+the recorded terminal state of PX-6 and WK-11, and CHAOS-54 measured what an
+FD-exhausted node then does to the SOCKS5 accept loop — so this fault feeds an
+amplifier this register already documents rather than staying contained.
+
+**Reproduced before it was fixed** (a listener that accepts and never writes):
+`Verify` was still blocked when the gate gave up, and the six defect gates were
+each verified failing against the pre-fix tree.
+
+### 26.3 The asymmetry that made it easy to miss
+
+The correct pattern was already in the tree, one call away. The **admin
+directory-test** endpoint (`ui_auth_ldap.go`) calls `conn.SetTimeout(8s)`
+immediately after dialing. The **per-request production path** did not.
+
+So the bounded path is the one an admin clicks occasionally, and the unbounded
+path is the one every proxied request takes. That is the inversion worth
+recording: a safe pattern existing in the repository is not the same as it
+being applied where the load is.
+
+### 26.4 The second layer, and why it is not belt-and-braces
+
+Adding `SetTimeout` is the obvious fix and it is **not sufficient**.
+`Conn.StartTLS` waits for the extended response through the message loop — which
+the timer covers — and then runs `tls.Client(l.conn, config).Handshake()` on the
+**raw socket**, outside the message loop and outside the timer. A directory that
+ACKs StartTLS and then never negotiates TLS hangs with `SetTimeout` armed.
+
+This was verified directly against the library, not assumed, and the check is
+kept as a permanent **defect proof**
+(`TestChaos57_SetTimeoutDoesNotBoundStartTLSHandshake`): it asserts that go-ldap
+still behaves this way, so a future library release that fixes it fails the
+build rather than leaving a backstop silently guarding nothing — the role
+`BareGracefulStopIsUnboundedOnAWedgedStream` plays for CHAOS-56.
+
+The second layer is therefore a whole-envelope watchdog that **closes the
+connection**. Closing is what unblocks a deadline-less read — the same reason
+`idleCopyCounted` hard-closes both conns on idle (CHAOS-03) instead of trusting
+a deadline the blocked goroutine cannot observe. Two properties of go-ldap make
+it safe and were read rather than assumed: `Close` is idempotent via
+`setClosing`, and `messageMutex` is released before every network wait
+(`sendMessageWithFlags` unlocks before sending; the StartTLS handshake runs with
+it released), so a timer-goroutine close cannot deadlock the operation it is
+rescuing.
+
+The same gap exists on the admin test path — which set the per-message timeout
+and was therefore *more* obviously bounded while carrying the one stage that
+timeout cannot reach, on an endpoint that actuates an admin-supplied address on
+demand. It gets the same watchdog under its own, deliberately generous, envelope
+(a diagnostic should report a slow directory rather than clip it; its job is to
+guarantee the handler goroutine is released at all).
+
+### 26.5 The budget
+
+One directory round trip is bounded **end to end at 10 s** — an envelope, not a
+per-step allowance, so the historical 10 s dial timeout becomes the ceiling for
+the whole flow rather than for its first step. Summing four per-operation
+budgets would have produced a ~42 s worst case on a per-request path, which is
+not a bound anyone would act on.
+
+10 s is deliberately the **same** budget this process already gives one identity
+resolution against an OIDC IdP (`http.Client{Timeout: 10s}`, `auth_oidc.go` /
+`auth_oidc_flow.go`). Two identity backends answering the same question on the
+same request path must not disagree about how long that decision may take —
+CHAOS-53's rule for the two body-scan back ends, applied to the two credential
+back ends. It is a constant for the same reason the JWKS stale ceiling is: a
+per-deployment knob whose only use is widening it re-opens the fault.
+
+The bound is unreachable on a functioning deployment — roughly 50x a healthy WAN
+round trip, with authoritative answers cached for 5 minutes.
+
+### 26.6 What changes for the operator
+
+Nothing new to learn, which is the design goal. A stalled directory now produces
+exactly what a down one produces: an `ErrorNetwork` the existing classifier
+already reads as unreachable, so it arms the same cooldown, moves the same
+`identity_backend` diagnostics row, increments the same
+`culvert_auth_backend_*` series, and fires the same
+`identity_backend_unreachable` alert. One additional rate-limited log line names
+the backend and the budget, with a **bounded reason class only** — no directory
+address and no server-supplied diagnostic on a per-request path (the WK-12/RS-5
+rule).
+
+The outage therefore becomes self-limiting: one probe per 3 s cooldown instead
+of one permanently hung goroutine per request, recovering on observed evidence
+with no restart.
+
+Runbook: `docs/operator/ldap-directory-stalls.md`.
+
+### 26.7 Gates
+
+Nine, in three groups — the controls exist because a bound that fired on a
+healthy directory would pass every defect gate while being strictly worse than
+the defect it replaced.
+
+| Group | Gate | Pins |
+|---|---|---|
+| Defect | `StalledDirectoryReleasesTheRequestGoroutine` | the call returns inside its envelope, fail-closed |
+| Defect | `StalledDirectoryArmsTheUnreachableCooldown` | the fault is now visible to CHAOS-47 at all |
+| Defect | `ArmedCooldownDeniesAStalledDirectoryWithoutDialing` | the outage is self-limiting, not re-paid per request |
+| Defect | `StartTLSHandshakeStallIsBounded` | layer 2 is load-bearing (remove the watchdog and it hangs) |
+| Defect | `AdminDirectoryTestIsBoundedOnAStartTLSStall` | the admin handler goroutine is released too |
+| Defect | `ConcurrentStallsDoNotAccumulateGoroutines` | 12 concurrent stalls all return and unwind |
+| Proof | `SetTimeoutDoesNotBoundStartTLSHandshake` | the library assumption layer 2 exists for |
+| Control | `PromptDirectoryIsNeitherClippedNorGated` | a healthy directory is not clipped, and its deny does not arm the gate |
+| Control | `WatchdogStopsWhenTheRoundTripCompletes` | a cancelled watchdog never closes a live connection |
+
+All six defect gates were verified failing against the pre-fix shape; the proof
+and both controls pass in both trees, which is what makes them controls.
+
+### 26.8 Deliberately left
+
+- **AU-3** (proxy-path bcrypt is not rate-limited) and **AU-11** (the credential
+  provider loop is sequential, so N providers serialise their budgets on one
+  request) are untouched and remain open. AU-11's worst case is now bounded
+  rather than infinite, which lowers its severity without closing it.
+- **The fail-closed posture is unchanged.** A directory that cannot answer
+  denies; it never becomes an implicit allow.
+- **No new metric.** A stall is an unreachable backend, and it now lands on the
+  series that already means that. A second name for one operator action is the
+  thing CHAOS-47's `identity_backend` naming note warns against.
+
+### 26.9 The general rule this sweep produces
+
+> A cooldown, breaker, or health gate armed by a returned error is blind to
+> every fault that hangs. Bounding the call is what makes the mitigation
+> reachable — the mitigation is not the bound.
+
+Recorded as **AU-14** so the next backend added to the credential chain inherits
+it instead of rediscovering it. The shipped backends satisfy it today: OIDC by
+`http.Client{Timeout}` on every call, SAML because it is browser-mediated, and
+LDAP as of this sweep.

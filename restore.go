@@ -37,6 +37,36 @@ import (
 // logic; D1.3b.1 rejects any other value.
 const restoreSchemaVersion = 1
 
+// maxRestoreEntryBytes bounds a single tarball entry's declared (decompressed)
+// size, checked against the tar header BEFORE readTarball's io.ReadAll(tr)
+// allocates it. A highly compressible payload (e.g. all-zero bytes) lets a
+// tiny .tar.gz file declare an enormous Size in its tar header — a classic
+// decompression bomb — and readTarball is reachable from a plain `culvert
+// --restore <path>` dry-run (no --confirm needed), so a corrupted or hostile
+// backup file must not be able to drive an unbounded allocation.
+// runBackupWith documents that a real backup (admin-config JSON/text files
+// only — no logs, no feed DBs) is "well under 100MB"; 256 MiB leaves
+// generous headroom for growth (e.g. 50 retained config_versions) while
+// still bounding memory use. Mirrors the same per-entry declared-size guard
+// release_catalog_bundle.go applies (catalogMaxReadBytes) and the
+// total-decompressed guard support_validate.go applies to support bundles
+// (maxValidateDecompressed) — restore.go was the one tar/gzip consumer in
+// this codebase with no such bound.
+const maxRestoreEntryBytes = 256 << 20 // 256 MiB
+
+// maxRestoreTotalBytes bounds the SUM of declared entry sizes across the
+// whole tarball. maxRestoreEntryBytes alone stops a single oversized entry,
+// but a hostile archive can split its payload across many uniquely named
+// data/* entries each at or under that per-entry cap — manifest/presence
+// validation only runs after every entry is already loaded into `files`, so
+// per-entry bounding alone still leaves total allocation unbounded (Codex
+// review, PR #1344). Checked cumulatively against declared hdr.Size as each
+// header is read, so the offending entry is rejected before its body is
+// allocated. Twice the per-entry bound: generous enough that a normal
+// backup's largest single legitimate file is never the constraint, while
+// still bounding the aggregate.
+const maxRestoreTotalBytes = 2 * maxRestoreEntryBytes // 512 MiB
+
 // restoreSummary is the data shape printed by printRestoreSummary and
 // returned to tests for assertion.
 type restoreSummary struct {
@@ -275,6 +305,7 @@ func readTarball(path, backupPassphrase string) (map[string][]byte, []string, er
 	tr := tar.NewReader(gz)
 	files := map[string][]byte{}
 	var order []string
+	var totalDeclared int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -282,6 +313,19 @@ func readTarball(path, backupPassphrase string) (map[string][]byte, []string, er
 		}
 		if err != nil {
 			return nil, nil, fmt.Errorf("restore: tar read: %w", err)
+		}
+		// Decompression-bomb guards: reject an implausibly large declared size
+		// — per-entry and cumulative — before io.ReadAll(tr) below allocates
+		// it. Checked first — cheaper than every other guard and the one that
+		// matters before any bytes of the entry body are read. Per-entry alone
+		// is not enough: a hostile archive can split its payload across many
+		// uniquely named entries each under that cap (Codex review, PR #1344).
+		if hdr.Size > maxRestoreEntryBytes {
+			return nil, nil, fmt.Errorf("restore: tarball entry %q declares %d bytes, exceeding the %d-byte per-entry bound", hdr.Name, hdr.Size, maxRestoreEntryBytes)
+		}
+		totalDeclared += hdr.Size
+		if totalDeclared > maxRestoreTotalBytes {
+			return nil, nil, fmt.Errorf("restore: tarball declares %d bytes across entries (at %q), exceeding the %d-byte total bound", totalDeclared, hdr.Name, maxRestoreTotalBytes)
 		}
 		// Absolute-path guard: tar entries must be relative under the
 		// backup namespace. Reject anything starting with "/" so a
