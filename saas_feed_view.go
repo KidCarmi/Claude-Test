@@ -22,6 +22,7 @@ package main
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/KidCarmi/Culvert/internal/hostutil"
@@ -97,6 +98,18 @@ type effectiveCategoryView struct {
 	// signed feed with no overrides), where the walk behaves exactly as before.
 	sealed map[string]bool
 
+	// base is the RAW, PRE-OVERRIDE host→category map this view was composed
+	// from — the signed generation's SnapshotEntries for a signed source, the
+	// embedded BuiltIn baseline classes for source=embedded. Captured at
+	// composition time (the production recompose's own input, never re-derived)
+	// so the bulk candidate validators can PREVIEW the post-apply effective
+	// view for a CANDIDATE override set by composing over this base — composing
+	// over the already-composed entries would double-apply the current
+	// overrides (final bulk-integrity correction §7). Read-only after
+	// construction; defaults to the composed entries for an override-free view
+	// (where raw == composed by definition).
+	base map[string]string
+
 	// Identity / provenance (all read-only).
 	Source         effectiveSource
 	FeedVersion    int64  // 0 for the embedded baseline
@@ -166,9 +179,48 @@ func newEffectiveViewWithMembership(entries map[string]string, members map[strin
 	} else {
 		meta.sealed = nil
 	}
+	// Raw pre-override base: defensively copied when the composer supplied one;
+	// an override-free construction defaults to the composed entries (raw ==
+	// composed by definition there).
+	if meta.base != nil {
+		bcp := make(map[string]string, len(meta.base))
+		for h, c := range meta.base {
+			bcp[h] = c
+		}
+		meta.base = bcp
+	} else {
+		meta.base = ecp
+	}
 	meta.entries = ecp
 	meta.members = mcp
 	return &meta
+}
+
+// baseClasses returns the view's RAW pre-override host→category base (see the
+// base field). READ-ONLY contract: callers (the bulk candidate preview) pass
+// it to the pure catoverride composers, which never mutate their input.
+func (v *effectiveCategoryView) baseClasses() map[string]string { return v.base }
+
+// HasCategoryName reports whether the view carries any host classified (or
+// membership-listed) under the named category, case-insensitively. Used by the
+// reference-validity predicate (referencedCategoryResolvable): a rule or group
+// member may legitimately reference a signed-feed class that is not a writable
+// catStore object. Admin-rate write-door read — O(view) is acceptable there
+// and this deliberately adds NO index the hot path would have to maintain.
+func (v *effectiveCategoryView) HasCategoryName(name string) bool {
+	for _, c := range v.entries {
+		if strings.EqualFold(c, name) {
+			return true
+		}
+	}
+	for _, cats := range v.members {
+		for _, c := range cats {
+			if strings.EqualFold(c, name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // HostCount / CategoryCount report the composed view's size.
@@ -316,6 +368,37 @@ type liveCategorySwapper interface {
 	Current() *effectiveCategoryView
 }
 
+// taxonomyAuthorityGate is the NARROW built-in-taxonomy ownership-transition
+// gate (transactional-integrity correction, Blocker C §§12–14). The signed
+// effective view can atomically transition embedded/local →
+// downloaded/cached/resumed between a v2 BuiltIn mutation's ownership check
+// and its durable catStore mutation — leaving a normal 2xx for a local edit
+// the now-serving signed view ignores. The ownership truth therefore
+// participates in the mutation's linearization:
+//
+//   - SHARED side (RLock): a v2 BuiltIn-category mutation holds it across
+//     [ownership read → durable catStore mutation] (beginV2CategoryMutation,
+//     ui_policy.go). The recompose runs AFTER release: a transition landing
+//     there is a legitimate LATER ordered supersession (§14 outcome B — the
+//     local mutation linearized first, durably), and the recompose always
+//     rebuilds from whatever authority is then live. Admin-created
+//     (BuiltIn=false) mutations never take the gate (§13 — they are never
+//     feed-owned, so serializing them against activation buys nothing).
+//   - EXCLUSIVE side (Lock): every PRODUCTION live-view transition — the
+//     activation coordinator's cutovers, recovery installs, and the
+//     override recomposes all publish through feedLiveStore.Swap below.
+//
+// LOCK ORDER (acyclic): {objectReferenceMutationGate | scheduler runMu |
+// coordinator internals} → taxonomyAuthorityGate → catStore locks. The
+// exclusive side wraps ONLY the pointer swap (no store lock is ever taken
+// while holding it); the shared side acquires catStore.mutMu underneath; and
+// a handler that later recomposes does so only AFTER releasing the shared
+// side (recompose reaches Swap → the exclusive side — holding the shared
+// side across it would self-deadlock, pinned in review). Current() stays a
+// bare atomic load — the policy hot path never touches the gate. This is
+// deliberately NOT a generic feed transaction manager.
+var taxonomyAuthorityGate sync.RWMutex
+
 // feedLiveStore is the production live holder: a single atomic.Pointer so the cutover is
 // a lock-free, all-or-nothing swap and concurrent readers never observe a torn view.
 type feedLiveStore struct {
@@ -324,7 +407,13 @@ type feedLiveStore struct {
 
 func newFeedLiveStore() *feedLiveStore { return &feedLiveStore{} }
 
+// Swap installs v as the live view. It is the ONE production transition seam,
+// so it enters the exclusive side of taxonomyAuthorityGate: a transition that
+// can change built-in ownership linearizes against every in-flight v2
+// BuiltIn mutation (Blocker C). The gate wraps only the pointer swap.
 func (s *feedLiveStore) Swap(v *effectiveCategoryView) *effectiveCategoryView {
+	taxonomyAuthorityGate.Lock()
+	defer taxonomyAuthorityGate.Unlock()
 	return s.ptr.Swap(v)
 }
 
@@ -346,3 +435,30 @@ func setSignedFeedOwnsLiveStore(owned bool) { signedFeedOwnsLiveStore.Store(owne
 
 // signedFeedOwnsLive reports the current ownership (read by the legacy syncer guard).
 func signedFeedOwnsLive() bool { return signedFeedOwnsLiveStore.Load() }
+
+// signedFeedOwnsBuiltInCategories is the AUTHORITATIVE mutability predicate for
+// BUILT-IN categories (2D-B final correction, Blocker D): true iff the live
+// effective view is serving a COMMITTED SIGNED GENERATION's classes. It is
+// derived from the actual authority semantics — the live view's Source — not
+// from provenance strings or status.state:
+//
+//   - view == nil (lifecycle unarmed): the full catStore taxonomy serves the
+//     policy path directly — built-in edits are live. NOT owned.
+//   - Source == embedded: the view is COMPOSED FROM catStore's BuiltIn
+//     taxonomy (embeddedBaselineEntries), so a built-in edit + recompose is
+//     effective. NOT owned.
+//   - Source == downloaded / cached / resumed: the classes come from the
+//     signed snapshot; a recompose rebuilds overrides over the SIGNED
+//     classes, so a catStore built-in edit is durable yet NEVER reaches
+//     enforcement. OWNED — the admin manages that content with SaaS
+//     Overrides. (This covers disabled-recovery/stale too by construction:
+//     whatever state the scheduler is in, the view Source says whose classes
+//     are actually serving — stale keeps serving the LKG signed generation,
+//     so it stays owned.)
+//
+// Admin-created (BuiltIn=false) categories are never feed-owned: the policy
+// path resolves them from catStore's adminIndex regardless of the view.
+func signedFeedOwnsBuiltInCategories() bool {
+	v := saasEffectiveView.Current()
+	return v != nil && v.Source != sourceEmbedded
+}

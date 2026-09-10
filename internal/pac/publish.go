@@ -29,6 +29,21 @@ type PublishedRevision struct {
 	// TS is the publish timestamp (RFC3339); set by the caller (the engine
 	// takes no wall clock).
 	TS string `json:"ts"`
+	// 2F-B identity + provenance (C8/C1): the configuration digest the
+	// authoritative commit was classified on, the referenced-pool digest at
+	// commit time (poolChangedSince is derived from it), the operation that
+	// produced the revision, and whether it was recorded by an admin repair.
+	OperationID string `json:"operationId,omitempty"`
+	SpecDigest  string `json:"specDigest,omitempty"`
+	PoolDigest  string `json:"poolDigest,omitempty"`
+	Repaired    bool   `json:"repaired,omitempty"`
+	// StoreRevision is the AUTHORITATIVE active-store revision the commit
+	// produced (2F-E correction round 2). "Committed historically" (this
+	// revision exists) is distinguished from "currently active" by comparing
+	// StoreRevision + SpecDigest against the active store — never by ActiveN
+	// alone: a direct profile PUT advances the store without moving the
+	// history pointer. 0 on revisions recorded before the field existed.
+	StoreRevision int64 `json:"storeRevision,omitempty"`
 }
 
 // ProfileLifecycle carries a profile's draft + immutable published history.
@@ -48,6 +63,70 @@ type ProfileLifecycle struct {
 	ActiveN int64 `json:"activeN"`
 	// Revisions is the append-only immutable history, oldest first.
 	Revisions []PublishedRevision `json:"revisions"`
+	// DraftRevision is the draft's optimistic-concurrency token (2F-A). It
+	// advances by one whenever the draft is replaced (save_draft, publish,
+	// rollback); a save_draft must echo the value it loaded, so two admins
+	// editing the same draft cannot silently overwrite each other. Records
+	// persisted before 2F-A load as 1 (see LifecycleStore.Load).
+	DraftRevision int64 `json:"draftRevision"`
+	// 2F-B operation model (intent.go): the durable in-flight intent, the
+	// unresolved ambiguity (if any) and the bounded decided-operation ring.
+	PendingOp  *PendingOp   `json:"pendingOp,omitempty"`
+	Ambiguous  *AmbiguousOp `json:"ambiguous,omitempty"`
+	Operations []DecidedOp  `json:"operations,omitempty"`
+	// HistoryIncarnation is the durable identity of this profile's history
+	// EPOCH (2F-E correction round 2): a UUID minted when the record is
+	// created and never reused. It is stable across draft saves, publishes
+	// and restarts, and ROTATES whenever the history is discarded — a profile
+	// delete (+ recreate under the same id, whose revisions restart at 1) or
+	// a history reset (quarantined file). It is what lets a client with a
+	// lost response tell "this history could still carry my decision" from
+	// "this is a different history": absence of an operationId from a
+	// different epoch proves nothing, and a re-send into a different epoch
+	// would run the operation AGAIN (the old decision record is gone), so
+	// publish/rollback may name the epoch they were reviewed in
+	// (expectedHistoryIncarnation) and are refused on a mismatch.
+	HistoryIncarnation string `json:"historyIncarnation,omitempty"`
+	// ObservedActiveRevision / ObservedActiveSpecDigest (2F-E correction
+	// round 3) record the AUTHORITATIVE active identity this history epoch
+	// was last consulted against (every lifecycle read/operation and every
+	// commit observes it). The epoch is not only discarded by an explicit
+	// delete or reset: a replace-mode import, a config rollback or a CP→DP
+	// snapshot can REPLACE the active spec at the same revision or REWIND it
+	// to an earlier one without touching this record, and a request reviewed
+	// against the earlier state would then pass the revision fence. Any such
+	// observed replacement/rewind ROTATES HistoryIncarnation (the evidence —
+	// revisions, decided operations, the draft — is kept), so a dispatch or
+	// re-send reviewed in the earlier epoch is refused. A zero observation is
+	// a record that predates the field (nothing can be concluded; the current
+	// identity is recorded on first access).
+	ObservedActiveRevision   int64  `json:"observedActiveRevision,omitempty"`
+	ObservedActiveSpecDigest string `json:"observedActiveSpecDigest,omitempty"`
+	// DeletePending (2F-E correction round 3) is the durable first write of a
+	// profile delete: it is set BEFORE the active profile is removed, so a
+	// crash or a failed record removal after the active delete can never
+	// leave this epoch looking valid for a profile recreated under the same
+	// id — a flagged record is finished (removed) once the profile is
+	// observed absent, and its epoch is ROTATED if the profile is observed
+	// still present (the transition began; whether the active delete ran is
+	// unknowable from here, so the epoch is conservatively discarded).
+	DeletePending bool `json:"deletePending,omitempty"`
+	// CreatePending + PreparedIncarnation (2F-E correction round 4) are the
+	// durable first write of a profile CREATE: the identity of the NEW epoch
+	// is minted and recorded BEFORE the active profile is created, while the
+	// existing identity and every piece of evidence (draft, revisions,
+	// decided operations, intents — which legitimately exist beside an
+	// absent profile after a rollback removed it, or a draft saved before a
+	// first publication) stay untouched. The transition is FINALIZED — the
+	// prepared identity becomes HistoryIncarnation, evidence kept — only once
+	// the active create is proven (the handler, or the next access/boot when
+	// the profile is observed present), and WITHDRAWN (flags cleared,
+	// evidence and identity intact) when the active create was refused or
+	// the profile is observed still absent after a crash. A pending create
+	// never exposes the old epoch beside a created profile: an access that
+	// cannot finalize durably reports no identity at all.
+	CreatePending       bool   `json:"createPending,omitempty"`
+	PreparedIncarnation string `json:"preparedIncarnation,omitempty"`
 }
 
 // ActiveRevision returns the currently-serving revision and true, or false
@@ -247,6 +326,7 @@ func (lc *ProfileLifecycle) Publish(draft Profile, digest, author, reason, ts st
 	})
 	lc.trimRevisions()
 	lc.Draft = draft
+	lc.DraftRevision++
 	lc.ActiveN = n
 	lc.DraftDirty = false
 	return n
@@ -271,6 +351,7 @@ func (lc *ProfileLifecycle) Rollback(targetN int64, author, ts string) (int64, b
 	})
 	lc.trimRevisions()
 	lc.Draft = spec
+	lc.DraftRevision++
 	lc.ActiveN = n
 	lc.DraftDirty = false
 	return n, true
@@ -280,6 +361,7 @@ func (lc *ProfileLifecycle) Rollback(targetN int64, author, ts string) (int64, b
 // Draft separately; this just flags divergence from the active revision.
 func (lc *ProfileLifecycle) TouchDraft(draft Profile) {
 	lc.Draft = draft
+	lc.DraftRevision++
 	active, ok := lc.ActiveRevision()
 	lc.DraftDirty = !ok || !sameProfileSpec(&draft, &active.Spec)
 }

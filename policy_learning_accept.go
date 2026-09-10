@@ -44,6 +44,10 @@ var (
 	errAcceptRequiresDraftMode = errors.New("accept requires Draft Mode (RequireCommit): acceptance creates a disabled rule in the Policy Draft only — arm Require Commit in Policy settings first")
 	errAcceptVersionConflict   = errors.New("policy/draft changed since the fence was read — reload and retry with the current version")
 	errAcceptIntegrityConflict = errors.New("a rule with this recommendation's target ID exists with DIFFERENT content — refusing to overwrite; resolve the draft rule manually")
+	// errAcceptDanglingReference: the recommendation's referenced category no
+	// longer resolves in any current category authority (deleted since
+	// generation) — accepting would stage a dangling candidate rule.
+	errAcceptDanglingReference = errors.New("the recommendation's referenced object no longer exists — refusing to stage a dangling draft rule")
 )
 
 // plAcceptOutcome carries the result of one accept attempt for the API layer.
@@ -132,8 +136,15 @@ func plAcceptRecommendation(eng *policylearn.Engine, recID string, ifVersion int
 	// (which let an append land on a candidate newer than expectedVersion,
 	// bypassing the optimistic conflict) nor remove the staged target between
 	// the append and the latch (which let accepted latch with an absent
-	// TargetRuleID). Lock order: policyLearnAdminMu (caller) → writeGate →
-	// c.mu → PolicyStore.mu; nothing below re-enters the gate.
+	// TargetRuleID). Lock order: policyLearnAdminMu (caller) →
+	// objectReferenceMutationGate (shared) → writeGate → c.mu →
+	// PolicyStore.mu; nothing below re-enters any of them.
+	//
+	// Blocker B (shared side): the accepted draft rule REFERENCES a category
+	// (ProposedRule DestCategory) — the append must not land between a
+	// concurrent category delete's reference scan and its deletion.
+	refWriteLock()
+	defer refWriteUnlock()
 	policyDraft.writeGate.Lock()
 	defer policyDraft.writeGate.Unlock()
 
@@ -244,6 +255,16 @@ func plAcceptRecommendation(eng *policylearn.Engine, recID string, ifVersion int
 		return plAcceptOutcome{}, fmt.Errorf("translated rule failed validation: %w", err)
 	}
 	stampRuleMetadataForWrite(&rule, nil, actor)
+	// Blocker B delete-first order: the recommendation's category was live at
+	// generation time but may have been deleted since. Validated here — on the
+	// FINAL canonical rule, under the shared objectReferenceMutationGate
+	// acquired above, before the staged append — so a delete that already won
+	// refuses the accept instead of staging a dangling candidate rule. The
+	// intent stays pending (a retry after the operator restores the category
+	// converges on the same target).
+	if e := validateRuleObjectRefs(&rule); e != nil {
+		return plAcceptOutcome{}, fmt.Errorf("%v: %w", e, errAcceptDanglingReference)
+	}
 
 	// M5B.1: the coordinator's durable check-and-mutate primitive — fence,
 	// append, and DURABLE persist under one lock. Structurally candidate-only
