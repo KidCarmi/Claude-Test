@@ -244,6 +244,13 @@ func (g releaseOrderGate) AdmitSideEffect(LiveGateInput) LiveGateDecision {
 	}
 }
 
+// AdmitAuxiliary satisfies the SEC-MCP-AUX-1 half of LiveExecutionGate. This double exercises the
+// side-effect release ordering only, so auxiliary traffic is admitted with the same release hook
+// and no reservation — an auxiliary call consumes no budget slot and names no attempt.
+func (g releaseOrderGate) AdmitAuxiliary(LiveGateInput) LiveGateDecision {
+	return LiveGateDecision{Admit: true, Release: func() { atomic.AddInt32(g.releases, 1) }}
+}
+
 // releaseOrderSafety captures the release count observed at the instant AttemptSettled fired.
 type releaseOrderSafety struct {
 	releases      *int32
