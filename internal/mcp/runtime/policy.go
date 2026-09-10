@@ -96,9 +96,12 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 		// routing and execution never observe two snapshots of the mutable rollout state
 		// (Codex P2, PR #1234). A record-only disposition keeps the inline Observe path;
 		// everything else is handed to Execute with the same resolution.
+		// Captured BEFORE the resolution, so it names the activation this request's scope
+		// decision was actually made under. See Deps.CanaryGeneration.
+		genAtResolve := p.deps.canaryGenerationAt(p.capability.String())
 		res := p.executor.Resolve(ei)
 		if res.Disposition != rollout.EffectRecordOnly {
-			return p.dispatchExecute(ctx, rb, ei, res)
+			return p.dispatchExecute(ctx, rb, ei, res, genAtResolve)
 		}
 		// record-only disposition ⇒ the inline Observe evidence path. Honor an emergency kill
 		// engaged AFTER Resolve before that path commits: the kill is a capability-wide
