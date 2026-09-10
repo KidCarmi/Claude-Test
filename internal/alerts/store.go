@@ -37,7 +37,7 @@ package alerts
 //                             sustained period, or has stopped entirely: SOCKS5 clients cannot
 //                             connect (CHAOS-54). Fired once per episode, never per retry.
 //   "threat_feed_stale"     — threat intelligence has not synced successfully for over 2x the sync
-//                             interval, or has NEVER synced on this node (CHAOS-58). The gateway
+//                             interval, or has NEVER synced on this node (CHAOS-59). The gateway
 //                             keeps enforcing last-known-good entries — nothing is wiped — so this
 //                             is degraded FRESHNESS, not a failing control; the never-synced case
 //                             means no threat-feed coverage at all and says so. Fired once per

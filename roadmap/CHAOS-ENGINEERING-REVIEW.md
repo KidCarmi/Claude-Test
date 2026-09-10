@@ -60,15 +60,21 @@ permanent defect proof. No new metric, no new alert, no new operator vocabulary:
 produces exactly what a down directory produces. 9 gates; all six defect gates verified failing
 against the pre-fix tree. See rows AU-5 (re-scored M→H) and AU-14, §25, and
 `docs/operator/ldap-directory-stalls.md`.
-**2026-09-03 — CHAOS-58 sweep (the intelligence-feed plane under origin outage).**
-*(Numbered CHAOS-58/§26 on merge: this sweep ran concurrently with the hijacked-tunnel sweep
-below and both independently took `CHAOS-57`/`§25` — the THIRD occurrence of the collision this
-section's header warns about, and the first one caught before it landed. It surfaced only as a
-git conflict in this file, which is luck rather than process: two sweeps that touched disjoint
-code would have merged cleanly and collided silently. The hijacked-tunnel sweep was already
-merged, so this one renumbered — renumbering an id that merged PRs reference stays the owner
+**2026-09-03 — CHAOS-59 sweep (the intelligence-feed plane under origin outage).**
+*(Numbered CHAOS-59/§27 on merge, at the SECOND attempt. This sweep ran concurrently with two
+others and collided with both: it first took `CHAOS-57`/`§25` alongside the hijacked-tunnel sweep
+(§25), renumbered to `CHAOS-58`/`§26`, and within hours collided AGAIN with the directory-stall
+sweep (§26) that took the same id. That is the THIRD and FOURTH occurrences of the collision this
+section's header warns about, both on one PR, in one afternoon. The pattern is now unambiguous:
+concurrent sweeps in this repository collide by default, and the only reason either was caught is
+that all three happened to edit THIS file — sweeps touching disjoint code merge cleanly and collide
+silently. The second collision also shows the failure surviving its own remedy: the automatic
+main-merge renumbered the SECTION (§26→§27) and left the `CHAOS-` id colliding, so a
+merge-conflict resolver is not a substitute for allocating the id. Each time, the already-merged
+sweep kept the id and this one moved — renumbering an id that merged PRs reference stays the owner
 decision the header records. The header's own recommendation — allocate the id at the START of a
-sweep in a committed placeholder row — would have prevented all three.)*
+sweep in a committed placeholder row — would have prevented all four, and is now overdue rather
+than advisable.)*
 Culvert ships THREE periodic feed schedulers and only the newest one — the signed SaaS
 feed's `saasFeedScheduler` — backs off, jitters, or reports. The two older loops
 (`internal/threatfeed`, `internal/feedsync`) were bare `time.NewTicker`s with the round's
@@ -97,7 +103,7 @@ because a third-party feed is unreachable converts a provider's outage into the 
 35 gates, the cadence ones failing against the bare-ticker shape by construction, with four
 CONTROLS (an immediate retry, a ceiling above the interval, and an always-firing alert each
 pass a defect gate while being worse than the defect). See rows WK-5/WK-5b/WK-5c/WK-6/WK-13b,
-§26, and `docs/operator/threat-feed-freshness.md`.
+§27, and `docs/operator/threat-feed-freshness.md`.
 
 **2026-09-01 — CHAOS-57 sweep (the hijacked-tunnel plane on the way out).** CHAOS-56 bounded
 the shutdown sequence end to end and made the drain honour its phase deadline. It did not ask the
@@ -628,11 +634,11 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | WK-19 | **The remote sidecar had none of the CHAOS-52 protections, and the runbook recommended switching to it.** Six further defects: any HTTP 200 whose body parsed as JSON (`{}`, `null`) was read as CLEAN with no counter/log/alert; NO `culvert_scan_*` series is produced on a sidecar node and `stat_remote_scan_fail` never reached `/metrics`; the fail-open alert fired per request ungated with a raw `err.Error()` (ephemeral port ⇒ un-dedupable key) and logged per request; scan exclusions were never LOADED in remote mode, so `scanexcl.Store` had no path and every admin Save was a silent no-op that returned 200 and was audited as success; the hash allowlist was never consulted and `Result.Hash` came from the SIDECAR; `Status()` decoded an unbounded body on an admin endpoint; and the sidecar's own status blob shadowed this node's `scan_svc_mode`, so a remote node reported "local". | GAP → **CLOSED (CHAOS-53)** | **H** | §21; `docs/engineering/CHAOS-ENGINEERING-REVIEW-2026-08-22.md` |
 | WK-3 | GeoIP cache-miss on the policy hot path fails **closed** (country allow-rule cannot match unknown country); `LookupCached` never blocks on DB/DNS. | ✓ | — | `policy.go:831-839`, `geoip.go:84-93`; tests `final_coverage_test.go:203` |
 | WK-4 | GeoIP DB missing/corrupt: reader stays nil, feature degrades to "no country data" — safe, but **no staleness/health signal** (MMDBs expire silently). | GAP (obs) → **PARTIALLY CLOSED** (`BuildTime()` reads the `.mmdb`'s own `build_epoch`; `GET /api/geoip` returns `dbBuildDate`/`dbAgeDays`; GeoIP Database panel shows the age, warn-colored past 90 days; load failures surfaced via `lastError`. Residual: no PROACTIVE alert/metric — an operator must open the panel to notice) | M | `internal/geoip/geoip.go` `BuildTime`, `ui_security.go` `apiGeoIPConfig` |
-| WK-5 | **Threat-feed timeout → stale-erase.** On partial failure `Sync` unconditionally replaces the maps with only what succeeded, discarding prior good entries; stamps `lastSync=now` even on failure; no backoff, no staleness alert → coverage silently shrinks for up to 6h. | GAP → **CLOSED** (stale-erase: per-source `replacedSources` replacement, `threatfeed.go` `applySync`. Backoff + staleness alert: CHAOS-58, §26) | H | `internal/threatfeed/threatfeed.go` `applySync`; `threatfeed_health.go` |
-| WK-5b | **The carry-forward fix removed the only signal.** `culvert_threat_feed_entries` is held at its last-good value by design, so after WK-5's fix a node whose feed has not synced in three weeks exported metrics byte-identical to one that synced ten minutes ago; the only surviving difference reached ONE role-gated admin JSON field no alerting rule scrapes. | GAP → **CLOSED (CHAOS-58)** — five `culvert_threat_feed_*` freshness series, `threat_feed` contract row, fire-once `threat_feed_stale` alert | **H** | §26; `threatfeed_health.go` |
-| WK-5c | **A feed round that fails at COLD START leaves the node with no coverage at all.** `Start` syncs immediately when the on-disk DB is empty (fresh install, re-image, replaced volume); pre-fix a failed first round was not retried for 6h, so the node enforced with an EMPTY threat database while every probe reported healthy. | GAP → **CLOSED (CHAOS-58)** — backoff ladder + a distinct never-synced alert/row at a 30-min grace rather than 2× the interval | **H** | §26; `threatfeed_health.go` `checkThreatFeed` |
-| WK-6 | UT1 category feed failures counted but **never alerted**; fixed 24h retry, no backoff. Stale-serve is safe (last-good BadgerDB). | GAP → **retry/backoff/jitter CLOSED (CHAOS-58)**; the alert half stays open by owner decision (last-good BadgerDB keeps serving; category staleness is not a security control) | M | `internal/feedsync/feedsync.go` `Start`/`syncRound`, §25 |
-| WK-13b | **No jitter on either legacy feed ticker** (the WK-13 herd finding, instantiated). `time.NewTicker` fires at a fixed offset from process start, so a fleet that boots together fetches from the same third-party origins forever — and the origins are public/shared (abuse.ch, openphish.com, a raw.githubusercontent.com mirror of a 50+ MB tarball). Rate-limiting of the customer's egress IP is the ordinary answer, which then produces the failure the absent backoff held the fleet at. | GAP → **CLOSED (CHAOS-58)** — stable per-node ±10% jitter on both, via `internal/feedsched` | M | §26; `internal/feedsched/feedsched.go` `StableJitter` |
+| WK-5 | **Threat-feed timeout → stale-erase.** On partial failure `Sync` unconditionally replaces the maps with only what succeeded, discarding prior good entries; stamps `lastSync=now` even on failure; no backoff, no staleness alert → coverage silently shrinks for up to 6h. | GAP → **CLOSED** (stale-erase: per-source `replacedSources` replacement, `threatfeed.go` `applySync`. Backoff + staleness alert: CHAOS-59, §27) | H | `internal/threatfeed/threatfeed.go` `applySync`; `threatfeed_health.go` |
+| WK-5b | **The carry-forward fix removed the only signal.** `culvert_threat_feed_entries` is held at its last-good value by design, so after WK-5's fix a node whose feed has not synced in three weeks exported metrics byte-identical to one that synced ten minutes ago; the only surviving difference reached ONE role-gated admin JSON field no alerting rule scrapes. | GAP → **CLOSED (CHAOS-59)** — five `culvert_threat_feed_*` freshness series, `threat_feed` contract row, fire-once `threat_feed_stale` alert | **H** | §27; `threatfeed_health.go` |
+| WK-5c | **A feed round that fails at COLD START leaves the node with no coverage at all.** `Start` syncs immediately when the on-disk DB is empty (fresh install, re-image, replaced volume); pre-fix a failed first round was not retried for 6h, so the node enforced with an EMPTY threat database while every probe reported healthy. | GAP → **CLOSED (CHAOS-59)** — backoff ladder + a distinct never-synced alert/row at a 30-min grace rather than 2× the interval | **H** | §27; `threatfeed_health.go` `checkThreatFeed` |
+| WK-6 | UT1 category feed failures counted but **never alerted**; fixed 24h retry, no backoff. Stale-serve is safe (last-good BadgerDB). | GAP → **retry/backoff/jitter CLOSED (CHAOS-59)**; the alert half stays open by owner decision (last-good BadgerDB keeps serving; category staleness is not a security control) | M | `internal/feedsync/feedsync.go` `Start`/`syncRound`, §25 |
+| WK-13b | **No jitter on either legacy feed ticker** (the WK-13 herd finding, instantiated). `time.NewTicker` fires at a fixed offset from process start, so a fleet that boots together fetches from the same third-party origins forever — and the origins are public/shared (abuse.ch, openphish.com, a raw.githubusercontent.com mirror of a 50+ MB tarball). Rate-limiting of the customer's egress IP is the ordinary answer, which then produces the failure the absent backoff held the fleet at. | GAP → **CLOSED (CHAOS-59)** — stable per-node ±10% jitter on both, via `internal/feedsched` | M | §27; `internal/feedsched/feedsched.go` `StableJitter` |
 | WK-7 | Category DB (Badger) corruption: read errors → "not found" (fail-open for category-block, no crash); value-log truncate/replay on restart. **The RUNTIME half is correct and unchanged; the claim about restart was not** — see ST-12/§17: a value log is indeed tolerated, but a torn MANIFEST used to be fatal at boot and a corrupt table panics uncatchably. | ✓ runtime / GAP boot → **boot half CLOSED** (CHAOS-50) | — | `internal/catdb/catdb.go` `Lookup`/`getExact`; boot path `internal/catdb/resilient.go` |
 | WK-8 | **Background workers have NO panic recovery.** `threatfeed.Start`, `feedsync.Start`, blocklistfeed scheduler, `startCDRHealthPoller`, `startAlertRetryLoop` all run their loop body with no `recover()`. One panic (bad feed line, nil-map deref, a `.(time.Time)` assertion) **terminates the whole in-line proxy.** | GAP → **CLOSED (CHAOS-24)** | **C** | was: `threatfeed.go:131-145`, `feedsync.go:171-187`, `cdr_health.go:65-80`, `alerts.go:46`→`store.go:511`. Now guarded per ROUND — see §12 |
 | WK-9 | Syslog on the hot path: `writeMsg` holds `s.mu` and does a **blocking 5s dial** while locked; TCP writes have **no write deadline** → a slow SIEM can stall proxy goroutines. UDP is non-blocking (acceptable). | GAP → **CLOSED** (async drain goroutine owns the socket, `internal/syslog`) | M | `internal/syslog/syslog.go:117-146,68` |
@@ -3323,7 +3329,7 @@ LDAP as of this sweep.
 
 ---
 
-## 27. CHAOS-58 — The intelligence-feed plane under origin outage
+## 27. CHAOS-59 — The intelligence-feed plane under origin outage
 
 **Date:** 2026-09-03
 **Scope:** the two legacy periodic feed loops — `internal/threatfeed`

@@ -184,5 +184,5 @@ never-synced row and suppress the alert for those nodes.
 
 - `docs/operator/category-store-recovery.md` — the community category store's
   own degradation and recovery.
-- `roadmap/CHAOS-ENGINEERING-REVIEW.md` §26 — the review that produced this
+- `roadmap/CHAOS-ENGINEERING-REVIEW.md` §27 — the review that produced this
   behaviour, with the evidence and the rejected alternatives.
