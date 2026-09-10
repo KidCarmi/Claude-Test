@@ -5,8 +5,8 @@ access rule scoped by destination country (`DestCountry`). On a node with
 neither, none of this runs and every surface below reports the feature as
 unused.
 
-**Finding:** CHAOS-57 · **Code:** `geoip.go` (resolver), `dns_health.go`
-(health plane) · **Register:** `roadmap/CHAOS-ENGINEERING-REVIEW.md` §25
+**Finding:** CHAOS-58 · **Code:** `geoip.go` (resolver), `dns_health.go`
+(health plane) · **Register:** `roadmap/CHAOS-ENGINEERING-REVIEW.md` §26
 
 ---
 

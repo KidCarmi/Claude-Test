@@ -71,7 +71,7 @@ for the two cheapest wrong fixes (force-close at drain START — which passes ev
 being strictly worse than the defect — and a non-idempotent release, whose negative gauge restores
 the original blindness by accident). See rows PX-4/PX-8, §25 and
 `docs/operator/tunnel-drain-on-shutdown.md`.
-**2026-09-04 — CHAOS-57 sweep (destination-host DNS resolution on the policy path).** The
+**2026-09-04 — CHAOS-58 sweep (destination-host DNS resolution on the policy path).** The
 sweep took the one failure domain the register had never entered: **DNS**, listed in the original
 scope and never swept, because it looks like somebody else's dependency. It is not — a
 `DestCountry` policy rule puts the customer's resolver on the critical path of every request that
@@ -3116,11 +3116,42 @@ carries more authority than an unexamined gap — it tells the next reader the
 question was asked and answered — so a wrong one is worse than silence. The
 entry has been struck rather than quietly deleted, so the record shows the claim
 was made and refuted.
-## 26. CHAOS-57 — Destination-host DNS resolution on the policy path
+## 26. CHAOS-58 — Destination-host DNS resolution on the policy path
 
 **Date:** 2026-09-04 · **Domain:** DNS (never previously swept) · **Code:**
 `geoip.go`, `dns_health.go`, `alerts.go` · **Runbook:**
 `docs/operator/dns-resolution-health.md`
+
+> **Renumbered from CHAOS-57 before merge — the collision this file warns about,
+> caught in the one window where it was still free to fix.** This sweep and §25
+> (the hijacked-tunnel plane) ran concurrently and each took `CHAOS-57`
+> independently: exactly the failure the header records for `CHAOS-50`, and the
+> THIRD occurrence of it. The merge that brought main into this branch resolved
+> the duplicate SECTION number (25 → 26) but left both sweeps stamped
+> `CHAOS-57`.
+>
+> The header states renumbering is an owner decision *because* "identifiers three
+> merged PRs already reference" would have to be rewritten. That reason is
+> **asymmetric here**: §25 was merged on 2026-09-01 and is referenced by merged
+> code, gates and the PX-4/PX-8 rows, so it KEEPS the id; this sweep was still
+> unmerged, so every reference to it lived inside one branch and cost nothing to
+> change. Renumbering the unmerged side is therefore not a unilateral edit of
+> shared history — it is the only moment at which the collision is free to
+> remove, and after merge it would have been permanent.
+>
+> Scope of the rename (mine only — §25's references were deliberately left
+> untouched, and `metrics.go` carries one line from each sweep): 22 `CHAOS-57`
+> mentions across `geoip.go`, `dns_health.go`, `alerts.go`, `metrics.go`,
+> `internal/geoip/geoip.go`, the two test files, `CLAUDE.md` and this file, plus
+> 43 `TestChaos57_*` gate names and the fixture hostnames. The same pass fixed
+> three cross-references the merge left pointing at §25 — `CLAUDE.md`'s DNS
+> bullet, the operator runbook header, and the GEO-1 note in
+> `internal/geoip/geoip.go` — each of which now resolved to the WRONG sweep.
+>
+> **The prevention the header already names still applies and is still not
+> implemented**: allocate the id in a committed placeholder row at the START of a
+> sweep. Two concurrent sweeps in one week reproduced the fault again; catching
+> this one early was luck (a merge conflict forced someone to look), not process.
 
 ### 26.1 Reachability
 
@@ -3264,14 +3295,14 @@ synchronous path for up to `hostIPCacheStaleMax`, leaving a country-scoped DENY
 rule dark for an **hour** after DNS recovered instead of the 30 s the negative
 TTL promises. Worse, `refreshAsync` SHEDS when the resolver pool is saturated,
 so under sustained load the bypass could persist for the full window. And it was
-a REGRESSION against the pre-CHAOS-57 behaviour, which re-resolved synchronously
+a REGRESSION against the pre-CHAOS-58 behaviour, which re-resolved synchronously
 the moment the negative TTL lapsed.
 
 Fixed by restricting the stale state to `e.ip != nil`. An expired negative is a
 MISS and takes the bounded, single-flighted blocking path, picking up a
 recovered resolver on the very next request. Pinned by
-`TestChaos57_ExpiredNegativeEntryIsNotStaleServed` and
-`TestChaos57_ExpiredNegativeStillReResolvesWhenTheResolverPoolIsSaturated`, both
+`TestChaos58_ExpiredNegativeEntryIsNotStaleServed` and
+`TestChaos58_ExpiredNegativeStillReResolvesWhenTheResolverPoolIsSaturated`, both
 verified failing against the reintroduced pre-fix shape.
 
 **The lesson worth keeping:** a mechanism justified by one case (a usable
@@ -3304,7 +3335,7 @@ against each state it can be in, not only the one that motivated it.
 
 ### 26.7 GEO-1 — a latent process-kill armed by a comment (recorded, not fixed)
 
-Found while sweeping the domain adjacent to CHAOS-57 and **not reachable in the
+Found while sweeping the domain adjacent to CHAOS-58 and **not reachable in the
 current tree**, but recorded because of how it is armed.
 
 `internal/geoip.InitGeoDB` claimed:

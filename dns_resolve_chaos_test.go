@@ -1,6 +1,6 @@
 package main
 
-// dns_resolve_chaos_test.go — CHAOS-57 gates.
+// dns_resolve_chaos_test.go — CHAOS-58 gates.
 //
 // Three DEFECT gates (D1–D3) were each verified FAILING against the pre-fix
 // tree: with `net.LookupHost` behind the seam and no single-flight, no
@@ -61,11 +61,11 @@ func blockingResolver(t *testing.T, release <-chan struct{}, addrs []string, err
 
 // ─── D1: the resolution is bounded in TIME ───────────────────────────────────
 
-// TestChaos57_WedgedResolverDoesNotBlockTheRequestPathForever pins the
+// TestChaos58_WedgedResolverDoesNotBlockTheRequestPathForever pins the
 // deadline. Pre-fix this call sat in net.LookupHost for the OS budget
 // (resolv.conf ships timeout:5 attempts:2 per nameserver) on the REQUEST
 // goroutine, holding a client connection and a per-IP connection-limiter slot.
-func TestChaos57_WedgedResolverDoesNotBlockTheRequestPathForever(t *testing.T) {
+func TestChaos58_WedgedResolverDoesNotBlockTheRequestPathForever(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	blockingResolver(t, release, nil, nil)
@@ -73,7 +73,7 @@ func TestChaos57_WedgedResolverDoesNotBlockTheRequestPathForever(t *testing.T) {
 	done := make(chan time.Duration, 1)
 	go func() {
 		start := time.Now()
-		_ = resolveHost("wedged.chaos57.invalid")
+		_ = resolveHost("wedged.chaos58.invalid")
 		done <- time.Since(start)
 	}()
 
@@ -90,14 +90,14 @@ func TestChaos57_WedgedResolverDoesNotBlockTheRequestPathForever(t *testing.T) {
 	}
 }
 
-// TestChaos57_TimeoutIsCountedAndClassified: a deadline overrun must be
+// TestChaos58_TimeoutIsCountedAndClassified: a deadline overrun must be
 // visible. Pre-fix nothing on this path counted, logged or alerted a failure.
-func TestChaos57_TimeoutIsCountedAndClassified(t *testing.T) {
+func TestChaos58_TimeoutIsCountedAndClassified(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	blockingResolver(t, release, nil, nil)
 
-	_ = resolveHost("timeout-counted.chaos57.invalid")
+	_ = resolveHost("timeout-counted.chaos58.invalid")
 
 	snap := dnsResolveState()
 	if snap.Failures == 0 {
@@ -113,13 +113,13 @@ func TestChaos57_TimeoutIsCountedAndClassified(t *testing.T) {
 
 // ─── D2: the resolution is SINGLE-FLIGHTED ───────────────────────────────────
 
-// TestChaos57_ConcurrentMissesForOneHostResolveOnce pins the single-flight.
+// TestChaos58_ConcurrentMissesForOneHostResolveOnce pins the single-flight.
 //
 // Pre-fix: 200 concurrent misses for one host produced 200 resolver
 // invocations — one blocked goroutine per request AND one query per request
 // aimed at a resolver that, in the failure case this matters for, is already
 // failing.
-func TestChaos57_ConcurrentMissesForOneHostResolveOnce(t *testing.T) {
+func TestChaos58_ConcurrentMissesForOneHostResolveOnce(t *testing.T) {
 	release := make(chan struct{})
 	calls := blockingResolver(t, release, []string{"203.0.113.57"}, nil)
 
@@ -132,7 +132,7 @@ func TestChaos57_ConcurrentMissesForOneHostResolveOnce(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			started <- struct{}{}
-			results[i] = resolveHost("herd.chaos57.invalid")
+			results[i] = resolveHost("herd.chaos58.invalid")
 		}(i)
 	}
 	for i := 0; i < goroutines; i++ {
@@ -156,11 +156,11 @@ func TestChaos57_ConcurrentMissesForOneHostResolveOnce(t *testing.T) {
 	}
 }
 
-// TestChaos57_FollowersAreReleasedWhenTheLeaderSheds: a leader that sheds must
+// TestChaos58_FollowersAreReleasedWhenTheLeaderSheds: a leader that sheds must
 // still finish its flight. If it did not, every follower would block forever on
 // a flight nobody completes — a bounded resolver fault converted into a
 // permanent request-plane hang that no upstream recover() can undo.
-func TestChaos57_FollowersAreReleasedWhenTheLeaderSheds(t *testing.T) {
+func TestChaos58_FollowersAreReleasedWhenTheLeaderSheds(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	blockingResolver(t, release, nil, nil)
@@ -173,7 +173,7 @@ func TestChaos57_FollowersAreReleasedWhenTheLeaderSheds(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < 50; i++ {
 			wg.Add(1)
-			go func() { defer wg.Done(); _ = resolveHost("shed-followers.chaos57.invalid") }()
+			go func() { defer wg.Done(); _ = resolveHost("shed-followers.chaos58.invalid") }()
 		}
 		wg.Wait()
 	}()
@@ -187,18 +187,18 @@ func TestChaos57_FollowersAreReleasedWhenTheLeaderSheds(t *testing.T) {
 
 // ─── D3: an expired-but-usable answer is SERVED, not discarded ───────────────
 
-// TestChaos57_ResolverOutageDoesNotTakeGeoRulesDark is the security half.
+// TestChaos58_ResolverOutageDoesNotTakeGeoRulesDark is the security half.
 //
 // A DestCountry rule that does not match is SKIPPED and evaluation continues to
 // lower-priority rules, so an unknown country silently stops a "block sanctioned
 // countries" rule from enforcing while a broad allow rule beneath it takes over.
 // Pre-fix, the first cache expiry during a resolver outage did exactly that for
 // every host at once.
-func TestChaos57_ResolverOutageDoesNotTakeGeoRulesDark(t *testing.T) {
+func TestChaos58_ResolverOutageDoesNotTakeGeoRulesDark(t *testing.T) {
 	calls, restore := stubResolver([]string{"203.0.113.58"}, nil)
 	defer restore()
 
-	warm := resolveHost("outage.chaos57.invalid")
+	warm := resolveHost("outage.chaos58.invalid")
 	if warm == nil {
 		t.Fatal("warm-up resolution failed")
 	}
@@ -210,21 +210,21 @@ func TestChaos57_ResolverOutageDoesNotTakeGeoRulesDark(t *testing.T) {
 	drainInflightResolutions()
 	origFn := lookupHostFn
 	lookupHostFn = func(_ context.Context, _ string) ([]string, error) {
-		return nil, &net.DNSError{Err: "server misbehaving", Name: "outage.chaos57.invalid"}
+		return nil, &net.DNSError{Err: "server misbehaving", Name: "outage.chaos58.invalid"}
 	}
 	defer func() {
 		drainInflightResolutions()
 		lookupHostFn = origFn
 	}()
-	expireEntry("outage.chaos57.invalid", time.Second)
+	expireEntry("outage.chaos58.invalid", time.Second)
 
-	got := resolveHost("outage.chaos57.invalid")
+	got := resolveHost("outage.chaos58.invalid")
 	if got == nil || !got.Equal(warm) {
 		t.Fatalf("resolveHost = %v during a resolver outage, want the last known address %v — geo-scoped rules go dark otherwise", got, warm)
 	}
 }
 
-// TestChaos57_FailedRefreshDoesNotDestroyTheStaleAnswer proves the background
+// TestChaos58_FailedRefreshDoesNotDestroyTheStaleAnswer proves the background
 // refresh cannot make an outage worse than it already is.
 //
 // The background refresh must not be able to make things worse. A failed
@@ -232,11 +232,11 @@ func TestChaos57_ResolverOutageDoesNotTakeGeoRulesDark(t *testing.T) {
 // the negative TTL — so without the guard in hostIPCache.put the refresh
 // introduced by this change would itself take geo dark for exactly the window
 // the stale answer existed to cover.
-func TestChaos57_FailedRefreshDoesNotDestroyTheStaleAnswer(t *testing.T) {
+func TestChaos58_FailedRefreshDoesNotDestroyTheStaleAnswer(t *testing.T) {
 	calls, restore := stubResolver([]string{"203.0.113.59"}, nil)
 	defer restore()
 
-	warm := resolveHost("refresh-fail.chaos57.invalid")
+	warm := resolveHost("refresh-fail.chaos58.invalid")
 	if warm == nil {
 		t.Fatal("warm-up resolution failed")
 	}
@@ -245,15 +245,15 @@ func TestChaos57_FailedRefreshDoesNotDestroyTheStaleAnswer(t *testing.T) {
 
 	origFn := lookupHostFn
 	lookupHostFn = func(_ context.Context, _ string) ([]string, error) {
-		return nil, &net.DNSError{Err: "server misbehaving", Name: "refresh-fail.chaos57.invalid"}
+		return nil, &net.DNSError{Err: "server misbehaving", Name: "refresh-fail.chaos58.invalid"}
 	}
 	defer func() {
 		drainInflightResolutions()
 		lookupHostFn = origFn
 	}()
 
-	expireEntry("refresh-fail.chaos57.invalid", time.Second)
-	if got := resolveHost("refresh-fail.chaos57.invalid"); got == nil {
+	expireEntry("refresh-fail.chaos58.invalid", time.Second)
+	if got := resolveHost("refresh-fail.chaos58.invalid"); got == nil {
 		t.Fatal("first stale serve returned nil")
 	}
 	// Let the failing refresh land.
@@ -269,12 +269,12 @@ func TestChaos57_FailedRefreshDoesNotDestroyTheStaleAnswer(t *testing.T) {
 	}
 
 	// The stale positive must survive the failed refresh.
-	if got := resolveHost("refresh-fail.chaos57.invalid"); got == nil || !got.Equal(warm) {
+	if got := resolveHost("refresh-fail.chaos58.invalid"); got == nil || !got.Equal(warm) {
 		t.Fatalf("after a failed refresh resolveHost = %v, want the preserved stale address %v — a failed refresh must never overwrite a still-servable answer", got, warm)
 	}
 }
 
-// TestChaos57_StaleServesDoNotStackRefreshes pins at most ONE refresh per host,
+// TestChaos58_StaleServesDoNotStackRefreshes pins at most ONE refresh per host,
 // however many requests are served stale behind it.
 //
 // At most ONE refresh per host may be in flight, however many requests are
@@ -283,7 +283,7 @@ func TestChaos57_FailedRefreshDoesNotDestroyTheStaleAnswer(t *testing.T) {
 // length of the outage — so a per-request refresh would put a resolution
 // attempt and an exclusive cache-lock acquisition on the policy path precisely
 // when the gateway is already degraded.
-func TestChaos57_StaleServesDoNotStackRefreshes(t *testing.T) {
+func TestChaos58_StaleServesDoNotStackRefreshes(t *testing.T) {
 	// The refresh is held OPEN for the whole burst, which is the case that
 	// matters: a completed refresh makes the entry fresh again, so only a
 	// resolver that is NOT answering keeps every request in the stale window —
@@ -294,7 +294,7 @@ func TestChaos57_StaleServesDoNotStackRefreshes(t *testing.T) {
 
 	close(warm)
 	go func() { <-warm; time.Sleep(20 * time.Millisecond); close(release) }()
-	if resolveHost("stale-stack.chaos57.invalid") == nil {
+	if resolveHost("stale-stack.chaos58.invalid") == nil {
 		t.Fatal("warm-up failed")
 	}
 	drainInflightResolutions()
@@ -319,7 +319,7 @@ func TestChaos57_StaleServesDoNotStackRefreshes(t *testing.T) {
 		drainInflightResolutions()
 		lookupHostFn = origFn
 	}()
-	expireEntry("stale-stack.chaos57.invalid", time.Second)
+	expireEntry("stale-stack.chaos58.invalid", time.Second)
 
 	// A burst of stale serves. The first becomes the refresh leader; every
 	// other one must ride behind it and be served immediately.
@@ -328,7 +328,7 @@ func TestChaos57_StaleServesDoNotStackRefreshes(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if ip := resolveHost("stale-stack.chaos57.invalid"); ip == nil {
+			if ip := resolveHost("stale-stack.chaos58.invalid"); ip == nil {
 				t.Error("a stale serve returned nil while a refresh was in flight")
 			}
 		}()
@@ -344,7 +344,7 @@ func TestChaos57_StaleServesDoNotStackRefreshes(t *testing.T) {
 	}
 }
 
-// TestChaos57_ExpiredNegativeEntryIsNotStaleServed pins that stale serving is
+// TestChaos58_ExpiredNegativeEntryIsNotStaleServed pins that stale serving is
 // for POSITIVE entries only (Codex review, PR #1312).
 //
 // A negative entry's stale value is nil, so serving it stale buys nothing and
@@ -357,11 +357,11 @@ func TestChaos57_StaleServesDoNotStackRefreshes(t *testing.T) {
 // The gate is written so it fails on the pre-fix shape: the resolver is healthy
 // by the time the negative expires, so a correct implementation returns the
 // address SYNCHRONOUSLY on the very next call.
-func TestChaos57_ExpiredNegativeEntryIsNotStaleServed(t *testing.T) {
-	calls, restore := stubResolver(nil, &net.DNSError{Err: "server misbehaving", Name: "neg-stale.chaos57.invalid"})
+func TestChaos58_ExpiredNegativeEntryIsNotStaleServed(t *testing.T) {
+	calls, restore := stubResolver(nil, &net.DNSError{Err: "server misbehaving", Name: "neg-stale.chaos58.invalid"})
 	defer restore()
 
-	if ip := resolveHost("neg-stale.chaos57.invalid"); ip != nil {
+	if ip := resolveHost("neg-stale.chaos58.invalid"); ip != nil {
 		t.Fatalf("setup: failed resolution returned %v, want nil", ip)
 	}
 	waitForResolverCalls(t, calls, 1)
@@ -376,9 +376,9 @@ func TestChaos57_ExpiredNegativeEntryIsNotStaleServed(t *testing.T) {
 		drainInflightResolutions()
 		lookupHostFn = origFn
 	}()
-	expireEntry("neg-stale.chaos57.invalid", time.Second)
+	expireEntry("neg-stale.chaos58.invalid", time.Second)
 
-	got := resolveHost("neg-stale.chaos57.invalid")
+	got := resolveHost("neg-stale.chaos58.invalid")
 	if got == nil {
 		t.Fatal("an EXPIRED NEGATIVE entry was served stale: resolveHost returned nil against a healthy resolver, so a country-scoped deny rule stays dark for up to the staleness ceiling instead of the negative TTL")
 	}
@@ -391,26 +391,26 @@ func TestChaos57_ExpiredNegativeEntryIsNotStaleServed(t *testing.T) {
 	}
 }
 
-// TestChaos57_ExpiredNegativeStillReResolvesWhenTheResolverPoolIsSaturated is
+// TestChaos58_ExpiredNegativeStillReResolvesWhenTheResolverPoolIsSaturated is
 // the load half of the same finding: the repair must not depend on the async
 // refresh, which sheds when the pool is full.
-func TestChaos57_ExpiredNegativeStillReResolvesWhenTheResolverPoolIsSaturated(t *testing.T) {
-	calls, restore := stubResolver(nil, &net.DNSError{Err: "server misbehaving", Name: "neg-shed.chaos57.invalid"})
+func TestChaos58_ExpiredNegativeStillReResolvesWhenTheResolverPoolIsSaturated(t *testing.T) {
+	calls, restore := stubResolver(nil, &net.DNSError{Err: "server misbehaving", Name: "neg-shed.chaos58.invalid"})
 	defer restore()
 
-	if ip := resolveHost("neg-shed.chaos57.invalid"); ip != nil {
+	if ip := resolveHost("neg-shed.chaos58.invalid"); ip != nil {
 		t.Fatalf("setup: failed resolution returned %v, want nil", ip)
 	}
 	waitForResolverCalls(t, calls, 1)
 	drainInflightResolutions()
-	expireEntry("neg-shed.chaos57.invalid", time.Second)
+	expireEntry("neg-shed.chaos58.invalid", time.Second)
 
 	// Saturate the pool. A stale-served negative would be repaired only by a
 	// refresh, and a refresh cannot run here — so the pre-fix shape returns nil
 	// forever. The blocking path sheds too, but it sheds WITHOUT caching, so the
 	// moment a slot frees the next request resolves.
 	restorePool := shrinkResolverPool(t, 0)
-	if ip := resolveHost("neg-shed.chaos57.invalid"); ip != nil {
+	if ip := resolveHost("neg-shed.chaos58.invalid"); ip != nil {
 		t.Fatalf("saturated pool returned %v, want nil (shed)", ip)
 	}
 	if snap := dnsResolveState(); snap.Shed == 0 {
@@ -428,7 +428,7 @@ func TestChaos57_ExpiredNegativeStillReResolvesWhenTheResolverPoolIsSaturated(t 
 		drainInflightResolutions()
 		lookupHostFn = origFn
 	}()
-	if got := resolveHost("neg-shed.chaos57.invalid"); got == nil || !got.Equal(net.ParseIP("203.0.113.98")) {
+	if got := resolveHost("neg-shed.chaos58.invalid"); got == nil || !got.Equal(net.ParseIP("203.0.113.98")) {
 		t.Fatalf("resolveHost = %v after the pool freed, want 203.0.113.98 — a shed resolution must not have been cached", got)
 	}
 }
@@ -459,7 +459,7 @@ func shrinkResolverPool(t *testing.T, n int) (restore func()) {
 	}
 }
 
-// TestChaos57_DistinctHostFloodIsShedNotQueued proves a herd spread across many
+// TestChaos58_DistinctHostFloodIsShedNotQueued proves a herd spread across many
 // hosts is shed rather than queued.
 //
 // Single-flight collapses a herd on ONE host and does nothing about a herd
@@ -467,7 +467,7 @@ func shrinkResolverPool(t *testing.T, n int) (restore func()) {
 // client during a resolver brownout would otherwise create one blocked
 // goroutine per distinct host, each holding a request, a connection and a
 // connection-limiter slot.
-func TestChaos57_DistinctHostFloodIsShedNotQueued(t *testing.T) {
+func TestChaos58_DistinctHostFloodIsShedNotQueued(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	blockingResolver(t, release, nil, nil)
@@ -502,7 +502,7 @@ func TestChaos57_DistinctHostFloodIsShedNotQueued(t *testing.T) {
 }
 
 func floodHost(i int) string {
-	return "flood-" + strings.Repeat("x", i%3) + itoaSmall(i) + ".chaos57.invalid"
+	return "flood-" + strings.Repeat("x", i%3) + itoaSmall(i) + ".chaos58.invalid"
 }
 
 func itoaSmall(i int) string {
@@ -519,21 +519,21 @@ func itoaSmall(i int) string {
 	return string(b[p:])
 }
 
-// TestChaos57_ShedResultIsNotCached: saturation is a fact about THIS node's
+// TestChaos58_ShedResultIsNotCached: saturation is a fact about THIS node's
 // load, not about the host. Caching it would let a transient overload suppress
 // resolution of a legitimate destination for a full negative TTL.
-func TestChaos57_ShedResultIsNotCached(t *testing.T) {
+func TestChaos58_ShedResultIsNotCached(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	blockingResolver(t, release, nil, nil)
 	restore := shrinkResolverPool(t, 0)
 	defer restore()
 
-	if ip := resolveHost("shed-nocache.chaos57.invalid"); ip != nil {
+	if ip := resolveHost("shed-nocache.chaos58.invalid"); ip != nil {
 		t.Fatalf("shed resolution returned %v, want nil", ip)
 	}
 	resolvedHostCache.mu.RLock()
-	_, cached := resolvedHostCache.entries["shed-nocache.chaos57.invalid"]
+	_, cached := resolvedHostCache.entries["shed-nocache.chaos58.invalid"]
 	resolvedHostCache.mu.RUnlock()
 	if cached {
 		t.Fatal("a shed resolution was written to the cache — a transient overload must not suppress a legitimate destination for a TTL")
@@ -542,7 +542,7 @@ func TestChaos57_ShedResultIsNotCached(t *testing.T) {
 
 // ─── Observability contracts ─────────────────────────────────────────────────
 
-// TestChaos57_NXDOMAINNeverDrivesDegradation keeps an authoritative "no such
+// TestChaos58_NXDOMAINNeverDrivesDegradation keeps an authoritative "no such
 // host" out of the degradation run.
 //
 // An authoritative "this name does not exist" is a resolver working perfectly,
@@ -550,7 +550,7 @@ func TestChaos57_ShedResultIsNotCached(t *testing.T) {
 // sinkholed C2. Counting them toward degradation would page on healthy traffic
 // — and, because the hostname is client-chosen, would let any client fabricate
 // the page on demand.
-func TestChaos57_NXDOMAINNeverDrivesDegradation(t *testing.T) {
+func TestChaos58_NXDOMAINNeverDrivesDegradation(t *testing.T) {
 	resetDNSResolveHealthForTest()
 	defer resetDNSResolveHealthForTest()
 
@@ -568,9 +568,9 @@ func TestChaos57_NXDOMAINNeverDrivesDegradation(t *testing.T) {
 	}
 }
 
-// TestChaos57_DegradationIsADurationAndAlertsOnce pins the threshold as a
+// TestChaos58_DegradationIsADurationAndAlertsOnce pins the threshold as a
 // DURATION and the page as fire-once per episode.
-func TestChaos57_DegradationIsADurationAndAlertsOnce(t *testing.T) {
+func TestChaos58_DegradationIsADurationAndAlertsOnce(t *testing.T) {
 	resetDNSResolveHealthForTest()
 	defer resetDNSResolveHealthForTest()
 
@@ -603,13 +603,13 @@ func TestChaos57_DegradationIsADurationAndAlertsOnce(t *testing.T) {
 	}
 }
 
-// TestChaos57_RecoveryIsOnObservedEvidence requires an observed successful
+// TestChaos58_RecoveryIsOnObservedEvidence requires an observed successful
 // resolution to clear the degraded state.
 //
 // Elapsed time never clears the degraded state. A gateway whose resolution
 // failures stop because traffic stopped has not recovered, and reporting that
 // as recovery is the mistake ca_health.go and storage_health.go both name.
-func TestChaos57_RecoveryIsOnObservedEvidence(t *testing.T) {
+func TestChaos58_RecoveryIsOnObservedEvidence(t *testing.T) {
 	resetDNSResolveHealthForTest()
 	defer resetDNSResolveHealthForTest()
 
@@ -632,13 +632,13 @@ func TestChaos57_RecoveryIsOnObservedEvidence(t *testing.T) {
 	}
 }
 
-// TestChaos57_PrivateOnlyAnswerIsNotAResolverFault treats an answer carrying only
+// TestChaos58_PrivateOnlyAnswerIsNotAResolverFault treats an answer carrying only
 // private addresses as a HEALTHY resolver.
 //
 // On a split-horizon estate this is the common case. The resolver ANSWERED, so
 // it must clear a failure episode exactly like a public answer does — otherwise
 // an internal-DNS deployment reports a permanently broken resolver.
-func TestChaos57_PrivateOnlyAnswerIsNotAResolverFault(t *testing.T) {
+func TestChaos58_PrivateOnlyAnswerIsNotAResolverFault(t *testing.T) {
 	resetDNSResolveHealthForTest()
 	defer resetDNSResolveHealthForTest()
 
@@ -652,7 +652,7 @@ func TestChaos57_PrivateOnlyAnswerIsNotAResolverFault(t *testing.T) {
 	}
 }
 
-// TestChaos57_AlertDetailIsBounded pins the dedup-key contract on BOTH
+// TestChaos58_AlertDetailIsBounded pins the dedup-key contract on BOTH
 // dns_failure producers.
 //
 // Store.Dispatch dedups on `event + ":" + Detail`. A *net.DNSError's text
@@ -660,7 +660,7 @@ func TestChaos57_PrivateOnlyAnswerIsNotAResolverFault(t *testing.T) {
 // gives every failure a distinct key the 30 s window cannot suppress — the
 // fan-out then lands in the 500-entry retry queue and evicts real threat
 // alerts (WK-12/RS-5).
-func TestChaos57_AlertDetailIsBounded(t *testing.T) {
+func TestChaos58_AlertDetailIsBounded(t *testing.T) {
 	seen := map[string]struct{}{}
 	for i := 0; i < 200; i++ {
 		err := &net.DNSError{
@@ -682,7 +682,7 @@ func TestChaos57_AlertDetailIsBounded(t *testing.T) {
 	}
 }
 
-func TestChaos57_ClassifyDNSFailureClasses(t *testing.T) {
+func TestChaos58_ClassifyDNSFailureClasses(t *testing.T) {
 	cases := []struct {
 		name string
 		err  error
@@ -703,7 +703,7 @@ func TestChaos57_ClassifyDNSFailureClasses(t *testing.T) {
 	}
 }
 
-// TestChaos57_NXDOMAINAtTheDeadlineBoundaryStaysNXDOMAIN keeps an authoritative
+// TestChaos58_NXDOMAINAtTheDeadlineBoundaryStaysNXDOMAIN keeps an authoritative
 // verdict authoritative even when the resolution's deadline has already passed.
 //
 // An authoritative NXDOMAIN that lands microseconds before the deadline leaves
@@ -713,7 +713,7 @@ func TestChaos57_ClassifyDNSFailureClasses(t *testing.T) {
 // that inversion hands any client a way to fabricate the page by requesting
 // nonexistent hosts under mild resolver latency. The resolver's own
 // classification is authoritative.
-func TestChaos57_NXDOMAINAtTheDeadlineBoundaryStaysNXDOMAIN(t *testing.T) {
+func TestChaos58_NXDOMAINAtTheDeadlineBoundaryStaysNXDOMAIN(t *testing.T) {
 	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 	if expired.Err() == nil {
@@ -756,7 +756,7 @@ func TestChaos57_NXDOMAINAtTheDeadlineBoundaryStaysNXDOMAIN(t *testing.T) {
 	}
 }
 
-// TestChaos57_ContractRowReportsWarnNotFail pins the degraded contract row at
+// TestChaos58_ContractRowReportsWarnNotFail pins the degraded contract row at
 // warn rather than fail.
 //
 // A resolver outage is fleet-wide by construction — every node shares the
@@ -764,7 +764,7 @@ func TestChaos57_NXDOMAINAtTheDeadlineBoundaryStaysNXDOMAIN(t *testing.T) {
 // is geo-scoped policy MATCHING. Reporting fail would be read as "this node is
 // broken" and, on a strict readiness deployment, would eject a fleet that is
 // serving.
-func TestChaos57_ContractRowReportsWarnNotFail(t *testing.T) {
+func TestChaos58_ContractRowReportsWarnNotFail(t *testing.T) {
 	resetDNSResolveHealthForTest()
 	defer resetDNSResolveHealthForTest()
 
@@ -787,10 +787,10 @@ func TestChaos57_ContractRowReportsWarnNotFail(t *testing.T) {
 	}
 }
 
-// TestChaos57_ContractRowNeverCarriesAHostname: /api/diagnostics is a
+// TestChaos58_ContractRowNeverCarriesAHostname: /api/diagnostics is a
 // viewer-role surface with a standing no-sensitive-values guardrail, and the
 // hostnames flowing through this path are the customer's destinations.
-func TestChaos57_ContractRowNeverCarriesAHostname(t *testing.T) {
+func TestChaos58_ContractRowNeverCarriesAHostname(t *testing.T) {
 	resetDNSResolveHealthForTest()
 	defer resetDNSResolveHealthForTest()
 
@@ -808,11 +808,11 @@ func TestChaos57_ContractRowNeverCarriesAHostname(t *testing.T) {
 // C1: the mechanism must still RESOLVE. A resolver that always shed, or always
 // served stale, or never refreshed would pass every defect gate above while
 // being far worse than the defect.
-func TestChaos57_Control_HealthyResolutionStillWorks(t *testing.T) {
+func TestChaos58_Control_HealthyResolutionStillWorks(t *testing.T) {
 	calls, restore := stubResolver([]string{"192.0.2.1", "203.0.113.77"}, nil)
 	defer restore()
 
-	got := resolveHost("healthy.chaos57.invalid")
+	got := resolveHost("healthy.chaos58.invalid")
 	if got == nil {
 		t.Fatal("CONTROL FAILED: a healthy resolver produced no address")
 	}
@@ -832,14 +832,14 @@ func TestChaos57_Control_HealthyResolutionStillWorks(t *testing.T) {
 // C2: a genuinely unresolvable host must still fail, be counted, and be
 // negative-cached. A change that "fixed" the outage case by serving something
 // for everything would pass D3 and be a security regression.
-func TestChaos57_Control_UnresolvableHostStillFailsAndIsCounted(t *testing.T) {
+func TestChaos58_Control_UnresolvableHostStillFailsAndIsCounted(t *testing.T) {
 	calls, restore := stubResolver(nil, &net.DNSError{Err: "no such host", IsNotFound: true})
 	defer restore()
 
-	if ip := resolveHost("nxdomain.chaos57.invalid"); ip != nil {
+	if ip := resolveHost("nxdomain.chaos58.invalid"); ip != nil {
 		t.Fatalf("CONTROL FAILED: an NXDOMAIN host resolved to %v", ip)
 	}
-	if ip := resolveHost("nxdomain.chaos57.invalid"); ip != nil {
+	if ip := resolveHost("nxdomain.chaos58.invalid"); ip != nil {
 		t.Fatalf("CONTROL FAILED: second call resolved to %v", ip)
 	}
 	if n := calls.Load(); n != 1 {
@@ -850,19 +850,19 @@ func TestChaos57_Control_UnresolvableHostStillFailsAndIsCounted(t *testing.T) {
 	}
 }
 
-// TestChaos57_StaleServeIsCounted: the stale-served counter is the leading
+// TestChaos58_StaleServeIsCounted: the stale-served counter is the leading
 // indicator that resolution has stopped completing — it moves before the
 // degradation threshold does, which is the whole point of exporting it.
-func TestChaos57_StaleServeIsCounted(t *testing.T) {
+func TestChaos58_StaleServeIsCounted(t *testing.T) {
 	calls, restore := stubResolver([]string{"203.0.113.88"}, nil)
 	defer restore()
 
-	if resolveHost("stale-counted.chaos57.invalid") == nil {
+	if resolveHost("stale-counted.chaos58.invalid") == nil {
 		t.Fatal("warm-up failed")
 	}
 	waitForResolverCalls(t, calls, 1)
-	expireEntry("stale-counted.chaos57.invalid", time.Second)
-	_ = resolveHost("stale-counted.chaos57.invalid")
+	expireEntry("stale-counted.chaos58.invalid", time.Second)
+	_ = resolveHost("stale-counted.chaos58.invalid")
 
 	if snap := dnsResolveState(); snap.StaleServed == 0 {
 		t.Fatalf("a stale serve was not counted: %+v", snap)
