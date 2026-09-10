@@ -13,10 +13,29 @@ package main
 // RLock+atomic cut the parallel tracked-host path 363→124 ns/op (2.9x) —
 // counters for different hosts live on different cache lines, so atomic adds
 // parallelize. The same conversion for tsRecordResult measured FLAT (~154
-// ns/op both ways): every request bumps the SAME current-minute bucket, so
-// the shared cache line — not the mutex — is the bound. tsRecordResult
-// therefore keeps its plain mutex; its benchmarks remain as the evidence and
-// to catch future regressions.
+// ns/op both ways), and was read at the time as "every request bumps the SAME
+// current-minute bucket, so the shared cache line, not the mutex, is the
+// bound".
+//
+// That reading was half right and it is why these benchmarks must be run
+// ACROSS CORE COUNTS, not at one. RWMutex cannot help a path that mutates, so
+// the flat result said nothing about the bound; and the shared cache line is
+// only inherent while the counter stays shared. Sharding the current minute
+// (2026-09, store.go) took tsRecordResult from 172.6 → 36.1 ns/op at
+// GOMAXPROCS=4 and the full recordStats fan-out from 275.8 → 131.2 ns/op, with
+// one core coming out ahead too. The ceiling, not the constant, is the thing
+// these benchmarks exist to expose:
+//
+//	                        │ -cpu=1 │ -cpu=4 │
+//	tsRecordResult   before │  87.4  │ 172.6  │  cores SUBTRACTED throughput
+//	tsRecordResult    after │  78.6  │  36.1  │
+//	recordStats      before │ 142.9  │ 275.8  │
+//	recordStats       after │ 130.0  │ 131.2  │
+//
+// Those recordStats rows are TIGHT-LOOP figures and are kept only because the
+// tsRecordResult rows beside them are the component measurement. For the
+// fan-out as a whole, read the marginal-cost table further down instead — the
+// methodology note explains why the tight-loop total is the wrong number.
 //
 // Follow-up (4-core, 2026-09): that 2.9x was real but measured only against
 // the plain mutex at ONE concurrency, and the RLock version turned out not to
@@ -28,9 +47,28 @@ package main
 //	RLock+atomic    │ 35.8 ns │ 92.6 ns │ 96.8 ns │ 0.37x (cores SUBTRACTED it)
 //	sync.Map        │ 42.0 ns │ 26.1 ns │ 16.1 ns │ 2.6x
 //
-// The tsRecordResult half was re-tested in the same pass and the 2026-07
-// conclusion HELD — see the timeSeries doc comment in store.go, which records
-// the lock-free and sharded shapes that were measured and rejected.
+// The tsRecordResult half was re-tested in that same pass and the 2026-07
+// conclusion was recorded as HOLDING. It did not: the sharded shape is what
+// this file's table above measures and what store.go now ships. The two
+// findings were developed in parallel and met at a merge, so read the table
+// above and the timeSeries doc comment in store.go as the current record for
+// tsRecordResult, and this section as the current record for topHosts.
+//
+// Under the marginal-cost method below — the one this file argues for — the
+// two changes COMPOSE, and that pairing is the number a gateway actually pays.
+// BenchmarkRequestCycle, isolated processes, n=5, medians, ns of stats fan-out
+// per request (WithStats minus WithoutStats):
+//
+//	                          │ -cpu=1 │ -cpu=4 │
+//	sharded topHosts only     │  129   │  490   │  cores made it WORSE
+//	+ sharded tsRecordResult  │  111   │   87   │
+//
+// Sharding topHosts alone left the fan-out's marginal cost rising 3.8x from
+// one core to four — the ceiling simply moved to the other component. With
+// both sharded it FALLS with core count, 5.6x cheaper at four cores. The
+// contended arm's bimodality warned about below is visible in exactly the
+// arm that still has a contended component: main's 4-core WithStats spread
+// 755-784 ns across five runs, this branch's 364-371.
 //
 // A METHODOLOGY NOTE, because it changed the conclusion twice. A tight
 // recordStats loop is not the production duty cycle: with every core
@@ -45,6 +83,7 @@ package main
 // can show any result you like.
 //
 // Run locally:
+//   go test -run '^$' -bench 'BenchmarkTopHosts|BenchmarkTSRecord|BenchmarkRecordStats' -benchmem -cpu=1,2,4 .
 //   go test -run '^$' -bench 'BenchmarkTopHosts|BenchmarkTSRecord|BenchmarkRecordStats' -benchmem .
 //   go test -run '^$' -bench BenchmarkTopHostsRecord_HitParallel -cpu=1,2,4 -count=7 .
 //   go test -run '^$' -bench BenchmarkRequestCycle -cpu=1,2,4 -count=5 .

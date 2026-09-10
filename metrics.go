@@ -1144,7 +1144,7 @@ culvert_socks5_accept_backoff_seconds %g
 		)
 	}
 
-	// CHAOS-58: destination-host DNS resolution health. Emitted ONLY once this
+	// CHAOS-59: destination-host DNS resolution health. Emitted ONLY once this
 	// node has actually resolved something — resolution runs on the policy path
 	// only for a DestCountry rule on a node with a GeoIP database, and a block
 	// of zeros on an appliance that has no geo rules is indistinguishable from a
