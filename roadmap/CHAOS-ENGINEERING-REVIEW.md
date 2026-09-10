@@ -1160,7 +1160,7 @@ binary terminated).
   semantics and is deliberately **not** bundled into a panic-containment change (§12.2's own lesson).
 - **Still unguarded: the MCP runtime listener** (`internal/mcp/runtime`). Left open on purpose: it
   is disabled-by-default with a different blast radius (its own listener, not the SWG request path),
-  it spans 25 subpackages, and ADR-0024's rollout ladder means "contain and continue" has to be
+  it spans 27 subpackages, and ADR-0024's rollout ladder means "contain and continue" has to be
   reconciled with the Observe/Shadow/Canary semantics before a guard is correct. Tracked as
   **CHAOS-26**.
 - The `crashThrottleEvery` (1s per component) flood guard still means a tight panic loop reports a

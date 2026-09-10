@@ -27,12 +27,13 @@ import (
 // lifecycle admission, and read-first are all REAL.
 func liveRealGate(capb rollout.Capability, trustOK bool) *mcpLiveSideEffectGate {
 	return &mcpLiveSideEffectGate{
-		capb:      capb,
-		admit:     mcpLiveTierFor(capb).admitExecution,
-		readFirst: canary.IsReadFirstOperation,
-		trustOK:   func(string, string, string, string, time.Time) bool { return trustOK },
-		reserve: func(now time.Time, ident canary.ExecutionIdentity) (canary.BudgetOutcome, uint64) {
-			return globalCanaryRuntime.reserveCanaryExecution(capb, now, ident)
+		capb:          capb,
+		admit:         mcpLiveTierFor(capb).admitExecution,
+		readFirst:     canary.IsReadFirstOperation,
+		trustPrecheck: stubTrustPrecheckEligible,
+		approvalOK:    func(canary.LiveTarget, time.Time) (bool, string) { return trustOK, "" },
+		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return globalCanaryRuntime.admitLiveExecution(capb, now, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
@@ -48,6 +49,11 @@ func liveRealGate(capb rollout.Capability, trustOK bool) *mcpLiveSideEffectGate 
 func armCanaryLiveTier(t *testing.T, up *recordingUpstream, trustOK bool, budgetTotal int) *mcpruntime.Config {
 	t.Helper()
 	resetLiveTierGlobals(t)
+	// This harness composes and activates at a FIXED fake instant (time.Unix(0,1)). Pin the
+	// Canary auto-stop clock to the same instant, or the absolute window deadline derived from a
+	// 1970 activation is — correctly — decades past, and every live test would begin life
+	// window_expired. Tests that exercise the window drive it explicitly instead.
+	swapCanaryClock(t, func() time.Time { return time.Unix(0, 1) })
 	setDataDirForTest(t, t.TempDir())
 
 	// Put the global rollout gateway state into Canary (scope admits server s1).
@@ -149,4 +155,11 @@ func TestLiveE2E_ControlOperationRejectedByReadFirst(t *testing.T) {
 	if out.Reason != mcperr.ReasonRolloutOutOfScope {
 		t.Fatalf("read-first refusal reason=%s want rollout_out_of_scope", out.Reason.Code())
 	}
+}
+
+// stubTrustPrecheckEligible is the LOCK-FREE trust half for tests that control trust through the
+// approval seam alone: the target is present, this tenant's, usable and fingerprint-matched, so no
+// authoritative drift is reported. Tests that exercise DRIFT supply their own precheck.
+func stubTrustPrecheckEligible(string, string, string, string) liveTrustPrecheck {
+	return liveTrustPrecheck{Eligible: true}
 }
