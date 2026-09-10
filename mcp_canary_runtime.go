@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -50,6 +51,10 @@ type canaryRuntimeState struct {
 	Budget         canary.Budget         `json:"budget"`
 	BudgetSnapshot canary.BudgetSnapshot `json:"budget_snapshot"`
 	AbortSnapshot  canary.AbortSnapshot  `json:"abort_snapshot"`
+	// HealthSnapshot carries the elevated-error-rate / latency-pathology counters. It is durable
+	// for the same reason the budget is: a detector that resets on restart is one a crash can
+	// silently disarm, handing a misbehaving Canary a clean slate.
+	HealthSnapshot canary.HealthSnapshot `json:"health_snapshot"`
 }
 
 // canaryCapRuntime is one capability's in-memory activation runtime.
@@ -60,6 +65,12 @@ type canaryCapRuntime struct {
 	budget     canary.Budget
 	enforcer   *canary.BudgetEnforcer
 	aborter    *canary.AbortController
+	health     *canary.HealthMonitor
+	// windowStop cancels this activation's traffic-independent window watchdog. It is a
+	// convenience for a RUNNING process only: the authoritative expiry check is the derived
+	// deadline (enforcer.WindowDeadline), re-evaluated on restore, so losing this timer can
+	// never restore authority the clock has already taken away.
+	windowStop func()
 }
 
 // canaryRuntime holds the two isolated capability runtimes.
@@ -244,6 +255,7 @@ func (rt *canaryRuntime) beginCanaryActivation(capb rollout.Capability, budget c
 	cr.budget = budget
 	cr.enforcer = canary.NewBudgetEnforcer(budget, gen, now)
 	cr.aborter = canary.NewAbortController(gen)
+	cr.health = canary.NewHealthMonitor(gen)
 	if err := canaryRuntimePersist(rt, capb, cr); err != nil {
 		// The activation was never durably established — DISARM in memory (fail closed) so no
 		// execution path can reserve work for an activation that does not durably exist (Codex P1).
@@ -251,6 +263,7 @@ func (rt *canaryRuntime) beginCanaryActivation(capb rollout.Capability, budget c
 		cr.active = false
 		cr.enforcer = nil
 		cr.aborter = nil
+		cr.health = nil
 		cr.budget = canary.Budget{}
 		// The persist may have left a VISIBLE Active record on disk (e.g. an AtomicWrite that replaced
 		// the target but could not fsync — ErrReplacedNotSynced). Durably remove it so a restart cannot
@@ -258,6 +271,11 @@ func (rt *canaryRuntime) beginCanaryActivation(capb rollout.Capability, budget c
 		_ = rt.removeRuntimeStateAfterSafetyPersistFailure(capb, "begin", err) // in-memory already disarmed; residual risk is logged
 		return gen, err
 	}
+	// Arm the traffic-independent automatic stop for the new activation. It is armed AFTER the
+	// durable persist, so a begin that never became durable never leaves a watchdog behind for an
+	// activation that does not exist. The same call also latches immediately if the derived
+	// deadline is somehow already past (a clock jump between the activation instant and now).
+	reconcileWindowDeadlineLocked(rt, capb, cr)
 	return gen, nil
 }
 
@@ -277,9 +295,11 @@ func (rt *canaryRuntime) demoteCanary(capb rollout.Capability) error {
 	cr := rt.capRuntime(capb)
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	stopWindowWatchdogLocked(cr)
 	cr.active = false
 	cr.enforcer = nil
 	cr.aborter = nil
+	cr.health = nil
 	cr.budget = canary.Budget{}
 	if err := canaryRuntimePersist(rt, capb, cr); err != nil {
 		// Persisting the disarmed record failed — remove the durable file so a restart cannot restore
@@ -297,6 +317,58 @@ func (rt *canaryRuntime) currentGeneration(capb rollout.Capability) uint64 {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 	return cr.generation
+}
+
+// activeBudget returns the budget the active generation is enforcing, and whether an activation is
+// currently armed. It lets a same-mode live update detect an authoritative-budget change that the
+// running generation would otherwise never pick up (Codex P2 round-6).
+func (rt *canaryRuntime) activeBudget(capb rollout.Capability) (canary.Budget, bool) {
+	cr := rt.capRuntime(capb)
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	return cr.budget, cr.active
+}
+
+// generationActive reports whether the SPECIFIC activation generation gen is still the current, armed,
+// execution-eligible generation. It is the final-boundary revalidation the live side-effect gate runs
+// right before the irreversible upstream call: a request admitted (budget-reserved) under generation gen
+// must be REFUSED if that generation was demoted (cr.active=false), superseded by a re-activation
+// (cr.generation != gen), or aborted (ExecutionEligible false) AFTER admission but before the call
+// (Codex P1 round-8, PR #1290). Fail-closed: a not-armed / nil-controller / generation-mismatch reads
+// false. It does NOT consume budget or evaluate the window — the reservation already did — so it can
+// only ever make an admitted request MORE restrictive, never admit one the reserve denied.
+func (rt *canaryRuntime) generationActive(capb rollout.Capability, gen uint64) bool {
+	cr := rt.capRuntime(capb)
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if !cr.active || cr.aborter == nil || cr.generation != gen {
+		return false
+	}
+	if !cr.aborter.ExecutionEligible(gen) {
+		return false
+	}
+	// THE WINDOW IS RE-CHECKED HERE, not merely at admission and not left to the watchdog.
+	//
+	// Reserve refuses a request that arrives past the deadline, but a request admitted one
+	// millisecond BEFORE it can sit between admission and preCallGuard for arbitrarily long — a
+	// scheduler pause, a slow credential path — and by the time it reaches the boundary the window
+	// may be over. The watchdog is asynchronous and time.AfterFunc offers no ordering guarantee
+	// against that goroutine, so relying on the latch having already happened is relying on a race
+	// (Codex round 2 P1). The deadline is absolute and cheap to evaluate, so the boundary evaluates
+	// it under the same lock rather than trusting that something else got there first.
+	//
+	// This makes the watchdog what it was always described as — a convenience that stops an IDLE
+	// experiment — rather than the only thing standing between an expired window and an upstream
+	// call.
+	// WindowOpen, not merely "before the deadline": the window has TWO ends. Reserve and the
+	// eligibility read both treat now < the activation instant as CLOSED, because a clock that has
+	// rolled back behind the activation cannot be used to reason about elapsed time at all. Testing
+	// only the upper bound here would let an already-admitted request cross during exactly that
+	// rollback (Codex round 3 P2) — the one condition every other gate in this file refuses.
+	if cr.enforcer != nil && !cr.enforcer.WindowOpen(canaryNow()) {
+		return false
+	}
+	return true
 }
 
 // armed reports whether the capability's runtime is currently armed (an activation record was
@@ -355,8 +427,24 @@ func (rt *canaryRuntime) reserveCanaryExecution(capb rollout.Capability, now tim
 	if !cr.aborter.ExecutionEligible(generation) {
 		return canary.BudgetDeniedInvalid, generation // the Canary is aborted — no execution
 	}
-	outcome = cr.enforcer.Reserve(generation, now, ident)
+	return rt.reserveLocked(cr, capb, generation, now, ident), generation
+}
+
+// reserveLocked is the budget-reservation core with cr.mu ALREADY HELD and the activation already
+// verified active + execution-eligible by the caller, which also supplies the generation it
+// captured. Extracted so the atomic admission transaction (mcp_canary_admission.go) can reserve
+// inside the SAME critical section that computed the trust verdict — the property that makes
+// "trust under G, reserve under G+1" unrepresentable rather than merely unlikely.
+func (rt *canaryRuntime) reserveLocked(cr *canaryCapRuntime, capb rollout.Capability, generation uint64, now time.Time, ident canary.ExecutionIdentity) canary.BudgetOutcome {
+	outcome := cr.enforcer.Reserve(generation, now, ident)
 	switch {
+	case outcome == canary.BudgetDeniedWindow:
+		// The TIME BOX closed, not the allowance. Both are whole-Canary stops, but the first cause
+		// is IMMUTABLE, so folding them together made the recorded reason depend on a race: whoever
+		// noticed first — this admission or the watchdog — decided whether the operator was told
+		// "budget_exhausted" or "window_expired", for the same underlying fact (Codex round 5 P2).
+		// Naming it here means the two paths agree whichever wins.
+		cr.aborter.Trip("window_expired", generation, now)
 	case outcome.WholeCanaryExhaustion():
 		// The blast-radius budget is spent — a whole-Canary breach. Latch the abort.
 		cr.aborter.Trip("budget_exhausted", generation, now)
@@ -383,10 +471,10 @@ func (rt *canaryRuntime) reserveCanaryExecution(capb rollout.Capability, now tim
 			// denies every later reserve on concurrency until restart). The monotonic TOTAL spend stays
 			// consumed (Release never decrements it), so the budget is never replayed (Codex P2).
 			cr.enforcer.Release()
-			return canary.BudgetDeniedInvalid, generation
+			return canary.BudgetDeniedInvalid
 		}
 	}
-	return outcome, generation
+	return outcome
 }
 
 // releaseCanaryExecution returns one in-flight concurrency slot after an execution reserved under
@@ -399,8 +487,29 @@ func (rt *canaryRuntime) releaseCanaryExecution(capb rollout.Capability, gen uin
 	cr := rt.capRuntime(capb)
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
-	if cr.enforcer != nil && cr.generation == gen {
-		cr.enforcer.Release()
+	if cr.enforcer == nil || cr.generation != gen {
+		return
+	}
+	cr.enforcer.Release()
+	// AUTHORITY CONSUMED (blocker #7 §7). This is the ONE place the exhaustion latch belongs,
+	// because it is the one place every authorized reservation ends up — including the ones that
+	// never sent anything.
+	//
+	// It was previously driven from the settled-attempt path, which excludes definitely-not-sent by
+	// design: an emergency kill or a tool-drift refusal at the final boundary releases the slot
+	// without settling an attempt. If that refusal took the LAST slot, the allowance was spent,
+	// nothing could execute again, and yet nothing latched — so the status surface kept reporting
+	// granted authority until an N+1 request arrived to discover it (Codex P2). Execution was
+	// already denied by the spent budget, so this is a truthfulness fix, not a containment one, and
+	// the traffic-independence claim is only true from here.
+	//
+	// BOTH conditions are required. Remaining()==0 is true the moment the last slot is RESERVED,
+	// which with N concurrent requests for N slots is while N-1 are still in flight; latching there
+	// would revoke authority the experiment had already granted. Inflight()==0 says the final
+	// authorized attempt has finished — and because this runs INSIDE the release, the check sees
+	// the post-release count.
+	if cr.enforcer.Remaining() <= 0 && cr.enforcer.Inflight() == 0 {
+		tripAutoStopLocked(rt, capb, cr, "budget_exhausted", canaryNow())
 	}
 }
 
@@ -415,10 +524,30 @@ func (rt *canaryRuntime) releaseCanaryExecution(capb rollout.Capability, gen uin
 // durable file is best-effort REMOVED on a persist failure — a missing file restores to the dormant
 // default (no execution), the safe direction. The in-memory abort is in effect regardless.
 func (rt *canaryRuntime) tripCanaryAbort(capb rollout.Capability, code string, now time.Time) canary.TripResult {
+	return rt.tripCanaryAbortForGeneration(capb, 0, code, now)
+}
+
+// tripCanaryAbortForGeneration is tripCanaryAbort bound to the activation the caller OBSERVED.
+// A wantGen of 0 means "whatever is current" and is reserved for callers with no originating
+// activation to name.
+//
+// The generation is checked under the SAME cr.mu acquisition that latches. Checking it separately
+// first is not equivalent and was the defect: a watchdog callback, or an in-flight request's
+// deferred report, can pass a check and then be descheduled while the activation is demoted and
+// replaced — and the trip that follows would latch the REPLACEMENT for something the previous
+// activation did. Stop() cannot help, because a callback already running cannot be cancelled. So
+// the expectation travels with the trip and is verified where the decision is made.
+func (rt *canaryRuntime) tripCanaryAbortForGeneration(capb rollout.Capability, wantGen uint64, code string, now time.Time) canary.TripResult {
 	cr := rt.capRuntime(capb)
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 	if !cr.active || cr.aborter == nil {
+		return canary.TripCanaryLatched
+	}
+	if wantGen != 0 && cr.generation != wantGen {
+		// The observation belongs to an activation that is gone. Discarding it is the fail-closed
+		// direction: that activation already has no execution authority, and the current one has
+		// done nothing to lose its own.
 		return canary.TripCanaryLatched
 	}
 	res := cr.aborter.Trip(code, cr.generation, now)
@@ -468,6 +597,9 @@ func (rt *canaryRuntime) persistLocked(capb rollout.Capability, cr *canaryCapRun
 	}
 	if cr.aborter != nil {
 		st.AbortSnapshot = cr.aborter.Snapshot()
+	}
+	if cr.health != nil {
+		st.HealthSnapshot = cr.health.Snapshot()
 	}
 	raw, err := json.Marshal(st)
 	if err != nil {
@@ -546,14 +678,42 @@ func (rt *canaryRuntime) restoreCapability(capb rollout.Capability) {
 	cr.budget = st.Budget
 	cr.enforcer = canary.RestoreBudgetEnforcer(st.Budget, st.Generation, st.BudgetSnapshot)
 	cr.aborter = canary.RestoreAbortController(st.Generation, st.AbortSnapshot)
-	if cr.enforcer == nil || cr.aborter == nil {
+	// The health snapshot is held to the SAME standard as the budget and abort snapshots, and for
+	// the same reason: it is safety state, not telemetry. A snapshot that is semantically damaged
+	// (more failures than samples, a negative counter), names a different activation, or is simply
+	// ABSENT against a non-zero generation would restore an activation whose detector reads clean —
+	// execution authority with the evidence wiped. "No evidence" is not "no failures", so the
+	// activation does not come back at all (Codex P1).
+	healthOK := false
+	cr.health, healthOK = canary.RestoreHealthMonitor(st.Generation, st.HealthSnapshot)
+	// CROSS-RECORD invariant, which HealthSnapshot.Valid cannot see: every health sample comes from
+	// an attempt that consumed a reservation, so the sample count can never exceed the reservations
+	// this activation actually made. Inflating Samples is the one damaged shape that makes the
+	// detector LESS likely to fire rather than more — 100 fabricated clean samples turn a real 1-of-2
+	// failure rate into 1-of-102 and hand the experiment back the execution the detector should have
+	// stopped (Codex round 2 P1). The two snapshots are written together atomically, so they cannot
+	// legitimately disagree.
+	if healthOK && st.HealthSnapshot.Samples > st.BudgetSnapshot.TotalReserved {
+		healthOK = false
+	}
+	if cr.enforcer == nil || cr.aborter == nil || !healthOK {
 		cr.active = false
 		cr.enforcer = nil
 		cr.aborter = nil
+		cr.health = nil
 		cr.budget = canary.Budget{}
+		if !healthOK {
+			logger.Printf("MCP canary runtime restore for %s: health snapshot missing, foreign-generation, damaged, or claiming more samples than reservations; disarmed (fail-closed)", capb.String())
+		}
 		return
 	}
 	cr.active = true
+	// The window is absolute and generation-bound. A restart NEVER restarts the clock: the
+	// deadline is re-derived from the persisted activation instant, so a process that comes back
+	// after expiry latches window_expired HERE — before any admission path can observe an
+	// execution-eligible activation — and one that comes back before expiry re-arms a watchdog
+	// for the REMAINING time only.
+	reconcileWindowDeadlineLocked(rt, capb, cr)
 }
 
 // strictDecodeCanaryRuntimeJSON decodes exactly one JSON value into v, rejecting unknown fields and
@@ -564,7 +724,11 @@ func strictDecodeCanaryRuntimeJSON(raw []byte, v any) error {
 	if err := dec.Decode(v); err != nil {
 		return err
 	}
-	if dec.More() {
+	// Require EOF after the value: dec.More() is NOT a reliable top-level end check — a trailing "}" or
+	// "]" makes it report false, so junk like `{...}}` would slip past. A SECOND decode must fail with
+	// io.EOF for the input to be exactly one value; any trailing token invalidates the record (Codex P2
+	// round-7, PR #1290).
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
 		return errors.New("trailing data after JSON value")
 	}
 	return nil
