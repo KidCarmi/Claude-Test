@@ -51,7 +51,7 @@ export function useDirtyGuard(dirty: boolean, what: string): DirtyGuard {
         body={
           <>
             Leaving this page discards {what}. Nothing has been sent to the
-            node.
+            appliance.
           </>
         }
         confirmLabel="Discard and leave"

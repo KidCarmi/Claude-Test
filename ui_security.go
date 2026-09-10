@@ -17,6 +17,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/fileblock"
 	"github.com/KidCarmi/Culvert/internal/fileutil"
 	"github.com/KidCarmi/Culvert/internal/geoip"
+	"github.com/KidCarmi/Culvert/internal/secscan"
 )
 
 // pendingCARotation holds a confirmation token for the two-step CA rotation flow.
@@ -374,6 +375,12 @@ func apiCertsUpload(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// The pair just written already passed certMgr.ParseTLSPair above, so any
+	// PRIOR corruption latch (a leftover pair from an earlier interrupted
+	// upload, surfaced as ui_custom_cert_corrupt) no longer describes what's
+	// on disk — clear it, or a successful re-upload would still show as
+	// "corrupt, restart won't help" until the next restart re-evaluates it.
+	uiCustomTLSCorrupt = false
 	auditEvent(r, "certs.upload_ui", "custom UI cert (requires restart)", "")
 	jsonOK(w, map[string]any{
 		"status":    "ok",
@@ -1453,7 +1460,15 @@ func apiScanSvcConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if globalRemoteScanner.Enabled() {
 		if err := globalRemoteScanner.Health(); err != nil {
-			resp["remote_status"] = "unreachable: " + err.Error()
+			// BOUNDED class only. The raw error is not renderable here: an
+			// unparseable base URL yields *url.Error{Op:"parse"} carrying the
+			// URL — password included — which would walk straight past the
+			// redaction applied to remote_url above, and a transport error
+			// still carries the username. Full cause goes to the log.
+			reason := secscan.ProbeFailureReason(err)
+			resp["remote_status"] = "unreachable: " + reason
+			logger.Printf("ScanSvc: health probe failed for %q: reason=%s",
+				sanitizeLog(redactURLUserinfo(globalRemoteScanner.URL())), sanitizeLog(reason))
 		} else {
 			resp["remote_status"] = "connected"
 		}
