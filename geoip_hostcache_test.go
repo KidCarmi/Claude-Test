@@ -31,13 +31,13 @@ func stubResolver(addrs []string, err error) (calls *atomic.Int64, restore func(
 	origCache := resolvedHostCache.entries
 	resolvedHostCache.mu.Lock()
 	resolvedHostCache.entries = map[string]hostIPEntry{}
-	// CHAOS-59: the single-flight map is part of the cache's state — a slot
+	// CHAOS-60: the single-flight map is part of the cache's state — a slot
 	// left behind by a previous test would make the next one a follower
 	// waiting on a resolution that already finished.
 	resolvedHostCache.inflight = map[string]*hostResolveCall{}
 	resolvedHostCache.mu.Unlock()
 	return &counter, func() {
-		// CHAOS-59: the warm pool's goroutines read lookupHostFn, and a warm
+		// CHAOS-60: the warm pool's goroutines read lookupHostFn, and a warm
 		// outlives the test body that armed it — `defer restore()` runs BEFORE
 		// any t.Cleanup, so restoring here without waiting writes the seam
 		// while a live warm is still reading it. That is a test-harness race

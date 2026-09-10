@@ -1103,7 +1103,7 @@ culvert_catfeeddb_quarantined_copies %d
 		cfdb.ResidualCopies,
 	)
 
-	// CHAOS-59: GeoIP resolution health. Emitted ONLY when a GeoIP database is
+	// CHAOS-60: GeoIP resolution health. Emitted ONLY when a GeoIP database is
 	// loaded — on the default appliance (no .mmdb configured) these series are
 	// absent entirely, because a flat 0 on a node that has no GeoIP is
 	// indistinguishable from a node whose geo rules have stopped enforcing, and

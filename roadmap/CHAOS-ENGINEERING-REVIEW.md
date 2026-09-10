@@ -104,8 +104,10 @@ because a third-party feed is unreachable converts a provider's outage into the 
 CONTROLS (an immediate retry, a ceiling above the interval, and an always-firing alert each
 pass a defect gate while being worse than the defect). See rows WK-5/WK-5b/WK-5c/WK-6/WK-13b,
 §27, and `docs/operator/threat-feed-freshness.md`.
-> **⚠️ `CHAOS-57` AND THEN `CHAOS-58` were each CLAIMED TWICE by the same open
-> PR — the renumber lost the race a second time.** Two sweeps ran concurrently in September 2026 and each took 57:
+> **⚠️ `CHAOS-57`, THEN `CHAOS-58`, THEN `CHAOS-59` were each CLAIMED TWICE by
+> the same open PR — the renumber lost the race three times running, because
+> "take the next free id" is a rule every concurrent sweep computes identically.**
+> Two sweeps ran concurrently in September 2026 and each took 57:
 > §25 (the hijacked-tunnel plane on the way out, merged via #1288) and the GeoIP
 > resolution chain (PR #1339). The collision surfaced as a merge conflict in
 > this file — both appended a `## 25. CHAOS-57` at the same position — which is
@@ -144,20 +146,45 @@ pass a defect gate while being worse than the defect). See rows WK-5/WK-5b/WK-5c
 > is not the edit; it is that the identifier in a merged commit message, a
 > review thread, or someone's notes now names a different sweep.
 >
-> Both collisions were caught only because both sides appended a heading to
+> **And then a THIRD time — which finally shows WHY the rule cannot converge.**
+> The GeoIP sweep took `CHAOS-59` / §27 on 2026-09-10; by the next merge of
+> `main`, that id was taken too — §27, the intelligence-feed plane under origin
+> outage. So the sweep moved a third time, to **`CHAOS-60` / §28**, same rule,
+> same afternoon, third application.
+>
+> Read the intelligence-feed sweep's own revision-log entry above and the
+> mechanism stops looking like bad luck: **it walked the identical path.** It
+> took `CHAOS-57`, collided with the hijacked-tunnel sweep and moved to
+> `CHAOS-58`, collided with the directory-stall sweep and moved to `CHAOS-59` —
+> and landed on the number the GeoIP sweep had just moved to for exactly the
+> same two reasons. Two sweeps, renumbering independently, in the same window,
+> produced the same sequence and collided at every step of it.
+>
+> That is the part worth keeping. **"Take the next free id" is not a
+> tie-breaker; it is a shared deterministic function of the same input.** Every
+> concurrent sweep computes "next free" against the same `main`, so they all
+> compute the SAME answer, and a collision does not disperse them — it moves
+> them together. The remedy behaves like the fault, which is why applying it
+> three times produced three collisions rather than converging. Nothing here
+> was done wrong; the rule cannot succeed against a concurrent peer running it.
+>
+> All three collisions were caught only because every side appended a heading to
 > THIS file at the same offset, so git surfaced them as a conflict. Nothing
 > checks the id itself. Two sweeps whose write-ups land in different sections —
 > or whose source comments collide but whose documents do not — merge clean and
 > silently share an id, which is exactly how `CHAOS-50` came to name three
 > sweeps.
 >
-> The placeholder row is still the prevention, and it now has a second piece of
-> evidence behind it: **allocate the id in a committed row on `main` BEFORE the
-> sweep is written**, so the claim is visible to every concurrent sweep at the
-> moment it picks a number, and a duplicate is a merge conflict on one line
-> instead of a rename across a dozen files. A cheap approximation while that is
-> unimplemented: prefer citing a sweep by SECTION and title, and treat the
-> `CHAOS-nn` id as a label that may move until the sweep merges.
+> The placeholder row is still the prevention, and it now has a third piece of
+> evidence behind it — the strongest, because it is the one that shows the
+> current rule is not merely expensive but non-convergent: **allocate the id in
+> a committed row on `main` BEFORE the sweep is written**, so the claim is
+> visible to every concurrent sweep at the moment it picks a number, the
+> allocation is serialised by `main` rather than recomputed independently by
+> each PR, and a duplicate is a merge conflict on one line instead of a rename
+> across a dozen files. A cheap approximation while that is unimplemented:
+> prefer citing a sweep by SECTION and title, and treat the `CHAOS-nn` id as a
+> label that may move until the sweep merges.
 
 **2026-09-01 — CHAOS-57 sweep (the hijacked-tunnel plane on the way out).** CHAOS-56 bounded
 the shutdown sequence end to end and made the drain honour its phase deadline. It did not ask the
@@ -194,7 +221,7 @@ for the two cheapest wrong fixes (force-close at drain START — which passes ev
 being strictly worse than the defect — and a non-idempotent release, whose negative gauge restores
 the original blindness by accident). See rows PX-4/PX-8, §25 and
 `docs/operator/tunnel-drain-on-shutdown.md`.
-**2026-09-07 — CHAOS-59 sweep (the GeoIP resolution chain under a failing resolver).**
+**2026-09-07 — CHAOS-60 sweep (the GeoIP resolution chain under a failing resolver).**
 This sweep started from a row in this document that said a path was SAFE. Row
 WK-3 recorded that `geo.LookupCached` — the accessor the per-request policy path
 uses for country-scoped rules — "never blocks on DB/DNS", marked ✓, citing
@@ -224,7 +251,7 @@ drop-on-full), single-flighted, off-path warm; the warm fills BOTH caches, so
 enforcement owns its own populator; and six `culvert_geo_*` series, of which
 `culvert_geo_policy_unresolved_total` is the first signal an operator has ever
 had that a geo rule is evaluating against an unknown country. The first-request
-window is unchanged and recorded as an owner decision (WK-3c). See §27.
+window is unchanged and recorded as an owner decision (WK-3c). See §28.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -717,9 +744,9 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | WK-2 | Remote scan sidecar down → fail-open, **but** alerted (`scan_svc_down`) + counted. Posture not admin-selectable; 30s per-request timeout stacks latency when hard-down. **Re-scoped by CHAOS-53 and much larger than recorded:** that 30 s timeout was not merely latency, it was a PRIVATE deadline three times the process's own fail-closed scan budget, and exceeding it surfaced as a transport error → classified as a fault → fail-OPEN. So a merely SLOW sidecar forwarded content unscanned while the local back end blocks for the identical condition (WK-19). The down-sidecar posture is split out as WK-2b. | GAP → **slowness/capacity CLOSED** (CHAOS-53, §21); the sidecar-DOWN posture is split out as WK-2b | H | `internal/secscan/remote.go` `ScanBody`/`scanOnce` |
 | WK-2b | **Posture**: a sidecar that is genuinely unreachable/erroring still fails OPEN (counted + alerted). Deliberately asymmetric with slowness and capacity, which now fail closed — exactly the WK-1/WK-1b split, for the same reasons. | GAP (**owner decision**; now counted, gated-alerted, rate-limit logged, and reachable only by an actual fault) | H | `internal/secscan/remote.go` `remoteScanFail` |
 | WK-19 | **The remote sidecar had none of the CHAOS-52 protections, and the runbook recommended switching to it.** Six further defects: any HTTP 200 whose body parsed as JSON (`{}`, `null`) was read as CLEAN with no counter/log/alert; NO `culvert_scan_*` series is produced on a sidecar node and `stat_remote_scan_fail` never reached `/metrics`; the fail-open alert fired per request ungated with a raw `err.Error()` (ephemeral port ⇒ un-dedupable key) and logged per request; scan exclusions were never LOADED in remote mode, so `scanexcl.Store` had no path and every admin Save was a silent no-op that returned 200 and was audited as success; the hash allowlist was never consulted and `Result.Hash` came from the SIDECAR; `Status()` decoded an unbounded body on an admin endpoint; and the sidecar's own status blob shadowed this node's `scan_svc_mode`, so a remote node reported "local". | GAP → **CLOSED (CHAOS-53)** | **H** | §21; `docs/engineering/CHAOS-ENGINEERING-REVIEW-2026-08-22.md` |
-| WK-3 | GeoIP cache-miss on the policy hot path fails **closed** (country allow-rule cannot match unknown country); `LookupCached` never blocks on DB/DNS. **The fail-closed half was and is true. The "never blocks" half STOPPED being true** and this row went on asserting it: the host→IP cache added in front of the engine made the common path fast without removing the blocking `net.LookupHost` from the MISS path, so the accessor the request goroutine calls performed an uncancellable resolution inside policy evaluation. Re-scoped by CHAOS-59 (§27) as GEO-1, with GEO-2 alongside it. | ✓ fail-closed / GAP no-block → **CLOSED (CHAOS-59)** | **H** | §27; `geoip.go` `LookupCached`/`resolveHostCached`, `geoip_resolve_health.go` |
-| WK-3b | **Country-scoped ENFORCEMENT was fed by a best-effort dashboard sampler.** On the request path the only populator of the IP→country cache that `matchDestNorm` reads was `trackDestinationCountry` — telemetry, ALLOW-branch only, drop-on-full at 256. A saturated sampler, or a first request that was blocked, left the country permanently unknown and every country-scoped rule silently non-matching. | GAP → **CLOSED (CHAOS-59)**; the enforcement path now owns its own bounded warmer | **H** | §27; `proxy.go` `trackDestinationCountry`, `geoip_resolve_health.go` `warmGeoHost` |
-| WK-3c | **Posture**: a country-scoped rule still does not match on the FIRST request to a host whose country is not yet cached — fail-closed for an allow-rule (user-visible block), fall-through for a deny-rule. Unchanged by CHAOS-59, which only makes the window converge in one request instead of depending on a sampler. Closing it means deciding what "unknown country" MEANS in policy, which is a product decision. | GAP (**owner decision**; now counted as `culvert_geo_policy_unresolved_total`) | M | §27.5; `policy.go` `matchDestNorm` |
+| WK-3 | GeoIP cache-miss on the policy hot path fails **closed** (country allow-rule cannot match unknown country); `LookupCached` never blocks on DB/DNS. **The fail-closed half was and is true. The "never blocks" half STOPPED being true** and this row went on asserting it: the host→IP cache added in front of the engine made the common path fast without removing the blocking `net.LookupHost` from the MISS path, so the accessor the request goroutine calls performed an uncancellable resolution inside policy evaluation. Re-scoped by CHAOS-60 (§28) as GEO-1, with GEO-2 alongside it. | ✓ fail-closed / GAP no-block → **CLOSED (CHAOS-60)** | **H** | §28; `geoip.go` `LookupCached`/`resolveHostCached`, `geoip_resolve_health.go` |
+| WK-3b | **Country-scoped ENFORCEMENT was fed by a best-effort dashboard sampler.** On the request path the only populator of the IP→country cache that `matchDestNorm` reads was `trackDestinationCountry` — telemetry, ALLOW-branch only, drop-on-full at 256. A saturated sampler, or a first request that was blocked, left the country permanently unknown and every country-scoped rule silently non-matching. | GAP → **CLOSED (CHAOS-60)**; the enforcement path now owns its own bounded warmer | **H** | §28; `proxy.go` `trackDestinationCountry`, `geoip_resolve_health.go` `warmGeoHost` |
+| WK-3c | **Posture**: a country-scoped rule still does not match on the FIRST request to a host whose country is not yet cached — fail-closed for an allow-rule (user-visible block), fall-through for a deny-rule. Unchanged by CHAOS-60, which only makes the window converge in one request instead of depending on a sampler. Closing it means deciding what "unknown country" MEANS in policy, which is a product decision. | GAP (**owner decision**; now counted as `culvert_geo_policy_unresolved_total`) | M | §28.5; `policy.go` `matchDestNorm` |
 | WK-4 | GeoIP DB missing/corrupt: reader stays nil, feature degrades to "no country data" — safe, but **no staleness/health signal** (MMDBs expire silently). | GAP (obs) → **PARTIALLY CLOSED** (`BuildTime()` reads the `.mmdb`'s own `build_epoch`; `GET /api/geoip` returns `dbBuildDate`/`dbAgeDays`; GeoIP Database panel shows the age, warn-colored past 90 days; load failures surfaced via `lastError`. Residual: no PROACTIVE alert/metric — an operator must open the panel to notice) | M | `internal/geoip/geoip.go` `BuildTime`, `ui_security.go` `apiGeoIPConfig` |
 | WK-5 | **Threat-feed timeout → stale-erase.** On partial failure `Sync` unconditionally replaces the maps with only what succeeded, discarding prior good entries; stamps `lastSync=now` even on failure; no backoff, no staleness alert → coverage silently shrinks for up to 6h. | GAP → **CLOSED** (stale-erase: per-source `replacedSources` replacement, `threatfeed.go` `applySync`. Backoff + staleness alert: CHAOS-59, §27) | H | `internal/threatfeed/threatfeed.go` `applySync`; `threatfeed_health.go` |
 | WK-5b | **The carry-forward fix removed the only signal.** `culvert_threat_feed_entries` is held at its last-good value by design, so after WK-5's fix a node whose feed has not synced in three weeks exported metrics byte-identical to one that synced ten minutes ago; the only surviving difference reached ONE role-gated admin JSON field no alerting rule scrapes. | GAP → **CLOSED (CHAOS-59)** — five `culvert_threat_feed_*` freshness series, `threat_feed` contract row, fire-once `threat_feed_stale` alert | **H** | §27; `threatfeed_health.go` |
@@ -3709,7 +3736,7 @@ documented residuals. This sweep adds one about **fixes**:
 The corollary is a review question worth asking of every degradation fix in
 this register: *what signal did the old, worse behaviour emit, and what emits
 it now?*
-## 28. CHAOS-59 — The GeoIP resolution chain under a slow or unavailable resolver
+## 28. CHAOS-60 — The GeoIP resolution chain under a slow or unavailable resolver
 
 **Date:** 2026-09-07
 **Scope:** `geo.LookupCached` (the per-request policy accessor), `resolveHost`,
@@ -3717,7 +3744,7 @@ it now?*
 **Shipped:** `geoip.go` (single-flight + a genuinely cache-only accessor),
 `geoip_resolve_health.go` (bounded warmer + health plane), `policy.go`
 (unresolved-country counter, two corrected comments), `metrics.go` (six series),
-`geoip_resolve_chaos_test.go` (17 gates).
+`geoip_resolve_chaos_test.go` (15 gates).
 
 ### 28.1 Why this domain
 
@@ -3834,7 +3861,7 @@ concurrent caller waits on its result (the jwksCache shape from
 `auth_oidc_flow.go`). The warmer takes that claim **synchronously**, before it
 consumes a slot or spawns anything, so N concurrent callers for one host cost
 exactly one slot and the other N−1 return having touched nothing. The ordering
-is not incidental — see §27.8, where getting it wrong re-entered this
+is not incidental — see §28.8, where getting it wrong re-entered this
 document's own finding.
 
 **The warm fills BOTH caches.** It calls `geoip.LookupByIP`, not just the
@@ -3883,7 +3910,7 @@ metrics carry the state. Recorded as a deliberate choice, not an oversight.
   rule still does not match on the first request to a host whose country is not
   yet cached. For an allow-rule that is fail-closed (a user-visible block that
   clears on retry); for a deny-rule it is traffic falling through to a
-  lower-priority rule. CHAOS-59 does not change this in either direction — it
+  lower-priority rule. CHAOS-60 does not change this in either direction — it
   makes the window converge in **one request** instead of depending on whether
   a dashboard sampler won a slot, and it makes the window **countable**.
 
@@ -3913,7 +3940,7 @@ metrics carry the state. Recorded as a deliberate choice, not an oversight.
 
 ### 28.6 Gates
 
-`geoip_resolve_chaos_test.go` (17). **Five defect gates were verified failing
+`geoip_resolve_chaos_test.go` (15). **Five defect gates were verified failing
 against the reintroduced pre-fix shape**, with the numbers quoted above:
 
 | Gate | Pre-fix result |
