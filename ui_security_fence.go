@@ -29,8 +29,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"sync"
+
+	"github.com/KidCarmi/Culvert/internal/redaction"
 )
 
 // contentSecMu serializes the fenced admin writes on the content-security
@@ -208,13 +209,15 @@ func (e errContentSecRevisionConflict) Error() string {
 
 // redactURLUserinfo strips embedded credentials (userinfo) from a URL before
 // it reaches a read surface — a scan-service URL configured as
-// http://user:secret@host must never echo the secret to viewers. Unparseable
-// input is returned verbatim (it cannot carry parseable userinfo).
+// http://user:secret@host must never echo the secret to viewers.
+//
+// It is FAIL-CLOSED on input url.Parse rejects. The first shipped shape
+// returned unparseable input verbatim on the reasoning that it "cannot carry
+// parseable userinfo", which is false: url.Parse rejects a bare '%', a raw
+// control character and a space in the authority, all of which are ordinary
+// inside a password — so precisely the awkward passwords were handed straight
+// to viewers. The strip is delegated to internal/redaction, the one owner of
+// this transform (internal/secscan uses the same function for its log lines).
 func redactURLUserinfo(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return raw
-	}
-	u.User = nil
-	return u.String()
+	return redaction.URLUserinfo(raw)
 }

@@ -19,7 +19,9 @@ func loadScanning(cfg scanningStartupConfig, ctx context.Context) *ScanService {
 	case cfg.RemoteScanURL != "":
 		globalRemoteScanner.Init(cfg.RemoteScanURL)
 		globalRemoteScanner.SetExclusions(globalScanExclusions)
-		logger.Printf("ScanSvc: remote mode, delegating to %s", cfg.RemoteScanURL)
+		// Userinfo-redacted: an operator URL may carry an embedded credential
+		// and the process log is shipped in support bundles.
+		logger.Printf("ScanSvc: remote mode, delegating to %s", redactURLUserinfo(cfg.RemoteScanURL))
 		loadScanExclusions(cfg.ScanExclusionsPath)
 		startThreatFeedIfEnabled(cfg, ctx)
 	case cfg.LocalEnabled:

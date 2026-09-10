@@ -21450,6 +21450,14 @@ function mcpxHealthCard(name, cap){
   mcpxRfKv(dl,'Accepted conns', rt.accepted_conns);
   mcpxRfKv(dl,'Rejected conns', rt.rejected_conns);
   mcpxRfKv(dl,'In flight', rt.in_flight);
+  mcpxRfKv(dl,'Requests total', rt.requests_total);
+  mcpxRfKv(dl,'Requests rejected', rt.requests_rejected);
+  mcpxRfKv(dl,'Queued', rt.queued);
+  mcpxRfKv(dl,'Timeouts', rt.timeouts);
+  mcpxRfKv(dl,'Auth failures', rt.auth_failures);
+  mcpxRfKv(dl,'Ambiguous headers rejected', rt.ambiguous_headers);
+  mcpxRfKv(dl,'Host/Origin mismatches rejected', rt.host_origin_failures);
+  mcpxRfKv(dl,'Observation events dropped', rt.observe_drops);
   mcpxRfKv(dl,'Servers', cap.servers);
   mcpxRfKv(dl,'Quarantined tools', cap.quarantined_tools);
   mcpxRfKv(dl,'Review required tools', cap.review_required_tools);
