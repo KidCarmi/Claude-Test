@@ -2462,6 +2462,11 @@
         ],
         "type": "object"
       },
+      "MaintAgentStatus": {
+        "additionalProperties": true,
+        "description": "Health of the CP-local maintenance agent, read from its GET /v1/status. `available:false` means the agent could not be reached or is not configured, with `reason` carrying the cause; otherwise carries agent_version, privilege_mode(+privilege_warning), and compose_stack_up(+compose_error).",
+        "type": "object"
+      },
       "MetricsConfig": {
         "additionalProperties": false,
         "properties": {
@@ -14858,6 +14863,45 @@
         "x-culvert-idempotency": "idempotent",
         "x-culvert-introduced-version": "1.0.0",
         "x-culvert-permission": "admin",
+        "x-culvert-stability": "stable",
+        "x-culvert-tenant-scope": "appliance",
+        "x-culvert-visibility": "admin-supported"
+      }
+    },
+    "/api/maintenance-agent": {
+      "get": {
+        "description": "Read-only health of the CP-local maintenance agent, sourced from its GET /v1/status (agent version, privilege posture, compose-stack state). Lets an admin confirm the host-root agent is reachable and healthy without SSH access to the host.",
+        "operationId": "getMaintenanceAgentStatus",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintAgentStatus"
+                }
+              }
+            },
+            "description": "Maintenance agent health."
+          },
+          "403": {
+            "$ref": "#/components/responses/PlainForbidden"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "basicAuth": []
+          }
+        ],
+        "summary": "Maintenance agent health",
+        "tags": [
+          "support"
+        ],
+        "x-culvert-idempotency": "safe",
+        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-permission": "viewer",
         "x-culvert-stability": "stable",
         "x-culvert-tenant-scope": "appliance",
         "x-culvert-visibility": "admin-supported"
