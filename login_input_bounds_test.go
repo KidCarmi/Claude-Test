@@ -12,7 +12,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/lockout"
 )
 
-// ─── CHAOS-59 — the public admin-login endpoint's attacker-controlled username ─
+// ─── CHAOS-60 — the public admin-login endpoint's attacker-controlled username ─
 //
 // POST /api/auth/login is on the public allowlist. Every failed attempt copied
 // the caller's username verbatim into the lockout maps, the in-memory audit
@@ -28,44 +28,44 @@ import (
 // login path it sits in front of (a guard that rejected everything would pass
 // every defect gate while being far worse than the defect).
 
-// chaos59ClientIP is the peer address jsonReq stamps on every request, and
+// chaos60ClientIP is the peer address jsonReq stamps on every request, and
 // therefore the IP half of every lockout key these tests must inspect. Asserting
 // against any other address would make the gates below pass vacuously.
-const chaos59ClientIP = "127.0.0.1"
+const chaos60ClientIP = "127.0.0.1"
 
-// chaos59WantStatus asserts the status WITHOUT dumping the response body.
+// chaos60WantStatus asserts the status WITHOUT dumping the response body.
 // assertStatus echoes the body on failure, and the pre-fix handler answers an
 // oversize login by reflecting the megabyte username back — re-verifying these
 // defect gates against the old shape then produced megabytes of test output.
 // A gate for a log-amplification defect must not be one itself.
-func chaos59WantStatus(t *testing.T, w *httptest.ResponseRecorder, want int) {
+func chaos60WantStatus(t *testing.T, w *httptest.ResponseRecorder, want int) {
 	t.Helper()
 	if w.Code != want {
 		t.Errorf("status = %d, want %d (body suppressed: %d bytes)", w.Code, want, w.Body.Len())
 	}
 }
 
-// chaos59Body builds a login POST carrying an n-byte username.
-func chaos59Body(n int) *http.Request {
+// chaos60Body builds a login POST carrying an n-byte username.
+func chaos60Body(n int) *http.Request {
 	return jsonReq(http.MethodPost, "/api/auth/login", map[string]string{
 		"user": strings.Repeat("A", n),
 		"pass": "irrelevant",
 	})
 }
 
-// chaos59Roster seeds one real admin so the handler reaches the ordinary
+// chaos60Roster seeds one real admin so the handler reaches the ordinary
 // credential path (a node with no credential backend takes apiAuthLogin's
 // pre-setup bypass, where every login succeeds and the control gates below
 // would prove nothing). It is a local, untagged equivalent of the uie2e
 // suite's seedUIRoster.
-func chaos59Roster(t *testing.T, user, pass string) {
+func chaos60Roster(t *testing.T, user, pass string) {
 	t.Helper()
 	snapshotCfgUIUsers(t)
 	prevFile := cfg.uiUsersFile
 	cfg.SetUIUsersFile(filepath.Join(t.TempDir(), "ui_users.json"))
 	t.Cleanup(func() { cfg.SetUIUsersFile(prevFile) })
 
-	if err := cfg.SetAuth("chaos59-bootstrap", "Chaos59-bootstrap-1!"); err != nil {
+	if err := cfg.SetAuth("chaos60-bootstrap", "Chaos60-bootstrap-1!"); err != nil {
 		t.Fatalf("SetAuth: %v", err)
 	}
 	t.Cleanup(func() { _ = cfg.SetAuth("", "") })
@@ -78,31 +78,31 @@ func chaos59Roster(t *testing.T, user, pass string) {
 	initSecret(t)
 }
 
-// TestChaos59_OversizeUsernameRejectedBeforeAnyState is the primary gate: the
+// TestChaos60_OversizeUsernameRejectedBeforeAnyState is the primary gate: the
 // oversize attempt is refused with 400 and counted.
-func TestChaos59_OversizeUsernameRejectedBeforeAnyState(t *testing.T) {
+func TestChaos60_OversizeUsernameRejectedBeforeAnyState(t *testing.T) {
 	snapshotLoginLimiter(t)
 	resetLoginOversizeStateForTest()
 	t.Cleanup(resetLoginOversizeStateForTest)
 
 	before := loginOversizeRejected.Load()
 	w := httptest.NewRecorder()
-	apiAuthLogin(w, chaos59Body(1<<20))
+	apiAuthLogin(w, chaos60Body(1<<20))
 
-	chaos59WantStatus(t, w, http.StatusBadRequest)
+	chaos60WantStatus(t, w, http.StatusBadRequest)
 	if got := loginOversizeRejected.Load(); got != before+1 {
 		t.Errorf("loginOversizeRejected = %d, want %d — the rejection is invisible to an operator", got, before+1)
 	}
 }
 
-// TestChaos59_OversizeUsernameNeverReachesTheDurableAuditLog is the DEFECT gate
+// TestChaos60_OversizeUsernameNeverReachesTheDurableAuditLog is the DEFECT gate
 // for the compliance-record destruction. It measures the BYTES the login path
 // commits to the durable audit JSONL, which is the resource the attack consumes.
 //
 // Pre-fix, each attempt wrote its whole username into the file: 8 x 512 KiB =
 // 4 MiB, i.e. ~8% of the 50 MB rotation budget from eight requests. Post-fix the
 // entries are O(1) and the whole run costs a few kilobytes.
-func TestChaos59_OversizeUsernameNeverReachesTheDurableAuditLog(t *testing.T) {
+func TestChaos60_OversizeUsernameNeverReachesTheDurableAuditLog(t *testing.T) {
 	snapshotLoginLimiter(t)
 	resetLoginOversizeStateForTest()
 	t.Cleanup(resetLoginOversizeStateForTest)
@@ -120,8 +120,8 @@ func TestChaos59_OversizeUsernameNeverReachesTheDurableAuditLog(t *testing.T) {
 	const attempts, nameBytes = 8, 512 * 1024
 	for i := 0; i < attempts; i++ {
 		w := httptest.NewRecorder()
-		apiAuthLogin(w, chaos59Body(nameBytes))
-		chaos59WantStatus(t, w, http.StatusBadRequest)
+		apiAuthLogin(w, chaos60Body(nameBytes))
+		chaos60WantStatus(t, w, http.StatusBadRequest)
 	}
 	// Flush is synchronous in internal/audit (unlike reqlog/logsink), so the
 	// file already reflects every entry by the time Add returns.
@@ -148,10 +148,10 @@ func TestChaos59_OversizeUsernameNeverReachesTheDurableAuditLog(t *testing.T) {
 	}
 }
 
-// TestChaos59_OversizeUsernameCreatesNoLockoutEntry is the DEFECT gate for the
+// TestChaos60_OversizeUsernameCreatesNoLockoutEntry is the DEFECT gate for the
 // heap axis: the pre-fix handler parked ~2 MiB per attempt in the two lockout
 // maps for at least lockout.Window, which the janitor cannot sweep sooner.
-func TestChaos59_OversizeUsernameCreatesNoLockoutEntry(t *testing.T) {
+func TestChaos60_OversizeUsernameCreatesNoLockoutEntry(t *testing.T) {
 	snapshotLoginLimiter(t)
 	resetLoginOversizeStateForTest()
 	t.Cleanup(resetLoginOversizeStateForTest)
@@ -159,13 +159,13 @@ func TestChaos59_OversizeUsernameCreatesNoLockoutEntry(t *testing.T) {
 	huge := strings.Repeat("A", 1<<20)
 	for i := 0; i < lockout.MaxAttempts+3; i++ {
 		w := httptest.NewRecorder()
-		apiAuthLogin(w, chaos59Body(1<<20))
-		chaos59WantStatus(t, w, http.StatusBadRequest)
+		apiAuthLogin(w, chaos60Body(1<<20))
+		chaos60WantStatus(t, w, http.StatusBadRequest)
 	}
 	// Nothing was recorded, so the limiter still offers a full budget — checked
 	// through the limiter's own clamped key, which is where a pre-fix entry
 	// would now live.
-	if left := loginLimiter.AttemptsLeft(chaos59ClientIP, huge); left != lockout.MaxAttempts {
+	if left := loginLimiter.AttemptsLeft(chaos60ClientIP, huge); left != lockout.MaxAttempts {
 		t.Errorf("AttemptsLeft = %d, want %d — the rejected attempts still created limiter state", left, lockout.MaxAttempts)
 	}
 	for _, e := range loginLimiter.Snapshot() {
@@ -175,29 +175,29 @@ func TestChaos59_OversizeUsernameCreatesNoLockoutEntry(t *testing.T) {
 	}
 }
 
-// TestChaos59_LimitBoundaryIsExact is the CONTROL that the guard rejects only
+// TestChaos60_LimitBoundaryIsExact is the CONTROL that the guard rejects only
 // what it must: a name of exactly maxUsernameLen goes through to the ordinary
 // credential path, one byte more does not.
-func TestChaos59_LimitBoundaryIsExact(t *testing.T) {
+func TestChaos60_LimitBoundaryIsExact(t *testing.T) {
 	snapshotLoginLimiter(t)
 	resetLoginOversizeStateForTest()
 	t.Cleanup(resetLoginOversizeStateForTest)
 
-	const adminUser, pass = "chaos59-admin", "Chaos59-pass-1!" // #nosec G101 -- test-only fixture
-	chaos59Roster(t, adminUser, pass)
+	const adminUser, pass = "chaos60-admin", "Chaos60-pass-1!" // #nosec G101 -- test-only fixture
+	chaos60Roster(t, adminUser, pass)
 
 	w := httptest.NewRecorder()
-	apiAuthLogin(w, chaos59Body(maxUsernameLen))
+	apiAuthLogin(w, chaos60Body(maxUsernameLen))
 	if w.Code == http.StatusBadRequest {
 		t.Errorf("a %d-byte username was rejected; the limit is inclusive", maxUsernameLen)
 	}
 
 	w = httptest.NewRecorder()
-	apiAuthLogin(w, chaos59Body(maxUsernameLen+1))
-	chaos59WantStatus(t, w, http.StatusBadRequest)
+	apiAuthLogin(w, chaos60Body(maxUsernameLen+1))
+	chaos60WantStatus(t, w, http.StatusBadRequest)
 }
 
-// TestChaos59_ConfiguredOversizeUsernameStillAuthenticates is the CONTROL for
+// TestChaos60_ConfiguredOversizeUsernameStillAuthenticates is the CONTROL for
 // the availability half, and it is the one the first draft of this change got
 // wrong (Codex review, PR #1320).
 //
@@ -209,7 +209,7 @@ func TestChaos59_LimitBoundaryIsExact(t *testing.T) {
 // username can already be a valid persisted admin, and refusing it here would
 // lock that operator out of their own admin UI on upgrade — a hardening change
 // turned into an outage for the one person who has to fix it.
-func TestChaos59_ConfiguredOversizeUsernameStillAuthenticates(t *testing.T) {
+func TestChaos60_ConfiguredOversizeUsernameStillAuthenticates(t *testing.T) {
 	snapshotLoginLimiter(t)
 	resetLoginOversizeStateForTest()
 	t.Cleanup(resetLoginOversizeStateForTest)
@@ -217,12 +217,12 @@ func TestChaos59_ConfiguredOversizeUsernameStillAuthenticates(t *testing.T) {
 	// A name well past maxUsernameLen, created through the store directly —
 	// exactly what the CLI/YAML and --reset-password paths do.
 	longUser := strings.Repeat("L", maxUsernameLen*3)
-	const pass = "Chaos59-long-pass-1!" // #nosec G101 -- test-only fixture
-	chaos59Roster(t, longUser, pass)
+	const pass = "Chaos60-long-pass-1!" // #nosec G101 -- test-only fixture
+	chaos60Roster(t, longUser, pass)
 
 	w := httptest.NewRecorder()
 	apiAuthLogin(w, jsonReq(http.MethodPost, "/api/auth/login", map[string]string{"user": longUser, "pass": pass}))
-	chaos59WantStatus(t, w, http.StatusOK)
+	chaos60WantStatus(t, w, http.StatusOK)
 	if loginOversizeRejected.Load() != 0 {
 		t.Error("a CONFIGURED account was counted as an oversize rejection")
 	}
@@ -231,32 +231,32 @@ func TestChaos59_ConfiguredOversizeUsernameStillAuthenticates(t *testing.T) {
 	// normal 401, not a 400 — the guard must not intercept it either.
 	w = httptest.NewRecorder()
 	apiAuthLogin(w, jsonReq(http.MethodPost, "/api/auth/login", map[string]string{"user": longUser, "pass": "wrong-" + pass}))
-	chaos59WantStatus(t, w, http.StatusUnauthorized)
+	chaos60WantStatus(t, w, http.StatusUnauthorized)
 
 	// And an equally long name that names NOTHING is still refused — the
 	// exemption must be account-scoped, not a blanket hole in the bound.
 	w = httptest.NewRecorder()
-	apiAuthLogin(w, chaos59Body(maxUsernameLen*3))
-	chaos59WantStatus(t, w, http.StatusBadRequest)
+	apiAuthLogin(w, chaos60Body(maxUsernameLen*3))
+	chaos60WantStatus(t, w, http.StatusBadRequest)
 	if loginOversizeRejected.Load() != 1 {
 		t.Errorf("loginOversizeRejected = %d, want 1 — the unknown oversize name was not refused",
 			loginOversizeRejected.Load())
 	}
 }
 
-// TestChaos59_LoginNameConfiguredMatchesVerifyUIUser pins the invariant the
+// TestChaos60_LoginNameConfiguredMatchesVerifyUIUser pins the invariant the
 // exemption rests on: the guard may refuse only names VerifyUIUser could never
 // authenticate. A divergence between the two resolutions is an admin lockout,
 // so it is checked directly rather than inferred — including the legacy
 // single-user case that Config.UIUserExists (roster-only) would have missed.
-func TestChaos59_LoginNameConfiguredMatchesVerifyUIUser(t *testing.T) {
+func TestChaos60_LoginNameConfiguredMatchesVerifyUIUser(t *testing.T) {
 	snapshotCfgUIUsers(t)
 	prevFile := cfg.uiUsersFile
 	cfg.SetUIUsersFile(filepath.Join(t.TempDir(), "ui_users.json"))
 	t.Cleanup(func() { cfg.SetUIUsersFile(prevFile) })
 
-	const legacyUser, rosterUser = "chaos59-legacy", "chaos59-roster"
-	const pass = "Chaos59-invariant-1!" // #nosec G101 -- test-only fixture
+	const legacyUser, rosterUser = "chaos60-legacy", "chaos60-roster"
+	const pass = "Chaos60-invariant-1!" // #nosec G101 -- test-only fixture
 	if err := cfg.SetAuth(legacyUser, pass); err != nil {
 		t.Fatalf("SetAuth: %v", err)
 	}
@@ -274,32 +274,32 @@ func TestChaos59_LoginNameConfiguredMatchesVerifyUIUser(t *testing.T) {
 				"the guard would refuse a real admin's login", name)
 		}
 	}
-	if cfg.LoginNameConfigured("chaos59-nobody") {
+	if cfg.LoginNameConfigured("chaos60-nobody") {
 		t.Error("LoginNameConfigured admitted a name that names no account")
 	}
 }
 
-// TestChaos59_OrdinaryLoginUnaffected is the no-regression CONTROL: a real
+// TestChaos60_OrdinaryLoginUnaffected is the no-regression CONTROL: a real
 // credential still authenticates and a wrong one still returns 401 and still
 // feeds the lockout counter. A guard that broke either would pass every gate
 // above while disabling admin access or brute-force protection.
-func TestChaos59_OrdinaryLoginUnaffected(t *testing.T) {
+func TestChaos60_OrdinaryLoginUnaffected(t *testing.T) {
 	snapshotLoginLimiter(t)
 	resetLoginOversizeStateForTest()
 	t.Cleanup(resetLoginOversizeStateForTest)
 
-	const adminUser, pass = "chaos59-ok-admin", "Chaos59-ok-pass-1!" // #nosec G101 -- test-only fixture
-	chaos59Roster(t, adminUser, pass)
+	const adminUser, pass = "chaos60-ok-admin", "Chaos60-ok-pass-1!" // #nosec G101 -- test-only fixture
+	chaos60Roster(t, adminUser, pass)
 
 	w := httptest.NewRecorder()
 	apiAuthLogin(w, jsonReq(http.MethodPost, "/api/auth/login", map[string]string{"user": adminUser, "pass": pass}))
 	assertStatus(t, w, http.StatusOK)
 
-	before := loginLimiter.AttemptsLeft(chaos59ClientIP, adminUser)
+	before := loginLimiter.AttemptsLeft(chaos60ClientIP, adminUser)
 	w = httptest.NewRecorder()
 	apiAuthLogin(w, jsonReq(http.MethodPost, "/api/auth/login", map[string]string{"user": adminUser, "pass": "wrong-" + pass}))
 	assertStatus(t, w, http.StatusUnauthorized)
-	if after := loginLimiter.AttemptsLeft(chaos59ClientIP, adminUser); after >= before {
+	if after := loginLimiter.AttemptsLeft(chaos60ClientIP, adminUser); after >= before {
 		t.Errorf("AttemptsLeft went %d -> %d on a failed login; the lockout counter stopped advancing", before, after)
 	}
 	if loginOversizeRejected.Load() != 0 {
@@ -307,16 +307,16 @@ func TestChaos59_OrdinaryLoginUnaffected(t *testing.T) {
 	}
 }
 
-// TestChaos59_RejectionIsOnTheMetricsSurface pins the operator's only signal
+// TestChaos60_RejectionIsOnTheMetricsSurface pins the operator's only signal
 // that the endpoint is being probed: the 400 is otherwise invisible.
-func TestChaos59_RejectionIsOnTheMetricsSurface(t *testing.T) {
+func TestChaos60_RejectionIsOnTheMetricsSurface(t *testing.T) {
 	snapshotLoginLimiter(t)
 	resetLoginOversizeStateForTest()
 	t.Cleanup(resetLoginOversizeStateForTest)
 
 	w := httptest.NewRecorder()
-	apiAuthLogin(w, chaos59Body(1<<20))
-	chaos59WantStatus(t, w, http.StatusBadRequest)
+	apiAuthLogin(w, chaos60Body(1<<20))
+	chaos60WantStatus(t, w, http.StatusBadRequest)
 
 	var buf strings.Builder
 	liveFeedWritePrometheus(&buf)
@@ -329,9 +329,9 @@ func TestChaos59_RejectionIsOnTheMetricsSurface(t *testing.T) {
 	}
 }
 
-// TestChaos59_TruncateForAuditMarksWhatItCut keeps a truncated audit actor from
+// TestChaos60_TruncateForAuditMarksWhatItCut keeps a truncated audit actor from
 // ever being mistaken for the value that was actually submitted.
-func TestChaos59_TruncateForAuditMarksWhatItCut(t *testing.T) {
+func TestChaos60_TruncateForAuditMarksWhatItCut(t *testing.T) {
 	if got := truncateForAudit("short"); got != "short" {
 		t.Errorf("truncateForAudit mutated a value within the bound: %q", got)
 	}
@@ -360,10 +360,10 @@ func TestChaos59_TruncateForAuditMarksWhatItCut(t *testing.T) {
 	}
 }
 
-// TestChaos59_OversizeLogLineIsRateLimited pins that the flood cannot buy log
+// TestChaos60_OversizeLogLineIsRateLimited pins that the flood cannot buy log
 // bandwidth: the whole defect was an attacker turning one request into a large
 // write, so the mitigation must not re-open that on the process log.
-func TestChaos59_OversizeLogLineIsRateLimited(t *testing.T) {
+func TestChaos60_OversizeLogLineIsRateLimited(t *testing.T) {
 	resetLoginOversizeStateForTest()
 	t.Cleanup(resetLoginOversizeStateForTest)
 

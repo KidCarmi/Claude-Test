@@ -211,7 +211,7 @@ components:
           type: string
           maxLength: 256
           description: |
-            Admin username. Bounded at 256 bytes (CHAOS-59): this endpoint is
+            Admin username. Bounded at 256 bytes (CHAOS-60): this endpoint is
             public, and an unbounded value here reaches the account-lockout
             maps and the durable audit log. A longer value is rejected with
             400 before any credential evaluation. A name that already belongs

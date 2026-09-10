@@ -1,4 +1,4 @@
-# Admin login input bounds (CHAOS-59)
+# Admin login input bounds (CHAOS-60)
 
 **Applies to:** every node running the admin UI · **Operator action required:** none
 by default; one alerting rule is recommended.
@@ -106,7 +106,7 @@ magnitude lives in the counter, not in the log.
 
 ## Related
 
-- `roadmap/CHAOS-ENGINEERING-REVIEW.md` §27 — the full finding, the measurement,
+- `roadmap/CHAOS-ENGINEERING-REVIEW.md` §28 — the full finding, the measurement,
   and what was deliberately not done.
 - `docs/operator/support-bundles-and-diagnostics.md` — the audit-persistence
   health surfaces this finding sits beside.
