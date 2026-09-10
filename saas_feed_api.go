@@ -18,6 +18,8 @@ package main
 // (409): feed policy is control-plane-authoritative.
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -133,19 +135,29 @@ func mergeCategoryOverrides(base, incoming CategoryOverrides) CategoryOverrides 
 
 // importSaaSFeedConfig applies the feed-config scalars from an import payload.
 // Never-wipe: applied only when the backup carries the config (SaaSFeedProtocol
-// set). Publishes to the durable holder only — persisted by the caller's
-// adminSettingsSave; no downloader/legacy-syncer call.
+// set). Blocker E: the install goes through installSaaSFeedDurable — read,
+// durable write, and holder publish in ONE adminSettingsMu transaction — so it
+// serializes against the fenced settings PUT instead of landing between a
+// PUT's precondition and its apply (the old direct setSaaSFeedDurable +
+// later adminSettingsSave pair could leave holder, revision, and file
+// disagreeing about which writer won). No downloader/legacy-syncer call.
 func importSaaSFeedConfig(b *configBackup) {
 	if b.SaaSFeedProtocol == "" {
 		return
 	}
-	d := getSaaSFeedDurable()
-	d.Managed = b.SaaSFeedManaged
-	d.Enabled = b.SaaSFeedEnabled
-	d.URL = b.SaaSFeedURL
-	d.Protocol = b.SaaSFeedProtocol
-	d.RefreshSeconds = b.SaaSFeedRefreshSeconds
-	setSaaSFeedDurable(d)
+	if err := installSaaSFeedDurable(func(cur saasFeedDurable) saasFeedDurable {
+		cur.Managed = b.SaaSFeedManaged
+		cur.Enabled = b.SaaSFeedEnabled
+		cur.URL = b.SaaSFeedURL
+		cur.Protocol = b.SaaSFeedProtocol
+		cur.RefreshSeconds = b.SaaSFeedRefreshSeconds
+		return cur
+	}); err != nil {
+		// Import stays section-tolerant: the feed target was never applied
+		// (runtime and disk agree on the pre-import config), the rest of the
+		// import proceeds, and the failure is logged.
+		logger.Printf("ConfigImport: saas feed settings persist failed, target never applied: %v", err)
+	}
 }
 
 // ─── GET/PUT /api/saas-feed/settings ────────────────────────────────────────────
@@ -201,12 +213,41 @@ func putSaaSFeedSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, sanitizeLog(err.Error()), http.StatusBadRequest)
 		return
 	}
-	// Apply-then-persist with runtime rollback on durable-write failure.
-	old := getSaaSFeedDurable()
-	setSaaSFeedDurable(next)
-	if err := SaveAdminSettings(); err != nil {
-		setSaaSFeedDurable(old) // ROLLBACK runtime; no config-snapshot change committed
-		logger.Printf("SaaSFeedSettings: persist failed, runtime reverted: %v", err)
+	// 2D-B.0c: persist-before-apply inside the serialized AdminSettings save
+	// domain, with the OPTIONAL revision fence (?ifRevision= — the v2 client
+	// always sends it; legacy callers without it keep replacement semantics).
+	// The comparison, the durable TARGET write and the runtime apply all run
+	// under ONE adminSettingsMu critical section — never a handler check
+	// followed by an unlocked save. A persist failure means the target was
+	// never applied: runtime and disk stay in agreement, no rollback branch.
+	ifRev := parseIfRevision(r)
+	var conflictCurrent string
+	err = saveAdminSettingsWithOverrides(adminSaveOverrides{
+		saasFeed: &next,
+		precondition: func() error {
+			if ifRev == nil {
+				return nil
+			}
+			if cur := saasFeedSettingsRevision(getSaaSFeedDurable()); cur != *ifRev {
+				conflictCurrent = cur
+				return errSaaSSettingsRevisionConflict
+			}
+			return nil
+		},
+		applyOnSuccess: func() { setSaaSFeedDurable(next) },
+	})
+	if errors.Is(err, errSaaSSettingsRevisionConflict) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck // response write
+			"error":           "settings revision conflict",
+			"currentRevision": conflictCurrent,
+			"yourRevision":    *ifRev,
+		})
+		return
+	}
+	if err != nil {
+		logger.Printf("SaaSFeedSettings: persist failed, target never applied: %v", err)
 		http.Error(w, "failed to persist saas feed settings", http.StatusInternalServerError)
 		return
 	}
@@ -254,8 +295,13 @@ func resolveSaaSFeedSettingsUpdate(body saasFeedSettingsBody) (saasFeedDurable, 
 // unavailable until the F3b signed-feed client lands — it NEVER fabricates
 // last_success, active version, freshness, or provenance.
 func saasFeedSettingsView() map[string]any {
+	// ONE capture of the durable holder: raw fields, the settings revision,
+	// AND the resolved block are all derived from the same `d` — a second
+	// holder read for the resolved block would let a concurrent writer pair
+	// one configuration's raw fields with another's resolution (POST-2D-A
+	// COHERENT-READ CORRECTION DISCOVERED DURING 2D-B REVIEW).
 	d := getSaaSFeedDurable()
-	resolved, resolveErr := resolvedSaaSFeedConfig()
+	resolved, resolveErr := resolveSaaSFeedConfigFrom(d)
 	view := map[string]any{
 		"managed":         d.Managed,
 		"enabled":         d.Enabled,
@@ -266,6 +312,10 @@ func saasFeedSettingsView() map[string]any {
 		// exact host the GUI constrains input to (no generic mirror).
 		"official_url": builtinSaaSFeedURL,
 		"editable":     !isManagedDataPlane(),
+		// The server-owned settings revision (content-derived over the feed
+		// CONFIGURATION only) — echoed back via ?ifRevision= on the PUT so two
+		// admins can never silently overwrite each other (2D-B §25).
+		"revision": saasFeedSettingsRevision(d),
 		// F3b-4: the signed-feed runtime (download/verify/activate/serve) is now wired.
 		// This endpoint stays CONFIG-only; the live runtime state (state/provenance/
 		// version/freshness/counts/activity) is on GET /api/saas-feed/status.
@@ -308,6 +358,10 @@ func apiSaaSFeedOverrides(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]any{
 			"overrides": ov,
 			"editable":  !isManagedDataPlane(),
+			// The server-owned override revision (the durable authority
+			// fingerprint) — echoed back via ?ifRevision= on the v2 PUT for
+			// stale-overwrite protection (2D-B §34).
+			"revision": saasFeedOverridesFingerprint(ov),
 		})
 
 	case http.MethodPut:
@@ -336,6 +390,32 @@ func putSaaSFeedOverrides(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
+	if ifRev := parseIfRevision(r); ifRev != nil {
+		// v2 fenced durable replacement (2D-B §34/§35): fence + validate +
+		// replace + durable save in ONE serialization domain — no detached
+		// handler check, no last-write-wins. A failed replacement is rolled
+		// back (memory + reload); recompose happens ONLY after durable
+		// success.
+		stored, err := globalCategoryOverrides.ReplaceAllDurable(ifRev, incoming, saasFeedOverridesFingerprint)
+		if err != nil {
+			writeOverrideMutationError(w, err)
+			return
+		}
+		auditEvent(r, "saasfeed.overrides", "replace", "category overrides updated")
+		saveConfigVersion(sessionAdmin(r), "saasfeed.overrides")
+		recomposeSignedFeedOverrides()
+		pubErr := publishCurrentConfigSnapshot()
+		resp := map[string]any{
+			"ok":        true,
+			"overrides": stored,
+			"revision":  saasFeedOverridesFingerprint(stored),
+		}
+		if pubErr != nil {
+			resp["cluster_publish_rejected"] = pubErr.Error()
+		}
+		jsonOK(w, resp)
+		return
+	}
 	old := globalCategoryOverrides.Get()
 	if err := globalCategoryOverrides.ReplaceAll(incoming); err != nil {
 		http.Error(w, "invalid overrides: "+sanitizeLog(err.Error()), http.StatusBadRequest)
@@ -358,4 +438,23 @@ func putSaaSFeedOverrides(w http.ResponseWriter, r *http.Request) {
 		resp["cluster_publish_rejected"] = pubErr.Error()
 	}
 	jsonOK(w, resp)
+}
+
+// writeOverrideMutationError maps a fenced override-replacement failure.
+func writeOverrideMutationError(w http.ResponseWriter, err error) {
+	var conflict *catoverride.RevisionConflictError
+	switch {
+	case errors.As(err, &conflict):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck // response write
+			"error":           "override revision conflict",
+			"currentRevision": conflict.Current,
+			"yourRevision":    conflict.Asserted,
+		})
+	case errors.Is(err, catoverride.ErrPersist):
+		http.Error(w, "failed to persist overrides: the replacement was rolled back", http.StatusInternalServerError)
+	default:
+		http.Error(w, "invalid overrides: "+sanitizeLog(err.Error()), http.StatusBadRequest)
+	}
 }
