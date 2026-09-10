@@ -90,7 +90,7 @@ func TestApiPACProfiles_SurfacesDegradedState(t *testing.T) {
 		{Field: "profiles", Entry: "branch-il", Code: "pool_not_found", Message: "pool \"il\" not found; rule dropped"},
 	}}, false)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/pac/profiles", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/pac/profiles", http.NoBody)
 	rec := httptest.NewRecorder()
 	apiPACProfiles(rec, req)
 	if rec.Code != http.StatusOK {
