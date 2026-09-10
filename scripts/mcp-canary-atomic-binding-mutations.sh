@@ -210,19 +210,19 @@ run_mutation M01 \
   'the activation lock is released around the trust observation' \
   'TestAtomicBinding_TrustProbeRunsUnderTheActivationLock' \
   . "$ADM" \
-  's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\tcr\.mu\.Unlock\(\)\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/'
+  's/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\}\n/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tcr\.mu\.Unlock\(\)\n\t\tobs = trust\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/'
 
 run_mutation M02 \
   'counter equality either side of an unlocked observation is substituted for locking' \
   'TestAtomicBinding_TrustProbeRunsUnderTheActivationLock' \
   . "$ADM" \
-  's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\tcr\.mu\.Unlock\(\)\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\tif cr\.generation != gen \{\n\t\t\treturn canaryAdmission\{Denial: canaryAdmitNoActivation\}\n\t\t\}\n\t\}\n/'
+  's/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\}\n/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tcr\.mu\.Unlock\(\)\n\t\tobs = trust\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\tif cr\.generation != gen \{\n\t\t\treturn canaryAdmission\{Denial: canaryAdmitNoActivation\}\n\t\t\}\n\t\}\n/'
 
 run_mutation M08 \
   'the lock is released after the observation and the latch stops re-verifying the generation' \
   'TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation' \
   . "$ADM" \
-  's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \
+  's/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\}\n/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \\
   's/\tif !cr\.active \|\| cr\.aborter == nil \|\| cr\.generation != gen \{\n\t\treturn canary\.TripCanaryLatched\n\t\}\n//'
 
 
@@ -246,13 +246,13 @@ run_mutation M06 \
   'an authoritative drift denies the request but never latches the active generation' \
   'TestAtomicBinding_A_DriftLatchesTheActiveGeneration' \
   . "$ADM" \
-  's/\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, gen, now\)/\t\tres := canary\.TripRequestScoped\n\t\t_ = res/'
+  's/\tres := rt\.tripLockedForGeneration\(cr, capb, code, gen, now\)\n\treturn canaryAdmission\{/\tres := canary\.TripRequestScoped\n\treturn canaryAdmission\{/'
 
 run_mutation M07 \
   'the drift is latched against whatever generation is current at trip time' \
   'TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation' \
   . "$ADM" \
-  's/\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, gen, now\)/\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, cr\.generation, now\)/'
+  's/\tres := rt\.tripLockedForGeneration\(cr, capb, code, gen, now\)\n\treturn canaryAdmission\{/\tcr\.mu\.Unlock\(\)\n\ttime\.Sleep\(100 \* time\.Millisecond\)\n\tcr\.mu\.Lock\(\)\n\tres := rt\.tripLockedForGeneration\(cr, capb, code, cr\.generation, now\)\n\treturn canaryAdmission\{/'
 
 # ── (4) THE RESERVATION ─────────────────────────────────────────────────────
 
@@ -297,7 +297,7 @@ run_mutation M12 \
   'the latch trusts the callers unlocked verdict instead of re-deriving under the lock' \
   'TestAtomicBinding_I_PreExecutorLatchNeverInventsABreach' \
   . "$ADM" \
-  's/\tcode := ""\n\tif trust != nil \{\n\t\t_, code = trust\(\)\n\t\}\n/\tcode := "tool_fingerprint_drift"\n/'
+  's/\tcode := ""\n\tif trust != nil \{\n\t\tcode = trust\(\)\.DriftCode\n\t\}\n/\tcode := "tool_fingerprint_drift"\n/'
 
 run_mutation M13 \
   'a pre-executor drift seen in the publication gap latches the next activation' \
@@ -320,7 +320,8 @@ run_mutation M16 \
   'the approval verdict is read before the lock and cached across it' \
   'TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction' \
   . mcp_live_gate.go \
-  's/\tadm := g\.admitUnderActivation\(in\.Now, canary\.ExecutionIdentity\{/\tpreHoist := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)\n\thoistOK, hoistCode := false, ""\n\tif preHoist.Eligible \{ hoistOK, hoistCode = g.approvalOK(preHoist.Target, in.Now) \}\n\tadm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{/; s/\t\treturn g\.approvalOK\(live\.Target, in\.Now\)/\t\treturn hoistOK, hoistCode/'
+  's/\tadm := g\.admitUnderActivation\(in\.Now, canary\.ExecutionIdentity\{/\tpreHoist := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)\n\thoistOK := false\n\tif preHoist.Eligible \{ hoistOK, _ = g.approvalOK(preHoist.Target, in.Now) \}\n\tadm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{/' \
+  's/\t\ttrusted, _ := g\.approvalOK\(live\.Target, in\.Now\)/\t\ttrusted := hoistOK/'
 
 run_mutation M18 \
   'the live-approval read takes the durable store lock again' \
@@ -377,16 +378,16 @@ run_mutation M24 \
 # evidence, and it is available where the transaction already owns the activation lock.
 
 run_mutation M25 \
-  'the rug-pull reason is dropped, so the breach reads as a missing approval' \
-  'TestLiveTrustRevalidate_RugPullReportsDriftNotMissingApproval' \
-  . mcp_live_gate.go \
-  's/\tif reviewedElsewhere \{\n\t\treturn false, "tool_fingerprint_drift"\n\t\}\n/\t_ = reviewedElsewhere\n/'
+  'a moved reviewed target is downgraded to a request-scoped denial and latches nothing' \
+  'TestReviewedBinding_C03_FingerprintDriftWithLiveApprovalLatches' \
+  . "$ADM" \
+  's/\t\treturn rt\.latchDriftLocked\(cr, capb, string\(v\), gen, now\)\n\t\}\n/\t\treturn canaryAdmission\{Denial: canaryAdmitUntrusted, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n/'
 
 run_mutation M26 \
-  'EVERY approval failure is classified as drift (the control)' \
-  'TestLiveTrustRevalidate_UnapprovedIsNotDrift' \
-  . mcp_live_gate.go \
-  's/\tif reviewedElsewhere \{/\tif reviewedElsewhere || true \{/'
+  'EVERY non-matching reviewed verdict is classified as drift (the control)' \
+  'TestReviewedBinding_C13_UnreviewedTargetIsRequestScopedNotDrift' \
+  . "$ADM" \
+  's/\tcase canary\.ReviewedOutOfScope:\n/\tcase canary\.ReviewedVerdict\("__unreachable__"\):\n/'
 
 run_mutation M27 \
   'the lock-free view hands out its shared records instead of copies' \

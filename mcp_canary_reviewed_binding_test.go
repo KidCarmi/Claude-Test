@@ -51,6 +51,7 @@ import (
 //	10  same-generation reviewed-set mutation attempt  → refused
 //	11  server identity change                         → server_identity_drift + latch
 //	12  demote G, activate G+1 against F2              → the old snapshot cannot affect G+1
+//	13  a RESOLVABLE tool never reviewed by this G     → request-scoped denial, NO latch
 
 // reviewedRig is one armed activation over the REAL inventory, the REAL approval store and the
 // REAL admission gate. Everything the matrix asserts flows through production code.
@@ -878,6 +879,51 @@ func publishTwoToolInventory(t *testing.T, sid, reviewedTool, otherTool string) 
 
 // The generation rules are the same as every other latch on this runtime, and they are what stop a
 // stale observation from reaching an activation it was never made under.
+// ── 13 ───────────────────────────────────────────────────────────────────────────────────────
+// A RESOLVABLE tool the activation was never reviewed for is REQUEST-SCOPED, not a breach.
+//
+// This is the control that keeps every latch in this file honest, and it belongs on the ADMISSION
+// path specifically. latchReviewedDriftUnderActivation has its own version
+// (ScopeIndependentPathIgnoresUnreviewedTools), but the admission transaction reaches the same
+// decision through a different branch — canaryAdmitNotReviewed — and nothing here exercised it
+// against a target that actually resolves. Without this, folding ReviewedOutOfScope into the drift
+// branch would pass the whole suite while letting any unrelated request stop a healthy experiment:
+// an activation correctly refusing a target outside its review IS the Canary working.
+//
+// The sibling tool must RESOLVE, or the probe reports "not found" and returns before the reviewed
+// comparison is reached — the hole a previous round of this campaign found the hard way.
+func TestReviewedBinding_C13_UnreviewedTargetIsRequestScopedNotDrift(t *testing.T) {
+	r := newReviewedRig(t)
+
+	const otherTool = "sibling"
+	publishTwoToolInventory(t, r.sid, r.tool, otherTool)
+	cur, ok := mcpCurrentAuthoritativeTarget(r.sid, otherTool)
+	if !ok {
+		t.Fatal("premise: the sibling tool must resolve to a real authoritative target, or the " +
+			"admission probe returns before the reviewed comparison and this proves nothing")
+	}
+	if _, reviewedOK := mcpCurrentAuthoritativeTarget(r.sid, r.tool); !reviewedOK {
+		t.Fatal("premise: republishing must have left the reviewed tool resolvable")
+	}
+
+	d := r.g.AdmitSideEffect(driftGateInput(r.sid, otherTool, hex.EncodeToString(cur.Fingerprint[:]), r.now))
+	if d.Release != nil {
+		d.Release()
+	}
+	if d.Admit {
+		t.Fatal("SECURITY: a target this activation was never reviewed for must not be admitted")
+	}
+	if r.rt.abortedNow(r.capb) {
+		t.Fatalf("SECURITY: refusing an UNREVIEWED target is the Canary working, not a breach of "+
+			"it — latching here (first cause %q) lets any unrelated request stop a healthy "+
+			"experiment", r.rt.abortCodeNow(r.capb))
+	}
+	// And the experiment is still live for the target it WAS reviewed for.
+	if !r.request(r.fp1, r.now) {
+		t.Fatal("the reviewed target must still be admitted after an unreviewed one was refused")
+	}
+}
+
 func TestReviewedBinding_ScopeIndependentPathHonoursGenerationRules(t *testing.T) {
 	t.Run("generation zero latches nothing", func(t *testing.T) {
 		r := newReviewedRig(t)
