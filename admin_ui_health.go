@@ -438,7 +438,6 @@ func resetAdminUIHealthForTest() {
 	adminUIListener.suppressed = 0
 	adminUIListener.alerted = false
 	adminUIEverFailed.Store(false)
-
 }
 
 // adminUIListenerStatus is the /health posture string for the admin UI
