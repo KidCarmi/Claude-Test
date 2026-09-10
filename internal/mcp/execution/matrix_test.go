@@ -37,7 +37,7 @@ func TestCanaryNineActionMatrix(t *testing.T) {
 	for action, shouldExecute := range execClass {
 		up := &fakeUpstream{}
 		e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
-		out := e.Execute(context.Background(), execInput(action, false))
+		out := runExec(e, context.Background(), execInput(action, false))
 		if shouldExecute && up.calls != 1 {
 			t.Fatalf("canary action %v should execute (calls=%d)", action, up.calls)
 		}
@@ -56,7 +56,7 @@ func TestCanaryNineActionMatrix(t *testing.T) {
 func TestCanaryRedactionFailsClosed(t *testing.T) {
 	up := &fakeUpstream{}
 	e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
-	out := e.Execute(context.Background(), execInput(policy.ActionAllowWithRedaction, false))
+	out := runExec(e, context.Background(), execInput(policy.ActionAllowWithRedaction, false))
 	if up.calls != 0 {
 		t.Fatalf("redaction must not reach the upstream (calls=%d)", up.calls)
 	}
@@ -86,7 +86,7 @@ func TestExecAdmissionSaturationNoUpstream(t *testing.T) {
 	}
 	up := &fakeUpstream{}
 	e := newExec(t, stateForMode(t, rollout.ModeCanary), up, ev)
-	out := e.Execute(context.Background(), execInput(policy.ActionAllow, false))
+	out := runExec(e, context.Background(), execInput(policy.ActionAllow, false))
 	if up.calls != 0 {
 		t.Fatalf("a degraded/saturated critical domain must reject admission with no upstream call (calls=%d)", up.calls)
 	}
@@ -153,7 +153,7 @@ func TestAntiWeakening_OutOfScopeDoesNotExecute(t *testing.T) {
 	in := execInput(policy.ActionAllow, false)
 	in.Input.Server.ServerID = "OTHER" // not in the canary scope (servers: s1)
 	in.Server.ID = "OTHER"
-	out := e.Execute(context.Background(), in)
+	out := runExec(e, context.Background(), in)
 	if up.calls != 0 {
 		t.Fatal("an out-of-scope call must not execute")
 	}
@@ -173,7 +173,7 @@ func TestAntiWeakening_ShadowCannotSoftenHardAuthFailure(t *testing.T) {
 	in := execInput(policy.ActionAllow, false)
 	in.Decision.HardOverride = true
 	in.Decision.Reason = policy.ReasonTenantMismatch // a hard auth/tenant failure
-	out := e.Execute(context.Background(), in)
+	out := runExec(e, context.Background(), in)
 	if up.calls != 0 {
 		t.Fatal("shadow must never soften a hard tenant/auth failure to an upstream call")
 	}
@@ -196,7 +196,7 @@ func TestAntiWeakening_DefaultEmptyScopeExecutesNothing(t *testing.T) {
 		Scope: rollout.ScopeSpec{Capability: rollout.CapabilityGateway}, ConnectorMode: rollout.ConnectorLocalClient}, "a", 1)
 	up := &fakeUpstream{}
 	e := newExec(t, st, up, realEvents(t, nil))
-	if out := e.Execute(context.Background(), execInput(policy.ActionAllow, false)); out.Executed || up.calls != 0 {
+	if out := runExec(e, context.Background(), execInput(policy.ActionAllow, false)); out.Executed || up.calls != 0 {
 		t.Fatal("a default empty shadow scope must execute nothing")
 	}
 }
@@ -205,10 +205,10 @@ func TestAntiWeakening_AllowOnceConsumedOnce(t *testing.T) {
 	up := &fakeUpstream{}
 	e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
 	in := execInput(policy.ActionAllowOnce, false)
-	if out := e.Execute(context.Background(), in); !out.Executed {
+	if out := runExec(e, context.Background(), in); !out.Executed {
 		t.Fatal("first ALLOW_ONCE should execute")
 	}
-	if out := e.Execute(context.Background(), in); out.Executed {
+	if out := runExec(e, context.Background(), in); out.Executed {
 		t.Fatal("a second ALLOW_ONCE must not execute (single use)")
 	}
 	if up.calls != 1 {
@@ -223,7 +223,7 @@ func TestExecResponseDLPBlocksSecret(t *testing.T) {
 	// before it is delivered to the client (no sensitive content returned).
 	up := &fakeUpstream{result: `{"data":"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q\n-----END RSA PRIVATE KEY-----"}`} // #nosec G101 -- test fixture; asserts response DLP blocks a private key
 	e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
-	out := e.Execute(context.Background(), execInput(policy.ActionAllow, false))
+	out := runExec(e, context.Background(), execInput(policy.ActionAllow, false))
 	if up.calls != 1 {
 		t.Fatal("the upstream is called, then the response is inspected")
 	}
@@ -257,7 +257,7 @@ func TestConcurrencyTransitionVsExecution(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		// Must never panic or observe a half-applied mode; the result is always one
 		// of the valid dispositions.
-		out := e.Execute(context.Background(), execInput(policy.ActionAllow, false))
+		out := runExec(e, context.Background(), execInput(policy.ActionAllow, false))
 		if out.ExecutionState == "" {
 			t.Fatal("execution produced no state under concurrency")
 		}
@@ -272,7 +272,7 @@ func TestNoTokenPassthrough(t *testing.T) {
 	e := newExec(t, stateForMode(t, rollout.ModeCanary), up, realEvents(t, nil))
 	// The ExecInput carries a resolved identity, never a raw token; with no broker
 	// configured the upstream call carries NO Authorization header.
-	_ = e.Execute(context.Background(), execInput(policy.ActionAllow, false))
+	_ = runExec(e, context.Background(), execInput(policy.ActionAllow, false))
 	if up.lastAuth != "" {
 		t.Fatalf("no client token / auth header may be forwarded upstream, got %q", up.lastAuth)
 	}
@@ -300,3 +300,171 @@ func spoolNewOSBackend() spool.Backend { return spool.NewOSBackend() }
 type spoolReceipt = spool.CommitReceipt
 
 var _ = json.Marshal
+
+// TestDiscovery_OnIngestFiresOnSuccessNotFailure proves the post-ingest reconcile seam: the
+// OnIngest hook fires exactly once after a SUCCESSFUL catalog ingest (so the composition root
+// can re-materialize an active approval's projection immediately, not after the next reconcile
+// tick) and never fires when discovery fails and the previous snapshot is retained.
+func TestDiscovery_OnIngestFiresOnSuccessNotFailure(t *testing.T) {
+	reg := registry.New(limits.DefaultCatalog())
+	id := registry.Identity("pin-1")
+	if _, err := reg.Register(registry.Registration{
+		ID: "s1", Endpoint: "https://s1.internal:443", PinnedIdentity: id, Capability: 0,
+		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, _, err := reg.VerifyIdentity("s1", id); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	cat := catalog.New(limits.DefaultCatalog())
+	up := &fakeUpstream{result: `{"tools":[]}`}
+	d, err := NewDiscovery(reg, cat, up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ingests int
+	d.OnIngest = func() { ingests++ }
+	if _, err := d.Discover(context.Background(), "s1"); err != nil {
+		t.Fatalf("discovery happy path: %v", err)
+	}
+	if ingests != 1 {
+		t.Fatalf("OnIngest must fire once after a successful ingest, got %d", ingests)
+	}
+	up.err = mcperr.New(mcperr.ReasonUpstreamTimeout, "test", "boom")
+	if _, err := d.Discover(context.Background(), "s1"); err == nil {
+		t.Fatal("expected a discovery failure")
+	}
+	if ingests != 1 {
+		t.Fatalf("OnIngest must NOT fire on a discovery failure, got %d", ingests)
+	}
+}
+
+// TestNewDiscovery_InstallsDefaultReconcileHook proves the round-14 wiring: NewDiscovery
+// installs the default post-ingest reconcile hook set by SetReconcileHook, so a normally
+// constructed Discovery reconciles trust after a successful ingest without the caller wiring
+// OnIngest itself. A cleared hook leaves OnIngest nil.
+func TestNewDiscovery_InstallsDefaultReconcileHook(t *testing.T) {
+	reg := registry.New(limits.DefaultCatalog())
+	cat := catalog.New(limits.DefaultCatalog())
+	up := &fakeUpstream{}
+
+	var fired int
+	SetReconcileHook(func() { fired++ })
+	defer SetReconcileHook(nil)
+	d, err := NewDiscovery(reg, cat, up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.OnIngest == nil {
+		t.Fatal("NewDiscovery must install the default reconcile hook when one is set")
+	}
+	d.OnIngest()
+	if fired != 1 {
+		t.Fatalf("the installed default hook must invoke the reconcile callback, fired=%d", fired)
+	}
+
+	// With the hook cleared, a fresh Discovery carries no default.
+	SetReconcileHook(nil)
+	d2, err := NewDiscovery(reg, cat, up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.OnIngest != nil {
+		t.Fatal("a cleared reconcile hook must leave OnIngest nil")
+	}
+}
+
+// TestNewDiscovery_InstallsDefaultIngestGuard proves the round-15 wiring: NewDiscovery installs
+// the default ingest-serialization guard set by SetIngestGuard, and Discover runs the catalog
+// ingest INSIDE that guard (so the composition root can hold the tool-trust derive lock across
+// the publish). A cleared guard leaves IngestGuard nil and the ingest runs directly.
+func TestNewDiscovery_InstallsDefaultIngestGuard(t *testing.T) {
+	reg := registry.New(limits.DefaultCatalog())
+	id := registry.Identity("pin-1")
+	if _, err := reg.Register(registry.Registration{
+		ID: "s1", Endpoint: "https://s1.internal:443", PinnedIdentity: id, Capability: 0,
+		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, _, err := reg.VerifyIdentity("s1", id); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	cat := catalog.New(limits.DefaultCatalog())
+	up := &fakeUpstream{result: `{"tools":[]}`}
+
+	var guardEntered, ingestRanInsideGuard bool
+	SetIngestGuard(func(ingest func() error) error {
+		guardEntered = true
+		// The ingest MUST run inside the guard — that is what makes the publish mutually
+		// exclusive with an approval critical section.
+		err := ingest()
+		ingestRanInsideGuard = true
+		return err
+	})
+	defer SetIngestGuard(nil)
+
+	d, err := NewDiscovery(reg, cat, up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.IngestGuard == nil {
+		t.Fatal("NewDiscovery must install the default ingest guard when one is set")
+	}
+	if _, err := d.Discover(context.Background(), "s1"); err != nil {
+		t.Fatalf("discover under guard: %v", err)
+	}
+	if !guardEntered || !ingestRanInsideGuard {
+		t.Fatalf("Discover must run the ingest inside the guard: entered=%v ranInside=%v", guardEntered, ingestRanInsideGuard)
+	}
+
+	// With the guard cleared, a fresh Discovery carries no default and the ingest runs directly.
+	SetIngestGuard(nil)
+	d2, err := NewDiscovery(reg, cat, up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.IngestGuard != nil {
+		t.Fatal("a cleared ingest guard must leave IngestGuard nil")
+	}
+	if _, err := d2.Discover(context.Background(), "s1"); err != nil {
+		t.Fatalf("discover without guard: %v", err)
+	}
+}
+
+// TestDiscovery_IngestGuardErrorFailsClosed proves a guard that refuses to run the ingest (e.g.
+// the critical section could not be entered) propagates as a discovery failure, so the previous
+// catalog snapshot is retained rather than silently skipping serialization.
+func TestDiscovery_IngestGuardErrorFailsClosed(t *testing.T) {
+	reg := registry.New(limits.DefaultCatalog())
+	id := registry.Identity("pin-1")
+	if _, err := reg.Register(registry.Registration{
+		ID: "s1", Endpoint: "https://s1.internal:443", PinnedIdentity: id, Capability: 0,
+		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, _, err := reg.VerifyIdentity("s1", id); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	cat := catalog.New(limits.DefaultCatalog())
+	up := &fakeUpstream{result: `{"tools":[]}`}
+	d, err := NewDiscovery(reg, cat, up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ingestRan int
+	d.IngestGuard = func(ingest func() error) error {
+		// Refuse without running the ingest.
+		_ = ingest
+		return mcperr.New(mcperr.ReasonUpstreamDiscoveryFailed, "test", "guard refused")
+	}
+	d.OnIngest = func() { ingestRan++ }
+	if _, err := d.Discover(context.Background(), "s1"); err == nil {
+		t.Fatal("a guard error must fail the discovery closed")
+	}
+	if ingestRan != 0 {
+		t.Fatalf("OnIngest must not fire when the guard refused, got %d", ingestRan)
+	}
+}

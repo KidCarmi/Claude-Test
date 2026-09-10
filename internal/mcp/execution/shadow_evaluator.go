@@ -6,6 +6,7 @@ import (
 
 	"github.com/KidCarmi/Culvert/internal/mcp/credentials/broker"
 	"github.com/KidCarmi/Culvert/internal/mcp/events"
+	"github.com/KidCarmi/Culvert/internal/mcp/events/model"
 	"github.com/KidCarmi/Culvert/internal/mcp/events/spool"
 	"github.com/KidCarmi/Culvert/internal/mcp/mcperr"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
@@ -137,16 +138,30 @@ func NewShadowEvaluator(cfg ShadowConfig) (*ShadowEvaluator, error) {
 	return &ShadowEvaluator{cfg: cfg, plan: plan, allowances: newAllowanceStore()}, nil
 }
 
-// Execute is the runtime.ExecutionProvider entry for a Shadow-only runtime. It
-// resolves the rollout disposition and dispatches — but it has no execute path.
-func (s *ShadowEvaluator) Execute(ctx context.Context, in runtime.ExecInput) runtime.ExecOutput {
+// Resolve implements runtime.ExecutionProvider: it resolves the rollout disposition for
+// this request EXACTLY ONCE (no side effect) so the runtime can route on it and hand the
+// SAME resolution back to Execute. A killed capability resolves to an emergency block
+// (never record-only), so the runtime routes it to Execute rather than its inline path.
+func (s *ShadowEvaluator) Resolve(in runtime.ExecInput) rollout.Resolution {
+	return resolveDisposition(s.cfg.State, in)
+}
+
+// Execute is the runtime.ExecutionProvider entry for a Shadow-only runtime. It acts on the
+// PRE-RESOLVED mode/scope disposition — it never re-resolves mode or scope (F7 single
+// resolution, Codex P2 #1234) — and dispatches. It has no execute path.
+//
+// The one thing it DOES re-read is the emergency kill: the kill switch is an immediate
+// admission stop (admin surface + runbook contract), so a kill engaged AFTER Resolve but
+// before this evaluation commits must still stop it — otherwise the evaluator would commit
+// durable evidence and return a would_* verdict AFTER the operator's emergency stop. This is
+// orthogonal to single-resolution: it reads only the monotonic kill flag and can only make
+// the outcome MORE restrictive (an emergency block), never turn a record-only into an
+// evaluation or an evaluation into an execute, so it cannot reopen the routing TOCTOU that
+// F7 closed (Codex P2, PR #1234).
+func (s *ShadowEvaluator) Execute(ctx context.Context, in runtime.ExecInput, res rollout.Resolution) runtime.ExecOutput {
 	if s.cfg.State.Killed() {
 		return s.blocked(in, mcperr.ReasonRolloutEmergencyActive, false)
 	}
-	subj := subjectFor(in)
-	action := mapAction(in.Decision.Action)
-	hardFail, hardReason := hardFailure(in)
-	res := s.cfg.State.ResolveFor(subj, action, hardFail, hardReason, true)
 	s.cfg.Metrics.ObserveResolution(in.Capability.String(), res)
 
 	switch res.Disposition {
@@ -167,6 +182,10 @@ func (s *ShadowEvaluator) Execute(ctx context.Context, in runtime.ExecInput) run
 	}
 }
 
+// KillActive implements runtime.ExecutionProvider: it reports whether this capability's
+// emergency kill switch is engaged, for the runtime's record-only fall-through re-check.
+func (s *ShadowEvaluator) KillActive() bool { return s.cfg.State.Killed() }
+
 // evaluate produces the formal ShadowDecision for an in-scope Shadow request. It
 // computes the Model-1 outcome (what a fully-enforcing mode WOULD do), derives
 // credential readiness from Plan alone, records durable evidence, and returns. There
@@ -184,6 +203,13 @@ func (s *ShadowEvaluator) evaluate(_ context.Context, in runtime.ExecInput) runt
 	if err := s.cfg.Events.CommitThenAct(facts, func(spool.CommitReceipt) error { return nil }); err != nil {
 		return s.blocked(in, mcperr.ReasonOf(err), false)
 	}
+	// Bounded, low-cardinality metric: ONE evaluation + its formal Model-1 verdict. The
+	// outcome enum is the only label; no tenant/subject/tool/argument is ever recorded.
+	// Emitted ONLY AFTER the durable commit succeeds (evidence-before-report): on a commit
+	// failure the evaluator returns a block (counted as an evaluation error), and recording
+	// a would_* verdict here too would double-count and overstate successful Shadow outcomes
+	// during exactly the durability failures an operator needs to see (Codex P2, PR #1234).
+	s.cfg.Metrics.ObserveShadowOutcome(in.Capability.String(), string(d.Outcome))
 
 	return runtime.ExecOutput{
 		Status:          200,
@@ -214,10 +240,11 @@ type ShadowDecision struct {
 
 // decide computes the ShadowDecision. It mirrors, in the same order, the pre-side-effect
 // decision the LIVE executor reaches for an in-scope enforcing request (kill checked by
-// the caller): hard control → policy class → allowance → credential readiness → stale →
-// execute. Credential precedes the (boundary) stale re-check because run.go plans the
-// credential before callUpstream's final drift check (Codex P2). Differential equivalence
-// with the live path is pinned by shadow_live_equivalence_test.go.
+// the caller): hard control → policy class → allowance → upstream-server usability →
+// credential readiness → stale → execute. Credential precedes the (boundary) stale
+// re-check because run.go plans the credential before callUpstream's final drift check
+// (Codex P2). Differential equivalence with the live path is pinned by
+// shadow_live_equivalence_test.go and shadow_prediction_parity_test.go.
 func (s *ShadowEvaluator) decide(in runtime.ExecInput) ShadowDecision {
 	action := mapAction(in.Decision.Action)
 	hardFail, _ := hardFailure(in)
@@ -241,20 +268,8 @@ func (s *ShadowEvaluator) decide(in runtime.ExecInput) ShadowDecision {
 	}
 
 	// 2. Policy verdict classes that a fully-enforcing mode blocks/gates.
-	switch action {
-	case rollout.ActionKindDenied:
-		d.Outcome = ShadowWouldBlock
-		return d
-	case rollout.ActionKindApproval:
-		d.Outcome = ShadowWouldRequireApproval
-		return d
-	case rollout.ActionKindConfirm:
-		d.Outcome = ShadowWouldRequireConfirmation
-		return d
-	case rollout.ActionKindRedaction:
-		// The guarded-execute path performs no request-argument redaction and fails
-		// closed (executor.go), so a fully-enforcing mode would block a redaction action.
-		d.Outcome = ShadowWouldBlock
+	if outcome, gated := policyClassOutcome(action); gated {
+		d.Outcome = outcome
 		return d
 	}
 
@@ -264,7 +279,23 @@ func (s *ShadowEvaluator) decide(in runtime.ExecInput) ShadowDecision {
 		return d
 	}
 
-	// 4. Credential readiness from Plan alone (metadata; never Materialize). This PRECEDES
+	// 4. Upstream server usability. The live path refuses an absent or unusable server
+	// record inside runExecute — BEFORE the durable commit, the credential plan and the
+	// call — with ReasonUpstreamServerUnusable, a HardServerTrust hard failure, so it sits
+	// exactly here: after the allowance consumption, before credential planning.
+	//
+	// SR-02. This is NOT already covered by the hard-control step above. The policy engine
+	// reads server state from the DECISION snapshot, while the executor re-reads the LIVE
+	// registry (runtime dispatchExecute) — which is the whole reason the live refusal
+	// exists. A record disabled, identity-mismatched or deregistered in that window
+	// reaches decide() with no hard override set, and without this gate Shadow promised
+	// WOULD_EXECUTE for a server enforcement will not call.
+	if in.Server == nil || !in.Server.Usable() {
+		d.Outcome = ShadowWouldFailHardControl
+		return d
+	}
+
+	// 5. Credential readiness from Plan alone (metadata; never Materialize). This PRECEDES
 	// the boundary drift re-check to match the LIVE order exactly (Codex P2): run.go plans
 	// the credential (materializeAndCall → Broker.Plan) BEFORE callUpstream performs the
 	// final drift check, so a request that is BOTH credential-invalid AND drifted returns
@@ -272,26 +303,17 @@ func (s *ShadowEvaluator) decide(in runtime.ExecInput) ShadowDecision {
 	// (pre-dispatch) drift before the provider (SHADOW-EVIDENCE-ROUTING-1), so the only
 	// drift decide() can observe is POST-ENTRY (boundary) drift — whose live precedence is
 	// credential-first.
-	if profileRef := in.Decision.Obligations.CredentialProfile; profileRef != "" {
-		if s.plan == nil {
-			// No planning capability is composed. Shadow must PREDICT what live does, not
-			// fail closed: the live executor gates credential materialization on
-			// `useBroker := e.cfg.Broker != nil && profileRef != ""` (run.go), so with no
-			// broker it attaches NO Authorization and PROCEEDS to the call. Failing closed
-			// here would diverge from live enforcement. The outcome stays WOULD_EXECUTE; the
-			// label records that the request would run with no credential attached — the
-			// truthful nuance an operator needs to read from the evidence.
-			d.CredentialPlan = planStatusNoPlanner
-		} else if _, err := s.plan(planInput(in, profileRef)); err != nil {
-			d.CredentialPlan = planStatusInvalid
-			d.Outcome = ShadowWouldFailCredentialReadiness
-			return d
-		} else {
-			d.CredentialPlan = planStatusValid
-		}
+	planStatus, planReady := s.credentialReadiness(in)
+	if !planReady {
+		d.CredentialPlan = planStatus
+		d.Outcome = ShadowWouldFailCredentialReadiness
+		return d
+	}
+	if planStatus != "" {
+		d.CredentialPlan = planStatus
 	}
 
-	// 5. Stale decision (post-entry tool drift — the boundary re-check). Reached only when
+	// 6. Stale decision (post-entry tool drift — the boundary re-check). Reached only when
 	// the credential (if any) planned cleanly, mirroring callUpstream's drift check AFTER
 	// Broker.Plan. Pure, no side effect.
 	if in.ToolStillCurrent != nil && !in.ToolStillCurrent() {
@@ -299,9 +321,63 @@ func (s *ShadowEvaluator) decide(in runtime.ExecInput) ShadowDecision {
 		return d
 	}
 
-	// 6. Everything an enforcing mode checks before the side-effect boundary passed.
+	// 7. Everything an enforcing mode checks before the side-effect boundary passed.
 	d.Outcome = ShadowWouldExecute
 	return d
+}
+
+// policyClassOutcome maps a policy verdict class that a fully-enforcing mode blocks or
+// gates onto its Model-1 outcome. gated=false means the action is allow-class and the
+// evaluation continues to the allowance, server, credential and staleness steps.
+//
+// Extracted from decide() only to keep it under the cyclop threshold; the mapping and its
+// order are unchanged. Every arm is a REFUSAL — nothing here can produce WOULD_EXECUTE, so
+// a class added without an arm falls through to the allow-class steps and must therefore
+// be an allow-class action.
+func policyClassOutcome(action rollout.ActionKind) (ShadowOutcome, bool) {
+	switch action {
+	case rollout.ActionKindDenied:
+		return ShadowWouldBlock, true
+	case rollout.ActionKindApproval:
+		return ShadowWouldRequireApproval, true
+	case rollout.ActionKindConfirm:
+		return ShadowWouldRequireConfirmation, true
+	case rollout.ActionKindRedaction:
+		// The guarded-execute path performs no request-argument redaction and fails
+		// closed (executor.go), so a fully-enforcing mode would block a redaction action.
+		return ShadowWouldBlock, true
+	default:
+		return "", false
+	}
+}
+
+// credentialReadiness derives the credential sub-fact from Plan alone — metadata only,
+// never Materialize. It returns the status label to record and whether the request would
+// still reach the call; ready=false means a fully-enforcing mode would fail credential
+// readiness. An empty status with ready=true means no credential profile was named, so the
+// caller keeps its planStatusNone default.
+//
+// Extracted from decide() only to keep it under the cyclop threshold; the semantics and
+// the position of this step in the live order are unchanged.
+func (s *ShadowEvaluator) credentialReadiness(in runtime.ExecInput) (string, bool) {
+	profileRef := in.Decision.Obligations.CredentialProfile
+	if profileRef == "" {
+		return "", true
+	}
+	if s.plan == nil {
+		// No planning capability is composed but a credential IS required. Shadow PREDICTS what live
+		// does, and live now FAILS CLOSED here: a credential-required request with no broker would
+		// otherwise reach the upstream with NO Authorization, letting a credential-required operation
+		// hit an upstream that accepts ambient/unauthenticated access (Codex P2 round-6, PR #1290). The
+		// live executor blocks this before any side effect (run.go: profileRef != "" && Broker == nil ⇒
+		// ReasonCredentialProfileMissing), so Shadow reports WOULD_FAIL_CREDENTIAL_READINESS to stay
+		// equivalent; the planStatusNoPlanner label records WHY (no planner composed).
+		return planStatusNoPlanner, false
+	}
+	if _, err := s.plan(planInput(in, profileRef)); err != nil {
+		return planStatusInvalid, false
+	}
+	return planStatusValid, true
 }
 
 // requestInspectionStatus reports the truthful request-inspection sub-fact (§13): when no
@@ -318,22 +394,35 @@ func requestInspectionStatus(in runtime.ExecInput) string {
 	return inspectionWouldPass
 }
 
+// shadowEvidence is THE single mapping from a ShadowDecision to the durable/reportable
+// Shadow sub-facts. Both the transient JSON-RPC response (shadowResult) and the durable
+// event (shadowDecisionFacts) derive from this ONE function, so the record an operator
+// reads back from the archive is fact-for-fact identical to what the client saw at
+// request time (SHADOW-EVIDENCE-ROUTING-1 §3 parity). The raw evaluated policy action is
+// NOT duplicated here: it is carried in DecisionEvidence.Action (its single home).
+func shadowEvidence(d ShadowDecision) model.ShadowEvidence {
+	return model.ShadowEvidence{
+		Outcome:                  string(d.Outcome),
+		Override:                 d.ShadowOverride,
+		CredentialPlan:           d.CredentialPlan,
+		MaterializationReadiness: d.MaterializeReady,
+		RequestInspection:        d.RequestInspection,
+		ResponseInspection:       d.ResponseInspection,
+	}
+}
+
 // shadowDecisionFacts builds the durable evidence for a Shadow evaluation. It reuses the
-// execute path's decisionFacts (same identity/decision/snapshot shape) and re-stamps the
-// execution state as a shadow evaluation, never an execution. The recorded action stays
-// the raw policy action; the enforcement prediction rides in the Shadow-outcome fields so
-// the archive can reconstruct WHY the evaluation reached its verdict without materializing
-// a secret or making an upstream call.
-func shadowDecisionFacts(in runtime.ExecInput, _ ShadowDecision) events.DecisionFacts {
+// execute path's decisionFacts (same identity/decision/snapshot shape), re-stamps the
+// execution state as a shadow evaluation (never an execution), and attaches the complete
+// durable ShadowEvidence built from the SAME ShadowDecision returned to the client. The
+// event is thereby a SchemaVersionV2 Shadow decision event (buildEvent), which persists
+// the full enforcement prediction so the archive reconstructs WHY the evaluation reached
+// its verdict — with no secret, credential value, or upstream call (SHADOW-EVIDENCE-ROUTING-1).
+func shadowDecisionFacts(in runtime.ExecInput, d ShadowDecision) events.DecisionFacts {
 	facts := decisionFacts(in)
-	// Mark the record a shadow evaluation via the EXISTING ExecutionState field only — a
-	// known, digest-safe value change, not a new field. The ShadowDecision sub-facts are
-	// deliberately NOT stamped into this schema_version:1 envelope: adding digest-covered
-	// fields would misverify valid shadow events on a binary rollback (Codex P2, PR #1226).
-	// The full decision rides the transient response body; durable persistence with a v2
-	// envelope is deferred to the Shadow-activation slice (SHADOW-EVIDENCE-ROUTING-1). The
-	// ShadowDecision argument is retained for signature stability and that future wiring.
 	facts.Decision.ExecutionState = "shadow_evaluated"
+	ev := shadowEvidence(d)
+	facts.Shadow = &ev
 	return facts
 }
 

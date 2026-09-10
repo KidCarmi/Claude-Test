@@ -27,10 +27,75 @@
 // its intrinsic digest.
 package model
 
-// SchemaVersion is the current event-envelope schema version. An event carrying
-// an unknown schema version is rejected at validation (fail closed; no
-// forward-guessing of an unrecognised layout).
-const SchemaVersion = 1
+// Event-envelope schema versions. An event carrying an UNSUPPORTED schema version
+// is rejected at validation AND at recovery (fail closed; no forward-guessing of an
+// unrecognised layout).
+//
+// v1 is the original envelope. v2 is ADDITIVE: it introduces the durable Shadow
+// sub-facts (ShadowEvidence) and is stamped ONLY on a Shadow decision event — the
+// only event that carries ShadowEvidence. Every non-shadow event stays v1, so its
+// canonical digest is byte-identical across this change (SHADOW-EVIDENCE-ROUTING-1).
+//
+// v3 is ADDITIVE in the same way for the First-Canary attempt evidence: the
+// attempt-identity / physical-send fields on OutcomeEvidence and the
+// ReconciliationEvidence sub-fact. It is stamped ONLY on an event that actually
+// carries one of them, so an outcome event without them stays v1 and keeps its
+// pre-v3 digest byte-for-byte.
+//
+// Stamping is not bookkeeping. CanonicalBytes covers these fields, so a record that
+// carries them while claiming v1 is UNREADABLE by a build that predates them: the
+// reader drops what it does not know, recomputes a different digest, and reports the
+// record as SPOOL CORRUPTION. A version rollback would then raise the alarm reserved
+// for tampering and disk damage, and abort recovery, instead of the documented clean
+// "unsupported schema" refusal. The version field is what lets a reader say "this
+// record is newer than me" rather than "this ledger is broken".
+const (
+	// SchemaVersionV1 is the original envelope (no Shadow sub-facts).
+	SchemaVersionV1 = 1
+	// SchemaVersionV2 adds durable ShadowEvidence; stamped only on Shadow events.
+	SchemaVersionV2 = 2
+	// SchemaVersionV3 adds the First-Canary attempt evidence (attempt identity,
+	// reservation/generation binding, physical-send state, and the reconciliation
+	// sub-fact); stamped only on an event that carries it.
+	SchemaVersionV3 = 3
+	// SchemaVersion is the DEFAULT version stamped on an event that carries no Shadow
+	// sub-facts and no attempt evidence. It is deliberately kept at v1 so every
+	// pre-existing writer's events, and their digests, are unchanged. A Shadow
+	// decision event is stamped SchemaVersionV2 and an attempt-evidence event
+	// SchemaVersionV3 by the adapter, from the evidence itself.
+	SchemaVersion = SchemaVersionV1
+)
+
+// SupportedSchemaVersion reports whether THIS build can interpret an event carrying
+// schema version v. A build supports every version up to its own; any other version
+// is rejected as an unknown schema (fail closed) at validation and at recovery. An
+// older build rejects a newer event — the documented downgrade posture
+// (SHADOW-EVIDENCE-ROUTING-1): it must refuse newer evidence, never partially
+// interpret it as its own version.
+func SupportedSchemaVersion(v int) bool {
+	return v == SchemaVersionV1 || v == SchemaVersionV2 || v == SchemaVersionV3
+}
+
+// CarriesAttemptEvidence reports whether this event carries any of the v3-only
+// evidence shapes. It is the SINGLE predicate behind both the stamp (events/decide.go)
+// and the validation pairing, so the two can never drift into a record that carries
+// v3 fields under a v1 stamp — the exact shape that reads back as corruption.
+//
+// DecisionRef, Executed, StatusClass, DurationMs, UpstreamResponseClass,
+// InspectionResult and FailureReason are deliberately NOT in this set: they are the
+// original v1 OutcomeEvidence fields, and including them would re-stamp every
+// pre-existing outcome event as v3, changing digests that must not change.
+func (e Event) CarriesAttemptEvidence() bool {
+	if e.Reconciliation != nil {
+		return true
+	}
+	o := e.Outcome
+	if o == nil {
+		return false
+	}
+	return o.AttemptID != "" || o.ReservationID != "" ||
+		o.ActivationGeneration != 0 || o.PhysicalSendState != SendStateUnset
+}
 
 // Phase is the lifecycle phase of an event. The zero value is invalid.
 type Phase uint8
@@ -54,6 +119,19 @@ const (
 	PhaseRecoveryMarker
 	// PhaseHealth — a health/degradation-transition marker.
 	PhaseHealth
+	// PhaseSendIntent — a DURABLE SEND INTENT committed immediately before the
+	// final boundary guards and the irreversible upstream call. It names the exact
+	// physical attempt (AttemptID) and the reservation and activation generation
+	// that authorized it, so a process that dies after the peer received the bytes
+	// still leaves proof that the attempt EXISTED. Without it, a post-send crash is
+	// indistinguishable from "never sent" — which is the one inference that must
+	// never be made (see PhysicalSendState).
+	PhaseSendIntent
+	// PhaseReconciliation — APPEND-ONLY authoritative evidence resolving (or failing
+	// to resolve) an orphaned attempt against an independent witness. It never
+	// rewrites the original send intent: the intent records what Culvert authorized,
+	// this records what an independent observer saw. Both stay in the ledger.
+	PhaseReconciliation
 )
 
 // String returns the stable machine string for the phase.
@@ -69,13 +147,17 @@ func (p Phase) String() string {
 		return "recovery_marker"
 	case PhaseHealth:
 		return "health"
+	case PhaseSendIntent:
+		return "send_intent"
+	case PhaseReconciliation:
+		return "reconciliation"
 	default:
 		return "none"
 	}
 }
 
 // Valid reports whether the phase is a real phase.
-func (p Phase) Valid() bool { return p >= PhaseDecision && p <= PhaseHealth }
+func (p Phase) Valid() bool { return p >= PhaseDecision && p <= PhaseReconciliation }
 
 // Criticality is the durability class of an event. It selects the partition and
 // governs the fail-closed / degraded posture. The zero value is invalid.
@@ -317,17 +399,48 @@ type DecisionEvidence struct {
 	OperationClass      string   `json:"operation_class,omitempty"`
 	RiskClass           string   `json:"risk_class,omitempty"`
 	ExecutionState      string   `json:"execution_state,omitempty"`
-	// NOTE (Codex P2, PR #1226): the Shadow enforcement-prediction sub-facts
-	// (shadow_outcome/override, credential-plan and inspection readiness) are DELIBERATELY
-	// NOT persisted as new digest-covered fields on this schema_version:1 envelope. Adding
-	// them here would be a rollback hazard — a pre-change binary reading a shadow event
-	// drops the unknown fields on unmarshal, recomputes CanonicalBytes without them, and
-	// misreports the valid record as corrupted. Durable shadow-evidence persistence needs
-	// its own schema version (v2, with explicit v1/v2 recovery) and belongs in the reviewed
-	// Shadow-activation slice (execution is disabled here, so no shadow event is ever
-	// written). Today a shadow evaluation is marked ONLY by the existing ExecutionState
-	// value "shadow_evaluated" (a known field, digest-safe), and the full ShadowDecision is
-	// carried in the transient response body. Tracked as SHADOW-EVIDENCE-ROUTING-1.
+	// NOTE: the Shadow enforcement-prediction sub-facts are NOT stored inline on
+	// DecisionEvidence. Adding them here as digest-covered v1 fields would be a rollback
+	// hazard — a pre-change binary reading a shadow event drops the unknown fields on
+	// unmarshal, recomputes CanonicalBytes without them, and misreports the valid record
+	// as corrupted. They live in a SEPARATE typed sub-evidence pointer, Event.Shadow, on a
+	// v2 envelope with explicit v1/v2 recovery (SHADOW-EVIDENCE-ROUTING-1, closed). The raw
+	// evaluated policy action stays in Action above (its existing home); ExecutionState
+	// carries "shadow_evaluated" for a shadow event. See ShadowEvidence.
+}
+
+// ShadowEvidence records the durable, per-request Shadow enforcement prediction — the
+// full ShadowDecision an operator uses to judge Canary readiness. It is a typed,
+// secret-free sub-evidence (like Outcome/Denial/Marker): present ONLY on a
+// SchemaVersionV2 Shadow decision event (ExecutionState "shadow_evaluated") and nil
+// otherwise. It carries the SAME facts returned to the client in the transient Shadow
+// response body (execution.shadowResult), so the durable record reconstructs exactly
+// what the caller saw at request time.
+//
+// The raw/evaluated policy action is NOT duplicated here — it lives in
+// DecisionEvidence.Action (single source of truth). Every field below is a bounded enum
+// (validated in Validate); no secret, argument, output or credential value appears.
+type ShadowEvidence struct {
+	// Outcome is the Model-1 enforcement prediction (would_execute, would_block,
+	// would_require_approval, would_require_confirmation, would_fail_credential_readiness,
+	// would_fail_inspection, would_fail_stale_decision, would_fail_hard_control).
+	Outcome string `json:"outcome"`
+	// Override is true when the policy verdict itself is restrictive (non-allow-class),
+	// so a policy DENY/APPROVAL/CONFIRMATION is never laundered into a plain would_execute.
+	Override bool `json:"override"`
+	// CredentialPlan is the credential-readiness sub-fact derived from Plan metadata only
+	// (no_credential_profile, credential_plan_valid, credential_plan_invalid,
+	// no_planner_composed). Shadow never materializes a credential.
+	CredentialPlan string `json:"credential_plan"`
+	// MaterializationReadiness is ALWAYS "not_evaluated": Shadow never evaluates
+	// materialization (it holds no materialize-capable broker). Any other value is invalid.
+	MaterializationReadiness string `json:"materialization_readiness"`
+	// RequestInspection is the pre-executor inspection sub-fact (would_pass, would_fail,
+	// not_evaluated). not_evaluated means no inspection ran — never a false would_pass.
+	RequestInspection string `json:"request_inspection"`
+	// ResponseInspection is ALWAYS "not_evaluated": a Shadow evaluation makes no upstream
+	// call, so no upstream response exists to inspect. Any other value is invalid.
+	ResponseInspection string `json:"response_inspection"`
 }
 
 // InspectionEvidence records only sanitized inspection facts (MCP-INSP-*). No
@@ -361,9 +474,95 @@ type CredentialEvidence struct {
 	CacheState   string `json:"cache_state,omitempty"` // hit / miss metadata, never a value
 }
 
-// OutcomeEvidence records a post-execution outcome. A later execution slice sets
-// it; it does not replace the pre-execution decision commit. An outcome event
-// MUST reference a committed decision via DecisionRef.
+// PhysicalSendState is the TRUTH about whether request bytes for one physical tool
+// invocation could have reached the peer. It is deliberately NOT a boolean.
+//
+// "Executed" is a statement about Culvert's own control flow; it cannot answer the
+// question that matters after a transport fault or a crash, which is whether the
+// PEER may already have acted. Collapsing that into a bool forces every ambiguous
+// case to be recorded as one of two lies. This enum keeps uncertainty explicit and
+// conservative: an unknown outcome is never downgraded to "not sent".
+type PhysicalSendState string
+
+const (
+	// SendStateUnset is the zero value and is INVALID on a committed outcome.
+	SendStateUnset PhysicalSendState = ""
+	// SendDefinitelyNotSent may be used ONLY when it is mechanically provable that
+	// no request byte could have reached the peer — in practice, when a guard denied
+	// BEFORE the physical call began. It must never be inferred from a missing
+	// record or from an error observed after the call started.
+	SendDefinitelyNotSent PhysicalSendState = "definitely_not_sent"
+	// SendMayHaveBeenSent is the conservative state for every ambiguous transport
+	// outcome once the physical call has begun: connection reset, timeout, context
+	// cancellation, or a crash with no terminal record. Reconciliation against an
+	// independent witness is required to resolve it.
+	SendMayHaveBeenSent PhysicalSendState = "may_have_been_sent"
+	// SendPeerResponseReceived means the peer returned a response, so the invocation
+	// demonstrably reached it. This says nothing about whether the response was
+	// later blocked by inspection.
+	SendPeerResponseReceived PhysicalSendState = "peer_response_received"
+	// SendReconciledReceived resolves an ambiguous attempt against an authoritative
+	// independent witness that HAS the attempt.
+	SendReconciledReceived PhysicalSendState = "reconciled_received"
+	// SendReconciledNotReceived resolves an ambiguous attempt against an
+	// authoritative independent witness that definitively does NOT have it.
+	SendReconciledNotReceived PhysicalSendState = "reconciled_not_received"
+)
+
+// Valid reports whether the state is one of the defined non-zero states.
+func (s PhysicalSendState) Valid() bool {
+	switch s {
+	case SendDefinitelyNotSent, SendMayHaveBeenSent, SendPeerResponseReceived,
+		SendReconciledReceived, SendReconciledNotReceived:
+		return true
+	default:
+		return false
+	}
+}
+
+// MayHaveReachedPeer is the CONSERVATIVE predicate: it answers false only for the
+// two states that positively prove the peer did not act. Everything else — including
+// an unset/unknown state — answers true, so budget accounting and reconciliation
+// can never treat uncertainty as a non-event.
+func (s PhysicalSendState) MayHaveReachedPeer() bool {
+	return s != SendDefinitelyNotSent && s != SendReconciledNotReceived
+}
+
+// ProvesReceipt is the POSITIVE counterpart, and it is NOT the negation of
+// MayHaveReachedPeer.
+//
+// Only two states are affirmative evidence that the peer acted: the peer answered,
+// or an authoritative witness resolved it as received. Everything else — including
+// may_have_been_sent — proves nothing, and may_have_been_sent is precisely the
+// uncertainty a witness exists to resolve (ReconciliationRequired answers true for
+// it).
+//
+// The two predicates are deliberately separate because the middle ground is real:
+// a state can be neither proven-received nor proven-not-received. Reusing
+// MayHaveReachedPeer as a stand-in for "the peer received it" reads that middle
+// ground as receipt, which turns the canonical reconciliation case — an ambiguous
+// send that a complete witness view says never arrived — into a contradiction and
+// makes it unresolvable (Codex round 8, P1).
+func (s PhysicalSendState) ProvesReceipt() bool {
+	return s == SendPeerResponseReceived || s == SendReconciledReceived
+}
+
+// ReconciliationRequired reports whether this attempt still needs an authoritative
+// independent witness to reach a final answer.
+func (s PhysicalSendState) ReconciliationRequired() bool {
+	return s == SendMayHaveBeenSent || s == SendStateUnset
+}
+
+// OutcomeEvidence records a post-execution outcome. It does not replace the
+// pre-execution decision commit. An outcome event MUST reference a committed
+// decision via DecisionRef.
+//
+// The attempt-identity and physical-send fields exist so the record can answer the
+// First-Canary question — "did Culvert cause exactly the tool effects it
+// authorized, and does it know what happened to each one?" — WITHOUT consulting
+// anything mutable. They are an immutable snapshot at outcome time, bound to the
+// activation generation and reservation that authorized the effect, so an orphan
+// from a superseded generation can be recognized as such after a restart.
 type OutcomeEvidence struct {
 	DecisionRef           string `json:"decision_ref"`
 	Executed              bool   `json:"executed"`
@@ -372,6 +571,91 @@ type OutcomeEvidence struct {
 	UpstreamResponseClass string `json:"upstream_response_class,omitempty"`
 	InspectionResult      string `json:"inspection_result,omitempty"`
 	FailureReason         string `json:"failure_reason,omitempty"`
+
+	// AttemptID names ONE potential physical tool invocation. It is not an
+	// execution id, a server id, or a JSON-RPC wire id: exactly one AttemptID
+	// corresponds to at most one side-effect-bearing tool send, which is what makes
+	// independent witness correlation possible.
+	AttemptID string `json:"attempt_id,omitempty"`
+	// ReservationID binds the attempt to the budget slot that authorized it, so a
+	// physical effect can never be attributed to an unauthorized reservation.
+	ReservationID string `json:"reservation_id,omitempty"`
+	// ActivationGeneration is the Canary generation in force when the attempt was
+	// authorized. An orphan carrying generation G must remain visible under G+1 and
+	// must never become fresh execution allowance.
+	ActivationGeneration uint64 `json:"activation_generation,omitempty"`
+	// PhysicalSendState is the conservative truth about peer reachability.
+	PhysicalSendState PhysicalSendState `json:"physical_send_state,omitempty"`
+}
+
+// ReconciliationResult is the DERIVED knowledge about one attempt after consulting
+// an independent witness. It is derived from observed FACTS (count + completeness +
+// binding), never asserted directly by a caller: an API that accepted a verdict
+// would turn an operator or client claim into execution truth.
+type ReconciliationResult string
+
+const (
+	// ReconRequired — knowledge is still insufficient. This is the resting state and
+	// the only safe answer when the witness is unavailable, incomplete, malformed or
+	// silent. `unknown` is NEVER collapsed into "not received".
+	ReconRequired ReconciliationResult = "reconciliation_required"
+	// ReconReceived — the witness observed EXACTLY ONE matching physical invocation.
+	ReconReceived ReconciliationResult = "reconciled_received"
+	// ReconNotReceived — the witness observed ZERO matching invocations AND proved
+	// its observation set complete for the relevant interval. Absence alone is never
+	// enough.
+	ReconNotReceived ReconciliationResult = "reconciled_not_received"
+	// ReconConflict — the evidence contradicts itself or the durable intent: more
+	// than one physical invocation for one attempt (a blocker-#6 invariant breach),
+	// a binding mismatch, or a later observation contradicting a settled one.
+	ReconConflict ReconciliationResult = "reconciliation_conflict"
+)
+
+// Valid reports whether r is a defined result.
+func (r ReconciliationResult) Valid() bool {
+	switch r {
+	case ReconRequired, ReconReceived, ReconNotReceived, ReconConflict:
+		return true
+	default:
+		return false
+	}
+}
+
+// Resolved reports whether this result is a terminal knowledge state. Note that
+// ReconConflict IS resolved as knowledge (we know the evidence is broken) while
+// ReconRequired is not.
+func (r ReconciliationResult) Resolved() bool {
+	return r == ReconReceived || r == ReconNotReceived || r == ReconConflict
+}
+
+// ReconciliationEvidence is the durable, append-only record of one reconciliation
+// attempt against an independent witness. It carries identifiers, counts,
+// timestamps and bounded digests ONLY — never request bodies, credentials or
+// Authorization material.
+type ReconciliationEvidence struct {
+	AttemptID            string               `json:"attempt_id"`
+	ReservationID        string               `json:"reservation_id,omitempty"`
+	ActivationGeneration uint64               `json:"activation_generation,omitempty"`
+	Result               ReconciliationResult `json:"result"`
+	// WitnessSource identifies the independent observer that produced the
+	// observation, so a later audit can tell WHOSE evidence this was.
+	WitnessSource string `json:"witness_source,omitempty"`
+	// ObservationCount is the number of matching physical invocations the witness
+	// reports. It is retained verbatim: >1 is a physical-effect breach and must not
+	// be normalized away to "received".
+	ObservationCount int `json:"observation_count"`
+	// WindowStartUnixNano / WindowEndUnixNano bound the interval the witness claims
+	// to have observed.
+	WindowStartUnixNano int64 `json:"window_start_unix_nano,omitempty"`
+	WindowEndUnixNano   int64 `json:"window_end_unix_nano,omitempty"`
+	// CompletenessWatermark is the witness's proof that its observation set is
+	// complete for that interval (a durable monotonic watermark, sequence boundary or
+	// equivalent). Empty means completeness was NOT proven.
+	CompletenessWatermark string `json:"completeness_watermark,omitempty"`
+	// EvidenceDigest is a bounded, non-reversible reference to the witness record.
+	EvidenceDigest       string `json:"evidence_digest,omitempty"`
+	ObservedAtUnixNano   int64  `json:"observed_at_unix_nano,omitempty"`
+	ReconciledAtUnixNano int64  `json:"reconciled_at_unix_nano"`
 }
 
 // DenialEvidence records a coalesced denial aggregate (P-DEN). It retains count,
@@ -424,8 +708,16 @@ type Event struct {
 	Inspection InspectionEvidence `json:"inspection"`
 	Credential CredentialEvidence `json:"credential"`
 	Outcome    *OutcomeEvidence   `json:"outcome,omitempty"`
-	Denial     *DenialEvidence    `json:"denial,omitempty"`
-	Marker     *MarkerEvidence    `json:"marker,omitempty"`
+	// Reconciliation is present ONLY on a PhaseReconciliation event.
+	Reconciliation *ReconciliationEvidence `json:"reconciliation,omitempty"`
+	Denial         *DenialEvidence         `json:"denial,omitempty"`
+	Marker         *MarkerEvidence         `json:"marker,omitempty"`
+	// Shadow is the durable Shadow enforcement prediction, present ONLY on a
+	// SchemaVersionV2 Shadow decision event and nil otherwise. Because it is a nil
+	// pointer with omitempty on every non-shadow (v1) event, it is OMITTED from the
+	// canonical encoding of those events, so their digest is byte-identical to the
+	// pre-v2 encoding (SHADOW-EVIDENCE-ROUTING-1 digest-compatibility invariant).
+	Shadow *ShadowEvidence `json:"shadow,omitempty"`
 
 	// EventDigest is the intrinsic content digest (hex sha256). It is excluded
 	// from the canonical encoding used to compute it.

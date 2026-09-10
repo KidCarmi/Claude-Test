@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -119,7 +120,9 @@ type startupState struct {
 	backupEncrypt           *bool
 	restoreIn               *string
 	restoreMode             *string
-	restoreConfirm          *bool
+	restoreConfirm          *confirmFlag
+	prepareDowngrade        *bool
+	downgradeTargetSchema   *int
 	restoreAcceptDPReenroll *bool
 	restoreAllowCounterRB   *bool
 	listLeftovers           *bool
@@ -170,6 +173,11 @@ func main() {
 	// must run BEFORE the global flag set is defined (it is not a flag).
 	maybeRunBootstrapResolve(os.Args)
 
+	// PR-C1: the persisted-state root (default /data) is resolved ONCE from
+	// CULVERT_DATA_DIR before the flag set and before any one-shot command,
+	// so every consumer of dataDir sees one value for the life of the process.
+	applyDataDirFromEnv()
+
 	s := &startupState{}
 	parseFlags(s)
 	handleOneShotCommands(s)
@@ -186,6 +194,9 @@ func main() {
 	loadFileConfigAndFlags(s)
 	initUIExtras(s)
 	initLogger(s)
+	if dataDirOverridden() {
+		logger.Printf("DataDir: persisted-state root set by %s: %s", dataDirEnv, dataDir)
+	}
 	initMemoryBackstop() // P0-2: soft GOMEMLIMIT so a large config-apply degrades to GC, not OOM
 	initLifecycleContext(s)
 	defer appLifecycleCancel() // kept in main() for panic safety; initLifecycleContext only creates the context.
@@ -206,6 +217,17 @@ func main() {
 	initPolicy(s)
 	initURLCategories(s)
 	initFileBlocking(s)
+	// 2D-A/2D-C rename recovery: ONE pass, and its position is load-bearing —
+	// every store it reads must already be loaded: policy + draft (initPolicy),
+	// category groups + decryption profiles (initURLCategories), and file
+	// profiles (initFileBlocking — the 2D-C final correction: running before it
+	// reconciled FileProfileID names against an EMPTY store, so a crashed
+	// rename's stale display name survived every restart). Converges any
+	// denormalized object display names a crashed/failed rename left stale
+	// (the stable object-link IDs kept enforcement correct throughout). No-op —
+	// no write, no version movement — on a clean boot. Runs long before any
+	// listener starts (startUI / startProxy come after the init block).
+	reconcileObjectRefNames()
 	initSSLBypassAndDPI(s)
 	initH2InspectServer() // PR3d: eager-build the shared graceful-shutdown H2 server
 	initRewriteAndDefaultAction(s)
@@ -218,9 +240,17 @@ func main() {
 	initPersistentAdminState(s)
 	initPolicyLearning(s)  // ADR-0025: disabled-by-default advisory learning engine (governed via AdminSettings; no SWG effect when off)
 	initMCPRuntime(s)      // PR-5: disabled-by-default MCP listener runtime (no SWG effect when off)
+	initMCPToolTrust(s)    // ADR-0034: disabled-by-default tool-trust store + catalog Usable projection. MUST run after initMCPRuntime (needs the published inventory) and BEFORE initMCPRollout, whose restore() runs the Shadow preflight that reads catalog.Usable — otherwise a valid persisted Shadow rollout is clamped to Disabled every restart before approved tools are re-promoted.
 	initMCPRollout(s)      // PR-11: disabled-by-default rollout composition (Gateway/Management isolated)
 	initMCPDistribution(s) // PR-12: disabled-by-default DP applier composition (after rollout state is restored)
 	loadReleaseManagement(resolveReleaseStartupConfig())
+	// 2F-B (C1): complete the post-commit effects of any PAC publish/rollback
+	// that was proven committed but not fully recorded when the previous
+	// process stopped (config version, cluster publication, success audit,
+	// terminal record). Position is load-bearing: every store the config
+	// version captures is loaded above; the loader itself (initPAC) only
+	// settled the node-local half.
+	pacReconcileAllLifecycles()
 	startAdminUI(s)
 
 	proxySrv := buildAndStartProxyServer(s)
@@ -300,7 +330,10 @@ func parseFlags(s *startupState) {
 	s.backupEncrypt = flag.Bool("encrypt", false, "Encrypt the --backup tarball with AES-256-GCM (D1.4); requires "+backupPassphraseEnv+" env var. Lose the passphrase, lose the backup.")
 	s.restoreIn = flag.String("restore", "", "Validate a backup tarball and print restore plan (dry-run; D1.3b.1)")
 	s.restoreMode = flag.String("mode", "", "Restore mode: full | trust-root-only | state-only (D1.3b.2a; default: full)")
-	s.restoreConfirm = flag.Bool("confirm", false, "Commit the restore destructively (D1.3b.2b). Without --confirm, --restore is a dry-run.")
+	s.restoreConfirm = &confirmFlag{}
+	flag.Var(s.restoreConfirm, "confirm", "Commit the restore destructively (D1.3b.2b) or the leftover cleanup; for --prepare-downgrade, --confirm <word> carries the Tier-3 confirmation word printed by the dry-run. Without --confirm every one of these is a dry-run.")
+	s.prepareDowngrade = flag.Bool("prepare-downgrade", false, "Rewrite admin_settings.json for the frozen predecessor binary (unseals parent-proxy credentials into the legacy list, removes upstream_proxies_v2) and exit; dry-run unless --confirm <word> (2F-D)")
+	s.downgradeTargetSchema = flag.Int("target-schema", 0, "Target admin-settings schema for --prepare-downgrade (only the frozen predecessor's schema is supported) (2F-D)")
 	s.restoreAcceptDPReenroll = flag.Bool("accept-dp-reenrollment", false, "Acknowledge that restoring will require enrolled DPs to re-enroll (D1.3b.2a/b)")
 	s.restoreAllowCounterRB = flag.Bool("allow-counter-rollback", false, "Acknowledge that restoring will roll back TOTP counters for some users (D1.3b.2a/b)")
 	s.listLeftovers = flag.Bool("list-restore-leftovers", false, "List restore leftover .bak/.staging dirs (siblings of dataDir) and exit (D1.3c)")
@@ -346,6 +379,14 @@ func handleOneShotCommands(s *startupState) {
 		}
 		os.Exit(0)
 	}
+	// ── One-shot: prepare-downgrade (2F-D, C10) — dry-run unless --confirm <word> ──
+	if *s.prepareDowngrade {
+		if err := runPrepareDowngradeCommand(s, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Prepare-downgrade error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	// ── One-shot: restore (D1.3b.1 dry-run + D1.3b.2a analyzer + D1.3b.2b commit) ─
 	//nolint:nestif // Same one-shot dispatch shape as --reset-password
 	// and --backup; flattening into helpers would scatter the dry-run
@@ -363,7 +404,7 @@ func handleOneShotCommands(s *startupState) {
 			AllowCounterRollback: *s.restoreAllowCounterRB,
 			BackupPassphrase:     os.Getenv(backupPassphraseEnv),
 		}
-		if *s.restoreConfirm {
+		if s.restoreConfirm.Bool() {
 			if err := runRestoreCommit(*s.restoreIn, dataDir, passphrase, opts); err != nil {
 				fmt.Fprintf(os.Stderr, "Restore commit error: %v\n", err)
 				os.Exit(1)
@@ -409,7 +450,7 @@ func handleOneShotCommands(s *startupState) {
 		}
 		usersPath := *s.uiUsersFile
 		if usersPath == "" {
-			usersPath = "/data/ui_users.json"
+			usersPath = filepath.Join(dataDir, "ui_users.json")
 		}
 		cfg.SetUIUsersFile(usersPath)
 		_ = cfg.LoadUIUsersFile() // may not exist yet, that's fine
@@ -472,7 +513,7 @@ func runCleanupCommand(s *startupState) error {
 		return fmt.Errorf("--keep-last must be >= 0")
 	}
 	return runCleanupLeftovers(dataDir, cleanupOpts{
-		Confirm:   *s.restoreConfirm,
+		Confirm:   s.restoreConfirm.Bool(),
 		OlderThan: older,
 		KeepLast:  *s.cleanupKeepLast,
 	})
@@ -520,6 +561,9 @@ func loadFileConfigAndFlags(s *startupState) {
 	// 8080 too). Must run before any of the three listeners bind, so a
 	// collision fails fast here instead of deep into startup with a bare
 	// OS-level "listen tcp :N: bind: address already in use".
+	if err := validatePortRanges(s.pPort, s.uPort, s.socks5PortVal); err != nil {
+		log.Fatalf("Invalid port configuration: %v", err)
+	}
 	if err := validatePortCollisions(s.pPort, s.uPort, s.socks5PortVal); err != nil {
 		log.Fatalf("Invalid port configuration: %v", err)
 	}
@@ -770,7 +814,7 @@ func initLogStore(s *startupState) {
 // Behaviour is unchanged — loader errors are logged (non-fatal) so
 // startup continues with in-memory defaults, matching the original body.
 func initFileBlocking(s *startupState) {
-	if err := loadFileBlocking(resolveFileBlockStartupConfig(s.fc, *s.fileProfilesFile)); err != nil {
+	if err := loadFileBlocking(resolveFileBlockStartupConfig(s.fc, *s.fileProfilesFile, dataDir)); err != nil {
 		logger.Printf("FileProfiles: load error (%v) — using in-memory defaults", err)
 	}
 }
@@ -832,7 +876,7 @@ func initCDR(s *startupState) {
 		log.Fatalf("Invalid -cdr-fail-mode %q: must be \"open\" or \"closed\"", fm)
 	}
 	loadCDR(
-		resolveCDRStartupConfig(s.fc, cdrCLIFlags{
+		resolveCDRStartupConfig(s.fc, dataDir, cdrCLIFlags{
 			Enabled:     *s.cdrEnabledFlag,
 			Endpoint:    *s.cdrEndpointFlag,
 			FailMode:    *s.cdrFailModeFlag,
@@ -1046,12 +1090,89 @@ func runProxyUntilShutdown(s *startupState, proxySrv *http.Server, quit chan os.
 	<-quit
 	logger.Println("Shutting down gracefully…")
 
+	// CHAOS-56: arm the escalation path BEFORE the sequence starts. Until
+	// now signal.Notify had taken SIGINT/SIGTERM away from the Go runtime's
+	// default terminate behaviour and nothing read `quit` again, so a second
+	// signal — an impatient operator's Ctrl-C, an orchestrator escalating —
+	// landed in the channel buffer and did nothing at all. The only way to
+	// end a stalled shutdown was SIGKILL, which is exactly the outcome the
+	// escalation is trying to avoid.
+	stopEscalation := armShutdownEscalation(quit, os.Exit)
+	defer stopEscalation()
+
 	var early, late shutdownRegistry
 	registerEarlyShutdownHooks(&early, s)
 	registerLateShutdownHooks(&late, s, proxySrv)
-	runShutdownSequence(&early, &late, 30*time.Second)
+	runShutdownSequence(&early, &late, defaultShutdownBudget)
 
+	// Disarm as soon as the sequence is done, not at function exit: a stray
+	// signal arriving in the gap would otherwise turn a shutdown that
+	// COMPLETED into exit status 1. stop is idempotent, so the defer above
+	// stays as the backstop for the paths that do not reach here.
+	stopEscalation()
+
+	// NOTE: the log sink is closed by the last flush hook, so this line
+	// reaches stderr/stdout only if the process log has not been redirected
+	// to a file-backed sink. The operator-visible completion record is the
+	// "flushing durable state…" line runShutdownSequence emits BEFORE the
+	// flush phase.
 	logger.Println("Stopped.")
+}
+
+// armShutdownEscalation watches for a SECOND shutdown signal while the
+// shutdown sequence runs and exits the process immediately when one arrives,
+// flushing the process log first so the reason survives. Returns a function
+// that stops the watcher.
+//
+// `exit` is injected so the escalation contract is testable without killing
+// the test binary. CHAOS-56.
+//
+// A second signal is an explicit operator instruction to stop waiting, so it
+// is honoured immediately rather than shortening a budget: the flush hooks
+// that have already run are on disk, and the ones that have not are exactly
+// what the operator has decided not to wait for. Exit code 1 (not 0) because
+// the shutdown did not complete — an orchestrator reading the exit status
+// must not record a forced teardown as a clean stop.
+func armShutdownEscalation(quit <-chan os.Signal, exit func(int)) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+		case sig := <-quit:
+			if !shouldEscalate(done) {
+				return
+			}
+			logger.Printf("Second %v during shutdown — exiting immediately; in-flight tunnels and unflushed state are dropped", sig)
+			flushLogSink()
+			exit(1)
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
+}
+
+// shouldEscalate reports whether a signal just received on the quit channel
+// should force an exit, given the escalation's disarm channel. False once the
+// escalation has been disarmed.
+//
+// This exists as its own function because the case it guards is one Go makes
+// NON-DETERMINISTIC: when the disarm and a second signal become ready at the
+// same moment, the watcher's select picks uniformly between them, so half the
+// time it took the signal branch and reported a shutdown that had COMPLETED as
+// exit status 1 (Codex P2 on this PR). Re-checking the disarm makes
+// "disarmed first" win every time.
+//
+// A gate that raced the scheduler to reproduce the tie could only ever be
+// probabilistic, and this repo's rule is that a gate which can flake gets muted
+// (see CHAOS-54's rejected scaling gates). Splitting the decision out makes it
+// pin deterministically instead.
+func shouldEscalate(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
 }
 
 // seedYARARules copies bundled starter rules from /app/yara to the target
@@ -1106,6 +1227,40 @@ func firstNonZero(vals ...int) int {
 		}
 	}
 	return 0
+}
+
+// validatePortRanges checks the three RESOLVED listener ports (proxy, admin
+// UI, SOCKS5 — already merged through firstNonZero(CLI, config.yaml,
+// default)) fall within the valid TCP port range 1-65535.
+// config.yaml's proxy.port/ui_port/socks5_port are range-checked by
+// FileConfig.validateLimits, but that check runs on the raw YAML fields
+// BEFORE CLI-flag overrides are merged in loadFileConfigAndFlags — a value
+// that reaches this function only via a CLI flag never passes through
+// validateLimits at all, and previously flowed straight to
+// http.Server{Addr: fmt.Sprintf(":%d", port)} unchecked, surfacing only as
+// a bare ListenAndServe error well into startup (after the admin UI is
+// already listening). Checking here, on the resolved values, closes that
+// gap for both the YAML and CLI paths identically — mirrors
+// validatePortCollisions's resolved-value approach and SOCKS5-disabled
+// exemption.
+func validatePortRanges(proxyPort, uiPort, socks5Port int) error {
+	named := []struct {
+		name string
+		port int
+	}{
+		{"proxy port", proxyPort},
+		{"UI port", uiPort},
+		{"SOCKS5 port", socks5Port},
+	}
+	for _, n := range named {
+		if n.port == 0 {
+			continue
+		}
+		if n.port < 1 || n.port > 65535 {
+			return fmt.Errorf("%s must be 1-65535, got %d", n.name, n.port)
+		}
+	}
+	return nil
 }
 
 // validatePortCollisions checks the three RESOLVED listener ports (proxy,
@@ -1262,9 +1417,13 @@ func applyHotReload(fc *FileConfig) {
 		logger.Printf("Reload: IP filter mode %s", fc.Security.IPFilterMode)
 	}
 
-	// Rewrite rules
+	// Rewrite rules — published under the settings writer domain (2D-C §25)
+	// so a reload cannot interleave with an interactive rewrite mutation's
+	// read→persist→publish critical section. YAML rules have no stable IDs;
+	// identities are minted at publication and become durable at the next
+	// ordinary settings save (the documented YAML-seed posture).
 	if len(fc.Rewrite) > 0 {
-		rewriter.SetRules(fc.Rewrite)
+		publishRewriteRules(fc.Rewrite)
 		logger.Printf("Reload: rewrite %d rules", len(fc.Rewrite))
 	}
 
@@ -1273,7 +1432,12 @@ func applyHotReload(fc *FileConfig) {
 	// shared with the startup slice (resolveUpstreamPoolStartupConfig).
 	if len(fc.Upstream.Proxies) > 0 {
 		ucfg := resolveUpstreamPoolStartupConfig(fc)
-		upstreamPool.Configure(ucfg.Proxies, ucfg.CBThreshold, ucfg.CBTimeout)
+		if err := upstreamPool.Configure(ucfg.Proxies, ucfg.CBThreshold, ucfg.CBTimeout); err != nil {
+			logger.Printf("ERROR: Reload: upstream YAML proxies rejected (pool unchanged): %v", err)
+			upstreamNoteYAMLDegraded(err)
+		} else {
+			upstreamClearYAMLDegraded()
+		}
 		applyUpstreamProxy()
 		logger.Printf("Reload: upstream %s", formatUpstreamSummary(ucfg.Proxies))
 	}

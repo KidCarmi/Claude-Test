@@ -217,9 +217,39 @@ func (s *Spool) replaySegmentRecordsLocked(seg *segState, buf []byte, chain [32]
 		if verr != nil {
 			return nil, chain, spWrap(mcperr.ReasonEventSpoolCorrupt, "record verify", verr)
 		}
+		// The schema version is read FIRST, leniently, from the authenticated
+		// plaintext. Both checks below — the strict decode and the intrinsic digest —
+		// structurally cannot pass on a record written by a newer build, so leaving
+		// the version check after them made a version rollback report as spool
+		// corruption and abort recovery, which is the alarm reserved for tampering and
+		// disk damage. An unsupported version is now refused AS a schema fault, which
+		// is what the paragraph below already claimed and could not deliver.
+		if v, ok := peekSchemaVersion(pt); ok && !model.SupportedSchemaVersion(v) {
+			return nil, chain, spErr(mcperr.ReasonEventSchemaVersion, "record unknown schema version")
+		}
 		var e model.Event
 		if uerr := unmarshalEvent(pt, &e); uerr != nil || !e.VerifyDigest() {
 			return nil, chain, spErr(mcperr.ReasonEventSpoolCorrupt, "record event invalid")
+		}
+		// v1/v2 reader contract (SHADOW-EVIDENCE-ROUTING-1 §4/§8). A digest-valid record
+		// must still carry a SUPPORTED schema version — an unknown version is rejected as
+		// such (fail closed), never partially interpreted — and its Shadow sub-facts, if
+		// any, must be consistent (complete evidence on a v2 event, no shadow evidence on a
+		// v1 event, valid enums, no impossible combination). Recovery never repairs
+		// malformed evidence into valid evidence.
+		// Retained as defence in depth behind the pre-decode peek above: the peek is
+		// lenient, so this is the check that runs against the DECODED value.
+		if !model.SupportedSchemaVersion(e.SchemaVersion) {
+			return nil, chain, spErr(mcperr.ReasonEventSchemaVersion, "record unknown schema version")
+		}
+		if serr := e.ValidateShadowEvidence(); serr != nil {
+			return nil, chain, spWrap(mcperr.ReasonEventSpoolCorrupt, "record shadow evidence invalid", serr)
+		}
+		// The attempt-evidence sibling of the shadow check: a record whose stamped
+		// version disagrees with the evidence it carries is a schema fault, not a
+		// record to be accepted into recovery.
+		if verr := e.ValidateEvidenceSchema(); verr != nil {
+			return nil, chain, spWrap(mcperr.ReasonEventSchemaVersion, "record evidence schema invalid", verr)
 		}
 		chain = next
 		seg.records++

@@ -112,7 +112,19 @@ func TestChaos55_ResumeDuringBackendOutage_RegainsWriteAuthority(t *testing.T) {
 	// etcd comes back. No operator, no restart.
 	o.down.Store(false)
 
-	if !haWaitFor(20*time.Second, h.WriteAllowed) {
+	// Wait for the SETTLED state, not just for write authority: the grant is
+	// installed (making WriteAllowed true) a beat before completeLeaseRecovery
+	// collapses the term into the epoch and the loop clears the recovering flag,
+	// so a check landing between the two would read the pre-recovery term (11)
+	// while the epoch already carries the grant — the Term assertion below would
+	// then flake under load. That transient is harmless in production (authority
+	// first, bookkeeping second is the safe direction), but asserting on a
+	// mid-commit snapshot is not a real contract. The recovery loop drops its
+	// channel handle only after the term is written, so !leaseRecoveryActive()
+	// gates on the fully-settled state.
+	if !haWaitFor(20*time.Second, func() bool {
+		return h.WriteAllowed() && !h.leaseRecoveryActive()
+	}) {
 		t.Fatal("HA-7: write authority never returned after the fencing backend recovered — " +
 			"the node is a permanently read-only leader until an operator intervenes")
 	}
@@ -515,10 +527,22 @@ func TestChaos55_LeaseHealthReportsRecovering(t *testing.T) {
 		t.Errorf("lease_recovering = %v, want true — an operator must be able to tell "+
 			"'read-only and working on it' from 'read-only and stuck'", resp["lease_recovering"])
 	}
+	// The GUI's recovery banner (loadHA in static/index.html) needs the attempt
+	// count to say something more useful than "retrying" — both fields must be
+	// present (int64, so they render even at zero) whenever a lease is armed.
+	if _, ok := resp["lease_reacquire_attempts"].(int64); !ok {
+		t.Errorf("lease_reacquire_attempts = %v (%T), want an int64", resp["lease_reacquire_attempts"], resp["lease_reacquire_attempts"])
+	}
+	if _, ok := resp["lease_reacquired_total"].(int64); !ok {
+		t.Errorf("lease_reacquired_total = %v (%T), want an int64", resp["lease_reacquired_total"], resp["lease_reacquired_total"])
+	}
 
 	// Legacy mode carries neither field.
 	legacy := map[string]any{}
 	addLeaseHealth(legacy, &HAState{})
+	if _, ok := legacy["lease_reacquire_attempts"]; ok {
+		t.Error("legacy mode must not carry lease_reacquire_attempts")
+	}
 	if _, ok := legacy["lease_recovering"]; ok {
 		t.Error("legacy mode must not carry lease_recovering")
 	}

@@ -771,6 +771,63 @@ const (
 	// gone). The decision is stale and must not authorize the call. Appended at the
 	// END of the enum so no existing ordinal moves.
 	ReasonDecisionSnapshotStale
+
+	// ─── tool-trust approval / promotion (ADR-0034) ───
+	// Appended at the END of the enum; every ordinal above is frozen. These name
+	// the ways a tool-trust (catalog Usable promotion) decision is refused. None
+	// carries a token, credential, raw schema/body, or private identity material —
+	// Detail is fixed developer text.
+
+	// ReasonToolNotApprovable — the addressed tool is not in a state a trust grant
+	// can promote (e.g. its server identity changed and it is ServerDisabled, or it
+	// is already the target of a live grant). Fails closed; never promotes.
+	ReasonToolNotApprovable
+	// ReasonToolApprovalStale — the catalog advanced under the decision (a concurrent
+	// ingest won the optimistic CAS), so the exact reviewed target can no longer be
+	// promoted atomically. The caller re-reads and re-decides; nothing is promoted.
+	ReasonToolApprovalStale
+	// ReasonToolFingerprintMismatch — the tool's CURRENT observed fingerprint does
+	// not exactly match the reviewed digest the approval binds to (the rug-pull
+	// guard). A trust decision never authorizes a different fingerprint. Fails closed.
+	ReasonToolFingerprintMismatch
+	// ReasonServerNotUsable — the tool's server is unregistered, disabled, or its
+	// pinned identity no longer verifies, so no tool behind it can be promoted.
+	ReasonServerNotUsable
+	// ReasonToolNotFound — the addressed tool does not exist in the live catalog
+	// within the caller's authorized tenant scope. Uniform not-found.
+	ReasonToolNotFound
+	// ReasonApprovalRevoked — the approval was revoked (terminal). A revoked grant
+	// never re-activates from a later identical discovery; a fresh decision is
+	// required. Rejected.
+	ReasonApprovalRevoked
+	// ReasonApprovalTenantConflict — the approval's tenant does not match the target
+	// server's ownership scope, or a cross-tenant approval action was attempted.
+	// Fails closed; no cross-tenant existence is revealed.
+	ReasonApprovalTenantConflict
+	// ReasonApprovalPurposeUnsupported — an approval purpose that is not issuable in
+	// this build was requested (only shadow_evaluation is issuable; live_execution is
+	// refused at issue). The live-execution firewall's negative half. Fails closed.
+	ReasonApprovalPurposeUnsupported
+	// ReasonApprovalNotAuthorized — the actor is not authorized for the requested
+	// trust operation (role, scope, or an empty/over-bound actor). Fails closed.
+	ReasonApprovalNotAuthorized
+	// ReasonApprovalStoreUnavailable — the durable approval store could not be written
+	// (a full or read-only disk, an I/O error). The in-memory state is left unchanged and
+	// the unchanged mutation is RETRYABLE once storage recovers, so it maps to 503 (service
+	// unavailable), never 400 — the caller's input was valid. Distinct from
+	// ReasonConfigInvalid, which is reserved for a corrupt/marshal/decode fault.
+	ReasonApprovalStoreUnavailable
+	// ReasonRolloutBudgetExhausted — the Canary blast-radius budget denied a live execution
+	// (whole-Canary total/window/concurrency/rate spent, or a per-identity blast-radius cap
+	// exceeded). No upstream call is made. Distinct from an emergency kill and from a trust
+	// failure so §14 evidence can tell "approved + budget-aborted" apart from the others.
+	ReasonRolloutBudgetExhausted
+	// ReasonLiveTrustRevalidationFailed — the runtime live-execution trust revalidation at the
+	// side-effect boundary found no currently-valid live_execution approval binding the exact
+	// tenant/server/tool/fingerprint (revoked, expired, tool drifted, or never approved). No
+	// upstream call is made. Distinct from ReasonApprovalRequired (a policy-level obligation) so
+	// evidence can tell a runtime trust withdrawal apart from a decision-time approval gap.
+	ReasonLiveTrustRevalidationFailed
 )
 
 // reasonCode maps each Reason to its stable machine string. The strings are part
@@ -999,6 +1056,20 @@ var reasonCode = map[Reason]string{ // #nosec G101 -- stable machine-readable er
 	ReasonUpstreamDiscoveryFailed:      "upstream_discovery_failed",
 	ReasonAmbiguousRequestHeader:       "ambiguous_request_header",
 	ReasonDecisionSnapshotStale:        "decision_snapshot_stale",
+
+	// ─── tool-trust approval / promotion (ADR-0034) ───
+	ReasonToolNotApprovable:           "tool_not_approvable",
+	ReasonToolApprovalStale:           "tool_approval_stale",
+	ReasonToolFingerprintMismatch:     "tool_fingerprint_mismatch",
+	ReasonServerNotUsable:             "server_not_usable",
+	ReasonToolNotFound:                "tool_not_found",
+	ReasonApprovalRevoked:             "approval_revoked",
+	ReasonApprovalTenantConflict:      "approval_tenant_conflict",
+	ReasonApprovalPurposeUnsupported:  "approval_purpose_unsupported",
+	ReasonApprovalNotAuthorized:       "approval_not_authorized",
+	ReasonApprovalStoreUnavailable:    "approval_store_unavailable",
+	ReasonRolloutBudgetExhausted:      "rollout_budget_exhausted",
+	ReasonLiveTrustRevalidationFailed: "live_trust_revalidation_failed",
 }
 
 // Code returns the stable machine string for the reason (e.g. "malformed_json").
@@ -1071,11 +1142,23 @@ func ReasonOf(err error) Reason {
 		if e, ok := err.(*Error); ok {
 			return e.Reason
 		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
+		switch u := err.(type) {
+		case interface{ Unwrap() error }:
+			err = u.Unwrap()
+		case interface{ Unwrap() []error }:
+			// A multi-error tree (e.g. fmt.Errorf with more than one %w verb). errors.As/errors.Is
+			// traverse these; ReasonOf must too, or a bounded reason wrapped alongside another cause
+			// would read as ReasonNone. Return the FIRST bounded reason found across the branches,
+			// mirroring the single-chain "first wrapped reason wins" semantics.
+			for _, branch := range u.Unwrap() {
+				if r := ReasonOf(branch); r != ReasonNone {
+					return r
+				}
+			}
+			return ReasonNone
+		default:
 			return ReasonNone
 		}
-		err = u.Unwrap()
 	}
 	return ReasonNone
 }

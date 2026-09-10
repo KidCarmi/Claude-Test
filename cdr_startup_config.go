@@ -1,5 +1,7 @@
 package main
 
+import "path/filepath"
+
 // cdr_startup_config.go — resolved config for the CDR (Sluice) slice. Pure
 // DTO + a single side-effect-free resolver invoked from the initCDR shim.
 // The CLI flag values are passed IN as a value struct so the resolver stays
@@ -31,13 +33,18 @@ type cdrStartupConfig struct {
 	// registry with path=="" silently no-ops its Save.
 	InstancesPath string
 	PoliciesPath  string
+
+	// EnrollReceiptsPath holds the bounded enrollment recovery receipts
+	// (2E-C R8, cdr_enroll_receipts.go) — non-secret operation identities
+	// that let an unknown-outcome enrollment be resolved after a restart.
+	EnrollReceiptsPath string
 }
 
 // resolveCDRStartupConfig merges CLI flags over the config file (CLI wins,
 // zero values fall through). Pure and deterministic; safe on a zero-value
 // *FileConfig. fc.CDR is a value field, so the merge mutates a copy — never
 // the caller's FileConfig.
-func resolveCDRStartupConfig(fc *FileConfig, flags cdrCLIFlags) cdrStartupConfig {
+func resolveCDRStartupConfig(fc *FileConfig, dataDir string, flags cdrCLIFlags) cdrStartupConfig {
 	cfg := fc.CDR
 	if flags.Enabled {
 		cfg.Enabled = true
@@ -67,8 +74,9 @@ func resolveCDRStartupConfig(fc *FileConfig, flags cdrCLIFlags) cdrStartupConfig
 		cfg.CertsDir = d
 	}
 	return cdrStartupConfig{
-		CDR:           cfg,
-		InstancesPath: "/data/cdr_instances.json",
-		PoliciesPath:  "/data/cdr_policies.json",
+		CDR:                cfg,
+		InstancesPath:      filepath.Join(dataDir, "cdr_instances.json"),
+		PoliciesPath:       filepath.Join(dataDir, "cdr_policies.json"),
+		EnrollReceiptsPath: filepath.Join(dataDir, "cdr_enroll_receipts.json"),
 	}
 }

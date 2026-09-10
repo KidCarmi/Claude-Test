@@ -191,6 +191,23 @@ server disabled, request inspection fail, kill switch active — and asserts bot
 the same canonical pre-side-effect verdict. See §13 for the two deliberately-excluded
 divergences.
 
+**Extended (SR-01/SR-02, `shadow_prediction_parity_test.go`):** the equivalence above is
+directional — an over-permissive prediction is the one that costs a promotion made on
+false evidence, so the wall states it as *Shadow is never more permissive than the
+enforcement it predicts* and closes the two stages the first differential set did not
+reach:
+
+- **Upstream-server eligibility** (listed in the stage list above but unmodelled): the
+  live path refuses an absent or `!Usable()` server record inside `runExecute` with
+  `ReasonUpstreamServerUnusable`, and it is not subsumed by the policy hard override — the
+  policy engine reads server state from the DECISION snapshot while the executor re-reads
+  the LIVE registry, which is exactly why that refusal exists. `decide()` now models it,
+  between the allowance step and credential planning, where live sits it.
+- **Allowance capacity**: `wouldSatisfy` treated any present key as a reusable slot, but
+  `consume` SWEEPS expired session grants before its capacity check, so a request whose own
+  slot is an expired session has it deleted and is then refused if the store is still full.
+  Only a slot that survives that sweep now exempts the request from the gate.
+
 ---
 
 ## 5. Credential architecture for Shadow (task 14)
@@ -299,54 +316,107 @@ materialized credentials · upstream Authorization headers · secrets · raw sen
 request body beyond existing retention policy. Enforced by the existing redaction
 backstop that rejects any event containing secret patterns.
 
-**Current implementation state (this architecture-only increment).** The list above is the
-DESIGN target. Today a shadow evaluation commits a durable record marked by the existing
-`ExecutionState = "shadow_evaluated"` field (a digest-safe value on the current
-`schema_version:1` envelope), and the FULL ShadowDecision — outcome, credential-plan and
-inspection readiness — rides the transient JSON-RPC response body. The
-enforcement-prediction SUB-FACTS are deliberately NOT added as new digest-covered fields on
-v1: doing so would misverify valid shadow events after a binary rollback (a pre-change
-reader drops the unknown fields and recomputes a different `CanonicalBytes` digest — Codex
-P2, PR #1226). Persisting them durably requires a `schema_version:2` envelope with explicit
-v1/v2 recovery, which belongs in the reviewed Shadow-activation slice (execution is disabled
-here, so no shadow event is ever written). Tracked as `SHADOW-EVIDENCE-ROUTING-1`.
+**Current implementation state.** A shadow evaluation now commits the FULL ShadowDecision
+durably on a `schema_version:2` envelope: the typed `Event.Shadow *ShadowEvidence` sub-evidence
+carries outcome, override, credential-plan, and request/response inspection readiness, and the
+raw evaluated action stays in `Decision.Action`. The transient JSON-RPC response and the durable
+record derive from ONE mapping (`execution.shadowEvidence(ShadowDecision)`), so the archive
+reconstructs exactly what the client saw at request time. This closes the
+`SHADOW-EVIDENCE-ROUTING-1` **durable-envelope addendum** (the v2 sub-fact persistence) only. The
+PARENT `SHADOW-EVIDENCE-ROUTING-1` item — routing the pre-dispatch fail-closed signals (an
+inspection `HardFail`, an initial pre-dispatch tool drift) into `shadow_evaluated` evidence
+instead of the runtime's own rejection observation — **REMAINS OPEN, deferred by design** (see
+§13, limitation 3): those two classes are terminally handled before the Shadow provider is
+invoked, so a Shadow-only (`culvert_mcp_shadow_*`) readiness analysis still undercounts them
+(they ARE recorded, in a different evidence shape) until the executor-arming slice routes them.
+
+The v2 envelope is ADDITIVE and stamped ONLY on shadow events — every non-shadow event stays v1
+with a byte-identical canonical digest (golden-vector proven), so no historical record is
+rewritten. A v2-capable build reads v1 and v2; a pre-v2 build refuses a v2 event (its decoder
+rejects the unknown `shadow` field — fail closed, never a partial v1 interpretation), which is
+the documented downgrade posture (rolling back across persisted v2 evidence is an operator
+procedure, not a silent downgrade). `Validate` fails closed on unknown enums and the
+architecturally impossible combinations (materialization/response-inspection are always
+`not_evaluated`; `would_execute` is unreachable through a failing request inspection); recovery
+re-checks the schema and shadow consistency as defense-in-depth over Commit-time validation and
+the AEAD record chain.
 
 Evidence is durable **before** Shadow reports success, consistent with the existing
 critical-commit-before-response ordering.
 
 ---
 
-## 10. Kill switch at the boundary — HARD CANARY PREREQUISITE (task 12, PREREQ-MCP-KILL-1)
+## 10. Kill switch at the boundary — HARD CANARY PREREQUISITE · CLOSED (task 12, PREREQ-MCP-KILL-1)
 
-The kill switch is checked once at the top of `Executor.Execute` but **not re-checked at
-the irreversible boundary** (`run.go` `callUpstream`). Between admission and the boundary
-the executor performs a durable decision commit, credential planning and credential
-materialization — all of which can block — so a kill engaged during that window does NOT
-stop an in-flight live call today. The existing OVN-09 tool-drift re-check sits exactly at
-the boundary (`callUpstream` re-invokes `ToolStillCurrent`); the kill re-check does not yet
-join it.
+> **CLOSED 2026-08-29.** The authoritative emergency-kill state is now revalidated at the ONE
+> irreversible boundary (`run.go` `callUpstream`), immediately before `Upstream.Call`, on both
+> the credential and no-credential paths, with NOTHING between the final check and the call. A
+> kill engaged anywhere in the admission→boundary window (durable commit, credential planning,
+> materialization, or the final tool-freshness check) aborts the call: `up.calls == 0`, block
+> reason `rollout_emergency_active`, `Executed == false`.
 
-> **Prerequisite (blocking).** **Canary/Production activation is PROHIBITED until the
-> authoritative kill state is revalidated immediately before the irreversible side-effect
-> boundary.** A kill engaged during credential planning or materialization MUST abort the
-> upstream call (`up.calls == 0`), landing as `WOULD_BLOCK` / block reason
-> `rollout_emergency_active`. This is a HARD gate, not a nicety: the kill switch is the
-> operator's only immediate stop, and a stop that a slow commit window can outrun is not a
-> stop.
+**Original gap (for the record).** The kill switch was checked once at the top of
+`Executor.Execute` but not re-checked at the irreversible boundary. Between admission and the
+boundary the executor performs a durable decision commit, credential planning and credential
+materialization — all of which can block — so a kill engaged during that window did not stop
+an in-flight live call. The existing OVN-09 tool-drift re-check already sat exactly at the
+boundary; the kill re-check now joins it.
 
-Scope of the change (deferred; NOT implemented in the Shadow-readiness/Layer-B increment):
-add a `killEpoch` to the boundary re-check alongside the existing tool-drift re-check, so
-the final `callUpstream` re-reads the authoritative execution state before the side effect.
-For Shadow the kill switch already affects the verdict consistently with live at admission
-(a killed capability yields `WOULD_BLOCK` reason `rollout_emergency_active`); the boundary
-re-check matters only for a live-capable mode, which is why it is a Canary prerequisite
-rather than a Shadow one.
+**Design — Model B (monotonic kill generation).** `rollout.State` carries a `killGen` field
+**inside the immutable `activeState` snapshot** (published by the same atomic pointer swap as
+`killed`, so a lock-free reader can never see `killed==true` with the pre-engage generation —
+Codex P1 on PR #1248), incremented exactly once per false→true engage transition (never decremented
+on clear) and read lock-free via `State.KillGeneration()`. `Executor.Execute` captures
+`admKillGen` at admission; `callUpstream` re-reads the generation and, when
+`KillGeneration() != admKillGen`, aborts with the package-private `errKilledAtBoundary` before
+`Upstream.Call`. Model B was chosen over a current-state boolean deliberately: it also refuses
+the **engage→clear (ABA)** window that a boolean re-read at the boundary would miss, because
+any kill that straddled the request advanced the generation. The re-read is an emergency
+monotonic restriction ONLY — it reads solely the kill generation and never re-resolves
+mode/scope/policy/approval, so it preserves F7 single-resolution and can only make the outcome
+more restrictive.
 
-Tracking: `PREREQ-MCP-KILL-1` in `docs/engineering/TECHNICAL-DEBT-REGISTER.md`. The gap is
-pinned non-vacuously by `TestCanaryPrerequisite_KillStateNotRevalidatedAtSideEffectBoundary`
-(`internal/mcp/execution`), which drives the admission→boundary window and asserts the
-current (gap-present) behaviour; closing the prerequisite means inverting that assertion to
-`up.calls == 0` and checking off the §12 exit criterion below.
+**Reason mapping.** `errKilledAtBoundary` is package-private (`ReasonOf == ReasonNone`), so
+each path reclassifies it to `ReasonRolloutEmergencyActive`: the no-credential path when the
+sentinel escapes `CommitThenAct`, the credential path when `materializeAndCall` absorbs it into
+a blocked output (reclassified ahead of the drift reason — an emergency stop is paramount). No
+branch returns `ReasonNone` or a transport/durability fault for a kill refusal, and the block
+is metered as an emergency block with `Executed=false` so evidence never claims an execution.
+
+**Honest scope (§8 of the closure brief).** A kill after admission does NOT unwind credential
+Plan/Materialize work already in flight — provider `Fetch`/materialization can complete — but
+the boundary still guarantees `Upstream.Call == 0`. The invariant is "no irreversible upstream
+side effect", not "no pre-boundary work occurred".
+
+**Accepted residual — the irreducible check-then-act window.** The boundary is lock-free: it
+reads the kill generation and then, a few instructions later, calls `Upstream.Call`. A kill
+engaged strictly *after* that read but before the call is not observed by that request. This
+window is NOT closeable without holding a lock across `Upstream.Call` that `EngageKillSwitch`
+also takes — which is rejected on two grounds: (1) it would place a mutex across a network I/O
+side effect, so a slow or hung upstream would make the operator's emergency kill itself block
+for the duration of an in-flight call, inverting the stop's purpose; and (2) §2 of the closure
+brief forbids inserting any blocking/business logic between the final kill check and the call.
+The stated invariant — the last executable instruction before the side effect honors the
+authoritative kill state *at that instant* — holds; a kill arriving after that instant was not
+yet authoritative when the request committed. The fix shrank the exposure from the entire
+durable-commit + credential-materialization span (blockable, milliseconds to seconds) to this
+handful of instructions, and it is recorded here as an accepted owner-decision residual (the
+same class as the in-flight-materialization note above), not an open defect.
+
+For Shadow the kill switch already affected the verdict consistently with live at admission (a
+killed capability yields `rollout_emergency_active` and never reaches the boundary); the
+boundary re-check matters only for a live-capable mode, which is why this was a Canary
+prerequisite rather than a Shadow one. Its closure does not authorize activation: execution
+posture stays CLOSED (no LiveExecutor composed; AST posture walls green).
+
+Tracking: `PREREQ-MCP-KILL-1` in `docs/engineering/TECHNICAL-DEBT-REGISTER.md` (CLOSED). The
+invariant is pinned non-vacuously by
+`TestCanaryPrerequisite_KillStateRevalidatedAtSideEffectBoundary` (inverted from the former
+`*_KillStateNotRevalidated*`; reaches the real production boundary), the deterministic
+`TestKillBoundary_RaceMatrix` (10 windows incl. ABA + concurrency, channel/barrier ordering,
+no sleeps), `TestKillBoundary_KillBetweenResolveAndExecute`,
+`TestKillBoundary_NoCredentialReasonMapping`, and a 10-defect mutation campaign whose
+mapping is recorded at the head of `internal/mcp/execution/kill_boundary_race_test.go`.
 
 ---
 
@@ -381,15 +451,45 @@ Measurable gates before Canary may even be *reviewed* (rationale, not arbitrary)
 - zero evidence gaps (every evaluation has a durable record).
 - zero stale-decision `WOULD_EXECUTE` (any staleness must land as `WOULD_FAIL_STALE_*`).
 - no unauthorized `WOULD_EXECUTE` (every one maps to an allow-class policy decision).
-- expected denial parity (Shadow `WOULD_BLOCK` set == Observe deny set for the same
-  traffic).
-- stable latency (Shadow p99 within budget; no admission saturation).
+- expected denial parity (driving the same traffic through Observe and Shadow does not
+  ALTER the denial decision — the raw policy action and reason code are identical across
+  modes, and Shadow never softens a non-allow decision into `WOULD_EXECUTE`; each refusal
+  maps to its faithful class outcome, `WOULD_BLOCK` for a policy DENY and
+  `WOULD_FAIL_HARD_CONTROL` for a hard-control denial. Authentication and tenant denials are
+  enforced before the rollout-mode branch and are therefore byte-identical across modes. The
+  mode-specific record shape — `execution_state`, the added `shadow_*` prediction fields, the
+  response envelope — is deliberately NOT part of the parity claim.
+  **Corrected 2026-08-29:** the earlier wording "Shadow `WOULD_BLOCK` set == Observe deny
+  set" was too narrow — a hard-control denial is `WOULD_FAIL_HARD_CONTROL`, not `WOULD_BLOCK`,
+  so a set-equality on `WOULD_BLOCK` alone would demand architecturally-incorrect behavior.
+  Parity is on the DECISION, not on one outcome label.)
+- stable latency (the Shadow-evaluation overhead is within a defined budget; no admission
+  saturation). The budget is expressed as a same-machine, same-run RATIO of the Shadow path
+  to the Observe baseline — both traverse the identical listener/auth/policy/durable-commit
+  path, so the ratio isolates the Shadow-evaluation + evidence overhead — following Culvert's
+  benchgate ratio-gate convention rather than an invented absolute SLA (which would be
+  hardware-dependent and CI-flaky).
 - credential planning reliability (readiness derivable without materialization).
-- kill-switch drills pass (engage → next evaluation is `WOULD_BLOCK`).
-- **`PREREQ-MCP-KILL-1` CLOSED** — the authoritative kill state is revalidated immediately
-  before the irreversible side-effect boundary (`run.go` `callUpstream`), so a kill engaged
-  during credential planning/materialization aborts the call (`up.calls == 0`). This is a
-  HARD blocker: Canary/Production activation is prohibited while this is open (§10).
+- kill-switch drills pass — an engaged kill is honored FAIL-CLOSED at admission, BEFORE any
+  Shadow evaluation: the request returns the deterministic `rollout_emergency_active` error,
+  commits NO `shadow_evaluated` event, and records an evaluation error rather than a `would_*`
+  verdict; clearing the kill restores normal evaluation.
+  **Corrected 2026-08-29 (Invariant A):** the earlier wording "engage → next evaluation is
+  `WOULD_BLOCK`" described an evaluation-path outcome the implementation deliberately does not
+  take, and demanding it would be architecturally WRONG. The kill switch is the operator's
+  immediate admission stop; the live `Executor` and the `ShadowEvaluator` BOTH short-circuit
+  at their `Execute` entry before any evaluation — so Shadow blocking before it evaluates is
+  the stronger, parity-preserving behavior, and fabricating a `shadow_evaluated`/`WOULD_BLOCK`
+  event after admission has already rejected the request would misrepresent what the node did
+  (it did not evaluate). The criterion now measures the real invariant (Option A of the
+  Phase-A brief).
+- **`PREREQ-MCP-KILL-1` CLOSED (2026-08-29)** — the authoritative kill state is revalidated
+  immediately before the irreversible side-effect boundary (`run.go` `callUpstream`), so a
+  kill engaged during credential planning/materialization aborts the call (`up.calls == 0`,
+  reason `rollout_emergency_active`, `Executed=false`) on both the credential and no-credential
+  paths (Model B / monotonic kill generation — see §10). This was a HARD blocker; its closure
+  is required for the Shadow→Canary review to pass but does NOT itself authorize
+  Canary/Production activation (execution posture stays CLOSED — no LiveExecutor composed).
 - restart drills pass (durable evidence survives; no execution replay).
 - observability verified (all series emit; health three-state correct).
 - operator procedure tested (runbook dry-run).
@@ -440,6 +540,16 @@ argument.
      `WOULD_FAIL_STALE_DECISION` is therefore reachable for drift that occurs AFTER the
      entry check (between it and the side-effect boundary — the `ToolStillCurrent`
      re-check), but the initial-drift case is runtime-refused and produces no Shadow event.
+     **Driven end-to-end 2026-08-29 (Shadow Exit criterion 4):** a controlled boundary drift
+     is now injected deterministically in the post-entry / pre-boundary window — the
+     credential-planner callback (one of the real blocking stages this comment names)
+     re-ingests a changed echo fingerprint through the production `catalog.Ingest` path — so
+     the production `ToolStillCurrent` re-check observes it and the evaluator records a
+     `shadow_evaluated` event with `WOULD_FAIL_STALE_DECISION`, with `up.calls == 0`
+     (`TestShadowExitC4_BoundaryDriftYieldsStale`). This does not change the routing of the
+     two runtime-terminal signals below; it exercises the boundary-drift branch that was
+     already reachable, using the real seam at the correct lifecycle point (the outcome is
+     computed by the production evaluator, never fabricated).
 
    Routing these two signals into Shadow evaluation (so a Shadow evaluation records the
    `WOULD_FAIL_*` evidence while enforcing modes keep their fail-closed block) is a

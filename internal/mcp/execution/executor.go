@@ -49,6 +49,18 @@ type Config struct {
 	Clock func() time.Time
 	// Actor labels events emitted by this executor.
 	Actor string
+	// LiveGate is the OPTIONAL composition-layer side-effect gate consulted at the boundary
+	// BEFORE the executor's own tool-freshness + emergency-kill re-check, so the kill re-read
+	// stays the LAST authoritative check before Upstream.Call (PREREQ-MCP-KILL-1). It owns the
+	// gates that live OUTSIDE this package — Canary blast-radius budget reservation, runtime
+	// live-execution trust revalidation, and read-first enforcement. nil ⇒ the executor is
+	// byte-identical to the pre-gate path (the ShadowEvaluator and any non-live composition
+	// never set it). See livegate.go.
+	LiveGate LiveExecutionGate
+	// Safety is the OPTIONAL narrow whole-Canary breach seam (blocker #7). Nil means no Canary is
+	// composed; it is replaced by a no-op so call sites never branch. It is deliberately separate
+	// from Metrics — see safety.go for why observability and control must not share a sink.
+	Safety CanarySafety
 }
 
 // Executor implements runtime.ExecutionProvider. It is the LIVE object: it possesses
@@ -75,6 +87,9 @@ func New(cfg Config) (*Executor, error) {
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = time.Now
+	}
+	if cfg.Safety == nil {
+		cfg.Safety = noopCanarySafety{}
 	}
 	if cfg.Metrics == nil {
 		cfg.Metrics = noopMetrics{}
@@ -113,21 +128,36 @@ func New(cfg Config) (*Executor, error) {
 	return &Executor{cfg: cfg, allowances: allow, shadow: shadow}, nil
 }
 
-// Execute is the runtime.ExecutionProvider entry. It resolves the effective
-// rollout disposition and dispatches record-only / block / execute.
-func (e *Executor) Execute(ctx context.Context, in runtime.ExecInput) runtime.ExecOutput {
-	// A capability-local kill switch stops all admission immediately.
+// Resolve implements runtime.ExecutionProvider: it resolves the effective rollout
+// disposition for this request EXACTLY ONCE (no side effect), so routing and execution
+// use the same snapshot. A killed capability resolves to an emergency block.
+func (e *Executor) Resolve(in runtime.ExecInput) rollout.Resolution {
+	return resolveDisposition(e.cfg.State, in)
+}
+
+// Execute is the runtime.ExecutionProvider entry. It acts on the PRE-RESOLVED mode/scope
+// disposition (it never re-resolves mode or scope — F7 single resolution, Codex P2 #1234)
+// and dispatches record-only / block / execute.
+//
+// It re-reads ONLY the emergency kill: the kill switch is an immediate admission stop, so a
+// kill engaged AFTER Resolve but before the irreversible upstream call must still stop it.
+// This is orthogonal to single-resolution — it reads only the monotonic kill flag and can
+// only make the outcome MORE restrictive (an emergency block), so it cannot reopen the
+// routing TOCTOU F7 closed. Fail-closed here matters most on the LIVE path: it stops an
+// upstream side effect that Resolve had cleared microseconds before the operator hit kill.
+func (e *Executor) Execute(ctx context.Context, in runtime.ExecInput, res rollout.Resolution) runtime.ExecOutput {
+	// Capture the authoritative emergency-kill generation at ADMISSION, before the
+	// admission check, so the irreversible side-effect boundary can detect any emergency
+	// kill engaged while this request is in flight — even one later cleared (Model B /
+	// monotonic epoch, PREREQ-MCP-KILL-1). A kill that races between this capture and the
+	// Killed() check below is caught by that check; one that races after it is caught at the
+	// boundary because the generation will have advanced past admKillGen.
+	admKillGen := e.cfg.State.KillGeneration()
 	if e.cfg.State.Killed() {
 		return e.blocked(in, mcperr.ReasonRolloutEmergencyActive, false)
 	}
 	subj := subjectFor(in)
 	action := mapAction(in.Decision.Action)
-	hardFail, hardReason := hardFailure(in)
-
-	// Resolve optimistically (obligations satisfied) to learn the disposition; only
-	// consume an allowance when we would actually execute (so a failed pre-execution
-	// hard control never consumes it).
-	res := e.cfg.State.ResolveFor(subj, action, hardFail, hardReason, true)
 	e.cfg.Metrics.ObserveResolution(in.Capability.String(), res)
 
 	switch res.Disposition {
@@ -154,11 +184,15 @@ func (e *Executor) Execute(ctx context.Context, in runtime.ExecInput) runtime.Ex
 				return e.blocked(in, mcperr.ReasonAllowanceConsumed, false)
 			}
 		}
-		return e.runExecute(ctx, in, subj, res)
+		return e.runExecute(ctx, in, subj, res, admKillGen)
 	default:
 		return e.blocked(in, mcperr.ReasonRolloutModeInvalid, false)
 	}
 }
+
+// KillActive implements runtime.ExecutionProvider: it reports whether this capability's
+// emergency kill switch is engaged, for the runtime's record-only fall-through re-check.
+func (e *Executor) KillActive() bool { return e.cfg.State.Killed() }
 
 // recordOnly returns the decision-only (observe) result: the true policy action is
 // recorded, no upstream call is made.
@@ -266,4 +300,24 @@ func policyHardReason(d policy.Decision) mcperr.Reason {
 // needsAllowance reports whether the action consumes a per-call/session allowance.
 func needsAllowance(a rollout.ActionKind) bool {
 	return a == rollout.ActionKindAllowOnce || a == rollout.ActionKindAllowSession
+}
+
+// resolveDisposition resolves the effective rollout disposition for a request EXACTLY
+// ONCE — the SINGLE point at which the mutable rollout state is read for this request, so
+// routing (record-only vs not) and execution act on the same snapshot and can never
+// diverge across a concurrent transition (Codex P2, PR #1234). A KILLED capability
+// resolves to an emergency block (never record-only): admission is stopped, so the
+// runtime routes it to Execute, which emits the block, rather than to its inline Observe
+// path. It performs no side effect.
+func resolveDisposition(st *rollout.State, in runtime.ExecInput) rollout.Resolution {
+	action := mapAction(in.Decision.Action)
+	if st.Killed() {
+		return rollout.Resolution{
+			Disposition: rollout.EffectBlock, BlockReason: mcperr.ReasonRolloutEmergencyActive,
+			EvaluatedAction: action, EffectiveAction: action,
+		}
+	}
+	subj := subjectFor(in)
+	hardFail, hardReason := hardFailure(in)
+	return st.ResolveFor(subj, action, hardFail, hardReason, true)
 }

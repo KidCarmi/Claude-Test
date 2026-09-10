@@ -123,13 +123,13 @@ func TestShadow_LivePreSideEffectEquivalence(t *testing.T) {
 			},
 		},
 		{
-			// Codex P2: a profile is named but NO broker/planner is composed. The live
-			// executor gates materialization on `Broker != nil` and otherwise attaches no
-			// Authorization and PROCEEDS — so Shadow must predict WOULD_EXECUTE too, not
-			// fail closed. Live: newExec builds the Executor with a nil Broker; Shadow:
-			// planner nil.
-			name: "credential_no_broker_executes",
-			want: cExecute,
+			// Codex P2 round-6: a profile is named but NO broker/planner is composed. The live
+			// executor now FAILS CLOSED (a credential is required but cannot be planned/materialized,
+			// so reaching the upstream with no Authorization would bypass the required credential
+			// path) — and Shadow must predict WOULD_FAIL_CREDENTIAL_READINESS to stay equivalent.
+			// Live: newExec builds the Executor with a nil Broker; Shadow: planner nil.
+			name: "credential_no_broker_fails_closed",
+			want: cFailCredential,
 			setup: func(t *testing.T) (runtime.ExecInput, *Executor, *ShadowEvaluator, *fakeUpstream) {
 				in := execInput(policy.ActionAllow, false)
 				in.Decision.Obligations.CredentialProfile = "prof-x"
@@ -220,8 +220,8 @@ func TestShadow_LivePreSideEffectEquivalence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			in, live, shadow, up := tc.setup(t)
 
-			liveOut := live.Execute(context.Background(), in)
-			shadowOut := shadow.Execute(context.Background(), in)
+			liveOut := runExec(live, context.Background(), in)
+			shadowOut := runExec(shadow, context.Background(), in)
 
 			// The Shadow evaluator must NEVER execute or touch upstream, ever.
 			if shadowOut.Executed {
@@ -267,7 +267,7 @@ func TestShadow_PreservesPolicyVerdictSeparately(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.wantAction, func(t *testing.T) {
 			shadow := shadowEval(t, nil)
-			out := shadow.Execute(context.Background(), execInput(tc.action, false))
+			out := runExec(shadow, context.Background(), execInput(tc.action, false))
 			if out.Executed {
 				t.Fatal("shadow must never execute")
 			}

@@ -22,6 +22,7 @@
 | DEBT-011 | 🟡 PARTIAL | MCP has no anti-drift wall: designed-and-documented controls that the request path never invokes | Two walls landed 2026-08-24/25 — `internal/mcp/runtime/limits_ownership_test.go` (every Limits bound must DECLARE an enforcement owner; type-aware via go/types, so a same-named accessor on a different type cannot satisfy a row) and `mcp_execution_posture_test.go` (the disabled-execution posture is three ABSENCES no unit test observes; now executable facts). `internal/mcpacceptance/criterion_ids_test.go` applies the same idea to acceptance criterion ids in both directions. The class is NOT fully walled: policy fields, event fields and inspection controls have no equivalent ownership registry yet. |
 | DEBT-012 | ✅ CLOSED | Five `runtime.Limits` knobs remain validated-but-unenforced at the MCP runtime layer | RESOLVED 2026-08-24: every bound now carries a declared enforcement status — `enforcedHere`, `delegated` (with the owning control named) or `reserved` (with a linked decision). `AdmissionBudget`, `MaxObservations` and `CleanupPerOp` are recorded as `reserved`, and the wall fails the build if a reserved bound is ever silently read, so none can quietly become load-bearing. `AdmissionBudget` remains tied to the still-open RISK-026. |
 | DEBT-013 | 🟡 PARTIAL | MCP registry existence still leaks to an authenticated-shaped caller; upstream `MaxConnsPerServer` is per-call | Enumeration half CLOSED 2026-08-24 (OVN-08): `resolveServer` no longer consults the registry, so server identity is resolved only AFTER authentication and an invalid credential can no longer distinguish a known from an unknown server id. The per-call transport half stands and is now a recorded trade-off rather than an oversight — a per-call `http.Transport` is what makes cross-server connection, TLS-identity and credential inheritance structurally impossible, at the cost of a TLS handshake per call. Revisit only with a per-server transport whose isolation is proven. |
+| DEBT-014 | MEDIUM | Documentation-governance program produces correct, low-risk, CI-green fixes that pile up unmerged — later runs then independently rediscover and re-fix the same defect | 11 days (2026-08-25 → 2026-09-05), 10 open `docs(governance)`/`docs:` PRs; one finding (T-48, ADR-0034 numbering collision) fixed independently 5 times across #1253/#1284/#1294/#1302/#1309 |
 
 ---
 
@@ -298,32 +299,154 @@
 - **Interest:** (a) bounded information disclosure; (b) a TLS handshake per upstream tool call
   once execution is armed.
 
-## PREREQ-MCP-KILL-1 — MCP kill switch not revalidated at the side-effect boundary · HARD CANARY PREREQUISITE (2026-08-25)
-- **Principal:** `Executor.Execute` checks `State.Killed()` once at admission, but the
-  irreversible boundary (`run.go` `callUpstream`) does NOT re-read the authoritative kill
+## PREREQ-MCP-KILL-1 — MCP kill switch not revalidated at the side-effect boundary · HARD CANARY PREREQUISITE · CLOSED (2026-08-25, closed 2026-08-29)
+- **Principal (as filed):** `Executor.Execute` checked `State.Killed()` once at admission, but
+  the irreversible boundary (`run.go` `callUpstream`) did NOT re-read the authoritative kill
   state before the upstream side effect. Between admission and the boundary the executor
   performs a durable decision commit, credential planning and credential materialization —
-  all of which can block — so an emergency kill engaged during that window does not abort an
-  in-flight live call. The OVN-09 tool-drift re-check already sits at that boundary; the kill
-  re-check does not yet join it.
-- **Status:** OPEN. This is a **blocking prerequisite**, not an ordinary debt item.
-  **Canary/Production activation is PROHIBITED until the authoritative kill state is
-  revalidated immediately before the irreversible side-effect boundary** (a kill during
-  planning/materialization must yield `up.calls == 0`, block reason
-  `rollout_emergency_active`). Compensating control today: no production executor is composed
-  (arming hooks uncalled; AST posture wall), so the window is unreachable in production — but
-  the prerequisite must be CLOSED before any live-capable mode is armed.
+  all of which can block — so an emergency kill engaged during that window did not abort an
+  in-flight live call. The OVN-09 tool-drift re-check already sat at that boundary; the kill
+  re-check did not yet join it.
+- **Status:** **CLOSED (2026-08-29).** The authoritative emergency-kill state is now
+  revalidated at the ONE irreversible boundary (`run.go` `callUpstream`, shared by the
+  credential and no-credential paths) immediately before `Upstream.Call`, with NOTHING between
+  the final check and the call.
+- **Resolution — Model B (monotonic epoch):** `rollout.State` carries a `killGen` field inside
+  the immutable `activeState` snapshot — published by the SAME atomic pointer swap as `killed`
+  (so no split-publication window; Codex P1 on PR #1248) — incremented exactly once per
+  false→true engage transition (never on clear), read lock-free via `State.KillGeneration()`. `Executor.Execute` captures `admKillGen` at
+  admission; `callUpstream` re-reads the generation and aborts with the package-private
+  `errKilledAtBoundary` when `KillGeneration() != admKillGen`. Model B was chosen over a
+  current-state boolean specifically to also refuse the engage→clear (ABA) window that a
+  boolean re-read would miss: any kill that straddled the request advanced the generation and
+  is therefore caught even if already cleared by the time the boundary is reached. The re-read
+  is an emergency monotonic restriction only — it reads solely the kill generation and never
+  re-resolves mode/scope/policy/approval, so it cannot reopen the F7 single-resolution TOCTOU.
+- **Reason mapping (both branches):** a boundary kill maps to `ReasonRolloutEmergencyActive`
+  on the no-credential path (the sentinel escapes `CommitThenAct` and is reclassified) and on
+  the credential path (the sentinel is absorbed by `materializeAndCall` into a blocked output
+  and reclassified in the `didBlock` branch, ahead of the drift reclassification — an
+  emergency stop is the paramount reason). No branch returns `ReasonNone` or a
+  transport/durability fault for a kill refusal. `Executed` stays false and the block is
+  metered as an emergency block, so operator evidence never claims an upstream execution
+  occurred.
+- **Honest credential-path note (§8):** a kill engaged after admission does NOT unwind
+  credential Plan/Materialize work already in flight — provider `Fetch`/materialization can
+  complete — but the boundary refusal still guarantees `Upstream.Call == 0`. The invariant is
+  "no irreversible upstream side effect", not "no pre-boundary work occurred".
+- **Accepted residual — irreducible check-then-act window:** the boundary is lock-free, so a
+  kill engaged strictly between the final `KillGeneration()` read and `Upstream.Call` (a
+  handful of instructions) is not observed by that request. Closing it fully would require a
+  lock held across `Upstream.Call` — placing a mutex across network I/O so a hung upstream
+  blocks the operator's emergency kill (inverting the stop), and violating §2's "nothing
+  between the final check and the call". Recorded as an accepted owner-decision residual; the
+  fix shrank the exposure from the whole commit + materialization span to instruction-level.
 - **Interest:** the kill switch is the operator's only immediate stop; a stop that a slow
-  commit/materialize window can outrun is not a stop. Purely a live-mode concern — Shadow
-  already reflects the kill at admission (`WOULD_BLOCK` / `rollout_emergency_active`) and never
-  reaches the boundary.
-- **Fix:** add a `killEpoch` re-read to `callUpstream` alongside the tool-drift re-check; on a
-  kill, abort before `Upstream.Call` and return the emergency block. Then invert
-  `TestCanaryPrerequisite_KillStateNotRevalidatedAtSideEffectBoundary`
-  (`internal/mcp/execution`) to assert `up.calls == 0` and check off the §12 exit criterion in
-  `docs/design/mcp/SHADOW-ARCHITECTURE.md`.
+  commit/materialize window can outrun is not a stop.
+- **Compensating control unchanged:** execution posture stays CLOSED — no production
+  LiveExecutor is composed, arming hooks remain uncalled, and the AST posture walls stay
+  green. This closes the prerequisite; it does NOT authorize Canary/Production activation.
 - **Evidence:** `docs/design/mcp/SHADOW-ARCHITECTURE.md` §10 (PREREQ-MCP-KILL-1) + §12 exit
-  criteria; non-vacuous gate `TestCanaryPrerequisite_KillStateNotRevalidatedAtSideEffectBoundary`.
+  criterion 13. Permanent non-vacuous gate
+  `TestCanaryPrerequisite_KillStateRevalidatedAtSideEffectBoundary` (inverted from the former
+  `*_KillStateNotRevalidated*`; reaches the real production boundary). Deterministic race
+  matrix `TestKillBoundary_RaceMatrix` (10 windows incl. ABA + concurrency, channel/barrier
+  ordering, no sleeps), `TestKillBoundary_KillBetweenResolveAndExecute`,
+  `TestKillBoundary_NoCredentialReasonMapping`, `TestKillBoundary_CleanRequestStillExecutes`
+  (control), all under `-race`. Mutation campaign of 10 defects, each mechanically
+  re-introduced and confirmed to fail its named guard (mapping recorded at the head of
+  `internal/mcp/execution/kill_boundary_race_test.go`).
+
+## CANARY-ACTIVATION-PREREQS — Machine-verifiable prerequisites before the first real MCP upstream execution · OPEN, DORMANT (2026-08-29)
+- **Principal:** Canary is the first phase where Culvert causes a real, irreversible MCP upstream
+  side effect. ADR-0035 defines the machine-verifiable readiness contract (`internal/mcp/canary`)
+  and a dormant activation preflight (`mcp_canary_preflight.go`); Canary is **architecturally
+  defined but not activatable**. The remaining prerequisites are each a **separately-reviewed
+  activation**, never a config change, and until they land the system stays fail-closed.
+- **Status:** OPEN (by design — this is the prerequisite ledger, not a defect). Every row below
+  is a HARD gate a future Canary-arming activation must satisfy with executable evidence; "code
+  basically supports it" does not close a row.
+- **Prerequisite ledger (each must become machine-attested before the first Canary):**
+  1. **Arm the live tier** — compose a live `execution.Executor` + bounded `UpstreamCaller` +
+     materialize-broker + inspection and call `markGatewayExecDepsReady`. Blocked today by the
+     execution-posture wall (`mcp_execution_posture_test.go`); arming EDITS that wall.
+     Machine-signal: `live_executor_absent` / `upstream_caller_absent` /
+     `credential_path_not_ready` / `kill_boundary_guard_absent` / `tool_freshness_guard_absent`
+     clear.
+  2. ~~**Make `live_execution` issuable** under stronger governance (four-eyes distinct
+     requester+approver, ≤24h TTL, exact target).~~ **DONE** (Live Execution Trust slice,
+     2026-09). `tooltrust.Purpose.Issuable()` now admits `live_execution`, issued ONLY through the
+     dedicated governed path (`RequestLiveApproval`/`ApproveLive`, `store.validateLiveApproveLocked`)
+     that enforces four-eyes on the canonical authenticated principal, a mandatory finite TTL ≤ 24h
+     (single authority `tooltrust.MaxLiveExecutionApprovalTTL`), exact-current-state at approval,
+     route isolation (shadow↔live cannot cross), and no `catalog.Usable` promotion. Wired into the
+     real preflight via `buildLiveApprovalBindings` in `productionCanaryActivationInputs`, so
+     readiness row 16 (`live_execution_approval_invalid`) is now **satisfiable, not auto-satisfied**.
+     This is a TRUST decision only — it arms no executor and cannot clear `live_executor_absent`
+     (item 1), pinned by `TestLiveTrust_NoActivationCoupling` and the execution-posture wall. See
+     ADR-0034 Addendum 2026-09.
+  3. **Bounded read-first scope** at activation (`canary.ValidateScope` → `ScopeOK`): enumerable,
+     ≤1 server / ≤2 tools / ≤2 principals, exact fingerprints, ≥1 EXACT principal with groups
+     forbidden, read/discovery only. Read-first is TWO gates: the scope axis (`ScopeReadFirst`
+     over `rollout.RiskClass`) is necessary but not sufficient — `mapRisk` folds `OpControl` into
+     `RiskRead`, so a live executor must ALSO enforce `canary.IsReadFirstOperation` per request
+     (OpRead/OpDiscovery only). Additionally, EVERY scoped tool needs its OWN live approval bound
+     to that exact tool+fingerprint (`canary.ValidateScopeApprovals`) — no single unconstrained
+     approval authorizes a multi-tool scope.
+  4. **Blast-radius budget** at activation (`canary.ValidateBudget` → `BudgetOK`) enforced at
+     runtime (total/rate/concurrency/window). The runtime ENFORCEMENT is a live-tier concern.
+     Durable-event readiness is a real HEALTH check, not presence: `durableEventsHealthy`
+     requires the capability domain's critical state to be "normal" (a degraded plane fails
+     `durable_events_degraded`).
+  5. **Shadow-Exit attestation surface** (`shadowExitReviewAttested` returns false today).
+  6. **Wire the preflight as the primary activation gate** and the abort taxonomy
+     (`canary.AbortConditions`) into runtime detectors.
+  7. **Real rollback-rehearsal attestation** (Codex P2, PR #1249): `RollbackPathHealthy` today
+     reads the `RollbackRehearsed` marker, which the admin `POST /api/mcp/rollout/rehearse`
+     (`recordRehearsal`) sets WITHOUT executing an actual Canary→Shadow/Observe demotion — a
+     self-attested marker, harmless while Canary never activates. Before the first Canary, bind
+     readiness to evidence produced by a SUCCESSFULLY EXECUTED rollback drill (a real demotion
+     with recorded evidence/attestation), not the manual marker. This is a live-activation
+     concern — the dormant build has no live Canary to roll back — so the readiness FACT stays as
+     the contract and the attestation strengthening lands with the live tier.
+- **Red-team → defense mapping (§18; all real attacks have a standing gate):** shadow approval
+  reused as live → `TestSatisfiesLiveExecution_ShadowApprovalNeverQualifies`; stale/long-TTL/
+  no-four-eyes approval → `TestSatisfiesLiveExecution_Rejections`; F1→F2 rug-pull → exact
+  fingerprint binding (same); scope widening / percentage / wildcard-tool → `TestValidateScope_Rejections`;
+  kill engage→clear ABA + tool-drift at boundary → PREREQ-MCP-KILL-1 gates; credential revoke
+  mid-flight / server-identity drift → whole-Canary abort taxonomy (`TestAbortConditions_*`);
+  CP rollback/replay + restart while configured → existing rollout apply/restore gates;
+  out-of-scope fallback executing → `TestAntiWeakening_OutOfScopeDoesNotExecute`; upstream success
+  + DLP failure → existing `finishUpstream` inspection fail-closed; LiveExecutor leak into Shadow
+  → `TestShadow_TypeGraphHasNoExecuteCapability` + `TestCanaryPackageHoldsNoExecutionCapability`;
+  one approval covering a multi-tool scope → `TestValidateScopeApprovals_MissingToolIsUnapproved`;
+  control-plane op smuggled as read-first → `TestIsReadFirstOperation_ControlIsExcluded`;
+  future-dated approval defeating the TTL ceiling → `TestSatisfiesLiveExecution_Rejections`
+  (approved_in_future); group-only/identity-less scope → `TestValidateScope_Rejections`
+  (no_identity/uses_groups); degraded durable-event plane still ready → `durableEventsHealthy`.
+  No open red-team finding: every attack maps to a standing gate or a dormant fail-closed state.
+- **Codex review hardening (PR #1249):** nine architecture gaps found across three Codex rounds
+  and closed in the contract before merge — (P1-A) request-time read-first gate
+  `IsReadFirstOperation` distinct from the RiskClass axis; (P1-B) `durableEventsHealthy` from real
+  critical-state health, not presence; (P1-C) per-tool approval binding `ValidateScopeApprovals`
+  replacing a single unconstrained approval; (P1-D) exact-identity requirement / groups forbidden;
+  (P2a) future/zero-dated `ApprovedAt` rejected before the TTL ceiling; (P2b) node-readiness
+  dry-run (`EvaluateNode`) evaluates node-level facts only, not not-yet-supplied activation
+  inputs; (P1-E) `rollbackPathHealthy` from durable persist + rollback-rehearsal state, not
+  coordinator existence; (P1-F) approval coverage keyed by tenant (a t2 approval never covers a
+  t1 scope); (P1-G) scope must bind exactly one concrete tenant (`ScopeNoTenant`/
+  `ScopeTooManyTenants` — an empty tenant selector is a rollout wildcard over every tenant);
+  (P2c) scope realizability — `scopeRealizable` witness check rejects a contradictory scope
+  (tool off the server dimension, or an excluded inclusion) that is enumerable yet matches
+  nothing (`ScopeNotRealizable`); (P1-H) `rollbackPathReady` reads persistStatus + rehearsal
+  evidence under `durableMu` so a preflight cannot observe an in-flight rehearsal as durable;
+  (P2d) `scopeRealizable` picks a non-excluded identity (`firstNotExcluded`) so a scope with a
+  surviving principal is not falsely rejected; (P2e) every durable rollout mutation clears a
+  stale `write_failed` on success, so a durable rehearsal after a transient failure is not stuck
+  reporting the rollback path unhealthy.
+- **Evidence:** ADR-0035; `docs/design/mcp/CANARY-READINESS-MATRIX.md`;
+  `docs/design/mcp/CANARY-FIRST-RUNBOOK.md`; `internal/mcp/canary/*_test.go`;
+  `mcp_canary_preflight_test.go`; the differential gate `TestShadow_LivePreSideEffectEquivalence`.
 
 ## SHADOW-EVIDENCE-ROUTING-1 — Pre-dispatch fail-closed signals not routed into Shadow evidence · LOW (2026-08-25)
 - **Principal:** Two failure classes are terminally handled by the runtime BEFORE the
@@ -366,14 +489,121 @@
   recomputes `CanonicalBytes` without them, and `VerifyDigest` misreports a valid shadow
   record as corrupted (the model fails closed on an unknown schema version, but the fields
   were added under v1, so it never gets that far). Found by Codex on PR #1226 (4bbf211).
-- **Status:** OPEN, deferred by design. Today a shadow evaluation is marked durably only by
-  the existing `ExecutionState = "shadow_evaluated"` value (digest-safe), and the full
-  ShadowDecision rides the response body. Execution is disabled, so no shadow event is ever
-  written in production.
-- **Fix:** in the Shadow-activation slice, introduce `schema_version:2` for the expanded
-  envelope with explicit v1/v2 recovery handling (a v2 event is rejected as "unknown schema
-  version" by a v1 reader — honest — rather than misverified), and stamp the sub-facts only
-  on v2 shadow events. Then `shadowDecisionFacts` populates the durable sub-facts.
-- **Evidence:** `internal/mcp/events/model/model.go` (DecisionEvidence note),
-  `internal/mcp/execution/shadow_evaluator.go` (`shadowDecisionFacts`),
+- **Status:** **CLOSED (2026-08-28)** — the dedicated durable-Shadow-evidence follow-up shipped
+  the `schema_version:2` envelope. This was the FIRST of the two hard prerequisites for a real
+  Controlled Shadow activation; it is now satisfied. The SECOND (a usable scoped tool via the
+  tool-approval / promotion slice) is now **CLOSED (2026-08-28)** by the MCP tool-trust approval /
+  promotion slice (ADR-0034, branch `claude/mcp-tool-trust-approval`): a durable
+  `internal/mcp/tooltrust` approval store is the source of truth and the catalog `Usable` state is
+  a materialized projection of it (promote on approve, demote on revoke/expiry, re-derive on
+  startup + read), so a scoped, human-approved tool now satisfies `evaluateShadowActivationPreflight`.
+  With BOTH prerequisites closed, Controlled Shadow activation is mechanically reachable — it stays a
+  deliberate, separately-reviewed operator action, and a `shadow_evaluation` approval structurally
+  cannot arm the live-execution tier (purpose firewall). (Elevated from "deferred by design"
+  to a hard prerequisite on PR #1234, the activation-plumbing slice; both prerequisites now closed.)
+- **Fix (shipped):** `schema_version:2` is an ADDITIVE envelope carrying a typed
+  `Event.Shadow *ShadowEvidence` sub-evidence (outcome, override, credential-plan, request/response
+  inspection readiness; the raw evaluated action stays in `Decision.Action`). It is stamped ONLY on
+  a Shadow decision event — every non-shadow event stays v1, so its canonical digest is byte-identical
+  (proven by golden vectors). One source of truth: the transient JSON-RPC response and the durable
+  event both derive from `execution.shadowEvidence(ShadowDecision)`, pinned by a field-by-field parity
+  gate. `Validate` fails closed on schema/shadow consistency, enum membership and the architecturally
+  impossible combinations; recovery re-checks `SupportedSchemaVersion` + `ValidateShadowEvidence` as
+  defense-in-depth over Commit-time validation + the AEAD record chain.
+- **v1/v2 reader contract + rollback semantics (§9):** a v2-capable build supports v1 AND v2
+  (`model.SupportedSchemaVersion`); a v2 event carries facts a v1 event never did. A pre-v2 (v1-only)
+  build **refuses v2 evidence** and never partially interprets it — `unmarshalEvent` uses
+  `DisallowUnknownFields`, so the unknown `shadow` key fails the decode, and the record is rejected as
+  corrupt (fail closed) rather than misverified. This is the accepted downgrade posture: **rolling a
+  binary back across persisted v2 shadow evidence requires an operator procedure** — the concrete,
+  surgical steps (archive the Gateway spool subtree, clear the Shadow-bearing `P-ORD` **and**
+  `P-CRIT` partitions — a read-class shadow `tools/call` is ordinary→`P-ORD`, a write/destructive
+  one is critical→`P-CRIT` — reset both export cursors, restart) are in
+  `docs/operator/mcp-shadow-activation.md` §8, which explicitly preserves the `P-DEN` partition,
+  the sealed DEK, and the `management/` subtree so an operator never deletes unrelated durable
+  evidence. Arbitrary binary downgrade over v2 evidence is
+  NOT silently safe, by design, and validation is not weakened to make it appear so. No historical v1
+  event is rewritten or migrated in place; existing v1 evidence stays immutable.
+- **Gates:** `internal/mcp/events/model/shadow_v2_compat_test.go` (golden v1 digest invariance),
+  `shadow_v2_test.go` (v2 digest sensitivity + validation fail-closed + supported-version set),
+  `shadow_v2_fuzz_test.go`; `internal/mcp/execution/shadow_evidence_parity_test.go` (response↔durable
+  parity + real-manager v2 commit); `internal/mcp/events/spool/shadow_v2_recovery_test.go`
+  (recover round-trip, mixed v1/v2, interior-corruption fail-closed, Commit rejects malformed);
+  `internal/mcp/events/export/shadow_v2_export_test.go` (export read → marshal → re-read round-trip).
+- **Evidence:** `internal/mcp/events/model/{model.go,validate.go,canonical.go}` (v2 envelope +
+  ShadowEvidence + Validate), `internal/mcp/events/decide.go` (v2 stamping), `internal/mcp/events/spool/recovery.go`
+  (recovery guard), `internal/mcp/execution/{responses.go,shadow_evaluator.go}` (single mapping),
   `docs/design/mcp/SHADOW-ARCHITECTURE.md` §9.
+
+## SHADOW-PREDICTION-PARITY-1 — Pre-side-effect gates have no ownership wall · LOW (2026-08-25)
+- **Principal:** `ShadowEvaluator.decide()` re-states, by hand, the sequence of refusals the
+  live `Executor` performs before the side-effect boundary (hard control → policy class →
+  allowance → upstream-server usability → credential readiness → boundary drift). Nothing
+  structural couples the two: a gate added to `Execute`/`runExecute` without a matching step
+  in `decide()` silently makes Shadow MORE PERMISSIVE than the enforcement it predicts, and
+  the only thing that catches it is whether someone remembers to extend the differential
+  test. Two such gaps existed in the shipped Layer-B split and were found by review, not by
+  a failing build (SR-01 allowance-capacity, SR-02 upstream-server usability — both fixed
+  and walled in `internal/mcp/execution/shadow_prediction_parity_test.go`).
+- **Status:** OPEN, deferred. Execution is disabled, so the class is future-facing. The
+  direction of the failure is what makes it worth recording: an over-permissive Shadow
+  prediction is an input to the Canary promotion decision, so the defect is consumed as
+  evidence rather than surfacing as a refusal.
+- **Fix (proposed):** an ownership registry in the shape of
+  `internal/mcp/runtime/limits_ownership_test.go` — enumerate the pre-side-effect refusal
+  sites in `executor.go`/`run.go` (via `go/types`, so a same-named helper on another type
+  cannot satisfy a row) and require each to DECLARE either a modelling step in `decide()`
+  or an explicit `not-predicted` justification. Then a new live gate fails the build until
+  Shadow models it.
+- **Evidence:** `docs/engineering/security-reviews/2026-08-25-shadow-layerb-and-ldap-window.md`
+  §§3–4 and §6 residual risk; `docs/design/mcp/SHADOW-ARCHITECTURE.md` §4 (the stage list
+  that already named "server eligibility" as requiring proof); DEBT-011 is the same class
+  one layer up.
+
+## DEBT-014 — Documentation-governance PR backlog: fixes pile up unmerged, defects get re-fixed · MEDIUM (2026-09-05)
+
+- **Principal:** The scheduled Language & Terminology / Documentation Governance routine correctly
+  finds real drift, writes correct fixes, and opens PRs — but essentially none of them merge. The
+  last governance PR that landed on `main` is `TERMINOLOGY-GOVERNANCE-REVIEW-2026-08-25.md`
+  (T-47, the third ADR-numbering-collision recurrence). Every dated report since then
+  (`2026-08-28` through `2026-09-04`, 8 reports) exists only inside still-open PR branches. As of
+  this entry, **10 open `docs`/`docs(governance)` PRs carry verified, CI-green, non-conflicting
+  fixes with zero requested changes**: #1239 (T-31 ClamAV metric dual-emit, open 8 days), #1250
+  (`internal/mcp` subpackage count 25→27, open 7 days), #1253/#1284/#1294/#1302/#1309 (T-48, the
+  fourth ADR-0034-numbering-collision recurrence — **the identical fix, independently
+  rediscovered and rewritten 5 separate times** because each run correctly observes `main` is
+  still broken and has no way to see a sibling PR's already-written fix without deliberately
+  querying open PRs first), #1293 (`internal/` package count 63→65), #1300 (stale/overstated
+  ADR status on 5 shipped features), #1308 (stale README release-catalog-path claim).
+- **Interest paid per change:** every day this backlog stays unmerged, `main` keeps the stale
+  doc, so the *next* scheduled run either (a) burns a full pass re-finding and re-fixing a defect
+  someone already fixed (the T-48/ADR-0034 case — 5x duplicated analysis + diff effort for one
+  one-line rename), or (b) has to spend part of its pass on PR-backlog archaeology instead of new
+  drift (as this entry itself did). The failure mode compounds: PR #1260 (2026-08-30) already
+  flagged this exact problem as a "process note" and named #1239/#1253 as ready to merge — that
+  PR is itself still unmerged 6 days later, so even the meta-finding about the backlog joined the
+  backlog.
+- **Why this is a process gap, not a documentation-content gap:** every PR checked in this pass
+  has passing CI (`security/snyk` green, no failing required check), no reviewer-requested
+  changes, and a clean, small, single-concern diff. Nothing in the review pipeline is blocking
+  these — they are simply not being merged. A governance program whose output is never consumed
+  is equivalent to not running it, at a lower confidence: it manufactures the additional
+  duplicate-work cost above without the compensating benefit of ever fixing `main`.
+- **Recommended remediation (docs-process, not code):**
+  1. Merge #1309 for T-48 (it supersedes #1253/#1284/#1294/#1302 — same rename, plus a
+     `TestADRNumbering_NoDuplicateAcrossADRAndRFCTracks` CI gate the other four lack); close the
+     other four as superseded duplicates.
+  2. Merge #1239, #1250, #1293, #1300, #1308 — five independent, non-overlapping, low-risk fixes.
+  3. Merge #1260 (the T-52 Incident-row fix + the original process note) or fold its one
+     remaining content fix into a future pass if it has since drifted from `main`.
+  4. Going forward, each scheduled run should check `list_pull_requests`/`search_pull_requests`
+     for open `docs(governance)`/terminology-review PRs *before* re-auditing a backlog item,
+     the way #1260 and this entry did — and should prefer commenting "still valid, please merge"
+     over re-deriving an identical diff.
+- **Status:** OPEN. This is a merge/triage action item for the repository owner, not something a
+  future automated pass can resolve by writing more documentation — the fixes already exist.
+- **Evidence:** GitHub PR list for `KidCarmi/Culvert` as of 2026-09-05 (PR numbers above, each
+  independently diff-verified against `origin/main` tip `290e376` — all still show the described
+  drift on `main`, all target files are unedited by any other pending PR in the set except the
+  T-48 quintet which are mutually exclusive by design); `docs/engineering/TERMINOLOGY-GOVERNANCE-REVIEW-2026-09-05.md`
+  (this pass's dated report) for the full audit trail.

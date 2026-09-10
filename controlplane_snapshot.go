@@ -15,6 +15,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/cpdp"
 	"github.com/KidCarmi/Culvert/internal/pac"
 	"github.com/KidCarmi/Culvert/internal/session"
+	"github.com/KidCarmi/Culvert/internal/urlcat"
 )
 
 // categoryOverrideHostCount returns the aggregate number of host-keys in an
@@ -386,6 +387,39 @@ func validateConfigSnapshot(snap ConfigSnapshot) error {
 	if agg > maxSnapAggregateEntries {
 		return fmt.Errorf("config snapshot aggregate host-scale entries=%d exceeds cap %d (too large to sync in one CP↔DP frame)", agg, maxSnapAggregateEntries)
 	}
+	// Per-category host cap (§19, whole-snapshot 10k gate): the DP apply used
+	// to reject only the URL-category SLICE (ReplaceAllChecked), so a snapshot
+	// carrying one over-cap category applied MIXED — new rulebase against the
+	// old taxonomy, the exact torn state a whole-snapshot contract exists to
+	// prevent. Judged here so callers reject the ENTIRE snapshot before any
+	// slice applies; ReplaceAllChecked stays in applySnapshotURLCategories as
+	// defense in depth.
+	if err := urlcat.ValidateEntries(snap.URLCategories); err != nil {
+		return fmt.Errorf("config snapshot url_categories invalid: %w", err)
+	}
+	// Object-reference graph (§18): deterministic both-sides-carried checks —
+	// PolicyRules↔CategoryGroups, PolicyRules↔DecryptionProfiles, and the
+	// category-name edges (group members + direct DestCategory) against the
+	// carried taxonomy plus the applying node's live view/UT1 layers. A
+	// dangling reference rejects the WHOLE snapshot: the fleet keeps its last
+	// valid config instead of installing a rulebase whose DENY/DROP rules
+	// silently stop matching.
+	if err := validateSnapshotRefGraph(snap); err != nil {
+		return fmt.Errorf("config snapshot reference graph invalid: %w", err)
+	}
+	// Rewrite stable-identity uniqueness (2D-C §22/§39): duplicate stable IDs
+	// in the synced rule set reject the ENTIRE snapshot — the DP must never
+	// silently re-identify one of two claimants of a CP identity.
+	if err := validateRewriteStableIDs(snap.RewriteRules); err != nil {
+		return fmt.Errorf("config snapshot rewrite_rules invalid: %w", err)
+	}
+	// File-profile identity invariants (2D-C final §13–§15): FileProfile IDs
+	// are enforcement-authoritative, so a snapshot carrying a duplicate or
+	// missing ID (or duplicate names) is ambiguous identity — reject the
+	// ENTIRE snapshot before ANY slice applies.
+	if err := validateFileProfiles(snap.FileProfiles); err != nil {
+		return fmt.Errorf("config snapshot file_profiles invalid: %w", err)
+	}
 	return nil
 }
 
@@ -541,6 +575,16 @@ var dpControlPlanePollFailing atomic.Bool
 // clear signal (fail-open on new threats). The CP's own local proxying is
 // unaffected (its stores already hold the data); only distribution is gated.
 func (s *ConfigStore) Update(snap ConfigSnapshot) error {
+	// Gate 0 — rewrite management-identity degradation: while the latch is
+	// set, CurrentConfigSnapshot has captured KNOWN-ephemeral rewrite
+	// StableIDs that must not be distributed to the fleet as authoritative
+	// identity (a DP applies them verbatim, and they re-mint on the CP's next
+	// restart). Reuses the existing commit-time rejection contract — logged,
+	// alerted, LastPublishError; the fleet stays on the last valid snapshot —
+	// rather than silently omitting or re-minting the rewrite slice.
+	if d := rewriteIdentityDegraded(); d != nil {
+		return s.rejectPublish(fmt.Errorf("rewrite management identity degraded (%s): refusing to publish ephemeral rewrite StableIDs as authoritative fleet identity", d.reason))
+	}
 	// Gate 1 — entry counts (fast pre-check).
 	if err := validateConfigSnapshot(snap); err != nil {
 		return s.rejectPublish(err)
@@ -753,6 +797,14 @@ func applyConfigSnapshot(snap ConfigSnapshot) error {
 		return fmt.Errorf("config snapshot v%d rejected: %w", snap.Version, err)
 	}
 
+	// Blocker B (exclusive side): a snapshot apply both REMOVES shared
+	// objects and INSTALLS references wholesale, so the whole apply holds the
+	// reference-integrity gate exclusively — a node-local rule/group write or
+	// object delete cannot interleave with it. Acquired OUTERMOST; nothing
+	// under the apply acquires the gate.
+	refScanDeleteLock()
+	defer refScanDeleteUnlock()
+
 	applySnapshotPolicyAndTraffic(snap)
 	applySnapshotClusterRuntime(snap)
 
@@ -860,28 +912,48 @@ func applySnapshotTrafficExceptBlocklist(snap ConfigSnapshot) {
 		}
 	}
 
-	// URL categories.
+	// URL categories. Checked install (Blocker C): the whole pushed taxonomy
+	// is judged against the canonical per-category host cap BEFORE anything
+	// installs — an over-cap candidate is rejected wholesale (logged; the node
+	// keeps serving its current taxonomy), never truncated or partially
+	// applied. Same per-field reject-and-continue posture as the SSL-bypass
+	// Set above; the aggregate maxSnapURLCategoryHosts snapshot cap is NOT
+	// this invariant.
 	if snap.URLCategories != nil {
-		catStore.ReplaceAll(snap.URLCategories)
-		// P3.4 caller-side persist (Bucket-4 fsync-safe Save
-		// hardened in PR #246).
-		catStore.Save()
-		// The CP-pushed taxonomy's BuiltIn entries are served to policy from the
-		// effective view, not catStore, so without this recompose a CP taxonomy
-		// change that carries no override change is silently unenforced on EVERY
-		// data-plane node until it restarts. applySnapshotSaaSFeed's recompose is
-		// gated on an override-fingerprint change and does not cover this.
-		recomposeSignedFeedTaxonomy()
+		if err := catStore.ReplaceAllChecked(snap.URLCategories); err != nil {
+			logger.Printf("DataPlane: URL categories rejected (taxonomy unchanged): %v", err)
+		} else {
+			// P3.4 caller-side persist (Bucket-4 fsync-safe Save
+			// hardened in PR #246).
+			catStore.Save()
+			// The CP-pushed taxonomy's BuiltIn entries are served to policy from the
+			// effective view, not catStore, so without this recompose a CP taxonomy
+			// change that carries no override change is silently unenforced on EVERY
+			// data-plane node until it restarts. applySnapshotSaaSFeed's recompose is
+			// gated on an override-fingerprint change and does not cover this.
+			recomposeSignedFeedTaxonomy()
+		}
 	}
 
-	// File profiles.
+	// File profiles. The preflight (validateConfigSnapshot) already rejected
+	// ambiguous identity with the whole snapshot; the store-boundary refusal
+	// is defense-in-depth and must never install a set the preflight would
+	// have refused.
 	if snap.FileProfiles != nil {
-		globalProfileStore.ReplaceAll(snap.FileProfiles)
+		if err := globalProfileStore.ReplaceAll(snap.FileProfiles); err != nil {
+			logger.Printf("ConfigSnapshot: file profiles NOT applied: %v", err)
+		}
 	}
 
-	// Rewrite rules.
+	// Rewrite rules. FOLLOWER semantics (2D-C §39): the CP is authoritative —
+	// its stable rule identities are preserved verbatim (SetRules keeps
+	// non-empty stableIds; uniqueness was validated with the whole snapshot),
+	// published under the settings writer domain so the bulk publish cannot
+	// interleave with a node-local interactive mutation, and deliberately NOT
+	// written to the follower's admin_settings (the CP re-syncs on every
+	// version bump — same posture as the file-profile / feed-config slices).
 	if snap.RewriteRules != nil {
-		rewriter.SetRules(snap.RewriteRules)
+		publishRewriteRules(snap.RewriteRules)
 	}
 
 	// DPI patterns.
@@ -934,7 +1006,16 @@ func applySnapshotClusterRuntime(snap ConfigSnapshot) {
 	}
 	// PAC profiles/pools (PAC initiative PR 2): nil-skip (old CP), non-nil
 	// replace — [] is an explicit wipe. Tolerant Set (never rejects).
+	// 2F-E correction round 4: inside the shared PAC writer transaction
+	// boundary (pacProfilesWriterLock — lock order gate → pacProfilesAPIMu).
+	// 2F-E correction round 7: a pending lifecycle intent of every profile
+	// the snapshot CHANGES is settled durably before the write
+	// (pacSettlePendingBeforeWrite); if that cannot be persisted the PAC
+	// profiles slice is deferred to the next sync (the rest of the snapshot
+	// still applies).
 	if snap.PACProfiles != nil || snap.PACPools != nil {
+		unlock := pacProfilesWriterLock()
+		before := pacProfiles.Get()
 		cur := pacProfiles.Get()
 		if snap.PACProfiles != nil {
 			cur.Profiles = snap.PACProfiles
@@ -942,9 +1023,12 @@ func applySnapshotClusterRuntime(snap ConfigSnapshot) {
 		if snap.PACPools != nil {
 			cur.Pools = snap.PACPools
 		}
-		if err := pacProfiles.Set(cur); err != nil {
+		if err := pacSettlePendingBeforeWrite(before, cur); err != nil {
+			logger.Printf("DataPlane: PAC profiles not applied this sync (deferred): %v", err)
+		} else if err := pacProfiles.Set(cur); err != nil {
 			logger.Printf("DataPlane: PAC profiles: %v", err)
 		}
+		unlock()
 	}
 
 	if snap.ThreatDomainAllowlist != nil {
@@ -1271,11 +1355,14 @@ func CurrentConfigSnapshot() ConfigSnapshot {
 		snap.CAFingerprint = fp
 	}
 
-	// Full policy sync.
+	// Full policy sync. Rules + version come from ONE running-store snapshot
+	// (§13 fenced-read audit): List() then policyVersion() as two reads let a
+	// concurrent mutation pair generation-P rules with a generation-P+1
+	// version in the published snapshot.
 	snap.DefaultAction = defaultPolicyAction()
-	snap.PolicyRules = policyStore.List()
-	pv, _ := policyStore.policyVersion()
-	snap.PolicyVersion = pv
+	ps := policyStore.SnapshotWithVersion()
+	snap.PolicyRules = ps.Rules
+	snap.PolicyVersion = ps.Version
 	snap.SSLBypassPatterns = sslBypass.List()
 	cats := catStore.All()
 	snap.URLCategories = cats

@@ -14,6 +14,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/protocol"
 	"github.com/KidCarmi/Culvert/internal/mcp/registry"
+	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 )
 
 // ExecutionProvider is the PR-11 guarded-execution seam. It is consulted AFTER a
@@ -24,10 +25,27 @@ import (
 // The provider MUST NOT be consulted for Management (which never executes an
 // upstream tools/call); the runtime only wires it for the Gateway capability.
 type ExecutionProvider interface {
-	// Execute runs the guarded rollout-mode path and returns the terminal result +
-	// the observation fields to record. It performs its OWN durable
-	// commit-before-side-effect; the runtime does not pre-commit for this path.
-	Execute(ctx context.Context, in ExecInput) ExecOutput
+	// Resolve resolves the effective rollout disposition for this request EXACTLY ONCE,
+	// with no side effect (no commit, no upstream call). The runtime routes on it — a
+	// record-only disposition (Observe / Disabled / out-of-scope, and a killed capability
+	// resolves to a block, never record-only) keeps the runtime's inline Observe evidence
+	// path — and hands the SAME resolution back to Execute. Resolving once and carrying it
+	// into execution is what closes the TOCTOU: routing and execution can never observe two
+	// different snapshots of the mutable rollout state across a concurrent transition, so a
+	// request never falls through as Observe without its Shadow evaluation, nor reaches the
+	// evaluator's record-only path without the inline durable commit (Codex P2, PR #1234).
+	Resolve(in ExecInput) rollout.Resolution
+	// Execute runs the guarded rollout-mode path for a PRE-RESOLVED disposition and returns
+	// the terminal result + the observation fields to record. It NEVER re-resolves the
+	// rollout state — it acts on the resolution Resolve produced. It performs its OWN
+	// durable commit-before-side-effect; the runtime does not pre-commit for this path.
+	Execute(ctx context.Context, in ExecInput, res rollout.Resolution) ExecOutput
+	// KillActive reports whether the capability's emergency kill switch is currently engaged.
+	// The runtime consults it on the RECORD-ONLY fall-through, so an emergency admission stop
+	// blocks even the inline Observe path; the executing path is covered by Execute's own
+	// entry re-check. Reading only the monotonic kill flag can only make the outcome more
+	// restrictive, so it does not reopen the single-resolution TOCTOU (Codex P2, PR #1234).
+	KillActive() bool
 }
 
 // ExecInput carries the already-resolved request facts the executor needs. It
@@ -80,24 +98,14 @@ type ExecOutput struct {
 	Executed        bool
 }
 
-// dispatchExecute hands a decision-point outcome to the guarded executor and maps
-// the result back into a terminal Outcome. It is only reached when p.executor is
-// non-nil (the disabled-by-default posture keeps the decision-only path).
-func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, req Request, msg jsonrpc.Message, ident *identity.ResolvedContext, in policy.DecisionInput, d policy.Decision, insp inspectionRun, snapshotHash string, now time.Time) Outcome {
-	// OVN-09 — decision/execution TOCTOU. The policy decision was computed against
-	// a catalog SNAPSHOT. Between then and the irreversible upstream call there is a
-	// real window (inspection, durable commit, credential planning, provider fetch)
-	// in which a concurrent discovery — execution.Discovery -> catalog.Ingest
-	// publishes a new snapshot — can change the tool the decision was made about.
-	// Re-validate against the LIVE catalog and refuse a stale decision before any
-	// side effect. This is the drift MCP-TOOL-001 / MCP-T-011 / MCP-T-016 exist to
-	// prevent, and the executor never re-checked it.
-	if out, stale := p.refuseOnToolDrift(rb, in, msg.ID); stale {
-		return out
-	}
-	// The same predicate, handed to the executor to re-run adjacent to the upstream
-	// call. Captured by value from this decision's input, so it can never be
-	// satisfied by a DIFFERENT request's tool.
+// buildExecInput materializes the ExecInput the executor needs from the resolved
+// decision facts. It is pure (a registry snapshot read + a captured drift predicate)
+// so it can be built once and used both for the RecordsOnly routing probe and for
+// Execute, guaranteeing the disposition the runtime routes on is computed from the
+// exact same input the executor acts on.
+func (p *pipeline) buildExecInput(req Request, msg jsonrpc.Message, ident *identity.ResolvedContext, in policy.DecisionInput, d policy.Decision, insp inspectionRun, snapshotHash string, now time.Time) ExecInput {
+	// The drift predicate, captured by value from this decision's input, so it can
+	// never be satisfied by a DIFFERENT request's tool.
 	toolStillCurrent := func() bool { return !p.toolHasDrifted(in) }
 	var srv *registry.ServerRecord
 	if req.ServerID != "" && p.deps.Registry != nil {
@@ -110,7 +118,7 @@ func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, req Requ
 		r := insp.result
 		inspResult = &r
 	}
-	ei := ExecInput{
+	return ExecInput{
 		Capability:   p.capability,
 		Method:       msg.Method,
 		MessageID:    msg.ID,
@@ -125,13 +133,36 @@ func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, req Requ
 
 		ToolStillCurrent: toolStillCurrent,
 	}
+}
+
+// dispatchExecute hands a decision-point outcome to the guarded executor and maps
+// the result back into a terminal Outcome. It is reached only for a NON-record-only
+// disposition (Shadow evaluate / Canary-Production execute / hard block): a
+// record-only disposition keeps the runtime's inline Observe evidence path instead
+// (dispatchPolicy), so a composed evaluator never displaces the decision-event commit.
+// It receives the resolution the runtime already resolved and passes it to Execute, so
+// the disposition is never re-resolved.
+func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, ei ExecInput, res rollout.Resolution, genAtResolve uint64) Outcome {
+	// OVN-09 — decision/execution TOCTOU. The policy decision was computed against
+	// a catalog SNAPSHOT. Between then and the irreversible upstream call there is a
+	// real window (inspection, durable commit, credential planning, provider fetch)
+	// in which a concurrent discovery — execution.Discovery -> catalog.Ingest
+	// publishes a new snapshot — can change the tool the decision was made about.
+	// Re-validate against the LIVE catalog and refuse a stale decision before any
+	// side effect. This is the drift MCP-TOOL-001 / MCP-T-011 / MCP-T-016 exist to
+	// prevent, and the executor never re-checked it.
+	// canaryScoped: only the ENFORCING execute disposition is the Canary's own reviewed traffic. A
+	// shadow evaluation (including the Canary-mode out-of-scope fallback) is not.
+	if out, stale := p.refuseOnToolDrift(rb, ei.Input, ei.MessageID, res.Disposition == rollout.EffectExecute, genAtResolve); stale {
+		return out
+	}
 	// SEC-MCP-03. The executor performs the REAL upstream side effect and must
 	// inherit the request's deadline and cancellation: with a DETACHED background
 	// context here, a disconnected client, an exhausted RequestDeadline or a
 	// shutdown could not stop an in-flight upstream call, and every ctx-honouring
 	// stage the executor reaches (broker, provider, dial, TLS, response read,
 	// response inspection) silently lost its bound.
-	out := p.executor.Execute(ctx, ei)
+	out := p.executor.Execute(ctx, ei, res)
 
 	// Record the truthful observation fields.
 	if out.EvaluatedAction != "" {
@@ -170,18 +201,36 @@ func (p *pipeline) dispatchExecute(ctx context.Context, rb *recBuilder, req Requ
 // compare, and inventing drift there would refuse traffic the gateway is
 // configured to allow.
 func (p *pipeline) toolHasDrifted(in policy.DecisionInput) bool {
+	return p.toolDriftClass(in) != ""
+}
+
+// toolDriftClass names WHICH KIND of drift the decision's tool has suffered, as one of the
+// whole-Canary breach codes, or "" for none. toolHasDrifted is the boolean view of the same
+// predicate, so the refusal behaviour is unchanged and there is exactly one implementation.
+//
+// The class matters because the abort's first cause is IMMUTABLE. Reporting every drift as
+// tool_fingerprint_drift meant an operator was told the tool's SHAPE changed when what actually
+// happened was their own catalog.DisableServer — and, since the admission-time classifier calls
+// that same condition server_identity_drift, the name an operator saw depended on which detection
+// window happened to win the race (Codex round 15). Two windows must not disagree about what one
+// fact is called; that is the round-5 window/budget lesson in a different subsystem.
+//
+// A tool that has VANISHED from the catalog is classed as fingerprint drift: the server may be
+// perfectly healthy, and what is gone is the reviewed tool itself. Neither code is a exact fit and
+// the taxonomy offers no third, so the choice is recorded here rather than left to the reader.
+func (p *pipeline) toolDriftClass(in policy.DecisionInput) string {
 	if in.Tool == nil || p.deps.Catalog == nil {
-		return false
+		return ""
 	}
 	rec, ok := p.deps.Catalog.Current().Get(catalog.ToolKey{
 		Server: registry.ServerID(in.Tool.ServerID), Name: in.Tool.Name,
 	})
 	if !ok {
-		return true
+		return "tool_fingerprint_drift"
 	}
 	sum := rec.Fingerprint.Sum()
 	if hex.EncodeToString(sum[:]) != in.Tool.FingerprintHash {
-		return true
+		return "tool_fingerprint_drift"
 	}
 	// ELIGIBILITY IS A SEPARATE AXIS FROM THE FINGERPRINT, and checking only the
 	// fingerprint misses an entire class of revocation. catalog.DisableServer copies
@@ -196,12 +245,61 @@ func (p *pipeline) toolHasDrifted(in policy.DecisionInput) bool {
 	// built with (policy.go) -- so this asks exactly the question the decision
 	// answered, rather than a second, independently-drifting notion of "eligible".
 	disp, drift := policyDisposition(rec.Eligibility)
-	return disp != in.Tool.Disposition || drift != in.Tool.Drift
+	if disp != in.Tool.Disposition || drift != in.Tool.Drift {
+		// The fingerprint is IDENTICAL and the eligibility moved — DisableServer, a quarantine, a
+		// review requirement. The tool's shape did not change; its server stopped being usable,
+		// which is exactly what the admission-time classifier calls server_identity_drift.
+		return "server_identity_drift"
+	}
+	return ""
 }
 
-func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id jsonrpc.ID) (Outcome, bool) {
-	if !p.toolHasDrifted(in) {
+func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id jsonrpc.ID, canaryScoped bool, genAtResolve uint64) (Outcome, bool) {
+	code := p.toolDriftClass(in)
+	if code == "" {
 		return Outcome{}, false
+	}
+	// AUTHORITATIVE DRIFT, and refusing the request is only half the answer.
+	//
+	// The reviewed tool is no longer the one the decision was computed against. For an ordinary
+	// gateway that is a stale decision and nothing more; for a CANARY it is proof the experiment's
+	// premise — a pinned, reviewed target — no longer holds, and the experiment must stop rather
+	// than merely decline this request. Detected here and left unreported, a rug-pull landing
+	// before this check stopped nothing, and every later request against the new fingerprint failed
+	// approval validation instead, which reads as ordinary denial (Codex round 14).
+	//
+	// ONLY FOR THE CANARY'S OWN TRAFFIC. With Shadow fallback enabled, an OUT-OF-SCOPE request
+	// under Canary mode resolves to a shadow evaluation and still reaches this refusal — so an
+	// unconditional report let a catalog change for a tool the experiment never reviewed abort the
+	// whole Canary (Codex round 15). That is the direction a safety control must never err in:
+	// stopping a healthy experiment for something outside its own blast radius is indistinguishable,
+	// to an operator, from the control being wrong. The seam is nil in every non-Canary composition,
+	// so this is a no-op there as well.
+	if canaryScoped {
+		// REPORTED WITH ITS TARGET, so the latch can be taken where it can be attributed.
+		//
+		// No reservation exists yet, so nothing here binds this request to an activation, and an
+		// observation that cannot be attributed must not latch one: charging it to whatever is
+		// current stops an experiment that may never have seen the drift.
+		//
+		// But the answer to that is to GIVE the observation a binding, not to drop the latch. A
+		// rug-pull that lands before policy resolution is refused right here, and every later
+		// request then resolves cleanly against the NEW fingerprint and fails approval validation
+		// instead — request-scoped, not drift — so nothing downstream would ever latch it and an
+		// authoritative whole-Canary breach would stop nothing (Codex round 20; the round-14
+		// finding rebuilt). "Self-heals on the next request" was simply not true.
+		//
+		// So the TARGET goes with the observation and the root re-derives the drift live inside the
+		// activation critical section, latching against the exact generation active for that
+		// evaluation — and latching nothing at all when no activation is live (§6).
+		p.deps.noteCanaryDriftObserved(p.capability.String(), CanaryDriftTarget{
+			Generation: genAtResolve,
+			Code:       code,
+			Tenant:     in.Principal.Tenant,
+			ServerID:   toolServerID(in),
+			ToolName:   toolName(in),
+			DecisionFP: toolFingerprint(in),
+		})
 	}
 	p.ctr.requestsRejected.Add(1)
 	rb.rec.PolicyAction = "BLOCKED_BY_DECISION_STALE"
@@ -211,4 +309,28 @@ func (p *pipeline) refuseOnToolDrift(rb *recBuilder, in policy.DecisionInput, id
 		Status: 200, Disposition: DispRejected, Reason: mcperr.ReasonDecisionSnapshotStale,
 		ResponseBody: inspectionError(id, mcperr.ReasonDecisionSnapshotStale),
 	}), true
+}
+
+// toolServerID / toolName / toolFingerprint read the drift target off the decision input without
+// assuming a tool is present. A malformed input yields empty strings, which the root's live
+// re-derivation treats as a target it cannot match — request-scoped, never a latch.
+func toolServerID(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.ServerID
+}
+
+func toolName(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.Name
+}
+
+func toolFingerprint(in policy.DecisionInput) string {
+	if in.Tool == nil {
+		return ""
+	}
+	return in.Tool.FingerprintHash
 }

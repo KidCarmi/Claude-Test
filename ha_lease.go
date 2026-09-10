@@ -313,13 +313,20 @@ func (h *HAState) selfFence(reason string) {
 	// Status take h.mu) is then guaranteed the config write has completed —
 	// the small file write is worth the determinism (matches EnableAsLeader).
 	_ = saveHAConfig(h.snapshotConfigLocked())
+	// M5: record the demotion in the failover ring INSIDE the lock too, before
+	// the role flip above becomes observable. IsLeader/Status take h.mu, so an
+	// observer cannot see role=="standby" until this Unlock returns — recording
+	// here guarantees that whoever sees the demotion also sees WHY (the
+	// leader->standby entry is already in the ring). Recording after the unlock
+	// left a window where IsLeader()==false but the ring had no self-fence entry
+	// yet. The ring's mutex is a leaf lock (no re-entry into h.mu), so holding
+	// h.mu across record is safe. The epoch is the one being fenced out, captured
+	// before the zero above.
+	globalHAFailoverRing.Load().record("leader", "standby", "self-fence: "+reason, fencedEpoch, time.Now())
 	h.mu.Unlock()
 	h.promoted.Store(false) // a future (fence-gated) promotion is legitimate
 
 	logger.Printf("HA: SELF-FENCED — demoted to read-only standby: %s", sanitizeLog(reason))
-	// M5: record the demotion in the failover ring (the epoch is the one being
-	// fenced out, captured before the zero above).
-	globalHAFailoverRing.Load().record("leader", "standby", "self-fence: "+reason, fencedEpoch, time.Now())
 	go alerts.Fire("ha_self_fenced", alerts.Payload{
 		Event:  "ha_self_fenced",
 		Detail: "leader lost the fencing lease and demoted to read-only standby: " + reason,
@@ -392,7 +399,14 @@ func addLeaseHealth(resp map[string]any, h *HAState) {
 		resp["epoch"] = epoch
 		// CHAOS-55: "read-only and working on it" is a different operator
 		// decision from "read-only and stuck", and before this they looked
-		// identical on every surface.
+		// identical on every surface. lease_recovering itself already reached
+		// /healthz and /metrics (culvert_ha_lease_recovering) at CHAOS-55 time,
+		// but never the browser-facing HA panel an operator actually watches
+		// during an incident — this is purely carrying it (plus the attempt/
+		// success magnitude already exported as counters) onto the same JSON
+		// surface the panel already polls, so the GUI can render it too.
 		resp["lease_recovering"] = h.leaseRecoveryActive()
+		resp["lease_reacquire_attempts"] = statHALeaseReacquireAttempts.Load()
+		resp["lease_reacquired_total"] = statHALeaseReacquired.Load()
 	}
 }

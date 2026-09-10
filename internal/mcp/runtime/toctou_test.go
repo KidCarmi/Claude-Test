@@ -12,6 +12,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/protocol"
 	"github.com/KidCarmi/Culvert/internal/mcp/registry"
+	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 )
 
 // recordingExec captures whether the guarded executor was reached, standing in for
@@ -21,13 +22,22 @@ type recordingExec struct {
 	gotTool string
 }
 
-func (e *recordingExec) Execute(_ context.Context, in ExecInput) ExecOutput {
+func (e *recordingExec) Execute(_ context.Context, in ExecInput, _ rollout.Resolution) ExecOutput {
 	e.reached++
 	if in.Input.Tool != nil {
 		e.gotTool = in.Input.Tool.FingerprintHash
 	}
 	return ExecOutput{Status: 200, Disposition: DispObserveOnly, ExecutionState: "not_implemented"}
 }
+
+// Resolve returns a non-record-only disposition so the runtime always reaches Execute
+// (this fixture verifies the runtime's entry-side tool-drift refusal before the executor).
+func (e *recordingExec) Resolve(ExecInput) rollout.Resolution {
+	return rollout.Resolution{Disposition: rollout.EffectShadowEvaluate}
+}
+
+// KillActive: these fixtures never engage the kill switch.
+func (e *recordingExec) KillActive() bool { return false }
 
 // ingestTool publishes a tool into the catalog with the given input schema, and
 // returns its resulting fingerprint hash.
@@ -166,7 +176,7 @@ func TestTOCTOU_StaleDecisionFingerprintIsRefusedAtTheExecutionBoundary(t *testi
 			Disposition: liveDisp, Drift: liveDrift,
 		},
 	}
-	out, ok := p.refuseOnToolDrift(rb, in, jsonrpc.ID{})
+	out, ok := p.refuseOnToolDrift(rb, in, jsonrpc.ID{}, true, driftTestGen)
 	if !ok {
 		t.Fatal("a stale decision fingerprint must be refused at the execution boundary")
 	}
@@ -185,7 +195,7 @@ func TestTOCTOU_StaleDecisionFingerprintIsRefusedAtTheExecutionBoundary(t *testi
 			Disposition: liveDisp, Drift: liveDrift,
 		},
 	}
-	if _, refused := p.refuseOnToolDrift(rb, fresh, jsonrpc.ID{}); refused {
+	if _, refused := p.refuseOnToolDrift(rb, fresh, jsonrpc.ID{}, true, driftTestGen); refused {
 		t.Fatal("a current fingerprint must not be refused")
 	}
 }
@@ -202,7 +212,7 @@ func TestTOCTOU_ToolRemovedAfterDecisionRefusesExecution(t *testing.T) {
 		Capability: policy.CapGateway,
 		Tool:       &policy.Tool{Name: "never-ingested", ServerID: testServerID, FingerprintHash: "abc"},
 	}
-	if _, refused := p.refuseOnToolDrift(rb, in, jsonrpc.ID{}); !refused {
+	if _, refused := p.refuseOnToolDrift(rb, in, jsonrpc.ID{}, true, driftTestGen); !refused {
 		t.Fatal("a decision naming a tool that is no longer in the catalog must be refused")
 	}
 }
