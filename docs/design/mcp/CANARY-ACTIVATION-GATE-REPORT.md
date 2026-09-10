@@ -103,9 +103,24 @@ old budget/abort generation after reactivation.
 ## What still gates the first real Canary (out of scope here)
 
 Arming the live tier (compose a live executor + upstream + materialize-broker, call
-`markGatewayExecDepsReady`), making `live_execution` issuable under four-eyes governance, calling
-`beginCanaryActivation` from that armed path, and executing the first Canary per
-`CANARY-FIRST-RUNBOOK.md` — each a **separately-reviewed activation**, none performed here.
+`markGatewayExecDepsReady`), calling `beginCanaryActivation` from that armed path, and executing
+the first Canary per `CANARY-FIRST-RUNBOOK.md` — each a **separately-reviewed activation**, none
+performed here. (Making `live_execution` issuable under four-eyes governance has since landed as a
+trust-only slice — ADR-0034 Addendum 2026-09 — and does not arm the live tier or change this
+report's posture: LiveExecutor composed NO, Canary active NO.)
+
+> **UPDATE (live-tier composition phase): `CANARY-ROLLBACK-LIVE-QUIESCE-REHEARSAL` is CLOSED.** The
+> live tier now exists (composed behind a disabled-by-default, node-readiness-gated arming lifecycle),
+> so the live-armed **quiesce-then-demote** sequence is rehearsable and is rehearsed end to end by
+> `TestLiveQuiesceRehearsal_FullSequence` (`mcp_live_quiesce_rehearsal_test.go`): arm → drive
+> controlled synthetic executions → QUIESCE (un-arm, reject new, drain in-flight — live now OFF) →
+> emergency kill terminates the side-effect window → the authoritative coordinator `Canary→Observe`
+> demotion invalidates the generation → persist/recover proving a restart does not re-arm → live trust
+> is not resurrected. It records durable, build-bound evidence (`mcp_live_quiesce_rehearsal.go`,
+> `liveQuiesceRehearsed`), fail-closed against a build change or corruption. The report's dormancy
+> posture is UNCHANGED: composition is disabled-by-default with no production caller, arming is a
+> separate explicit act, and no Canary is activated — LiveExecutor production-composed NO, Canary
+> active NO. The original deferral rationale, retained below for provenance:
 
 **Deferred to the live-tier phase — `CANARY-ROLLBACK-LIVE-QUIESCE-REHEARSAL`.** The shared Shadow
 preflight forbids a Shadow target while the live-execution tier is armed

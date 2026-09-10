@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,7 +13,9 @@ import (
 	"time"
 
 	"github.com/KidCarmi/Culvert/internal/feedsync"
+	"github.com/KidCarmi/Culvert/internal/fileutil"
 	"github.com/KidCarmi/Culvert/internal/pac"
+	"github.com/KidCarmi/Culvert/internal/rewrite"
 )
 
 // blocklistCleanupUnattributed handles DELETE /api/blocklist?scope=unattributed:
@@ -459,15 +462,27 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleViewer) {
 			return
 		}
+		// One coherent snapshot: groups, names, and the fence version must
+		// describe the SAME store state — List()/Names()/Version() are three
+		// independent reads a writer can land between, handing the client rows
+		// from one state paired with the successor's fence value (POST-2D-A
+		// COHERENT-READ CORRECTION DISCOVERED DURING 2D-B REVIEW).
+		snap := globalCategoryGroups.SnapshotView()
 		jsonOK(w, map[string]any{
-			"groups": globalCategoryGroups.List(),
-			"names":  globalCategoryGroups.Names(),
+			"groups":  snap.Groups,
+			"names":   snap.Names,
+			"version": snap.Version,
 		})
 
 	case http.MethodPost:
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
+		// Blocker B (shared side): group membership REFERENCES categories —
+		// creating one must not interleave with a category delete's
+		// scan-and-delete decision.
+		refWriteLock()
+		defer refWriteUnlock()
 		var body struct {
 			Name       string   `json:"name"`
 			Categories []string `json:"categories"`
@@ -476,20 +491,40 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		g, err := globalCategoryGroups.Add(body.Name, body.Categories)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		// Blocker B delete-first order: every member category must currently
+		// resolve in some category authority — validated under the shared
+		// gate, before the commit.
+		if refuseDanglingGroupMembers(w, body.Categories) {
 			return
 		}
-		globalCategoryGroups.Save()
+		// Durable-or-nothing (2D-A.0): the fence check (optional ?ifVersion=),
+		// the mutation, and the persist run in one serialized critical section;
+		// a persist failure rolls the store back and maps to 500 — a confirmed
+		// 2xx means the group is restart-durable.
+		var g *CategoryGroup
+		err := globalCategoryGroups.MutateDurable(parseIfVersion(r), func() error {
+			created, aerr := globalCategoryGroups.Add(body.Name, body.Categories)
+			if aerr != nil {
+				return aerr
+			}
+			g = created
+			return nil
+		})
+		if writeObjectMutationError(w, err) {
+			return
+		}
 		auditEvent(r, "category-group.create", g.Name, fmt.Sprintf("%d categories", len(g.Categories)))
 		saveConfigVersion(sessionAdmin(r), "category-group.create")
-		jsonOK(w, map[string]any{"ok": true, "group": g})
+		jsonOK(w, map[string]any{"ok": true, "group": g, "version": globalCategoryGroups.Version()})
 
 	case http.MethodPut:
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
+		// Blocker B (shared side): membership edits CHANGE which categories a
+		// group references (and the rename cascade rewrites rule references).
+		refWriteLock()
+		defer refWriteUnlock()
 		var body struct {
 			Name       string   `json:"name"`
 			Categories []string `json:"categories"`
@@ -498,67 +533,22 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
+		// Blocker B delete-first order: membership edits must reference
+		// currently-resolvable categories (validated under the shared gate).
+		if refuseDanglingGroupMembers(w, body.Categories) {
+			return
+		}
 		// Prefer stable-ID addressing (rename-safe) when ?id= is supplied; fall
 		// back to name for legacy clients. Mirrors the policy ?id= path (#695).
 		if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
-			before := globalCategoryGroups.GetByID(id)
-			if before == nil {
-				http.Error(w, "group not found", http.StatusNotFound)
-				return
-			}
-			// Rename (references-by-id S2): UpdateByID keeps the current name, so a
-			// name change must be applied explicitly via Rename (re-keys the store)
-			// and cascaded onto referencing rules. Rules link by the group ID, so
-			// matching survives regardless; the cascade keeps the denormalized name
-			// honest for display/export/DP-sync.
-			newName := strings.TrimSpace(body.Name)
-			renamed := newName != "" && !strings.EqualFold(newName, before.Name)
-			if renamed {
-				// Pre-check the collision before mutating anything so a taken name
-				// fails cleanly (Rename re-checks under its own lock).
-				if g := globalCategoryGroups.GetByName(newName); g != nil && g.ID != id {
-					http.Error(w, "a group named "+newName+" already exists", http.StatusConflict)
-					return
-				}
-			}
-			// Apply the category update FIRST so a bad body returns before any
-			// rename is applied (no half-applied name change).
-			if err := globalCategoryGroups.UpdateByID(id, body.Categories); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if renamed {
-				if _, err := globalCategoryGroups.Rename(id, newName); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-			}
-			globalCategoryGroups.Save()
-			detail := fmt.Sprintf("%d categories", len(body.Categories))
-			if renamed {
-				// Refresh referencing rules on running AND the open draft candidate,
-				// then persist the policy store BEFORE versioning (the cascade is a
-				// real policy mutation that must survive a restart).
-				if n := policyStore.CascadeDestCategoryGroupRename(id, before.Name, newName); n > 0 {
-					policyStore.Save()
-				}
-				policyDraft.cascadeDestCategoryGroupRename(id, before.Name, newName)
-				detail += ", renamed from " + sanitizeLog(before.Name)
-			}
-			auditName := before.Name
-			if renamed {
-				auditName = newName
-			}
-			auditEventDiffID(r, "category-group.update", auditName, id, detail, nil, nil)
-			saveConfigVersion(sessionAdmin(r), "category-group.update")
-			jsonOK(w, map[string]any{"ok": true})
+			apiCategoryGroupUpdateByID(w, r, id, body.Name, body.Categories)
 			return
 		}
-		if err := globalCategoryGroups.Update(body.Name, body.Categories); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err := globalCategoryGroups.MutateDurable(nil, func() error {
+			return globalCategoryGroups.Update(body.Name, body.Categories)
+		}); writeObjectMutationError(w, err) {
 			return
 		}
-		globalCategoryGroups.Save()
 		auditEvent(r, "category-group.update", body.Name, fmt.Sprintf("%d categories", len(body.Categories)))
 		saveConfigVersion(sessionAdmin(r), "category-group.update")
 		jsonOK(w, map[string]any{"ok": true})
@@ -567,6 +557,10 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
+		// Blocker B: reference scan + durable delete as one atomic decision
+		// under the exclusive side of the reference-integrity gate.
+		refScanDeleteLock()
+		defer refScanDeleteUnlock()
 		// Stable-ID addressing (rename-safe); resolve to the current name for the
 		// reference-integrity check + audit, then delete by id.
 		if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
@@ -578,15 +572,18 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 			if deleteBlockedByReferences(w, r, "category-group", before.Name, "category-group.remove.blocked") {
 				return
 			}
-			name, err := globalCategoryGroups.DeleteByID(id)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+			var name string
+			err := globalCategoryGroups.MutateDurable(parseIfVersion(r), func() error {
+				n, derr := globalCategoryGroups.DeleteByID(id)
+				name = n
+				return derr
+			})
+			if writeObjectMutationError(w, err) {
 				return
 			}
-			globalCategoryGroups.Save()
 			auditEventDiffID(r, "category-group.delete", name, id, "", nil, nil)
 			saveConfigVersion(sessionAdmin(r), "category-group.delete")
-			jsonOK(w, map[string]any{"ok": true})
+			jsonOK(w, map[string]any{"ok": true, "version": globalCategoryGroups.Version()})
 			return
 		}
 		name := strings.TrimSpace(r.URL.Query().Get("name"))
@@ -600,11 +597,11 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 		if deleteBlockedByReferences(w, r, "category-group", name, "category-group.remove.blocked") {
 			return
 		}
-		if err := globalCategoryGroups.Delete(name); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err := globalCategoryGroups.MutateDurable(nil, func() error {
+			return globalCategoryGroups.Delete(name)
+		}); writeObjectMutationError(w, err) {
 			return
 		}
-		globalCategoryGroups.Save()
 		auditEvent(r, "category-group.delete", name, "")
 		saveConfigVersion(sessionAdmin(r), "category-group.delete")
 		jsonOK(w, map[string]any{"ok": true})
@@ -612,6 +609,92 @@ func apiCategoryGroups(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// apiCategoryGroupUpdateByID is the stable-ID PUT branch of apiCategoryGroups
+// (rename-safe addressing, mirrors the policy ?id= path, #695): the durable
+// content update + rename in one fenced critical section, then the rename
+// cascade onto running policy and the open draft candidate. The caller holds
+// the reference-integrity write gate.
+func apiCategoryGroupUpdateByID(w http.ResponseWriter, r *http.Request, id, name string, categories []string) {
+	before := globalCategoryGroups.GetByID(id)
+	if before == nil {
+		http.Error(w, "group not found", http.StatusNotFound)
+		return
+	}
+	// Rename (references-by-id S2): UpdateByID keeps the current name, so a
+	// name change must be applied explicitly via Rename (re-keys the store)
+	// and cascaded onto referencing rules. Rules link by the group ID, so
+	// matching survives regardless; the cascade keeps the denormalized name
+	// honest for display/export/DP-sync.
+	newName := strings.TrimSpace(name)
+	renamed := newName != "" && !strings.EqualFold(newName, before.Name)
+	// Phase 1 — the OBJECT domain, durable-or-nothing (2D-A.0): content
+	// update + rename apply and persist in one serialized critical section
+	// under the optional ?ifVersion= fence. Validation rejects before any
+	// state changes; a persist failure rolls everything back (500); a name
+	// collision is refused under the store lock (409, no TOCTOU).
+	err := globalCategoryGroups.MutateDurable(parseIfVersion(r), func() error {
+		if uerr := globalCategoryGroups.UpdateByID(id, categories); uerr != nil {
+			return uerr
+		}
+		if renamed {
+			if _, rerr := globalCategoryGroups.Rename(id, newName); rerr != nil {
+				return rerr
+			}
+		}
+		return nil
+	})
+	if writeObjectMutationError(w, err) {
+		return
+	}
+	detail := fmt.Sprintf("%d categories", len(categories))
+	// Phase 2/3 — the rename cascade onto RUNNING policy and the open
+	// draft candidate (composed cross-store operation, §6/§7): each is a
+	// real policy mutation that must survive a restart, so both persists
+	// are error-aware. A failure after the durable object rename keeps the
+	// (correct) in-memory cascade, is surfaced as a truthful 500 — never a
+	// 2xx with a known-failed durable domain — and converges at the next
+	// restart via reconcileObjectRefNames (the object store owns name truth).
+	var cascadeErr error
+	if renamed {
+		cascadeErr = cascadeCategoryGroupRenameDurable(id, before.Name, newName)
+		detail += ", renamed from " + sanitizeLog(before.Name)
+	}
+	auditName := before.Name
+	if renamed {
+		auditName = newName
+	}
+	if cascadeErr != nil {
+		auditEventDiffID(r, "category-group.update", auditName, id,
+			detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error(), nil, nil)
+		writeRenameCascadePersistFailure(w, "category group", cascadeErr)
+		return
+	}
+	auditEventDiffID(r, "category-group.update", auditName, id, detail, nil, nil)
+	saveConfigVersion(sessionAdmin(r), "category-group.update")
+	jsonOK(w, map[string]any{"ok": true, "version": globalCategoryGroups.Version()})
+}
+
+// cascadeCategoryGroupRenameDurable cascades a category-group rename onto
+// RUNNING policy and the open draft candidate and reports the first persist
+// failure of either domain (both are attempted; the errors are joined). The
+// in-memory cascade is kept on failure — the caller surfaces a truthful 500
+// and reconcileObjectRefNames converges at the next restart.
+func cascadeCategoryGroupRenameDurable(id, oldName, newName string) error {
+	var cascadeErr error
+	if n := policyStore.CascadeDestCategoryGroupRename(id, oldName, newName); n > 0 {
+		if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
+			cascadeErr = fmt.Errorf("running policy: %w", perr)
+		}
+	}
+	if derr := policyDraft.cascadeDestCategoryGroupRename(id, oldName, newName); derr != nil {
+		if cascadeErr != nil {
+			return fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
+		}
+		return fmt.Errorf("draft candidate: %w", derr)
+	}
+	return cascadeErr
 }
 
 // apiDecryptionProfiles is the CRUD handler for named SSL-decryption profiles
@@ -625,9 +708,14 @@ func apiDecryptionProfiles(w http.ResponseWriter, r *http.Request) { //nolint:cy
 		if !requireRole(w, r, RoleViewer) {
 			return
 		}
+		// One coherent snapshot — same coherent-read contract as the category-
+		// group list (POST-2D-A COHERENT-READ CORRECTION DISCOVERED DURING
+		// 2D-B REVIEW): rows, names, and the fence version from one lock hold.
+		snap := globalDecryptionProfiles.SnapshotView()
 		jsonOK(w, map[string]any{
-			"profiles": globalDecryptionProfiles.List(),
-			"names":    globalDecryptionProfiles.Names(),
+			"profiles": snap.Profiles,
+			"names":    snap.Names,
+			"version":  snap.Version,
 		})
 
 	case http.MethodPost:
@@ -639,20 +727,34 @@ func apiDecryptionProfiles(w http.ResponseWriter, r *http.Request) { //nolint:cy
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		created, err := globalDecryptionProfiles.Add(p)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		// Durable-or-nothing (2D-A.0): fence + mutation + persist in one
+		// serialized critical section; persist failure rolls back (500), name
+		// collision refuses under the store lock (409).
+		var created *DecryptionProfile
+		err := globalDecryptionProfiles.MutateDurable(parseIfVersion(r), func() error {
+			c, aerr := globalDecryptionProfiles.Add(p)
+			if aerr != nil {
+				return aerr
+			}
+			created = c
+			return nil
+		})
+		if writeObjectMutationError(w, err) {
 			return
 		}
-		globalDecryptionProfiles.Save()
 		auditEvent(r, "decryption-profile.create", created.Name, "")
 		saveConfigVersion(sessionAdmin(r), "decryption-profile.create")
-		jsonOK(w, map[string]any{"ok": true, "profile": created})
+		jsonOK(w, map[string]any{"ok": true, "profile": created, "version": globalDecryptionProfiles.Version()})
 
 	case http.MethodPut:
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
+		// Blocker B (shared side): the rename cascade REWRITES rule
+		// references, so a profile update must not interleave with a
+		// concurrent object delete's scan-and-delete decision.
+		refWriteLock()
+		defer refWriteUnlock()
 		var p DecryptionProfile
 		if err := decodeJSON(r, &p); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -673,57 +775,68 @@ func apiDecryptionProfiles(w http.ResponseWriter, r *http.Request) { //nolint:cy
 			// honest for display/export/DP-sync.
 			newName := strings.TrimSpace(p.Name)
 			renamed := newName != "" && !strings.EqualFold(newName, before.Name)
-			if renamed {
-				// Pre-check the name collision BEFORE mutating anything so a taken
-				// name fails cleanly (Rename re-checks under its own lock — this only
-				// avoids applying the content update below and then bouncing on the
-				// rename). A different profile owning the target name is a conflict.
-				if g := globalDecryptionProfiles.GetByName(newName); g != nil && g.ID != id {
-					http.Error(w, "a profile named "+newName+" already exists", http.StatusConflict)
-					return
+			// Phase 1 — the OBJECT domain, durable-or-nothing (2D-A.0): content
+			// update (validates first — no partial state where the name changed but
+			// the content bounced) + rename apply and persist in one serialized
+			// critical section under the optional ?ifVersion= fence. Persist
+			// failure rolls back (500); a name collision is refused under the
+			// store lock (409, no TOCTOU).
+			err := globalDecryptionProfiles.MutateDurable(parseIfVersion(r), func() error {
+				if uerr := globalDecryptionProfiles.UpdateByID(id, p); uerr != nil {
+					return uerr
 				}
-			}
-			// Apply the content update FIRST: it validates the profile body, so a
-			// bad-field rejection returns before any rename is applied (no partial
-			// state where the name changed but the content update bounced).
-			if err := globalDecryptionProfiles.UpdateByID(id, p); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				if renamed {
+					if _, rerr := globalDecryptionProfiles.Rename(id, newName); rerr != nil {
+						return rerr
+					}
+				}
+				return nil
+			})
+			if writeObjectMutationError(w, err) {
 				return
 			}
-			if renamed {
-				if _, err := globalDecryptionProfiles.Rename(id, newName); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-			}
-			globalDecryptionProfiles.Save()
 			detail := ""
+			// Phase 2/3 — the rename cascade onto RUNNING policy and the open
+			// draft candidate (§6/§7): error-aware persists; a failure after the
+			// durable object rename keeps the correct in-memory cascade, surfaces
+			// a truthful 500 (never 2xx with a known-failed durable domain), and
+			// converges at the next restart via reconcileObjectRefNames.
+			var cascadeErr error
 			if renamed {
-				// Refresh referencing rules on running AND the open draft candidate,
-				// then persist the policy store BEFORE versioning (durability: a
-				// restart before the next policy edit must not reload stale names —
-				// the cascade is a real policy mutation). The draft cascade keeps a
-				// staged candidate from re-writing stale names back at commit time.
 				if n := policyStore.CascadeDecryptionProfileRename(id, before.Name, newName); n > 0 {
-					policyStore.Save()
+					if perr := policyStore.SaveErr(); perr != nil && !errors.Is(perr, fileutil.ErrReplacedNotSynced) {
+						cascadeErr = fmt.Errorf("running policy: %w", perr)
+					}
 				}
-				policyDraft.cascadeDecryptionProfileRename(id, before.Name, newName)
+				if derr := policyDraft.cascadeDecryptionProfileRename(id, before.Name, newName); derr != nil {
+					if cascadeErr != nil {
+						cascadeErr = fmt.Errorf("%w; draft candidate: %w", cascadeErr, derr)
+					} else {
+						cascadeErr = fmt.Errorf("draft candidate: %w", derr)
+					}
+				}
 				detail = "renamed from " + sanitizeLog(before.Name)
 			}
 			auditName := before.Name
 			if renamed {
 				auditName = newName
 			}
+			if cascadeErr != nil {
+				auditEventDiffID(r, "decryption-profile.update", auditName, id,
+					detail+" — rename durable but display-name cascade not persisted: "+cascadeErr.Error(), nil, nil)
+				writeRenameCascadePersistFailure(w, "decryption profile", cascadeErr)
+				return
+			}
 			auditEventDiffID(r, "decryption-profile.update", auditName, id, detail, nil, nil)
 			saveConfigVersion(sessionAdmin(r), "decryption-profile.update")
-			jsonOK(w, map[string]any{"ok": true})
+			jsonOK(w, map[string]any{"ok": true, "version": globalDecryptionProfiles.Version()})
 			return
 		}
-		if err := globalDecryptionProfiles.Update(p); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err := globalDecryptionProfiles.MutateDurable(nil, func() error {
+			return globalDecryptionProfiles.Update(p)
+		}); writeObjectMutationError(w, err) {
 			return
 		}
-		globalDecryptionProfiles.Save()
 		auditEvent(r, "decryption-profile.update", p.Name, "")
 		saveConfigVersion(sessionAdmin(r), "decryption-profile.update")
 		jsonOK(w, map[string]any{"ok": true})
@@ -732,6 +845,10 @@ func apiDecryptionProfiles(w http.ResponseWriter, r *http.Request) { //nolint:cy
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
+		// Blocker B: reference scan + durable delete as one atomic decision
+		// under the exclusive side of the reference-integrity gate.
+		refScanDeleteLock()
+		defer refScanDeleteUnlock()
 		// Stable-ID addressing (rename-safe); resolve to the current name for the
 		// reference-integrity check + audit, then delete by id.
 		if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
@@ -743,15 +860,18 @@ func apiDecryptionProfiles(w http.ResponseWriter, r *http.Request) { //nolint:cy
 			if deleteBlockedByReferences(w, r, "decryption-profile", before.Name, "decryption-profile.remove.blocked") {
 				return
 			}
-			name, err := globalDecryptionProfiles.DeleteByID(id)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+			var name string
+			err := globalDecryptionProfiles.MutateDurable(parseIfVersion(r), func() error {
+				n, derr := globalDecryptionProfiles.DeleteByID(id)
+				name = n
+				return derr
+			})
+			if writeObjectMutationError(w, err) {
 				return
 			}
-			globalDecryptionProfiles.Save()
 			auditEventDiffID(r, "decryption-profile.delete", name, id, "", nil, nil)
 			saveConfigVersion(sessionAdmin(r), "decryption-profile.delete")
-			jsonOK(w, map[string]any{"ok": true})
+			jsonOK(w, map[string]any{"ok": true, "version": globalDecryptionProfiles.Version()})
 			return
 		}
 		name := strings.TrimSpace(r.URL.Query().Get("name"))
@@ -765,11 +885,11 @@ func apiDecryptionProfiles(w http.ResponseWriter, r *http.Request) { //nolint:cy
 		if deleteBlockedByReferences(w, r, "decryption-profile", name, "decryption-profile.remove.blocked") {
 			return
 		}
-		if err := globalDecryptionProfiles.Delete(name); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err := globalDecryptionProfiles.MutateDurable(nil, func() error {
+			return globalDecryptionProfiles.Delete(name)
+		}); writeObjectMutationError(w, err) {
 			return
 		}
-		globalDecryptionProfiles.Save()
 		auditEvent(r, "decryption-profile.delete", name, "")
 		saveConfigVersion(sessionAdmin(r), "decryption-profile.delete")
 		jsonOK(w, map[string]any{"ok": true})
@@ -798,7 +918,27 @@ func apiDecryptionExclusions(w http.ResponseWriter, r *http.Request) {
 		// into fail-open and how many rules reference them. 0/0 ⇒ nothing can ever
 		// auto-disable inspection (an empty cache alone does not prove this).
 		foProfiles, foRules := failOpenFootprint()
+		// ONE Stats snapshot: the stats block AND the tunables revision derive
+		// from it, so the served {current values, revision} pair is coherent
+		// (2E-B §D — the revision must fingerprint exactly the returned state).
+		stats := autoExclude().Stats()
 		exclusions := autoExclude().List()
+		// Bounded management read (2E-B §E): ?limit= caps the entry corpus a
+		// browser is handed (the cache itself is bounded by max_entries, which an
+		// admin may raise to 262144 — far past a sane management payload). Absent
+		// ⇒ the legacy full listing. stats.active keeps the full population.
+		truncated := false
+		if limStr := strings.TrimSpace(r.URL.Query().Get("limit")); limStr != "" {
+			lim, err := strconv.Atoi(limStr)
+			if err != nil || lim < 1 {
+				http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+				return
+			}
+			if len(exclusions) > lim {
+				exclusions = exclusions[:lim]
+				truncated = true
+			}
+		}
 		// Resolve each scope's CURRENT profile name + rule-count blast radius by ID
 		// (a rename keeps the profile ID; the entry's cached ScopeName may be stale).
 		// Both maps are keyed by scope ID; the UI prefers the current name.
@@ -828,7 +968,9 @@ func apiDecryptionExclusions(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOK(w, map[string]any{
 			"exclusions":         exclusions,
-			"stats":              autoExclude().Stats(),
+			"truncated":          truncated,
+			"stats":              stats,
+			"tunables_revision":  autoExcludeTunablesRevisionOf(autoExcludeTunablesFromStats(stats)),
 			"fail_open_profiles": foProfiles,
 			"fail_open_rules":    foRules,
 			"scope_rule_counts":  scopeRules, // keyed by scope_id
@@ -844,7 +986,13 @@ func apiDecryptionExclusions(w http.ResponseWriter, r *http.Request) {
 		if host != "" {
 			// Evict one (scope, host). scope is the owning decryption-profile ID.
 			removed := autoExclude().Remove(scope, host)
-			auditEvent(r, "decryption.autoexclude.evict", scope+"/"+host, "manual eviction of a learned exclusion")
+			// Audit truth (2E-B §I): the record reflects what actually happened —
+			// a request for an absent entry is not an eviction.
+			detail := "manual eviction of a learned exclusion"
+			if !removed {
+				detail = "eviction requested; entry was not present"
+			}
+			auditEvent(r, "decryption.autoexclude.evict", scope+"/"+host, detail)
 			jsonOK(w, map[string]any{"ok": true, "removed": removed})
 			return
 		}
@@ -915,22 +1063,52 @@ func apiDecryptionExclusionTunables(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// VALIDATE (done) → PERSIST target → APPLY runtime. Persist first: a write
-		// failure must not have already evicted learned entries (persist-before-apply).
-		// The apply runs via applyOnSuccess INSIDE the save's lock so a concurrent
-		// omnibus save can't revert the just-persisted tunables on disk.
-		old := currentAutoExcludeTunables()
-		if err := saveAdminSettingsWithOverrides(adminSaveOverrides{
-			autoExclude:    &resolved,
+		// VALIDATE (done) → FENCE → PERSIST target → APPLY runtime. Persist first: a
+		// write failure must not have already evicted learned entries
+		// (persist-before-apply). The OPTIONAL ?ifRevision= stale-writer fence
+		// (2E-B §D) is compared inside the save's precondition — the comparison and
+		// the durable target write share ONE serialized AdminSettings save domain,
+		// so two racing fenced admins cannot both pass; absent keeps the legacy
+		// replacement contract (the v2 client always asserts). The apply runs via
+		// applyOnSuccess INSIDE the save's lock so a concurrent omnibus save can't
+		// revert the just-persisted tunables on disk.
+		ifRev := parseIfRevision(r)
+		var old autoExcludeTunables
+		err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+			autoExclude: &resolved,
+			precondition: func() error {
+				old = currentAutoExcludeTunables()
+				if ifRev != nil {
+					if cur := autoExcludeTunablesRevisionOf(old); cur != *ifRev {
+						return errContentSecRevisionConflict{current: cur, asserted: *ifRev}
+					}
+				}
+				return nil
+			},
 			applyOnSuccess: func() { autoExclude().Reconfigure(resolved.engineConfig()) },
-		}); err != nil {
+		})
+		var conflict errContentSecRevisionConflict
+		if errors.As(err, &conflict) {
+			writeContentSecRevisionConflict(w, "auto-exclusion tunables", conflict.current, conflict.asserted)
+			return
+		}
+		if err != nil {
 			logger.Printf("decryption tunables: persist failed, runtime unchanged: %v", err)
 			http.Error(w, "failed to persist tunables", http.StatusInternalServerError)
 			return
 		}
 		auditEventDiff(r, "decryption.autoexclude.tunables", "tunables",
 			"updated adaptive decryption-exclusion tunables", old, resolved)
-		jsonOK(w, resolved)
+		// The response is the set THIS PUT installed plus its revision (coherent
+		// by construction — never a re-read).
+		jsonOK(w, map[string]any{
+			"confirm_n":       resolved.ConfirmN,
+			"ttl_secs":        resolved.TTLSecs,
+			"pinned_ttl_secs": resolved.PinnedTTLSecs,
+			"window_secs":     resolved.WindowSecs,
+			"max_entries":     resolved.MaxEntries,
+			"revision":        autoExcludeTunablesRevisionOf(resolved),
+		})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -940,28 +1118,10 @@ func apiDecryptionExclusionTunables(w http.ResponseWriter, r *http.Request) {
 func apiURLCat(w http.ResponseWriter, r *http.Request) { //nolint:cyclop,funlen,gocognit // CRUD handler: one branch per HTTP method is intentional
 	switch r.Method {
 	case http.MethodGet:
-		all := catStore.All()
-		// Enrich with feed-backed flag so the GUI shows which categories
-		// have UT1 community feed domains behind them.
-		ut1Set := make(map[string]bool)
-		feedActive := communityDB != nil // only show badge if feed is actually configured
-		if feedActive {
-			for _, cat := range feedsync.MappedCategories() {
-				ut1Set[strings.ToLower(cat)] = true
-			}
-		}
-		type enrichedCat struct {
-			CategoryEntry
-			FeedBacked bool `json:"feedBacked"`
-		}
-		enriched := make([]enrichedCat, len(all))
-		for i, e := range all {
-			enriched[i] = enrichedCat{
-				CategoryEntry: e,
-				FeedBacked:    ut1Set[strings.ToLower(e.Name)],
-			}
-		}
-		jsonOK(w, enriched)
+		// LEGACY raw-array contract — never reshaped (2D-B §8; the v2 read
+		// is GET /api/urlcat/state). Same enrichment helper as /state so the
+		// two reads cannot disagree.
+		jsonOK(w, enrichedURLCategories())
 
 	case http.MethodPost:
 		if !requireRole(w, r, RoleOperator) {
@@ -985,6 +1145,22 @@ func apiURLCat(w http.ResponseWriter, r *http.Request) { //nolint:cyclop,funlen,
 		}
 		if len(body.Hosts) > 10000 {
 			http.Error(w, "category cannot contain more than 10000 hosts", http.StatusBadRequest)
+			return
+		}
+		if ifRev := parseIfRevision(r); ifRev != nil {
+			// v2 fenced STRICT create (2D-B §9/§10): fence + mutation +
+			// durable publish in one serialization domain; an existing name
+			// is a 409, never a silent upsert. Recompose ONLY after durable
+			// success (§13) — a failed mutation never reaches the effective
+			// policy view.
+			if err := catStore.CreateDurable(ifRev, body.Name, body.Hosts); err != nil {
+				writeTaxonomyMutationError(w, err)
+				return
+			}
+			recomposeSignedFeedTaxonomy()
+			auditEvent(r, "urlcat.create", body.Name, fmt.Sprintf("%d host(s)", len(body.Hosts)))
+			saveConfigVersion(sessionAdmin(r), "urlcat.create")
+			jsonOK(w, map[string]any{"name": body.Name, "revision": catStore.ContentFingerprint()})
 			return
 		}
 		if err := catStore.Set(body.Name, body.Hosts, false); err != nil {
@@ -1013,6 +1189,31 @@ func apiURLCat(w http.ResponseWriter, r *http.Request) { //nolint:cyclop,funlen,
 		}
 		if err := decodeJSON(r, &body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if ifRev := parseIfRevision(r); ifRev != nil {
+			// Blocker D + C: a BuiltIn category owned by an active signed
+			// generation is read-only on the v2 surface (structured 409 →
+			// SaaS Overrides), and the ownership decision is linearized with
+			// the durable mutation against signed cutover (§14) — released
+			// before the recompose.
+			release, refused := beginV2CategoryMutation(w, name)
+			if refused {
+				return
+			}
+			// v2 fenced host replacement: the store preserves BuiltIn INSIDE
+			// the transaction (no read-then-write window) and enforces the
+			// MaxHostsPerCategory bound; recompose only after durable success.
+			err := catStore.ReplaceHostsDurable(ifRev, name, body.Hosts)
+			release()
+			if err != nil {
+				writeTaxonomyMutationError(w, err)
+				return
+			}
+			recomposeSignedFeedTaxonomy()
+			auditEvent(r, "urlcat.update", name, fmt.Sprintf("%d host(s)", len(body.Hosts)))
+			saveConfigVersion(sessionAdmin(r), "urlcat.update")
+			jsonOK(w, map[string]any{"name": name, "revision": catStore.ContentFingerprint()})
 			return
 		}
 		// Preserve builtIn flag when updating.
@@ -1050,7 +1251,36 @@ func apiURLCat(w http.ResponseWriter, r *http.Request) { //nolint:cyclop,funlen,
 		// GET /api/objects/references can never disagree. Deleting a referenced
 		// category was fail-open: a Deny rule scoped to it silently stopped
 		// blocking.
+		//
+		// Blocker B: the scan and the deletion hold the reference-integrity
+		// gate EXCLUSIVELY as one atomic decision — a reference writer can no
+		// longer land between "unreferenced" and the delete (the recorded
+		// POLICY-REFS-PLAN.md TOCTOU).
+		refScanDeleteLock()
+		defer refScanDeleteUnlock()
 		if deleteBlockedByReferences(w, r, "category", name, "urlcat.delete.blocked") {
+			return
+		}
+		if ifRev := parseIfRevision(r); ifRev != nil {
+			// Blocker D + C: deleting a feed-owned BuiltIn category cannot
+			// remove it from enforcement — refuse (409 → SaaS Overrides
+			// tombstones); ownership decision linearized with the durable
+			// delete (§14), released before the recompose.
+			release, refused := beginV2CategoryMutation(w, name)
+			if refused {
+				return
+			}
+			// v2 fenced durable delete; recompose only after durable success.
+			err := catStore.DeleteDurable(ifRev, name)
+			release()
+			if err != nil {
+				writeTaxonomyMutationError(w, err)
+				return
+			}
+			recomposeSignedFeedTaxonomy()
+			auditEvent(r, "urlcat.delete", name, "")
+			saveConfigVersion(sessionAdmin(r), "urlcat.delete")
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if err := catStore.Delete(name); err != nil {
@@ -1088,6 +1318,27 @@ func apiURLCatHost(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "category and host are required", http.StatusBadRequest)
 			return
 		}
+		if ifRev := parseIfRevision(r); ifRev != nil {
+			// Blocker D + C: no v2 host mutation on a feed-owned BuiltIn
+			// category; ownership decision linearized with the mutation.
+			release, refused := beginV2CategoryMutation(w, body.Category)
+			if refused {
+				return
+			}
+			// v2 fenced durable single-host add (post-mutation cap enforced
+			// at the store boundary); recompose only after durable success.
+			err := catStore.AddHostDurable(ifRev, body.Category, body.Host)
+			release()
+			if err != nil {
+				writeTaxonomyMutationError(w, err)
+				return
+			}
+			recomposeSignedFeedTaxonomy()
+			auditEvent(r, "urlcat.host.add", body.Category, body.Host)
+			saveConfigVersion(sessionAdmin(r), "urlcat.host.add")
+			jsonOK(w, map[string]any{"category": body.Category, "host": body.Host, "revision": catStore.ContentFingerprint()})
+			return
+		}
 		if err := catStore.AddHost(body.Category, body.Host); err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
@@ -1107,6 +1358,26 @@ func apiURLCatHost(w http.ResponseWriter, r *http.Request) {
 		host := r.URL.Query().Get("host")
 		if category == "" || host == "" {
 			http.Error(w, "category and host query params required", http.StatusBadRequest)
+			return
+		}
+		if ifRev := parseIfRevision(r); ifRev != nil {
+			// Blocker D + C: no v2 host mutation on a feed-owned BuiltIn
+			// category; ownership decision linearized with the mutation.
+			release, refused := beginV2CategoryMutation(w, category)
+			if refused {
+				return
+			}
+			// v2 fenced durable single-host remove.
+			err := catStore.RemoveHostDurable(ifRev, category, host)
+			release()
+			if err != nil {
+				writeTaxonomyMutationError(w, err)
+				return
+			}
+			recomposeSignedFeedTaxonomy()
+			auditEvent(r, "urlcat.host.remove", category, host)
+			saveConfigVersion(sessionAdmin(r), "urlcat.host.remove")
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if err := catStore.RemoveHost(category, host); err != nil {
@@ -1264,11 +1535,21 @@ type configBackup struct {
 	// calls saveConfigVersion; sibling RateLimitRPM was already covered. It is
 	// NOT one of the five export/import-only fields below. See
 	// roadmap/CATEGORY-B-PRIME-FINDING-10.3-SPEC.md.
-	AlertWebhooks     []AlertWebhook  `json:"alertWebhooks,omitempty"`
-	BlockPageHTML     string          `json:"blockPageHTML,omitempty"`
-	UpstreamProxies   []UpstreamEntry `json:"upstreamProxies,omitempty"`
-	ConnLimitEnabled  bool            `json:"connLimitEnabled,omitempty"`
-	ConnLimitMaxPerIP int             `json:"connLimitMaxPerIP,omitempty"`
+	AlertWebhooks []AlertWebhook `json:"alertWebhooks,omitempty"`
+	BlockPageHTML string         `json:"blockPageHTML,omitempty"`
+	// UpstreamProxies is the pre-2F-D legacy list: IMPORT-ONLY compatibility
+	// (authority-keyed, versioned `xxxxx` rule — upstream_portability.go).
+	// Never written by an export since schema version 2.
+	UpstreamProxies []UpstreamEntry `json:"upstreamProxies,omitempty"`
+	// UpstreamProxiesV2 + UpstreamCredentials are the 2F-D export contract
+	// (C5): the versioned managed-entry representation {id, scheme, host,
+	// port, username, credentialState} and the constant marker "omitted" —
+	// no password, sealed record, ciphertext, key id or redaction marker
+	// ever leaves the node. Import plans them identity-first (C9).
+	UpstreamProxiesV2   *upstreamExportDocument `json:"upstream_proxies_v2,omitempty"`
+	UpstreamCredentials string                  `json:"upstream_credentials,omitempty"`
+	ConnLimitEnabled    bool                    `json:"connLimitEnabled,omitempty"`
+	ConnLimitMaxPerIP   int                     `json:"connLimitMaxPerIP,omitempty"`
 
 	// CategoryGroups extends the rollback surface to cover the
 	// PolicyRules → CategoryGroup reference. Per
@@ -1341,6 +1622,15 @@ type configBackup struct {
 func apiRewrite(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		// Management-surface closure: RewriteRule serializes stableId, so the
+		// LEGACY list is a management-identity read too — while identity is
+		// not durable it answers the SAME structured 503 as the v2 state
+		// surface (one dialect; ephemeral StableIDs are never exposed as a
+		// healthy management list). Healthy behavior is unchanged.
+		if d := rewriteIdentityDegraded(); d != nil {
+			writeRewriteIdentityDegraded(w, d)
+			return
+		}
 		rules := rewriter.List()
 		jsonOK(w, map[string]any{"rules": rules, "count": len(rules)})
 
@@ -1348,43 +1638,156 @@ func apiRewrite(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		var rule RewriteRule
-		if err := decodeJSON(r, &rule); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		added := rewriter.Add(rule)
-		logID := strings.ReplaceAll(fmt.Sprintf("%d", added.ID), "\n", "_")
-		logger.Printf("UI: rewrite rule added id=%s host=%q", logID, sanitizeLog(added.Host))
-		auditEvent(r, "rewrite.add", fmt.Sprintf("id=%d host=%s", added.ID, added.Host), "")
-		adminSettingsSave()
-		saveConfigVersion(sessionAdmin(r), "rewrite.add")
-		jsonOK(w, added)
+		apiRewriteAdd(w, r)
 
 	case http.MethodDelete:
 		if !requireRole(w, r, RoleOperator) {
 			return
 		}
-		idStr := strings.TrimSpace(r.URL.Query().Get("id"))
-		var id int
-		if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-			http.Error(w, "missing or invalid id param", http.StatusBadRequest)
-			return
-		}
-		if !rewriter.RemoveByID(id) {
-			http.Error(w, "rule not found", http.StatusNotFound)
-			return
-		}
-		logID := strings.ReplaceAll(fmt.Sprintf("%d", id), "\n", "_")
-		logger.Printf("UI: rewrite rule removed id=%s", logID)
-		auditEvent(r, "rewrite.remove", fmt.Sprintf("id=%d", id), "")
-		adminSettingsSave()
-		saveConfigVersion(sessionAdmin(r), "rewrite.remove")
-		w.WriteHeader(http.StatusNoContent)
+		apiRewriteRemove(w, r)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// apiRewriteAdd is the POST branch of apiRewrite (the caller has already
+// enforced the operator role): degradation disclosure AFTER the RBAC
+// boundary, server-owned identity, and the durable-or-nothing append inside
+// one adminSettingsMu critical section (§22/§24).
+func apiRewriteAdd(w http.ResponseWriter, r *http.Request) {
+	// AFTER the RBAC boundary (authorization precedes degradation
+	// disclosure): while management identity is not durable a v2
+	// mutation could create/address identity that re-mints on restart
+	// (and a save could clobber a refused/corrupt settings file) — refuse
+	// with the structured 503, visible to authorized Operators only.
+	if d := rewriteIdentityDegraded(); d != nil {
+		writeRewriteIdentityDegraded(w, d)
+		return
+	}
+	var rule RewriteRule
+	if err := decodeJSON(r, &rule); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := validateIncomingRewriteRule(rule); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Server-owned identity (§22): a client-supplied stableId is ignored.
+	rule.StableID = rewrite.NewStableID()
+	ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
+	// Durable-or-nothing (§24): fence + target build + settings persist +
+	// runtime publication in ONE adminSettingsMu critical section. A hard
+	// persist failure means the rule was never active anywhere.
+	err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+		rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
+			if ferr := rewriteFence(ifRev, current); ferr != nil {
+				return nil, ferr
+			}
+			return append(append([]RewriteRule(nil), current...), rule), nil
+		},
+	})
+	if err != nil {
+		var conflict *errRewriteRevisionConflict
+		if errors.As(err, &conflict) {
+			writeRewriteRevisionConflict(w, conflict.current, ifRev)
+			return
+		}
+		http.Error(w, "rewrite rule not persisted: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// The published copy carries the process-local integer id assigned at
+	// publication — return it for legacy-client compatibility.
+	added := rule
+	for _, lr := range rewriter.List() {
+		if lr.StableID == rule.StableID {
+			added = lr
+			break
+		}
+	}
+	logger.Printf("UI: rewrite rule added stableId=%s host=%q", sanitizeLog(added.StableID), sanitizeLog(added.Host))
+	auditEvent(r, "rewrite.add", fmt.Sprintf("stableId=%s host=%s", added.StableID, added.Host), "")
+	saveConfigVersion(sessionAdmin(r), "rewrite.add")
+	jsonOK(w, added)
+}
+
+// apiRewriteRemove is the DELETE branch of apiRewrite (the caller has already
+// enforced the operator role): v2 ?stableId= addressing with the legacy ?id=
+// resolved to the durable identity INSIDE the critical section, so a
+// concurrent reload cannot retarget it.
+func apiRewriteRemove(w http.ResponseWriter, r *http.Request) {
+	// AFTER the RBAC boundary — same ordering contract as POST.
+	if d := rewriteIdentityDegraded(); d != nil {
+		writeRewriteIdentityDegraded(w, d)
+		return
+	}
+	// v2 addressing: ?stableId= (durable identity). Legacy ?id= (process-
+	// local integer) stays supported for existing clients; it is resolved
+	// to the durable identity INSIDE the critical section so a concurrent
+	// reload cannot retarget it.
+	stableID := strings.TrimSpace(r.URL.Query().Get("stableId"))
+	idStr := strings.TrimSpace(r.URL.Query().Get("id"))
+	var legacyID int
+	hasLegacy := false
+	if stableID == "" {
+		if _, err := fmt.Sscanf(idStr, "%d", &legacyID); err != nil {
+			http.Error(w, "missing or invalid id/stableId param", http.StatusBadRequest)
+			return
+		}
+		hasLegacy = true
+	}
+	ifRev := strings.TrimSpace(r.URL.Query().Get("ifRevision"))
+	removedStable := stableID
+	err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+		rewriteMutate: func(current []RewriteRule) ([]RewriteRule, error) {
+			if ferr := rewriteFence(ifRev, current); ferr != nil {
+				return nil, ferr
+			}
+			target, removed, ok := rewriteRulesWithout(current, stableID, hasLegacy, legacyID)
+			if !ok {
+				return nil, errRewriteRuleNotFound
+			}
+			removedStable = removed
+			return target, nil
+		},
+	})
+	if err != nil {
+		var conflict *errRewriteRevisionConflict
+		if errors.As(err, &conflict) {
+			writeRewriteRevisionConflict(w, conflict.current, ifRev)
+			return
+		}
+		if errors.Is(err, errRewriteRuleNotFound) {
+			http.Error(w, "rule not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "rewrite rule removal not persisted: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	logger.Printf("UI: rewrite rule removed stableId=%s", sanitizeLog(removedStable))
+	auditEvent(r, "rewrite.remove", "stableId="+removedStable, "")
+	saveConfigVersion(sessionAdmin(r), "rewrite.remove")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// rewriteRulesWithout returns current minus the FIRST rule addressed by
+// stableID (durable identity) or, when hasLegacy, by the process-local
+// legacy id; removed is the StableID of the dropped rule and ok is false
+// when nothing matched.
+func rewriteRulesWithout(current []RewriteRule, stableID string, hasLegacy bool, legacyID int) (target []RewriteRule, removed string, ok bool) {
+	target = make([]RewriteRule, 0, len(current))
+	for _, cr := range current {
+		match := (stableID != "" && cr.StableID == stableID) ||
+			(hasLegacy && cr.ID == legacyID)
+		if match && !ok {
+			ok = true
+			removed = cr.StableID
+			continue
+		}
+		target = append(target, cr)
+	}
+	return target, removed, ok
 }
 
 // ─── Policy API ───────────────────────────────────────────────────────────────
@@ -1427,6 +1830,16 @@ func stampObjectRefIDs(rule *PolicyRule) {
 	if rule.DestCategoryGroup != "" {
 		if g := globalCategoryGroups.GetByName(rule.DestCategoryGroup); g != nil {
 			rule.DestCategoryGroupID = g.ID
+		}
+	}
+	// File profile (2D-C promotion): same trust boundary — the NAME is client
+	// intent, the ID is server-derived. A legacy built-in name with no store
+	// object (compiled fileProfileExts fallback) legitimately stamps no ID and
+	// keeps resolving by name.
+	rule.FileProfileID = ""
+	if rule.FileProfile != "" && rule.FileProfile != FileProfileNone {
+		if p := globalProfileStore.GetByName(string(rule.FileProfile)); p != nil {
+			rule.FileProfileID = p.ID
 		}
 	}
 }
@@ -1505,17 +1918,22 @@ func apiPolicy(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		// Effective view: the candidate while the draft is engaged (so the editor
-		// shows what will be committed), else running (policy-draft G2). The
-		// draft flag mirrors the same predicate so the SPA banner never claims
-		// draft editing while the rules shown (and written) are the live ones.
-		rules := effectivePolicyList()
-		ver, updatedAt := effectivePolicyVersion()
+		// shows what will be committed), else running (policy-draft G2). ONE
+		// coordinator-locked capture supplies the store choice, the rules, the
+		// version fence, AND the draft fact (§§6–8 fenced-read correction):
+		// independent effectivePolicyList/effectivePolicyVersion calls let a
+		// staged edit land in between, tearing rules from version — a client
+		// holding generation-P rules with a generation-P+1 token would pass the
+		// optimistic fence with a stale edit. The draft flag comes from the same
+		// selected state so the SPA banner never claims draft editing while the
+		// rules shown (and written) are the live ones.
+		snap, draft := effectiveManagementSnapshot()
 		jsonOK(w, map[string]any{
-			"rules":     rules,
-			"count":     len(rules),
-			"version":   ver,
-			"updatedAt": updatedAt,
-			"draft":     policyDraftEngaged(),
+			"rules":     snap.Rules,
+			"count":     len(snap.Rules),
+			"version":   snap.Version,
+			"updatedAt": snap.UpdatedAt,
+			"draft":     draft,
 		})
 	case http.MethodPost:
 		apiPolicyCreate(w, r)
@@ -1526,23 +1944,6 @@ func apiPolicy(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-// findRuleByPriorityCopy returns a copy of the stored rule at the given
-// priority (nil if none) — the before-state snapshot for diff/audit.
-func findRuleByPriorityCopy(priority int) *PolicyRule {
-	// Index-based range: PolicyRule is a large struct (CLAUDE.md rangeValCopy
-	// convention) — copy only the matched rule, not every iteration.
-	// Effective list: candidate while drafting, else running (policy-draft G2) —
-	// the before-state for a diff/audit must come from what is being edited.
-	rules := effectivePolicyList()
-	for i := range rules {
-		if rules[i].Priority == priority {
-			r2 := rules[i]
-			return &r2
-		}
-	}
-	return nil
 }
 
 // effectiveRuleByID returns a copy of the rule with the given ID from the
@@ -1563,6 +1964,11 @@ func apiPolicyCreate(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, RoleOperator) {
 		return
 	}
+	// Blocker B (shared side): a new rule CREATES references (destCategory /
+	// destCategoryGroup / fileProfile / decryptionProfile) — it must not land
+	// between a concurrent object delete's reference scan and its deletion.
+	refWriteLock()
+	defer refWriteUnlock()
 	if policyVersionConflict(w, r) {
 		return
 	}
@@ -1581,22 +1987,66 @@ func apiPolicyCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `auth rules are managed via /api/authpolicy (admin only)`, http.StatusBadRequest)
 		return
 	}
-	if err := validatePolicyRule(rule, effectivePolicyList(), -1); err != nil {
+	// Structural validation (state-independent) stays a pre-fence 400; the
+	// name/priority uniqueness checks run INSIDE the fence below (2E-C
+	// concurrency-status correction).
+	if err := validateRuleShape(rule); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// SERVER CANONICALIZATION FIRST (ID-trust correction): stamp metadata and
+	// re-derive object IDs from NAMES (client-supplied IDs are discarded),
+	// then validate the FINAL canonical rule — reference validation must
+	// never trust a client ID, and no restamp may follow it.
 	stampRuleMetadataForWrite(&rule, nil, sessionAdmin(r))
+	// Blocker B delete-first order: validate every referenced object UNDER the
+	// shared gate, before the commit — a delete that already won makes this
+	// fail 400 instead of committing a dangling reference.
+	if refuseDanglingRuleRefs(w, &rule) {
+		return
+	}
+	policyWriteStateDecision(r, "resolved")
+	policyWriteStateDecision(r, "fence")
 	// Serialize with commit/revert (Codex round 16; see beginPolicyWrite).
 	beginPolicyWrite()
 	defer endPolicyWrite()
-	added := policyWriteStore(sessionAdmin(r)).Add(rule)
+	// Atomic fence + uniqueness validation + mutation (2B.0a): the version
+	// comparison, the duplicate-name/priority check and the Add run in one
+	// coordinator critical section against the same snapshot — the early
+	// policyVersionConflict above stays as fast-path/400 only.
+	var (
+		added  PolicyRule
+		ref    fencedRefusal
+		curVer int64
+	)
+	res := policyDraft.fencedMutate(sessionAdmin(r), parseIfVersion(r), func(target *PolicyStore) bool {
+		curVer, _ = target.policyVersion()
+		if err := validateRuleUniqueness(rule, target.List(), -1); err != nil {
+			ref = fencedRefusal{reason: err.Error()}
+			return false
+		}
+		added = target.Add(rule)
+		return true
+	})
+	if res.conflict != nil {
+		writePolicyVersionConflictError(w, res.conflict)
+		return
+	}
+	if res.err != nil {
+		writePolicyPersistFailure(w, res.err)
+		return
+	}
+	if !res.ok {
+		writeFencedRefusal(w, r, ref, curVer)
+		return
+	}
 	logName := strings.ReplaceAll(strings.ReplaceAll(added.Name, "\n", "_"), "\r", "_")
 	logAction := strings.ReplaceAll(strings.ReplaceAll(string(added.Action), "\n", "_"), "\r", "_")
 	logPriority := strings.ReplaceAll(fmt.Sprintf("%d", added.Priority), "\n", "_")
 	logger.Printf("UI: policy rule added priority=%s name=%q action=%q", logPriority, logName, logAction)
 	auditEventDiffID(r, "policy.add", added.Name, added.ID,
 		fmt.Sprintf("priority=%d action=%s", added.Priority, added.Action), nil, added)
-	afterPolicyWrite(r, "policy.add")
+	finalizeFencedPolicyWrite(r, "policy.add", res)
 	jsonOK(w, added)
 }
 
@@ -1604,6 +2054,11 @@ func apiPolicyUpdate(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, RoleOperator) {
 		return
 	}
+	// Blocker B (shared side): an edited rule can CHANGE which objects it
+	// references — covers the ?id= delegate below too (acquire once here;
+	// shared holds must never nest).
+	refWriteLock()
+	defer refWriteUnlock()
 	if policyVersionConflict(w, r) {
 		return
 	}
@@ -1620,12 +2075,6 @@ func apiPolicyUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing or invalid priority param", http.StatusBadRequest)
 		return
 	}
-	beforeRule := findRuleByPriorityCopy(priority)
-	// Auth (Stage-1) rules are admin-managed via /api/authpolicy only.
-	if beforeRule != nil && ruleTypeOf(beforeRule) == ruleTypeAuth {
-		http.Error(w, `auth rules are managed via /api/authpolicy (admin only)`, http.StatusBadRequest)
-		return
-	}
 	var rule PolicyRule
 	if err := decodeJSON(r, &rule); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -1635,24 +2084,69 @@ func apiPolicyUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `auth rules are managed via /api/authpolicy (admin only)`, http.StatusBadRequest)
 		return
 	}
-	if err := validatePolicyRule(rule, effectivePolicyList(), priority); err != nil {
+	if err := validateRuleShape(rule); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	stampRuleMetadataForWrite(&rule, beforeRule, sessionAdmin(r))
+	// SERVER CANONICALIZATION FIRST (ID-trust correction): stamp metadata and
+	// re-derive object IDs from NAMES (client-supplied IDs are discarded),
+	// then validate the FINAL canonical rule — reference validation must
+	// never trust a client ID, and no restamp may follow it. CreatedAt is
+	// carried from the target resolved INSIDE the fence.
+	stampRuleMetadataForWrite(&rule, nil, sessionAdmin(r))
+	// Blocker B delete-first order: validate referenced objects under the
+	// shared gate before committing the edit.
+	if refuseDanglingRuleRefs(w, &rule) {
+		return
+	}
+	policyWriteStateDecision(r, "resolved")
+	policyWriteStateDecision(r, "fence")
 	// Serialize with commit/revert (Codex round 16; see beginPolicyWrite).
 	beginPolicyWrite()
 	defer endPolicyWrite()
-	if !policyWriteStore(sessionAdmin(r)).Update(priority, rule) {
-		policyDraft.reconcile() // a failed mutation may have opened a now-clean draft
-		http.Error(w, "rule not found", http.StatusNotFound)
+	// Target existence, rule type and uniqueness are decided against the
+	// FENCED snapshot (2E-C concurrency-status correction).
+	var (
+		beforeRule *PolicyRule
+		ref        fencedRefusal
+		curVer     int64
+	)
+	res := policyDraft.fencedMutate(sessionAdmin(r), parseIfVersion(r), func(target *PolicyStore) bool {
+		curVer, _ = target.policyVersion()
+		beforeRule = findByPriorityIn(target, priority)
+		if beforeRule == nil {
+			ref = fencedRefusal{notFound: true}
+			return false
+		}
+		// Auth (Stage-1) rules are admin-managed via /api/authpolicy only.
+		if ruleTypeOf(beforeRule) == ruleTypeAuth {
+			ref = fencedRefusal{reason: "auth rules are managed via /api/authpolicy (admin only)"}
+			return false
+		}
+		if err := validateRuleUniqueness(rule, target.List(), priority); err != nil {
+			ref = fencedRefusal{reason: err.Error()}
+			return false
+		}
+		rule.CreatedAt = beforeRule.CreatedAt
+		return target.Update(priority, rule)
+	})
+	if res.conflict != nil {
+		writePolicyVersionConflictError(w, res.conflict)
+		return
+	}
+	if res.err != nil {
+		writePolicyPersistFailure(w, res.err)
+		return
+	}
+	if !res.ok {
+		writeFencedRefusal(w, r, ref, curVer)
 		return
 	}
 	logPriority := strings.ReplaceAll(fmt.Sprintf("%d", priority), "\n", "_")
 	logger.Printf("UI: policy rule updated priority=%s name=%q", logPriority, sanitizeLog(rule.Name))
 	auditEventDiffID(r, "policy.update", rule.Name, ruleAuditID(beforeRule),
 		fmt.Sprintf("priority=%d action=%s", priority, rule.Action), beforeRule, rule)
-	afterPolicyWrite(r, "policy.update")
+	finalizeFencedPolicyWrite(r, "policy.update", res)
 	jsonOK(w, map[string]any{"ok": true})
 }
 
@@ -1679,28 +2173,50 @@ func apiPolicyDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing or invalid priority param", http.StatusBadRequest)
 		return
 	}
-	beforeRule := findRuleByPriorityCopy(priority)
-	// Auth (Stage-1) rules are admin-managed via /api/authpolicy only.
-	if beforeRule != nil && ruleTypeOf(beforeRule) == ruleTypeAuth {
-		http.Error(w, `auth rules are managed via /api/authpolicy (admin only)`, http.StatusBadRequest)
-		return
-	}
+	policyWriteStateDecision(r, "resolved")
+	policyWriteStateDecision(r, "fence")
 	// Serialize with commit/revert (Codex round 16; see beginPolicyWrite).
 	beginPolicyWrite()
 	defer endPolicyWrite()
-	if !policyWriteStore(sessionAdmin(r)).Delete(priority) {
-		policyDraft.reconcile() // a failed mutation may have opened a now-clean draft
-		http.Error(w, "rule not found", http.StatusNotFound)
+	// Atomic fence + in-fence target resolution + mutation (2B.0a; 2E-C): the
+	// rule at this priority is identified at the authoritative moment, so the
+	// auth-rule guard cannot be bypassed by a reorder and the audit names the
+	// rule that actually vanished.
+	var (
+		beforeRule *PolicyRule
+		ref        fencedRefusal
+		curVer     int64
+	)
+	res := policyDraft.fencedMutate(sessionAdmin(r), parseIfVersion(r), func(target *PolicyStore) bool {
+		curVer, _ = target.policyVersion()
+		beforeRule = findByPriorityIn(target, priority)
+		if beforeRule == nil {
+			ref = fencedRefusal{notFound: true}
+			return false
+		}
+		// Auth (Stage-1) rules are admin-managed via /api/authpolicy only.
+		if ruleTypeOf(beforeRule) == ruleTypeAuth {
+			ref = fencedRefusal{reason: "auth rules are managed via /api/authpolicy (admin only)"}
+			return false
+		}
+		return target.Delete(priority)
+	})
+	if res.conflict != nil {
+		writePolicyVersionConflictError(w, res.conflict)
 		return
 	}
-	name := fmt.Sprintf("priority=%d", priority)
-	if beforeRule != nil {
-		name = beforeRule.Name
+	if res.err != nil {
+		writePolicyPersistFailure(w, res.err)
+		return
+	}
+	if !res.ok {
+		writeFencedRefusal(w, r, ref, curVer)
+		return
 	}
 	logPriority := strings.ReplaceAll(fmt.Sprintf("%d", priority), "\n", "_")
 	logger.Printf("UI: policy rule deleted priority=%s", logPriority)
-	auditEventDiffID(r, "policy.remove", name, ruleAuditID(beforeRule), "", beforeRule, nil)
-	afterPolicyWrite(r, "policy.remove")
+	auditEventDiffID(r, "policy.remove", beforeRule.Name, ruleAuditID(beforeRule), "", beforeRule, nil)
+	finalizeFencedPolicyWrite(r, "policy.remove", res)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1718,16 +2234,6 @@ func ruleAuditID(r *PolicyRule) string {
 // addressing path. Mirrors the priority path's validation, auth-rule guard, and
 // metadata stamping but resolves the target by stable ULID (§1 identity seam).
 func apiPolicyUpdateByID(w http.ResponseWriter, r *http.Request, id string) {
-	beforeRule := effectiveRuleByID(id)
-	if beforeRule == nil {
-		http.Error(w, "rule not found", http.StatusNotFound)
-		return
-	}
-	// Auth (Stage-1) rules are admin-managed via /api/authpolicy only.
-	if ruleTypeOf(beforeRule) == ruleTypeAuth {
-		http.Error(w, `auth rules are managed via /api/authpolicy (admin only)`, http.StatusBadRequest)
-		return
-	}
 	var rule PolicyRule
 	if err := decodeJSON(r, &rule); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -1737,50 +2243,115 @@ func apiPolicyUpdateByID(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, `auth rules are managed via /api/authpolicy (admin only)`, http.StatusBadRequest)
 		return
 	}
-	// Exclude the rule's CURRENT slot from duplicate checks (same as the
-	// priority path passes the URL priority).
-	if err := validatePolicyRule(rule, effectivePolicyList(), beforeRule.Priority); err != nil {
+	if err := validateRuleShape(rule); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	stampRuleMetadataForWrite(&rule, beforeRule, sessionAdmin(r))
+	// SERVER CANONICALIZATION FIRST (ID-trust correction): stamp metadata and
+	// re-derive object IDs from NAMES (client-supplied IDs are discarded),
+	// then validate the FINAL canonical rule — reference validation must
+	// never trust a client ID, and no restamp may follow it. CreatedAt is
+	// carried from the target resolved INSIDE the fence.
+	stampRuleMetadataForWrite(&rule, nil, sessionAdmin(r))
+	// Blocker B delete-first order: validate referenced objects under the
+	// shared gate (held by the apiPolicyUpdate caller) before committing.
+	if refuseDanglingRuleRefs(w, &rule) {
+		return
+	}
+	policyWriteStateDecision(r, "resolved")
+	policyWriteStateDecision(r, "fence")
 	// Serialize with commit/revert (Codex round 16; see beginPolicyWrite).
 	beginPolicyWrite()
 	defer endPolicyWrite()
-	if !policyWriteStore(sessionAdmin(r)).UpdateByID(id, rule) {
-		policyDraft.reconcile() // a failed mutation may have opened a now-clean draft
-		http.Error(w, "rule not found", http.StatusNotFound)
+	// Atomic fence + in-fence resolution/validation + mutation (2B.0a; 2E-C):
+	// the rule's CURRENT slot is excluded from the duplicate checks at the
+	// authoritative moment, so a concurrent reorder yields the structured 409
+	// instead of a stale-slot "rule name already exists".
+	var (
+		beforeRule *PolicyRule
+		ref        fencedRefusal
+		curVer     int64
+	)
+	res := policyDraft.fencedMutate(sessionAdmin(r), parseIfVersion(r), func(target *PolicyStore) bool {
+		curVer, _ = target.policyVersion()
+		beforeRule = target.findByIDCopy(id)
+		if beforeRule == nil {
+			ref = fencedRefusal{notFound: true}
+			return false
+		}
+		// Auth (Stage-1) rules are admin-managed via /api/authpolicy only —
+		// an id never changes rule type, so this verdict is state-invariant.
+		if ruleTypeOf(beforeRule) == ruleTypeAuth {
+			ref = fencedRefusal{reason: "auth rules are managed via /api/authpolicy (admin only)", invariant: true}
+			return false
+		}
+		if err := validateRuleUniqueness(rule, target.List(), beforeRule.Priority); err != nil {
+			ref = fencedRefusal{reason: err.Error()}
+			return false
+		}
+		rule.CreatedAt = beforeRule.CreatedAt
+		return target.UpdateByID(id, rule)
+	})
+	if res.conflict != nil {
+		writePolicyVersionConflictError(w, res.conflict)
+		return
+	}
+	if res.err != nil {
+		writePolicyPersistFailure(w, res.err)
+		return
+	}
+	if !res.ok {
+		writeFencedRefusal(w, r, ref, curVer)
 		return
 	}
 	logger.Printf("UI: policy rule updated id=%s name=%q", sanitizeLog(id), sanitizeLog(rule.Name))
 	auditEventDiffID(r, "policy.update", rule.Name, id,
 		fmt.Sprintf("priority=%d action=%s", rule.Priority, rule.Action), beforeRule, rule)
-	afterPolicyWrite(r, "policy.update")
+	finalizeFencedPolicyWrite(r, "policy.update", res)
 	jsonOK(w, map[string]any{"ok": true})
 }
 
 // apiPolicyDeleteByID handles DELETE /api/policy?id=<ulid> — reorder-safe delete.
 func apiPolicyDeleteByID(w http.ResponseWriter, r *http.Request, id string) {
-	beforeRule := effectiveRuleByID(id)
-	if beforeRule == nil {
-		http.Error(w, "rule not found", http.StatusNotFound)
-		return
-	}
-	if ruleTypeOf(beforeRule) == ruleTypeAuth {
-		http.Error(w, `auth rules are managed via /api/authpolicy (admin only)`, http.StatusBadRequest)
-		return
-	}
+	policyWriteStateDecision(r, "resolved")
+	policyWriteStateDecision(r, "fence")
 	// Serialize with commit/revert (Codex round 16; see beginPolicyWrite).
 	beginPolicyWrite()
 	defer endPolicyWrite()
-	if !policyWriteStore(sessionAdmin(r)).DeleteByID(id) {
-		policyDraft.reconcile() // a failed mutation may have opened a now-clean draft
-		http.Error(w, "rule not found", http.StatusNotFound)
+	// Atomic fence + in-fence resolution + mutation (2B.0a; 2E-C).
+	var (
+		beforeRule *PolicyRule
+		ref        fencedRefusal
+		curVer     int64
+	)
+	res := policyDraft.fencedMutate(sessionAdmin(r), parseIfVersion(r), func(target *PolicyStore) bool {
+		curVer, _ = target.policyVersion()
+		beforeRule = target.findByIDCopy(id)
+		if beforeRule == nil {
+			ref = fencedRefusal{notFound: true}
+			return false
+		}
+		if ruleTypeOf(beforeRule) == ruleTypeAuth {
+			ref = fencedRefusal{reason: "auth rules are managed via /api/authpolicy (admin only)", invariant: true}
+			return false
+		}
+		return target.DeleteByID(id)
+	})
+	if res.conflict != nil {
+		writePolicyVersionConflictError(w, res.conflict)
+		return
+	}
+	if res.err != nil {
+		writePolicyPersistFailure(w, res.err)
+		return
+	}
+	if !res.ok {
+		writeFencedRefusal(w, r, ref, curVer)
 		return
 	}
 	logger.Printf("UI: policy rule deleted id=%s", sanitizeLog(id))
 	auditEventDiffID(r, "policy.remove", beforeRule.Name, id, "", beforeRule, nil)
-	afterPolicyWrite(r, "policy.remove")
+	finalizeFencedPolicyWrite(r, "policy.remove", res)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1805,27 +2376,56 @@ func apiPolicyBulkDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing priority param or priorities body", http.StatusBadRequest)
 		return
 	}
-	// Auth rules are admin-managed via /api/authpolicy only — reject the
-	// whole batch rather than silently skipping (explicit > silent).
-	for _, p := range body.Priorities {
-		if isAuthRulePriority(p) {
-			http.Error(w, fmt.Sprintf("priority %d is an auth rule — managed via /api/authpolicy (admin only)", p), http.StatusBadRequest)
-			return
-		}
-	}
+	policyWriteStateDecision(r, "resolved")
+	policyWriteStateDecision(r, "fence")
 	// Serialize with commit/revert (Codex round 16; see beginPolicyWrite).
 	beginPolicyWrite()
 	defer endPolicyWrite()
-	ws := policyWriteStore(sessionAdmin(r))
-	deleted := 0
-	for _, p := range body.Priorities {
-		if ws.Delete(p) {
-			deleted++
+	// Atomic fence + mutation (2B.0a): the whole batch runs in one critical
+	// section, so a fenced bulk delete is all-checked-then-deleted against the
+	// generation the client asserted. The auth-rule guard runs INSIDE the
+	// fence (2E-C): a priority that belongs to an admin-managed auth rule at
+	// the authoritative moment refuses the whole batch — explicit, never a
+	// silent skip, and never reachable by a reorder that moved an auth rule
+	// onto a listed slot after a pre-fence check. NOTE (recorded for the v2
+	// client): this endpoint addresses rules by PRIORITY, which is not stable
+	// across a reorder — the v2 frontend does not use it (2B parity record).
+	var (
+		deleted int
+		ref     fencedRefusal
+		curVer  int64
+	)
+	res := policyDraft.fencedMutate(sessionAdmin(r), parseIfVersion(r), func(target *PolicyStore) bool {
+		curVer, _ = target.policyVersion()
+		for _, p := range body.Priorities {
+			if rule := findByPriorityIn(target, p); rule != nil && ruleTypeOf(rule) == ruleTypeAuth {
+				ref = fencedRefusal{reason: fmt.Sprintf("priority %d is an auth rule — managed via /api/authpolicy (admin only)", p)}
+				return false
+			}
 		}
+		for _, p := range body.Priorities {
+			if target.Delete(p) {
+				deleted++
+			}
+		}
+		return deleted > 0
+	})
+	if res.conflict != nil {
+		writePolicyVersionConflictError(w, res.conflict)
+		return
+	}
+	if res.err != nil {
+		// Rolled back — nothing durable changed; the count must not be reported.
+		writePolicyPersistFailure(w, res.err)
+		return
+	}
+	if !res.ok && ref.reason != "" {
+		writeFencedRefusal(w, r, ref, curVer)
+		return
 	}
 	logger.Printf("UI: bulk policy delete %d rule(s)", deleted)
 	auditEvent(r, "policy.bulk_remove", fmt.Sprintf("%d rule(s)", deleted), "")
-	afterPolicyWrite(r, "policy.bulk_remove")
+	finalizeFencedPolicyWrite(r, "policy.bulk_remove", res)
 	jsonOK(w, map[string]any{"deleted": deleted})
 }
 
@@ -1867,39 +2467,87 @@ func apiPolicyReorder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	// Access-only contract: the list must be exactly the current Stage-2 access-
-	// rule priority set. Stage-1 auth rules are reordered exclusively via
-	// /api/authpolicy (admin-only) and keep their priorities, so this endpoint
-	// permutes access rules among their own slots and never touches an auth rule
-	// (no operator/admin escalation). Rejecting any auth priority — and any
-	// partial/stale list — keeps the permutation well-defined.
-	access := listPolicyRules()
-	accessPris := make(map[int]bool, len(access))
-	for i := range access {
-		accessPris[access[i].Priority] = true
-	}
-	if len(body.Priorities) != len(accessPris) {
+	if len(body.Priorities) == 0 {
 		http.Error(w, "priorities must list every access rule exactly once", http.StatusBadRequest)
 		return
 	}
-	for _, p := range body.Priorities {
-		if !accessPris[p] {
-			http.Error(w, fmt.Sprintf("priority %d is not an access rule", p), http.StatusBadRequest)
-			return
-		}
-	}
+	policyWriteStateDecision(r, "resolved")
+	policyWriteStateDecision(r, "fence")
 	// Serialize with commit/revert (Codex round 16; see beginPolicyWrite).
 	beginPolicyWrite()
 	defer endPolicyWrite()
-	if !policyWriteStore(sessionAdmin(r)).PermutePriorities(body.Priorities) {
-		policyDraft.reconcile() // a failed permute may have opened a now-clean draft
-		http.Error(w, "priority list length mismatch or unknown priority", http.StatusBadRequest)
+	// Access-only contract, decided INSIDE the fence (2E-C): the list must be
+	// exactly the current Stage-2 access-rule priority set at the
+	// authoritative moment. Stage-1 auth rules are reordered exclusively via
+	// /api/authpolicy (admin-only) and keep their priorities, so this endpoint
+	// permutes access rules among their own slots and never touches an auth
+	// rule (no operator/admin escalation). A list that no longer covers the
+	// set — a rule was added or removed since the client loaded — is a state
+	// conflict, never a silently applied stale permutation.
+	var (
+		ref    fencedRefusal
+		curVer int64
+	)
+	res := policyDraft.fencedMutate(sessionAdmin(r), parseIfVersion(r), func(target *PolicyStore) bool {
+		curVer, _ = target.policyVersion()
+		accessPris := accessPrioritySet(target)
+		if len(body.Priorities) != len(accessPris) {
+			ref = fencedRefusal{reason: "priorities must list every access rule exactly once"}
+			return false
+		}
+		for _, p := range body.Priorities {
+			if !accessPris[p] {
+				ref = fencedRefusal{reason: fmt.Sprintf("priority %d is not an access rule", p)}
+				return false
+			}
+		}
+		if !target.PermutePriorities(body.Priorities) {
+			ref = fencedRefusal{reason: "priority list length mismatch or unknown priority"}
+			return false
+		}
+		return true
+	})
+	if res.conflict != nil {
+		writePolicyVersionConflictError(w, res.conflict)
+		return
+	}
+	if res.err != nil {
+		writePolicyPersistFailure(w, res.err)
+		return
+	}
+	if !res.ok {
+		writeFencedRefusal(w, r, ref, curVer)
 		return
 	}
 	logger.Printf("UI: policy rules reordered (%d rules)", len(body.Priorities))
 	auditEvent(r, "policy.reorder", fmt.Sprintf("%d rules", len(body.Priorities)), "")
-	afterPolicyWrite(r, "policy.reorder")
+	finalizeFencedPolicyWrite(r, "policy.reorder", res)
 	jsonOK(w, map[string]any{"ok": true})
+}
+
+// accessPrioritySet returns the Stage-2 access-rule priority set of ps — the
+// in-fence authority for the reorder/move contracts.
+func accessPrioritySet(ps *PolicyStore) map[int]bool {
+	rules := ps.List()
+	out := make(map[int]bool, len(rules))
+	for i := range rules {
+		if ruleTypeOf(&rules[i]) == ruleTypeAccess {
+			out[rules[i].Priority] = true
+		}
+	}
+	return out
+}
+
+// accessRulesIn returns the Stage-2 access rules of ps in priority order.
+func accessRulesIn(ps *PolicyStore) []PolicyRule {
+	rules := ps.List()
+	out := make([]PolicyRule, 0, len(rules))
+	for i := range rules {
+		if ruleTypeOf(&rules[i]) == ruleTypeAccess {
+			out = append(out, rules[i])
+		}
+	}
+	return out
 }
 
 // POST /api/policy/move — move a rule to first/last/before/after a target rule.
@@ -1990,34 +2638,70 @@ func apiPolicyMove(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	// Access-only: build the moved order over Stage-2 access rules and permute
-	// just those priorities. Stage-1 auth rules are reordered via /api/authpolicy
-	// and keep their priorities, so an access move never crosses or renumbers one
-	// (no operator/admin escalation). Moving an auth rule via this endpoint is
-	// rejected because buildMovedPriorities won't find it among the access rules.
-	access := listPolicyRules()
-	if len(access) == 0 {
-		http.Error(w, "no rules to reorder", http.StatusBadRequest)
-		return
-	}
-	priorities, err := buildMovedPriorities(access, body.Priority, body.Position, body.TargetName)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+	policyWriteStateDecision(r, "resolved")
+	policyWriteStateDecision(r, "fence")
 	// Serialize with commit/revert (Codex round 16; see beginPolicyWrite).
 	beginPolicyWrite()
 	defer endPolicyWrite()
-	if !policyWriteStore(sessionAdmin(r)).PermutePriorities(priorities) {
-		policyDraft.reconcile() // a failed permute may have opened a now-clean draft
-		http.Error(w, "reorder failed (concurrent modification?)", http.StatusConflict)
+	// Access-only: the moved order is built INSIDE the fence over the CURRENT
+	// Stage-2 access rules (2E-C), so the requested relation ("before/after
+	// this rule") is honoured against the authoritative order rather than a
+	// permutation computed on the order the client saw. Stage-1 auth rules
+	// are reordered via /api/authpolicy and keep their priorities, so an
+	// access move never crosses or renumbers one (no operator/admin
+	// escalation); moving an auth rule here is refused because it is not
+	// among the access rules.
+	var (
+		ref    fencedRefusal
+		curVer int64
+	)
+	res := policyDraft.fencedMutate(sessionAdmin(r), parseIfVersion(r), func(target *PolicyStore) bool {
+		curVer, _ = target.policyVersion()
+		// The moved priority must belong to an ACCESS rule at the
+		// authoritative moment: an auth rule there is a current-state refusal
+		// (a reorder can change which rule holds a priority), no rule there
+		// is not-found.
+		if moved := findByPriorityIn(target, body.Priority); moved != nil && ruleTypeOf(moved) == ruleTypeAuth {
+			ref = fencedRefusal{reason: "auth rules are managed via /api/authpolicy (admin only)"}
+			return false
+		}
+		access := accessRulesIn(target)
+		if len(access) == 0 {
+			ref = fencedRefusal{notFound: true}
+			return false
+		}
+		priorities, err := buildMovedPriorities(access, body.Priority, body.Position, body.TargetName)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				ref = fencedRefusal{notFound: true}
+			} else {
+				ref = fencedRefusal{reason: err.Error()}
+			}
+			return false
+		}
+		if !target.PermutePriorities(priorities) {
+			ref = fencedRefusal{reason: "reorder failed (concurrent modification?)"}
+			return false
+		}
+		return true
+	})
+	if res.conflict != nil {
+		writePolicyVersionConflictError(w, res.conflict)
+		return
+	}
+	if res.err != nil {
+		writePolicyPersistFailure(w, res.err)
+		return
+	}
+	if !res.ok {
+		writeFencedRefusal(w, r, ref, curVer)
 		return
 	}
 	safePri := strings.ReplaceAll(fmt.Sprintf("%d", body.Priority), "\n", "")
 	safePos := sanitizeLog(body.Position)
 	logger.Printf("UI: policy rule pri=%s moved to %s", safePri, safePos)
 	auditEvent(r, "policy.move", fmt.Sprintf("pri=%s to %s", safePri, safePos), "")
-	afterPolicyWrite(r, "policy.move")
+	finalizeFencedPolicyWrite(r, "policy.move", res)
 	jsonOK(w, map[string]any{"ok": true})
 }
 
@@ -2297,7 +2981,9 @@ func registerPolicyRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/blocklist", apiBlocklist)
 	mux.HandleFunc("/api/fileblock", apiFileblock)
 	mux.HandleFunc("/api/fileblock/profiles", apiFileblockProfiles)
+	mux.HandleFunc("/api/fileblock/profiles/state", apiFileblockProfilesState)
 	mux.HandleFunc("/api/rewrite", apiRewrite)
+	mux.HandleFunc("/api/rewrite/state", apiRewriteState)
 	mux.HandleFunc("/api/policy", apiPolicy)
 	mux.HandleFunc("/api/policy/reorder", apiPolicyReorder)
 	mux.HandleFunc("/api/policy/move", apiPolicyMove)
@@ -2327,6 +3013,7 @@ func registerPolicyRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/decryption-exclusions", apiDecryptionExclusions)                 // GET list learned exclusions / DELETE evict one (?host=) or clear all
 	mux.HandleFunc("/api/decryption-exclusions/tunables", apiDecryptionExclusionTunables) // GET defaults+bounds / PUT admin runtime tunables (F10)
 	mux.HandleFunc("/api/urlcat", apiURLCat)                                              // GET/POST/PUT/DELETE categories
+	mux.HandleFunc("/api/urlcat/state", apiURLCatState)                                   // GET — v2 read: categories + server-owned semantic revision (2D-B)
 	mux.HandleFunc("/api/urlcat/host", apiURLCatHost)                                     // POST/DELETE individual hosts
 	mux.HandleFunc("/api/urlcat/lookup", apiURLCatLookup)                                 // GET — resolve a domain to its category
 	mux.HandleFunc("/api/urlcat/feed-status", apiURLCatFeedStatus)                        // GET — UT1 + SaaS feed freshness/failure counts (viewer, read-only)
