@@ -102,6 +102,20 @@ var (
 // histogram does: a read happens once per dashboard poll, a write once per
 // request.
 //
+// THE RING ITSELF MUST NOT BE SHARDED, and that is a separate, still-standing
+// rejection rather than an oversight. Sharding the ring was prototyped (60
+// buckets x 3 counters per shard, 16 shards, mutex and atomic variants) and did
+// not pay on 4-core hardware: the only shard key available here is a
+// rand.Uint64, and against an object that size its cost ate the gain. What
+// makes the CURRENT-MINUTE shard win instead is that it is 2 words rather than
+// 180, its shards are cache-line PADDED (16 unpadded shards still false-share),
+// and the verdict pair is PACKED into one atomic add rather than two or three —
+// so the same ~7 ns key stops mattering above one core. Do not re-derive this
+// as shared atomics either: removing the mutex without splitting the line
+// removes the BATCHING a lock holder gets (measured 62.2 ns/op at four cores
+// against this shape's 38.1). See the CLAUDE.md note for the paired
+// marginal-cost evidence.
+//
 // THE INVARIANT IS CONSERVATION, NOT INSTANT ATTRIBUTION. A request that reads
 // liveMin, is descheduled, and increments after a concurrent rollover lands in
 // the NEXT minute's accumulator rather than the one it read. Nothing is ever
