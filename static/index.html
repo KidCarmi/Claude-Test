@@ -1599,6 +1599,10 @@ table.mcpx-cat-tbl td{padding:6px 10px;border-bottom:1px solid var(--border)}
               <div style="font-size:.7rem;color:var(--muted);margin-bottom:2px" title="Remote scan round trips in flight. The saturation gauge for a sidecar deployment, where 'Scans in flight' is always zero.">Remote scans in flight</div>
               <div id="sec-remote-inflight" style="font-weight:600;font-size:.85rem">0</div>
             </div>
+            <div style="background:var(--surface2);border-radius:8px;padding:10px">
+              <div style="font-size:.7rem;color:var(--muted);margin-bottom:2px" title="A YARA regex match panicked (an internal crash, not a slow match) and was contained instead of taking down the scan. The verdict was decided by the configured on-timeout posture (block/allow), not by the rule itself. Non-zero points at a bug in a specific rule's regex, not a timeout — raising the timeout will not help.">YARA match panics</div>
+              <div id="sec-yara-match-panics" style="font-weight:600;font-size:.85rem">0</div>
+            </div>
           </div>
           <div id="sec-yara-warnings" style="display:none;background:rgba(234,179,8,.1);border-left:3px solid var(--yellow);padding:8px 12px;border-radius:6px;margin-bottom:14px;font-size:.78rem;color:var(--yellow)"></div>
 
@@ -4381,6 +4385,8 @@ Firefox (all platforms):
           <div style="display:flex;gap:8px;align-items:center">
             <input type="text" class="input" style="width:200px" id="audit-filter" placeholder="Filter (name, rule id, actor…)" data-input="renderAuditLog">
             <button class="btn ghost sm" data-click="loadAuditLog"><svg class="ico" aria-hidden="true"><use href="#i-refresh"/></svg> Refresh</button>
+            <button class="btn ghost sm" data-click="exportAuditLog" data-arg="csv" title="Download the persisted audit history as CSV"><svg class="ico" aria-hidden="true"><use href="#i-download"/></svg> CSV</button>
+            <button class="btn ghost sm" data-click="exportAuditLog" data-arg="json" title="Download the persisted audit history as JSON"><svg class="ico" aria-hidden="true"><use href="#i-download"/></svg> JSON</button>
           </div>
         </div>
         <div class="tbl-wrap">
@@ -4641,6 +4647,10 @@ Firefox (all platforms):
             <p id="ha-lease-note" style="display:none;color:var(--muted);font-size:.7rem;margin:0 0 16px 0">
               Fencing is configured at startup (<code>--ha-etcd-endpoints</code> / <code>cluster.etcd_endpoints</code>) and read once - this panel shows status only. With a lease armed, leadership and automatic failover are arbitrated by etcd; write authority requires a live lease. The <strong>Term</strong> tile above equals the epoch of the currently-held fencing lease (ADR-0005: term = a held lease's epoch). In a failure state where no lease is held - e.g. a leader that restarted and cannot reacquire the etcd lease, running read-only - the lease card shows <code>epoch 0</code> while <strong>Term</strong> retains the last synced value, so the two can differ precisely when you are diagnosing a fencing problem.
             </p>
+            <!-- CHAOS-55: an unfenced leader (role=leader, lease not held) is either
+                 actively self-healing or permanently stuck until an operator acts -
+                 those two states look identical unless called out explicitly. -->
+            <p id="ha-lease-recovery-banner" style="display:none;font-size:.8rem;margin:0 0 16px 0;padding:8px 12px;border-radius:6px"></p>
             <p id="ha-sync-note" style="display:none;color:var(--muted);font-size:.7rem;margin:0 0 16px 0">
               This standby polls the leader every ~5s. The <strong>Sync to Leader</strong> tile shows the current consecutive-failure streak - it resets to 0 on every successful sync. At the configured threshold this standby stops waiting and either self-promotes (automatic failover / fencing lease) or, if automatic failover is off, stays read-only until an operator promotes it manually. Watching this tile climb is your early warning before that happens.
             </p>
@@ -4859,6 +4869,10 @@ Firefox (all platforms):
           <p class="hint">
             Set per-group bandwidth limits using token bucket rate limiting. Higher priority policies take precedence.
           </p>
+          <div class="banner warn" style="margin-bottom:12px">
+            <span>&#9888;</span>
+            <span>Not yet enforced on the data path — policies below are stored and synced across the cluster, but traffic is not currently rate-limited by them. See the Diagnostics tab (<code>bandwidth_qos_enforcement</code>) for the live status.</span>
+          </div>
           <div id="bandwidth-policies-list">
             <em style="color:var(--muted);font-size:.82rem">Loading policies...</em>
           </div>
@@ -5684,6 +5698,7 @@ document.addEventListener('click', e => {
 
     // ── Audit / CA management ──
     case 'loadAuditLog':      loadAuditLog(); break;
+    case 'exportAuditLog':    exportAuditLog(arg); break;
     case 'toggleAuditDiff':   toggleAuditDiff(+arg); break;
     case 'loadCAMgmt':        loadCAMgmt(); break;
     case 'downloadCA':        downloadCA(); break;
@@ -9466,6 +9481,7 @@ async function loadSecScanStatus() {
     setMetric('sec-clam-error', s.stat_clam_scan_error, 1, 10);
     setMetric('sec-clam-saturated', s.stat_clam_saturated, 1, 10);
     setMetric('sec-scan-inflight', s.scan_inflight, 4, 16);
+    setMetric('sec-yara-match-panics', s.yara_match_panics, 1, 10);
     setMetric('sec-scan-late-discard', s.stat_scan_late_discard, 1, 10);
   } catch(e) { console.error(e); }
 }
@@ -10443,6 +10459,19 @@ function exportLogs(format) {
   a.click();
   document.body.removeChild(a);
   toast('Downloading logs as ' + format.toUpperCase(), 'success');
+}
+
+// exportAuditLog downloads the persisted audit history (not just the 500-entry
+// in-memory ring the panel renders from) as CSV/JSON, same server-streamed
+// attachment pattern as exportLogs — no client-side reassembly needed.
+function exportAuditLog(format) {
+  const a = document.createElement('a');
+  a.href = '/api/audit?format=' + format + '&source=file';
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  toast('Downloading audit log as ' + format.toUpperCase(), 'success');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -18256,7 +18285,7 @@ async function createBandwidthPolicy() {
 }
 
 async function deleteBandwidthPolicy(name) {
-  if (!await confirmAction('Delete Bandwidth Policy', `Delete bandwidth policy "${name}"? Rate limits will no longer apply.`)) return;
+  if (!await confirmAction('Delete Bandwidth Policy', `Delete bandwidth policy "${name}"? It is not currently enforced, but will no longer sync to the cluster or appear in configuration exports.`)) return;
   try {
     await api('/api/cluster/bandwidth?name=' + encodeURIComponent(name), { method: 'DELETE' });
     loadBandwidthPolicies(true);
@@ -18466,14 +18495,38 @@ async function loadHA(isCP) {
       // Fencing-lease posture (ADR-0005): startup-scoped config, status-only here.
       const leaseVal = document.getElementById('ha-lease-val');
       const leaseNote = document.getElementById('ha-lease-note');
+      const leaseRecoveryBanner = document.getElementById('ha-lease-recovery-banner');
       if (r.lease_mode === 'lease') {
         leaseVal.innerHTML = r.lease_valid
           ? `<span style="color:#22c55e">● held</span><br><span style="font-size:.65rem;color:var(--muted)">epoch ${escHtml(String(r.epoch))}</span>`
           : '<span style="color:#ef4444">○ not held</span><br><span style="font-size:.65rem;color:var(--muted)">writes fenced</span>';
         leaseNote.style.display = '';
+        // CHAOS-55: this node holds the LEADER role but not the fence - a state
+        // that must page. "recovering" (the background re-acquire loop is
+        // armed) and "stuck" (it gave up; a foreign holder took the lease, or
+        // there is no recorded ex-standby to resync from) look identical on
+        // every other surface, so call it out explicitly here rather than
+        // leaving the operator to infer it from /metrics or /healthz.
+        if (r.role === 'leader' && !r.lease_valid) {
+          if (r.lease_recovering) {
+            leaseRecoveryBanner.style.background = 'rgba(245,158,11,.12)';
+            leaseRecoveryBanner.style.color = '#f59e0b';
+            leaseRecoveryBanner.innerHTML = '<strong>Recovering write authority…</strong> the fencing lease was lost and this node is automatically retrying in the background (no operator action needed yet). ' +
+              escHtml(String(r.lease_reacquire_attempts || 0)) + ' attempt(s) so far this run' +
+              (r.lease_reacquired_total ? ', ' + escHtml(String(r.lease_reacquired_total)) + ' recovered previously' : '') + '.';
+          } else {
+            leaseRecoveryBanner.style.background = 'rgba(239,68,68,.12)';
+            leaseRecoveryBanner.style.color = '#ef4444';
+            leaseRecoveryBanner.innerHTML = '<strong>Write authority lost and recovery is not active.</strong> This node still holds the leader role but is running read-only, and it is not currently retrying - most likely another node already holds the fencing lease. Check <code>diagnose etcd</code> / peer status and promote or restart as needed; see docs/operator/ha-lease-recovery.md.';
+          }
+          leaseRecoveryBanner.style.display = '';
+        } else {
+          leaseRecoveryBanner.style.display = 'none';
+        }
       } else {
         leaseVal.innerHTML = '<span style="color:var(--muted)">none</span>';
         leaseNote.style.display = 'none';
+        leaseRecoveryBanner.style.display = 'none';
       }
       // Manual-failover button: only a standby can be promoted.
       document.getElementById('ha-promote-row').style.display = (r.role === 'standby') ? '' : 'none';
