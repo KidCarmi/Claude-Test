@@ -49,6 +49,14 @@ func mcpObserveRuntimeHealth(capability string) adminapi.RuntimeStateHealth {
 	h.AcceptedConns = nonNegU64(snap.AcceptedConns)
 	h.RejectedConns = nonNegU64(snap.RejectedConns)
 	h.InFlight = nonNegInt(snap.InFlight)
+	h.RequestsTotal = nonNegU64(snap.RequestsTotal)
+	h.RequestsRejected = nonNegU64(snap.RequestsRejected)
+	h.Queued = nonNegU64(snap.Queued)
+	h.Timeouts = nonNegU64(snap.Timeouts)
+	h.AuthFailures = nonNegU64(snap.AuthFailures)
+	h.AmbiguousHeaders = nonNegU64(snap.AmbiguousHeaders)
+	h.HostOriginFailures = nonNegU64(snap.HostOriginFailures)
+	h.ObserveDrops = nonNegU64(snap.ObserveDrops)
 	return h
 }
 
