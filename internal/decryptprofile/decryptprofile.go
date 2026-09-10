@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -35,6 +36,77 @@ import (
 	"github.com/KidCarmi/Culvert/internal/fileutil"
 	"github.com/KidCarmi/Culvert/internal/obs"
 )
+
+// writeFile is the persistence primitive, swappable ONLY for fault injection in
+// package-internal tests (the ErrReplacedNotSynced branch cannot be induced
+// through the real filesystem deterministically). Production behavior is always
+// fileutil.AtomicWrite.
+var writeFile = fileutil.AtomicWrite
+
+// ErrPersist marks a durable-persistence failure surfaced by MutateDurable
+// AFTER the in-memory mutation was rolled back: nothing durable changed and the
+// in-memory store was restored to the pre-mutation truth. Handlers map it to a
+// 5xx — never a success.
+var ErrPersist = errors.New("decryption profiles: durable persistence failed")
+
+// ErrNameTaken marks a name-collision refusal (create against an existing name,
+// or rename onto a name a DIFFERENT profile owns). Handlers map it to a 409 —
+// the server-authoritative refusal, checked under the store lock so a
+// concurrent create/rename cannot slip past a handler-level pre-check.
+var ErrNameTaken = errors.New("name already in use")
+
+// VersionConflictError is the optimistic-concurrency failure returned by
+// MutateDurable when the caller's asserted store generation no longer matches:
+// another admin mutated the store since the caller loaded it. The mutation
+// never ran. Mirrors package main's policyVersionConflictError contract.
+type VersionConflictError struct {
+	Current  int64 // the store generation at the locked moment of the check
+	Asserted int64 // the caller's ?ifVersion= assertion
+}
+
+func (e *VersionConflictError) Error() string {
+	return fmt.Sprintf("the decryption profiles changed since you loaded them (your version %d, current %d) — reload and reapply your change", e.Asserted, e.Current)
+}
+
+// storeEnvelope is the durable persistence unit (2D-A fence correction):
+// object CONTENT and the concurrency EPOCH land in ONE atomic write, so an
+// acknowledged mutation can never leave new content with an old durable
+// generation — including under ErrReplacedNotSynced, where the landed
+// replacement carries the new epoch with the new content. See the catgroup
+// twin for the full rationale; both implementations are proven independently.
+//
+// Backward compatibility: a legacy bare-array file (optionally with the
+// retired path+".meta" sidecar) still loads; the first durable save migrates
+// the format and removes the superseded sidecar. An older binary cannot read
+// the envelope (unmarshal error → empty store; recorded downgrade residual —
+// rules reference profiles by stable ID, so resolution degrades fail-closed).
+type storeEnvelope struct {
+	SchemaVersion int       `json:"schema_version"`
+	Version       int64     `json:"version"`
+	Profiles      []Profile `json:"profiles"`
+}
+
+// storeMeta is the RETIRED legacy sidecar shape (path+".meta") — read only
+// when loading a legacy bare-array file, never written.
+type storeMeta struct {
+	Version int64 `json:"version"`
+}
+
+// isLegacyArrayFile reports whether the persisted bytes are the legacy
+// bare-array format (pre-envelope).
+func isLegacyArrayFile(data []byte) bool {
+	for _, b := range data {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			continue
+		case '[':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
 
 // Clamp bounds for StallTimeoutSecs. 0 means "engine default" (the caller
 // substitutes sslInspectBodyStallTimeout); any other value must fall in
@@ -241,6 +313,46 @@ type Store struct {
 	profiles map[string]*Profile // keyed by lowercase name
 	order    []string            // insertion order for stable list output
 	path     string
+
+	// version is the DURABLE per-store mutation generation (2D-A object
+	// concurrency): bumped on every successful admin mutation and on bulk
+	// installs (ReplaceAll), persisted ATOMICALLY WITH THE CONTENT in the
+	// storeEnvelope so it stays monotonic across restarts and can never
+	// diverge from the objects it fences, surfaced on the list read, and
+	// asserted by MutateDurable's optional ifVersion fence.
+	version int64
+
+	// mutMu serializes EVERY runtime writer of the fenced domain — admin
+	// mutations (MutateDurable) AND bulk installs (ReplaceAll from cluster
+	// sync / import / rollback) — so no writer can alter contents or version
+	// between a client's version comparison and its protected mutation
+	// (2D-A fence correction, Blocker B). Readers and the proxy hot path
+	// never touch it. Startup-only writers (Load, seedDefault*, before
+	// listeners) are exempt by ordering.
+	mutMu sync.Mutex
+
+	// saveMu is the durable-PUBLICATION serializer (2D-A publication-ordering
+	// correction; PolicyStore.saveMu's sibling): it covers SNAPSHOT → marshal
+	// → AtomicWrite as one unit, so publications land in acquisition order and
+	// each writes the store state CURRENT at its own snapshot — an older Save
+	// that lost the race to a confirmed MutateDurable can never resume and
+	// rename a stale envelope over the acknowledged one. Locking only the
+	// write (after the snapshot) would NOT restore the invariant. LOCK ORDER:
+	// mutMu → saveMu → mu. EVERY runtime persistence entry goes through mutMu
+	// first (public SaveErr acquires it; MutateDurable holds it across the
+	// whole transaction and calls the internal saveErrLocked, which must
+	// never reacquire mutMu — the commit-boundary correction, so a standalone
+	// save can never publish an in-flight mutation's memory). Nothing takes
+	// mu then saveMu or mutMu, nothing takes saveMu then mutMu.
+	saveMu sync.Mutex
+}
+
+// Version returns the durable per-store mutation generation (the ifVersion
+// fence value clients echo back on mutations).
+func (s *Store) Version() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.version
 }
 
 // New builds an empty store.
@@ -301,12 +413,19 @@ func (s *Store) Load(path string) error {
 	if err != nil {
 		return nil // first run — no file
 	}
-	var profiles []Profile
-	if err := json.Unmarshal(data, &profiles); err != nil {
-		obs.Printf("DecryptionProfiles: unmarshal error from %s", path)
+	// Format sniff (2D-A fence correction): the envelope couples content +
+	// epoch; a legacy bare array is still accepted, with its version taken
+	// from the retired sidecar (absent ⇒ 0 — safe for LEGACY files only:
+	// every mutation acknowledged under the envelope model persists its epoch
+	// atomically with the content).
+	profiles, loadedVersion, err := decodeProfilesFile(path, data)
+	if err != nil {
 		return err
 	}
-	migrated, skipped, certMigrated := s.replace(profiles, true)
+	migrated, skipped, certMigrated := s.replaceContents(profiles, true)
+	s.mu.Lock()
+	s.version = loadedVersion
+	s.mu.Unlock()
 	obs.Printf("DecryptionProfiles: loaded %d profile(s) from %s", len(profiles), path)
 	// Persist backfilled IDs (?id= stability) and any fail-closed
 	// certVerification migration so the on-disk file stops carrying the retired
@@ -328,13 +447,56 @@ func (s *Store) Load(path string) error {
 	return nil
 }
 
-// Save persists the current profiles to disk (atomic write). No-op when path unset.
-func (s *Store) Save() {
+// Save persists the current profiles to disk (atomic write). No-op when path
+// unset. Best-effort legacy wrapper for old non-critical callers; the hardened
+// v2 mutation path (MutateDurable) uses the error-returning SaveErr and rolls
+// back on failure.
+func (s *Store) Save() { _ = s.SaveErr() }
+
+// SaveErr is the error-returning persistence core (2D-A durable-or-nothing).
+// Content and the fence epoch are ONE envelope in ONE atomic write, so they
+// can never diverge durably — including under ErrReplacedNotSynced, where the
+// landed replacement carries the new epoch with the new content. The retired
+// legacy sidecar is removed once the envelope has landed.
+//
+// SaveErr is the PUBLIC entry: it acquires mutMu FIRST (2D-A commit-boundary
+// correction), so a standalone save orders against the whole mutation domain
+// and can never observe — let alone publish — the memory state of an
+// in-flight MutateDurable transaction: fn's uncommitted content paired with
+// the not-yet-advanced epoch. Without this, a caller-side Save (the
+// production ReplaceAll+Save bulk shape) racing an admin mutation could
+// persist uncommitted-new-content + old-epoch; if that mutation then failed
+// its own publication and rolled back, the failed, unacknowledged mutation
+// stayed on disk. MutateDurable already holds mutMu and calls saveErrLocked
+// directly — mutMu is not reentrant, so an internal SaveErr call from inside
+// the mutation path would deadlock and must never be added.
+func (s *Store) SaveErr() error {
+	s.mutMu.Lock()
+	defer s.mutMu.Unlock()
+	return s.saveErrLocked()
+}
+
+// saveErrLocked is the INTERNAL publication helper. LOCK OWNERSHIP CONTRACT:
+// the caller MUST hold mutMu (public SaveErr acquires it; MutateDurable holds
+// it across the whole transaction) — it is never called bare, and it must
+// NOT reacquire mutMu.
+//
+// The WHOLE helper runs under saveMu — snapshot included, not just the
+// write — so publications form one monotonic order and durable state never
+// goes backwards: once MutateDurable has returned success for epoch N, no
+// older in-flight Save can replace the envelope with epoch < N. Every runtime
+// persistence path routes through here (Save is a thin wrapper over
+// SaveErr), so no caller sits outside the ordering domain. Lock order
+// within: saveMu → mu(RLock).
+func (s *Store) saveErrLocked() error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
 	s.mu.RLock()
 	path := s.path
 	if path == "" {
 		s.mu.RUnlock()
-		return
+		return nil
 	}
 	profiles := make([]Profile, 0, len(s.order))
 	for _, key := range s.order {
@@ -342,13 +504,87 @@ func (s *Store) Save() {
 			profiles = append(profiles, copyOut(p))
 		}
 	}
+	env := storeEnvelope{SchemaVersion: 1, Version: s.version, Profiles: profiles}
 	s.mu.RUnlock()
 
-	data, err := json.MarshalIndent(profiles, "", "  ")
+	data, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
-		return
+		return fmt.Errorf("marshal decryption profiles: %w", err)
 	}
-	_ = fileutil.AtomicWrite(path, data, 0o600)
+	werr := writeFile(path, data, 0o600)
+	if werr == nil || errors.Is(werr, fileutil.ErrReplacedNotSynced) {
+		_ = os.Remove(path + ".meta") // superseded legacy sidecar (best-effort)
+	}
+	if werr != nil {
+		return fmt.Errorf("write decryption profiles: %w", werr)
+	}
+	return nil
+}
+
+// MutateDurable runs ONE admin mutation with the OPTIONAL expected-version
+// fence AND the durable persist evaluated in the same serialized critical
+// section — the exact contract documented on catgroup.Store.MutateDurable
+// (fence mismatch ⇒ *VersionConflictError, fn error ⇒ atomic rollback,
+// persist failure ⇒ rollback + ErrPersist, ErrReplacedNotSynced ⇒
+// landed-content success WITH the epoch, since content + version are one
+// atomic envelope). ReplaceAll holds the same mutMu, so no writer can alter
+// the fenced domain between the version comparison and the mutation.
+func (s *Store) MutateDurable(ifVersion *int64, fn func() error) error {
+	s.mutMu.Lock()
+	defer s.mutMu.Unlock()
+
+	s.mu.RLock()
+	cur := s.version
+	s.mu.RUnlock()
+	if ifVersion != nil && *ifVersion != cur {
+		return &VersionConflictError{Current: cur, Asserted: *ifVersion}
+	}
+	prev := s.List() // value snapshot for the rollback path
+	if err := fn(); err != nil {
+		// fn is ATOMIC-or-nothing too: a composed mutation (content update +
+		// rename) that fails partway (e.g. rename collision after the content
+		// applied) must not half-land — restore the pre-mutation state.
+		s.restoreSnapshot(prev, cur)
+		return err
+	}
+	s.mu.Lock()
+	// Bump the LIVE value, never "captured + 1" (§7): serialized writers make
+	// them equal, but the live increment stays monotonic regardless.
+	s.version++
+	s.mu.Unlock()
+	// mutMu is already held for the whole transaction — call the internal
+	// publication helper directly (public SaveErr would self-deadlock).
+	if err := s.saveErrLocked(); err != nil {
+		if errors.Is(err, fileutil.ErrReplacedNotSynced) {
+			obs.Warnf("DecryptionProfiles: mutation persisted but parent-dir sync failed: %v", err)
+			return nil
+		}
+		s.restoreSnapshot(prev, cur)
+		return fmt.Errorf("%w: %w", ErrPersist, err)
+	}
+	return nil
+}
+
+// restoreSnapshot reinstalls a pre-mutation value snapshot and generation (the
+// MutateDurable rollback path). Rebuilds the name index like replace() but does
+// NOT re-validate (the snapshot came from this store) and does NOT bump version
+// (the failed mutation never happened).
+func (s *Store) restoreSnapshot(profiles []Profile, version int64) {
+	built := make(map[string]*Profile, len(profiles))
+	order := make([]string, 0, len(profiles))
+	for i := range profiles {
+		p := profiles[i]
+		p.securityGen = computeSecurityGen(&p)
+		key := strings.ToLower(p.Name)
+		np := p
+		built[key] = &np
+		order = append(order, key)
+	}
+	s.mu.Lock()
+	s.profiles = built
+	s.order = order
+	s.version = version
+	s.mu.Unlock()
 }
 
 // List returns a copy of all profiles (safe for JSON serialization).
@@ -362,6 +598,53 @@ func (s *Store) List() []Profile {
 		}
 	}
 	return out
+}
+
+// Snapshot is one coherent read of the whole list contract: the profiles, the
+// derived name list, and the durable fence version, all describing the SAME
+// store state (POST-2D-A COHERENT-READ CORRECTION DISCOVERED DURING 2D-B
+// REVIEW).
+type Snapshot struct {
+	Profiles []Profile
+	Names    []string
+	Version  int64
+}
+
+// SnapshotView captures profiles + names + version under ONE hold of the read
+// lock. List()/Names()/Version() assembled by a caller are three independent
+// reads — a writer landing between any two hands the client rows from one
+// state paired with the fence version of another, and an edit from that pair
+// passes the ifVersion fence against content the client never saw. Handlers
+// serving the fenced list contract must use this, never the trio.
+//
+// COMMITTED-SNAPSHOT rule (transactional-read correction): SnapshotView also
+// acquires mutMu FIRST. MutateDurable's fn mutates the store under mu and
+// RELEASES mu before the version bump and the durable publication, and a
+// persist failure rolls everything back to the pre-mutation state at the
+// SAME version — so a snapshot taken inside that window returns mutated rows
+// paired with the UNBUMPED version, and after the rollback a client edit
+// derived from those phantom rows PASSES the ifVersion fence against the
+// restored tree. Holding mutMu makes the snapshot wait until the open
+// transaction reaches success or rollback; it then describes committed truth
+// only. Cold admin read — hot-path accessors never touch mutMu. Lock order:
+// mutMu → mu (the store's established order).
+func (s *Store) SnapshotView() Snapshot {
+	s.mutMu.Lock()
+	defer s.mutMu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snap := Snapshot{
+		Profiles: make([]Profile, 0, len(s.order)),
+		Names:    make([]string, 0, len(s.order)),
+		Version:  s.version,
+	}
+	for _, key := range s.order {
+		if p, ok := s.profiles[key]; ok {
+			snap.Profiles = append(snap.Profiles, copyOut(p))
+			snap.Names = append(snap.Names, p.Name)
+		}
+	}
+	return snap
 }
 
 // FailOpenScope returns the profile's ID, its precomputed security generation, and
@@ -438,7 +721,7 @@ func (s *Store) Add(p Profile) (*Profile, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.profiles[key]; exists {
-		return nil, fmt.Errorf("profile %q already exists", p.Name)
+		return nil, fmt.Errorf("profile %q already exists: %w", p.Name, ErrNameTaken)
 	}
 	if p.ID == "" {
 		p.ID = uuid.NewString()[:12]
@@ -498,16 +781,34 @@ func (s *Store) Delete(name string) error {
 // Invalid profiles are skipped (fail-safe) so a bad remote/imported entry never
 // takes down the store or the valid entries. IDs are PRESERVED as provided
 // (backfilled only when empty) so a capture→apply→re-capture round-trip is stable.
-func (s *Store) ReplaceAll(profiles []Profile) { s.replace(profiles, false) }
+// Bulk install = a content change: the client-visible fence advances so any admin
+// edit loaded against the pre-install contents conflicts instead of silently
+// overwriting the installed truth.
+//
+// SERIALIZATION (2D-A fence correction, Blocker B): ReplaceAll holds the SAME
+// mutMu as MutateDurable, so a bulk install can never interleave between a
+// client's ifVersion comparison and its protected mutation — the two writer
+// classes observe exactly one serial order, and the fence generation cannot
+// alias across them.
+func (s *Store) ReplaceAll(profiles []Profile) {
+	s.mutMu.Lock()
+	defer s.mutMu.Unlock()
+	s.replaceContents(profiles, false)
+	s.mu.Lock()
+	s.version++
+	s.mu.Unlock()
+}
 
-// replace is the shared install path. skipInvalidLog controls whether skipped
+// replaceContents is the shared install path (no serialization, no version
+// movement — Load and the mutMu-holding ReplaceAll own those). skipInvalidLog
+// controls whether skipped
 // entries are logged (Load logs; ReplaceAll stays quiet on the hot sync path).
 // Returns the number of profiles that had a stable ID backfilled (migrated), the
 // number skipped as invalid/duplicate (skipped), and the number whose retired
 // certVerification=permissive was fail-closed-migrated to strict (certMigrated).
 // Load persists (migrated>0 || certMigrated>0) only when skipped==0, so a rewrite
 // never drops skipped entries.
-func (s *Store) replace(profiles []Profile, logSkips bool) (migrated, skipped, certMigrated int) {
+func (s *Store) replaceContents(profiles []Profile, logSkips bool) (migrated, skipped, certMigrated int) {
 	built := make(map[string]*Profile, len(profiles))
 	order := make([]string, 0, len(profiles))
 	for i := range profiles {
@@ -641,7 +942,7 @@ func (s *Store) Rename(id, newName string) (oldName string, err error) {
 		return oldName, nil
 	}
 	if _, taken := s.profiles[newKey]; taken {
-		return "", fmt.Errorf("a profile named %q already exists", newName)
+		return "", fmt.Errorf("a profile named %q already exists: %w", newName, ErrNameTaken)
 	}
 	np := *cur
 	np.Name = newName
@@ -711,4 +1012,42 @@ func (s *Store) SetPathForTest(path string) {
 	s.mu.Lock()
 	s.path = path
 	s.mu.Unlock()
+}
+
+// decodeProfilesFile decodes either file shape: a LEGACY bare array (its
+// fence generation comes from the retired .meta sidecar; absent ⇒ 0) or the
+// durable envelope, whose schema discriminator is LOAD-BEARING (fail-closed
+// format validation): exactly schema_version 1 is accepted — missing/zero,
+// negative, and unknown/future versions are refused with an explicit error,
+// since a future envelope must never be silently parsed with today's struct
+// (fields it relies on would be dropped and the truncated state re-persisted
+// as if authoritative). A negative persisted fence generation is impossible
+// for this store to have written and is refused rather than installed.
+func decodeProfilesFile(path string, data []byte) ([]Profile, int64, error) {
+	if isLegacyArrayFile(data) {
+		var profiles []Profile
+		if err := json.Unmarshal(data, &profiles); err != nil {
+			obs.Printf("DecryptionProfiles: unmarshal error from %s", path)
+			return nil, 0, err
+		}
+		var meta storeMeta
+		if mdata, merr := os.ReadFile(path + ".meta"); merr == nil { // #nosec G304 -- sibling of the operator-configured path
+			_ = json.Unmarshal(mdata, &meta)
+		}
+		return profiles, meta.Version, nil
+	}
+	var env storeEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		obs.Printf("DecryptionProfiles: unmarshal error from %s", path)
+		return nil, 0, err
+	}
+	if env.SchemaVersion != 1 {
+		obs.Printf("DecryptionProfiles: unsupported envelope schema_version %d in %s (this binary supports 1)", env.SchemaVersion, path)
+		return nil, 0, fmt.Errorf("decryption profiles: unsupported envelope schema_version %d (want 1)", env.SchemaVersion)
+	}
+	if env.Version < 0 {
+		obs.Printf("DecryptionProfiles: invalid negative persisted version %d in %s", env.Version, path)
+		return nil, 0, fmt.Errorf("decryption profiles: invalid negative persisted version %d", env.Version)
+	}
+	return env.Profiles, env.Version, nil
 }

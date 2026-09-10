@@ -942,9 +942,17 @@ const (
 	retryQueueMax = 500
 )
 
-// retryFile is a var (not const) so tests can redirect writes to a temp dir.
-// Production code never reassigns it.
+// retryFile is a var (not const) so tests can redirect writes to a temp dir
+// and so the appliance can bind it to its persisted-state root at boot
+// (SetRetryQueuePath). Production code never reassigns it after boot.
 var retryFile = "/data/alert_retry_queue.json"
+
+// SetRetryQueuePath binds the durable webhook retry queue to path. Called
+// once at boot, before Init, when the persisted-state root is resolved.
+func SetRetryQueuePath(path string) { retryFile = path }
+
+// RetryQueuePath reports the durable webhook retry queue path.
+func RetryQueuePath() string { return retryFile }
 
 // retryEntry represents a failed webhook delivery queued for retry.
 type retryEntry struct {

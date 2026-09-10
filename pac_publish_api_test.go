@@ -10,24 +10,37 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/KidCarmi/Culvert/internal/configver"
 	"github.com/KidCarmi/Culvert/internal/pac"
 )
 
+// resetPACPublishGlobals isolates the PAC stores AND the config-version
+// store for one test. A publish is complete only once its config-version
+// capture lands, so the store must live under the test's temp dir: on the
+// process default (<dataDir>/config_versions) a runner without a writable
+// /data fails every capture, the first publish stays pending_reconciliation
+// and the next one is refused with 409 operation_pending (PR-C1c; pinned by
+// pac_publish_env_red_test.go).
 func resetPACPublishGlobals(t *testing.T) {
 	t.Helper()
 	oc := pacStore.Snapshot()
 	op := pacProfiles.Snapshot()
 	ol := pacLifecycle.Snapshot()
+	ov := configVersions
 	t.Cleanup(func() {
 		pacStore.Restore(oc)
 		pacProfiles.Restore(op)
 		pacLifecycle.Restore(ol)
+		configVersions = ov
 	})
+	configVersions = configver.New(filepath.Join(t.TempDir(), "config_versions"), 0)
+	configVersions.Init()
 }
 
 func seedPublishProfile(t *testing.T) {
@@ -50,7 +63,7 @@ func seedPublishProfile(t *testing.T) {
 
 func pacPost(t *testing.T, path, body string, role UIRole, ip string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader([]byte(body)))
+	req := httptest.NewRequest(http.MethodPost, pacTestWithTokens(http.MethodPost, path, body), bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = ip
 	req = req.WithContext(context.WithValue(req.Context(), uiRoleKey{}, role))
@@ -188,8 +201,8 @@ func TestAPIPACLifecycle_NewDirectRequiresConfirmation(t *testing.T) {
 		t.Error("unconfirmed publish must not mutate the active profile")
 	}
 
-	// With the typed confirmation → publishes.
-	confirmed := `{"action":"publish","confirmDirect":"hq","draft":{"id":"hq","name":"HQ","enabled":true,"poolId":"main","privateNetworks":"proxy","availabilityMode":"balanced","rules":[{"kind":"domain","pattern":"x.example","action":"direct"}]}}`
+	// With the typed confirmation (the server's bound challenge, echoed) → publishes.
+	confirmed := pacTestWithConfirm(draft, pacTestConfirmFragment(t, rec))
 	rec = pacPost(t, "/api/pac/profiles/hq/lifecycle", confirmed, RoleAdmin, "198.51.100.124:0")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("confirmed publish: %d (%s)", rec.Code, rec.Body.String())
@@ -269,9 +282,10 @@ func TestAPIPACLifecycle_RollbackNewDirectRequiresConfirmation(t *testing.T) {
 	seedPublishProfile(t)
 	ip := "198.51.100.150:0"
 
-	// v1: a DIRECT rule (confirmed) → active now has DIRECT.
-	v1 := `{"action":"publish","confirmDirect":"hq","draft":{"id":"hq","name":"HQ","enabled":true,"poolId":"main","privateNetworks":"proxy","availabilityMode":"balanced","rules":[{"kind":"domain","pattern":"x.example","action":"direct"}]}}`
-	if rec := pacPost(t, "/api/pac/profiles/hq/lifecycle", v1, RoleAdmin, ip); rec.Code != http.StatusOK {
+	// v1: a DIRECT rule (confirmed via the bound challenge) → active now has DIRECT.
+	v1 := `{"action":"publish","draft":{"id":"hq","name":"HQ","enabled":true,"poolId":"main","privateNetworks":"proxy","availabilityMode":"balanced","rules":[{"kind":"domain","pattern":"x.example","action":"direct"}]}}`
+	v1c := pacTestWithConfirm(v1, pacTestConfirmFragment(t, pacPost(t, "/api/pac/profiles/hq/lifecycle", v1, RoleAdmin, ip)))
+	if rec := pacPost(t, "/api/pac/profiles/hq/lifecycle", v1c, RoleAdmin, ip); rec.Code != http.StatusOK {
 		t.Fatalf("publish v1: %d (%s)", rec.Code, rec.Body.String())
 	}
 	// v2: no DIRECT → active no longer has DIRECT.
@@ -291,8 +305,8 @@ func TestAPIPACLifecycle_RollbackNewDirectRequiresConfirmation(t *testing.T) {
 		t.Error("unconfirmed rollback must not mutate the active profile")
 	}
 
-	// With the typed confirmation → proceeds.
-	rbc := `{"action":"rollback","targetN":1,"confirmDirect":"hq"}`
+	// With the typed confirmation (bound to action rollback + targetN) → proceeds.
+	rbc := pacTestWithConfirm(rb, pacTestConfirmFragment(t, rec))
 	if rec := pacPost(t, "/api/pac/profiles/hq/lifecycle", rbc, RoleAdmin, ip); rec.Code != http.StatusOK {
 		t.Fatalf("confirmed rollback: %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -376,17 +390,22 @@ func TestAPIPACLifecycle_ConcurrentSaveDraftPublish(t *testing.T) {
 	pools := []string{"main", "alt"}
 	for i := 0; i < publishes; i++ {
 		wg.Add(2)
+		// 2F-A: publish echoes the active revision and save_draft the draft
+		// revision; a concurrent loser is refused with a structured 409 and
+		// retries with the reloaded token (pacPost injects the authoritative
+		// one per attempt). The property under test is unchanged: exactly
+		// `publishes` revisions, none lost, none duplicated.
 		go func(i int) {
 			defer wg.Done()
 			body := `{"action":"publish","draft":{"id":"hq","name":"HQ","enabled":true,"poolId":"` +
 				pools[i%2] + `","privateNetworks":"proxy","availabilityMode":"balanced","rules":[{"kind":"suffix","pattern":"cdn.example","action":"use_pool"}]}}`
-			pacPost(t, "/api/pac/profiles/hq/lifecycle", body, RoleAdmin, "198.51.100.140:0")
+			pacPostFencedRetry(t, body, "198.51.100.140:0")
 		}(i)
 		go func(i int) {
 			defer wg.Done()
 			body := `{"action":"save_draft","draft":{"id":"hq","name":"HQ","enabled":true,"poolId":"` +
 				pools[i%2] + `","privateNetworks":"proxy","availabilityMode":"balanced","rules":[{"kind":"suffix","pattern":"draft.example","action":"use_pool"}]}}`
-			pacPost(t, "/api/pac/profiles/hq/lifecycle", body, RoleAdmin, "198.51.100.141:0")
+			pacPostFencedRetry(t, body, "198.51.100.141:0")
 		}(i)
 	}
 	wg.Wait()
@@ -457,4 +476,19 @@ func TestAPIPACAnalyze_Diff(t *testing.T) {
 			t.Errorf("analyze profileId=%q: %d, want 404", id, rec.Code)
 		}
 	}
+}
+
+// pacPostFencedRetry posts a lifecycle mutation as a well-formed 2F-A client:
+// on a structured 409 "stale" it reloads (pacPost re-injects the current
+// tokens) and retries, bounded.
+func pacPostFencedRetry(t *testing.T, body, ip string) *httptest.ResponseRecorder {
+	t.Helper()
+	var rec *httptest.ResponseRecorder
+	for attempt := 0; attempt < 200; attempt++ {
+		rec = pacPost(t, "/api/pac/profiles/hq/lifecycle", body, RoleAdmin, ip)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"stale"`) {
+			return rec
+		}
+	}
+	return rec
 }
