@@ -274,7 +274,7 @@ func secScanStatusMap() map[string]interface{} {
 		m := map[string]interface{}{
 			"enabled":       true,
 			"scan_svc_mode": "remote",
-			"scan_svc_url":  globalRemoteScanner.URL(),
+			"scan_svc_url":  redactURLUserinfo(globalRemoteScanner.URL()),
 		}
 		if status, err := globalRemoteScanner.Status(); err == nil {
 			for k, v := range status {
@@ -287,7 +287,7 @@ func secScanStatusMap() map[string]interface{} {
 			// The identity of THIS node is not the far end's to state.
 			m["enabled"] = true
 			m["scan_svc_mode"] = "remote"
-			m["scan_svc_url"] = globalRemoteScanner.URL()
+			m["scan_svc_url"] = redactURLUserinfo(globalRemoteScanner.URL())
 			m["scan_svc_degraded"] = false
 		} else {
 			m["scan_svc_status"] = fmt.Sprintf("unreachable: %v", err)
@@ -329,6 +329,7 @@ func secScanStatusMap() map[string]interface{} {
 		"yara_warnings":            len(globalYARA.Warnings()), // Tier 2.1
 		"yara_inflight":            yaraInflightLoad(),         // Tier 1.3
 		"yara_inflight_max":        yaraGetMaxInflight(),       // Tier 1.3
+		"yara_match_panics":        yaraMatchPanicsLoad(),      // CHAOS-25: a match panicked (crashed) and was contained; distinct from a timeout
 		"yara_enabled":             yaraGetEnabled(),
 		"yara_timeout_secs":        yaraGetTimeoutSecs(),
 		"yara_on_timeout":          yaraGetOnTimeout(),
