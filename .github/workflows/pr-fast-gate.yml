@@ -219,11 +219,11 @@ jobs:
   test-race:
     name: "Gate · go test -race + coverage floors"
     runs-on: ubuntu-latest
-    # 35, against a 25m go-test budget below: the job also pays checkout, cache
+    # 50, against a 40m go-test budget below: the job also pays checkout, cache
     # restore, ~4m of -race compilation and the coverage-floor step, so the job
     # ceiling has to sit well above the test budget or it becomes the real limit
     # and truncates the panic dump that says WHICH test overran.
-    timeout-minutes: 35
+    timeout-minutes: 50
     needs: changes
     if: needs.changes.outputs.code == 'true'
     steps:
@@ -249,19 +249,48 @@ jobs:
         # seconds of root-package tests tipped it into a 15m timeout that reads
         # like a hang rather than a budget overrun.
         #
-        # 25m restores a real margin without weakening what is checked: the
+        # 25m restored a real margin without weakening what is checked: the
         # timeout exists to stop a genuinely hung test, and a hang still fails,
         # ~10 minutes later. It does NOT make the underlying problem acceptable
         # -- one test binary holding 900s while 65 others finish in seconds is
         # the thing to fix, by splitting the root package. Recorded as CI-01 in
         # docs/engineering/security-reviews/2026-08-25-mcp-overnight-hardening-run.md
-        run: go test -race -count=1 -timeout=25m -coverprofile=coverage.out ./...
+        #
+        # The margin was consumed again within two weeks: on 2026-09-08 the root
+        # package measured 1445s on origin/main (1b3d0e6, -race, same box, per-
+        # test -json) against the 1500s budget -- 3.7% of headroom -- and the
+        # QA gate's main-push run of the same suite took 24m35s end to end. The
+        # Batch 2 frontend PR (#1340) adds 445 root tests (58s) and a larger
+        # OpenAPI contract (the conformance slices, +20s), 1553s in total, and
+        # its gate run timed out at 1502.7s with one test 1s into its run. 40m
+        # is the same decision as 25m was, with today's numbers; the durable
+        # fix is unchanged (split the root package), and the per-binary budget
+        # here and in qa-gate.yml must move together.
+        run: go test -race -count=1 -timeout=40m -coverprofile=coverage.out ./...
 
       - name: Enforce coverage floors (global + per-file)
         # Single source of truth for BOTH coverage contracts — floors live in
         # .github/scripts/coverage-floor.sh (shared with qa-gate's main-push
         # run so the two event paths can never drift).
         run: .github/scripts/coverage-floor.sh coverage.out
+
+      - name: Mount-point regression (privileged)
+        # TestRestoreCommit_DataDirIsMountPoint_FailsInsteadOfCommitting
+        # (restore_mountpoint_test.go) needs CAP_SYS_ADMIN to bind-mount a
+        # directory — it reproduces docker-compose.yml's `cli` service
+        # topology, where the named volume proxy-data is mounted at /data.
+        # The main "Run full suite" step above runs as the unprivileged
+        # runner user, so this test only ever hits its t.Skip branch there
+        # and the regression is never actually exercised. ubuntu-latest
+        # grants the runner user passwordless sudo, so run just this test
+        # again, as root. sudo resets PATH (secure_path) and HOME (→ /root),
+        # which would hide the setup-go-cache toolchain and the module/build
+        # caches the step above just populated, forcing a cold re-download
+        # under root — forward PATH/GOCACHE/GOMODCACHE explicitly instead of
+        # `sudo -E`, so the toolchain resolves and the warm caches are reused.
+        run: |
+          sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" \
+            go test -run TestRestoreCommit_DataDirIsMountPoint_FailsInsteadOfCommitting -count=1 -v .
 
       - name: Upload coverage
         if: always()

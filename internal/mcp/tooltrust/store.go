@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -89,6 +90,38 @@ type Store struct {
 	// in-memory state byte-unchanged (durable-before-effect); production never
 	// replaces it.
 	writeFile func(path string, data []byte, perm os.FileMode) error
+	// liveView is a COPY-ON-WRITE snapshot of every record, published under mu and read
+	// WITHOUT it by ActiveLiveApprovals. See publishLiveViewLocked.
+	liveView atomic.Pointer[[]*ToolApproval]
+}
+
+// publishLiveViewLocked republishes the lock-free read snapshot. It MUST be called, with mu
+// held, by every path that mutates byID or any record it holds.
+//
+// WHY A LOCK-FREE READ EXISTS AT ALL. ActiveLiveApprovals is on the live-execution admission
+// path, which runs inside the Canary activation critical section — and that section also
+// latches automatic aborts and gates demotion. Every mutation here holds mu across
+// persistLocked and its atomic file write, so a blocking read would put a stuck disk in front
+// of the controls whose job is to stop the experiment (Codex round 21). Reading through an
+// atomic pointer removes that coupling entirely rather than ordering it, which is what lets
+// the admission path evaluate approval INSIDE the lock, where a concurrent revocation cannot
+// be missed (Codex round 22).
+//
+// THE SNAPSHOT HOLDS CLONES, and that is not defensive habit: mutators edit records IN PLACE
+// (Reject sets a.Status on the live pointer), so publishing the stored pointers would let a
+// lock-free reader observe a half-applied mutation. Cloning is bounded by maxRecords and
+// happens only on admin-rate writes.
+//
+// Adding a mutator without a publishLiveViewLocked call is a SECURITY failure, not a
+// staleness one: a revoked approval that keeps authorizing live execution. Pinned per mutator
+// by TestLiveView_EveryMutatorRepublishes.
+func (s *Store) publishLiveViewLocked() {
+	snap := make([]*ToolApproval, 0, len(s.byID))
+	for _, a := range s.byID {
+		snap = append(snap, a.clone())
+	}
+	sortApprovals(snap)
+	s.liveView.Store(&snap)
 }
 
 // NewStore constructs a Store bound to cfg. It does NOT read the durable file;
@@ -197,6 +230,10 @@ func (s *Store) Load() error {
 		return err
 	}
 	s.byID = byID
+	// Load replaces the whole index without going through persistLocked, so it publishes
+	// directly. Without this a recovered store would serve an EMPTY live view until the first
+	// admin write — every restored approval silently unable to authorize execution.
+	s.publishLiveViewLocked()
 	return nil
 }
 
@@ -326,6 +363,21 @@ func (s *Store) CreateRequest(in RequestInput) (*ToolApproval, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.clock()
+	// A live_execution request's expiry must be in the FUTURE and within the short-TTL ceiling
+	// measured from now (§6). validate() already proved it is present; this needs the clock. The
+	// AUTHORITATIVE ceiling is re-checked at Approve against ApprovedAt (the instant the grant
+	// becomes live), so a request that sits pending as the clock advances can never smuggle a
+	// window longer than the ceiling — but rejecting an over-ceiling window here fails a bad
+	// request early rather than letting it become a dead pending record.
+	if in.Purpose == PurposeLiveExecution {
+		exp := *in.ExpiresAt
+		if !exp.After(now) {
+			return nil, mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.request", "live_execution expiry must be in the future")
+		}
+		if exp.Sub(now) > MaxLiveExecutionApprovalTTL {
+			return nil, mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.request", "live_execution approval ttl exceeds ceiling")
+		}
+	}
 	// Decide capacity + id BEFORE any mutation, so an id-generation failure prunes
 	// nothing.
 	pruneID, err := s.capacityCheckLocked(in.Tenant, now)
@@ -437,6 +489,18 @@ func (s *Store) Approve(id, approver string, target CurrentTarget) (*ToolApprova
 	if !a.Purpose.Issuable() {
 		return nil, mcperr.New(mcperr.ReasonApprovalPurposeUnsupported, "tooltrust.approve", "purpose not issuable")
 	}
+	// LIVE-execution governance (§5/§6), enforced at the pending→active transition — the moment the
+	// grant becomes a real side-effect authority. FOUR-EYES: the approver must be a DISTINCT principal
+	// from the requester (the caller supplies a canonical authenticated principal for a live approval,
+	// so this compares stable identities, never display strings). Short TTL: the grant must carry an
+	// expiry within MaxLiveExecutionApprovalTTL measured from ApprovedAt (= now here). pastExpiry above
+	// already rejected an elapsed window, so the accepted window is necessarily positive and bounded —
+	// exactly the contract canary.SatisfiesLiveExecution re-checks at consumption.
+	if a.Purpose == PurposeLiveExecution {
+		if err := a.validateLiveApproveLocked(approver, now); err != nil {
+			return nil, err
+		}
+	}
 	if err := a.verifyTarget(target); err != nil {
 		return nil, err
 	}
@@ -475,6 +539,32 @@ func terminalApproveErr(status Status) error {
 	default:
 		return mcperr.New(mcperr.ReasonApprovalTerminalState, "tooltrust.approve", "not approvable")
 	}
+}
+
+// validateLiveApproveLocked enforces the live_execution-specific governance at the
+// pending→active transition (§5/§6): FOUR-EYES (a present approver distinct from the requester)
+// and the short-TTL contract (a present expiry within MaxLiveExecutionApprovalTTL measured from
+// the approval instant `now`). It is called with s.mu held, only for a PurposeLiveExecution
+// approval, after the caller has already verified the approver is present and the grant is not
+// past its expiry. Both requester and approver are canonical authenticated principals for a live
+// approval (the admin surface supplies them), so the equality check is a real separation of
+// duties, never a display-name comparison.
+func (a *ToolApproval) validateLiveApproveLocked(approver string, now time.Time) error {
+	// Four-eyes: requester and approver must both be present and DISTINCT. RequestedBy is required
+	// at request; approver is required by the Approve caller. A live grant a single human both
+	// requested and approved is refused fail-closed.
+	if a.RequestedBy == "" || approver == a.RequestedBy {
+		return mcperr.New(mcperr.ReasonApprovalSelfApproval, "tooltrust.approve", "live_execution approval requires a distinct requester and approver (four-eyes)")
+	}
+	// Short-TTL contract: a live grant MUST carry an expiry (defense-in-depth; the request path
+	// already required one), and the window from the approval instant must not exceed the ceiling.
+	if a.ExpiresAt == nil {
+		return mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.approve", "live_execution approval requires an explicit expiry")
+	}
+	if a.ExpiresAt.Sub(now) > MaxLiveExecutionApprovalTTL {
+		return mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.approve", "live_execution approval ttl exceeds ceiling")
+	}
+	return nil
 }
 
 // verifyTarget checks the approval's bound identity + fingerprint against the
@@ -754,6 +844,36 @@ func (s *Store) ActiveApprovals(now time.Time) []*ToolApproval {
 	return out
 }
 
+// ActiveLiveApprovals returns copies of every LIVE-execution grant that is live as of now
+// (active, live-purpose, unexpired) across ALL tenants. The coordinator (a trusted, in-process
+// caller — never a tenant-scoped request handler) uses it to feed the Canary activation
+// preflight's per-tool live-approval bindings. Like ActiveApprovals it is the mirror for the live
+// firewall half and NEVER consults a fingerprint — the caller matches each against the tool's
+// CURRENT observed target, and canary.SatisfiesLiveExecution re-checks four-eyes, the TTL
+// ceiling, and the exact target. It NEVER materializes catalog.Usable: live trust is orthogonal
+// to Shadow usability (§15), so no live grant reaches the ActiveApprovals→Usable projection.
+func (s *Store) ActiveLiveApprovals(now time.Time) []*ToolApproval {
+	// LOCK-FREE by design — see publishLiveViewLocked. The snapshot is filtered here rather
+	// than at publication because liveness depends on now (expiry), which the writer cannot
+	// know; the entries are already clones, so no caller can reach the stored records.
+	view := s.liveView.Load()
+	if view == nil {
+		return nil
+	}
+	var out []*ToolApproval
+	for _, a := range *view {
+		if a.activeLiveAsOf(now) {
+			// Cloned AGAIN on the way out. The snapshot's entries are already copies of the stored
+			// records, so a caller mutating one cannot corrupt the store — but it would corrupt the
+			// SHARED snapshot every other reader sees until the next publication, which the
+			// pre-snapshot implementation (a fresh clone per call) never allowed. Returning
+			// caller-owned records keeps that contract exactly (Codex round 23).
+			out = append(out, a.clone())
+		}
+	}
+	return out
+}
+
 // --- locked helpers -------------------------------------------------------
 
 // persistLocked rewrites the whole durable file atomically. Called with s.mu held,
@@ -777,6 +897,12 @@ func (s *Store) persistLocked() error {
 		// recovers. Classify it as service-unavailable (503), never invalid-input (400).
 		return mcperr.Wrap(mcperr.ReasonApprovalStoreUnavailable, "tooltrust.persist", "atomic write", err)
 	}
+	// The lock-free read snapshot is republished HERE — the single commit chokepoint every
+	// mutator already funnels through — rather than at five separate call sites, so a new
+	// mutator cannot forget it. Publishing AFTER the durable write (never before) keeps the
+	// view consistent with the store's durable-before-effect rule: on a write failure the
+	// caller reverts in memory and the un-republished view still describes committed state.
+	s.publishLiveViewLocked()
 	return nil
 }
 
@@ -864,9 +990,15 @@ func (in RequestInput) validate() error {
 		return err
 	}
 	if !in.Purpose.Issuable() {
-		// live_execution (and any non-shadow purpose) is refused at issue — fail
-		// closed. The live-execution firewall's negative half.
+		// PurposeUnset (and any unknown purpose) is refused at issue — fail closed.
 		return mcperr.New(mcperr.ReasonApprovalPurposeUnsupported, "tooltrust.request", "purpose not issuable")
+	}
+	// A live_execution request MUST carry an explicit finite expiry. This is the structural half
+	// of the §6 short-TTL contract — no expiry is ever silently defaulted in for a live grant; the
+	// operator must request one. The window/future/ceiling checks that need the clock are enforced
+	// in CreateRequest (and again at Approve, from ApprovedAt, the authoritative instant).
+	if in.Purpose == PurposeLiveExecution && in.ExpiresAt == nil {
+		return mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.request", "live_execution approval requires an explicit expiry")
 	}
 	if len(in.Reason) > maxReasonBytes {
 		return mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.request", "reason exceeds byte bound")
@@ -916,7 +1048,8 @@ func (a *ToolApproval) validateStored() error {
 	if err := boundedToken(a.ToolName, maxToolNameBytes, "tool name"); err != nil {
 		return err
 	}
-	if a.Purpose != PurposeShadowEvaluation {
+	if !a.Purpose.Issuable() {
+		// PurposeUnset (or an unknown purpose byte) is corruption — it was never issuable.
 		return mcperr.New(mcperr.ReasonConfigInvalid, "tooltrust.load", "record carries a non-issuable purpose")
 	}
 	if a.freeTextOverBound() {
@@ -924,6 +1057,31 @@ func (a *ToolApproval) validateStored() error {
 	}
 	if err := a.validateStatusLifecycle(); err != nil {
 		return err
+	}
+	if err := a.validateLiveInvariantsStored(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateLiveInvariantsStored fails Load closed for a live_execution record that violates the
+// live governance contract, so a corrupt, hand-edited, or downgrade-crafted file can never
+// resurrect a live grant that was never legitimately issued (§2, §19). A live record ALWAYS
+// carries an expiry (the issue path requires it), and an ACTIVE live grant ALWAYS carries
+// four-eyes evidence — a present approver DISTINCT from the requester. A shadow record is
+// unaffected: these invariants apply only to PurposeLiveExecution. This is defense-in-depth at
+// rest; canary.SatisfiesLiveExecution re-checks the same facts at consumption.
+func (a *ToolApproval) validateLiveInvariantsStored() error {
+	if a.Purpose != PurposeLiveExecution {
+		return nil
+	}
+	if a.ExpiresAt == nil {
+		return mcperr.New(mcperr.ReasonConfigInvalid, "tooltrust.load", "live_execution record without an expiry")
+	}
+	if a.Status == StatusActive {
+		if a.ApprovedBy == "" || a.RequestedBy == "" || a.ApprovedBy == a.RequestedBy {
+			return mcperr.New(mcperr.ReasonConfigInvalid, "tooltrust.load", "active live_execution record without four-eyes evidence")
+		}
 	}
 	return nil
 }

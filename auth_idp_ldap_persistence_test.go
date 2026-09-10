@@ -314,6 +314,10 @@ func TestIdPRegistry_LDAPProfilePersistsAndReloads(t *testing.T) {
 // path so the cutover's best-effort persist cannot touch other tests' state.
 func withLegacyLDAPAuthorityReset(t *testing.T) {
 	t.Helper()
+	// PR-C7b: a predecessor's best-effort save (adminSettingsSave) may still
+	// be in flight; drained here, it lands before this test owns the path
+	// and can never rewrite a fixture behind the test's back.
+	adminSettingsSaveWG.Wait()
 	prev := legacyLDAPRetiredFlag.Load()
 	legacyLDAPRetiredFlag.Store(false)
 	t.Cleanup(func() { legacyLDAPRetiredFlag.Store(prev) })
@@ -549,6 +553,9 @@ func TestLegacyLDAP_RetirementSentinelDurableRoundTrip(t *testing.T) {
 	if !savedSettings.LegacyLDAPRetired {
 		t.Fatal("saved settings do not carry the legacy_ldap_retired sentinel")
 	}
+	// PR-C7b: nothing may land on the fixture between the flag reset and the
+	// load; every best-effort save spawned so far has completed here.
+	adminSettingsSaveWG.Wait()
 	legacyLDAPRetiredFlag.Store(false)
 	if err := os.WriteFile(path, saved, 0o600); err != nil {
 		t.Fatalf("rewrite settings fixture: %v", err)
