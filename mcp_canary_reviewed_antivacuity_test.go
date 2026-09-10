@@ -35,8 +35,20 @@ import (
 func denialObservations() map[string]uint64 { return mcpLiveGateDenialSnapshot() }
 
 // observedDenials reports how many denials of the given reason code were recorded since before.
-func observedDenials(before map[string]uint64, code string) int {
-	return int(mcpLiveGateDenialSnapshot()[code] - before[code])
+//
+// It stays in uint64 rather than converting: the counters are uint64, and a conversion to int is
+// both a gosec G115 finding and a lie about the one case worth handling — a counter that appears to
+// have gone BACKWARDS. That cannot happen through the production path (the counters are monotonic
+// and this suite runs one request at a time), so it means a test reset the global between the two
+// snapshots. Wrapping it into a huge positive delta would satisfy an "exactly 1" assertion at
+// random; reporting 0 makes the anti-vacuity check fail, which is the safe direction for a helper
+// whose entire job is refusing to accept evidence it cannot vouch for.
+func observedDenials(before map[string]uint64, code string) uint64 {
+	now := mcpLiveGateDenialSnapshot()[code]
+	if now < before[code] {
+		return 0
+	}
+	return now - before[code]
 }
 
 // assertDeniedWithObservation is the anti-vacuity assertion.
