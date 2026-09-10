@@ -1,6 +1,6 @@
 package main
 
-// CHAOS-58 — the GeoIP resolution chain under a slow / unavailable resolver.
+// CHAOS-59 — the GeoIP resolution chain under a slow / unavailable resolver.
 //
 // Two defects, both reproduced against the pre-fix tree before this file was
 // written:
@@ -134,10 +134,10 @@ func waitForGeo(t *testing.T, d time.Duration, what string, cond func() bool) {
 
 // ── GEO-1: the request path must not block on DNS ──────────────────────────
 
-// TestChaos58_LookupCachedNeverBlocksOnDNS is the primary defect gate. The
+// TestChaos59_LookupCachedNeverBlocksOnDNS is the primary defect gate. The
 // resolver is stubbed to take far longer than any request budget; the policy
 // path's accessor must still answer immediately, fail-closed.
-func TestChaos58_LookupCachedNeverBlocksOnDNS(t *testing.T) {
+func TestChaos59_LookupCachedNeverBlocksOnDNS(t *testing.T) {
 	newGeoTestEngine(t)
 	const resolverDelay = 2 * time.Second
 	_, restore := stubResolver([]string{"203.0.113.7"}, nil)
@@ -163,12 +163,12 @@ func TestChaos58_LookupCachedNeverBlocksOnDNS(t *testing.T) {
 	}
 }
 
-// TestChaos58_PreFixShapeBlocksOnDNS is a permanent DEFECT PROOF. It rebuilds
+// TestChaos59_PreFixShapeBlocksOnDNS is a permanent DEFECT PROOF. It rebuilds
 // the pre-fix body of LookupCached inline and shows it blocks, so the gate
 // above can never quietly start proving less than it claims — if a future
 // change makes the resolver stub cheap, or makes resolveHost non-blocking by
 // accident, this test fails and says so.
-func TestChaos58_PreFixShapeBlocksOnDNS(t *testing.T) {
+func TestChaos59_PreFixShapeBlocksOnDNS(t *testing.T) {
 	newGeoTestEngine(t)
 	const resolverDelay = 300 * time.Millisecond
 	_, restore := stubResolver([]string{"203.0.113.8"}, nil)
@@ -201,11 +201,11 @@ func TestChaos58_PreFixShapeBlocksOnDNS(t *testing.T) {
 	}
 }
 
-// TestChaos58_ConcurrentMissesResolveOnce pins the single-flight. Pre-fix,
+// TestChaos59_ConcurrentMissesResolveOnce pins the single-flight. Pre-fix,
 // concurrent misses for one host each fired their own resolution, so a
 // reconnect storm against a single host multiplied 1:1 into DNS queries aimed
 // at a resolver that is, by hypothesis, already failing.
-func TestChaos58_ConcurrentMissesResolveOnce(t *testing.T) {
+func TestChaos59_ConcurrentMissesResolveOnce(t *testing.T) {
 	calls, restore := stubResolver([]string{"203.0.113.9"}, nil)
 	defer restore()
 	orig := lookupHostFn
@@ -243,10 +243,10 @@ func TestChaos58_ConcurrentMissesResolveOnce(t *testing.T) {
 
 // ── GEO-2: enforcement must not depend on the dashboard sampler ────────────
 
-// TestChaos58_WarmConvergesWithoutTheDashboardSampler is the GEO-2 gate. The
+// TestChaos59_WarmConvergesWithoutTheDashboardSampler is the GEO-2 gate. The
 // destination-country tracker is not involved at all here: a miss on the
 // policy path must arm its own warm, and the NEXT evaluation must match.
-func TestChaos58_WarmConvergesWithoutTheDashboardSampler(t *testing.T) {
+func TestChaos59_WarmConvergesWithoutTheDashboardSampler(t *testing.T) {
 	eng := newGeoTestEngine(t)
 	_, restore := stubResolver([]string{"203.0.113.11"}, nil)
 	defer restore()
@@ -272,11 +272,11 @@ func TestChaos58_WarmConvergesWithoutTheDashboardSampler(t *testing.T) {
 	}
 }
 
-// TestChaos58_WarmFiresWhenOnlyTheCountryHalfIsMissing covers the other miss
+// TestChaos59_WarmFiresWhenOnlyTheCountryHalfIsMissing covers the other miss
 // shape: the host→IP entry is live but the IP has never been geolocated. Left
 // unwarmed, that host is permanently undecidable on the policy path whenever
 // the dashboard sampler is saturated.
-func TestChaos58_WarmFiresWhenOnlyTheCountryHalfIsMissing(t *testing.T) {
+func TestChaos59_WarmFiresWhenOnlyTheCountryHalfIsMissing(t *testing.T) {
 	eng := newGeoTestEngine(t)
 	_, restore := stubResolver([]string{"203.0.113.12"}, nil)
 	defer restore()
@@ -301,12 +301,12 @@ func TestChaos58_WarmFiresWhenOnlyTheCountryHalfIsMissing(t *testing.T) {
 	})
 }
 
-// TestChaos58_NegativeCachedHostDoesNotWarm pins the other direction: a host
+// TestChaos59_NegativeCachedHostDoesNotWarm pins the other direction: a host
 // that RESOLVED to nothing usable (NXDOMAIN, resolver down, private-only) is
 // already negative-cached, and its TTL — not a warm per request — governs when
 // it is retried. Warming here would put the blocking resolution back on the
 // request path's critical rate, one goroutine per request.
-func TestChaos58_NegativeCachedHostDoesNotWarm(t *testing.T) {
+func TestChaos59_NegativeCachedHostDoesNotWarm(t *testing.T) {
 	eng := newGeoTestEngine(t)
 	_, restore := stubResolver(nil, errors.New("NXDOMAIN"))
 	defer restore()
@@ -337,11 +337,11 @@ func TestChaos58_NegativeCachedHostDoesNotWarm(t *testing.T) {
 
 // ── bounds, saturation, and the counters that make it visible ──────────────
 
-// TestChaos58_WarmIsBoundedAndDropsWhenSaturated pins the drop-on-full bound.
+// TestChaos59_WarmIsBoundedAndDropsWhenSaturated pins the drop-on-full bound.
 // A queue here would convert a resolver outage into unbounded memory; the
 // bound is what keeps a blackholed resolver from costing one goroutine (and
 // one resolver FD) per request.
-func TestChaos58_WarmIsBoundedAndDropsWhenSaturated(t *testing.T) {
+func TestChaos59_WarmIsBoundedAndDropsWhenSaturated(t *testing.T) {
 	newGeoTestEngine(t)
 	_, restore := stubResolver([]string{"203.0.113.13"}, nil)
 	defer restore()
@@ -371,10 +371,10 @@ func TestChaos58_WarmIsBoundedAndDropsWhenSaturated(t *testing.T) {
 	}
 }
 
-// TestChaos58_WarmSkipsAHostAlreadyBeingResolved pins the second half of the
+// TestChaos59_WarmSkipsAHostAlreadyBeingResolved pins the second half of the
 // single-flight: a warm for a host whose resolution is already in flight must
 // not consume a slot to do nothing.
-func TestChaos58_WarmSkipsAHostAlreadyBeingResolved(t *testing.T) {
+func TestChaos59_WarmSkipsAHostAlreadyBeingResolved(t *testing.T) {
 	newGeoTestEngine(t)
 	_, restore := stubResolver([]string{"203.0.113.14"}, nil)
 	defer restore()
@@ -406,11 +406,11 @@ func TestChaos58_WarmSkipsAHostAlreadyBeingResolved(t *testing.T) {
 	}
 }
 
-// TestChaos58_UnresolvedCountryEvaluationIsCounted pins the security-relevant
+// TestChaos59_UnresolvedCountryEvaluationIsCounted pins the security-relevant
 // signal. A country-scoped rule that does not match because the country is
 // unknown is a rule that did not enforce, and this counter is the operator's
 // only way to see it.
-func TestChaos58_UnresolvedCountryEvaluationIsCounted(t *testing.T) {
+func TestChaos59_UnresolvedCountryEvaluationIsCounted(t *testing.T) {
 	newGeoTestEngine(t)
 	_, restore := stubResolver([]string{"203.0.113.15"}, nil)
 	defer restore()
@@ -430,10 +430,10 @@ func TestChaos58_UnresolvedCountryEvaluationIsCounted(t *testing.T) {
 	}
 }
 
-// TestChaos58_SaturationRecoversOnEvidenceNotTime pins the recovery
+// TestChaos59_SaturationRecoversOnEvidenceNotTime pins the recovery
 // discipline shared with storage_health.go and socks5_health.go: the degraded
 // state clears when a warm actually gets a slot, never because time passed.
-func TestChaos58_SaturationRecoversOnEvidenceNotTime(t *testing.T) {
+func TestChaos59_SaturationRecoversOnEvidenceNotTime(t *testing.T) {
 	newGeoTestEngine(t)
 	_, restore := stubResolver([]string{"203.0.113.16"}, nil)
 	defer restore()
@@ -466,12 +466,12 @@ func TestChaos58_SaturationRecoversOnEvidenceNotTime(t *testing.T) {
 
 // ── controls ───────────────────────────────────────────────────────────────
 
-// TestChaos58_ControlWarmerActuallyResolves is the control for the gates
+// TestChaos59_ControlWarmerActuallyResolves is the control for the gates
 // above. A warmer that spawned a goroutine and did nothing would satisfy every
 // "does not block" and "is bounded" assertion while leaving country rules
 // permanently unenforceable — strictly worse than the defect. This proves the
 // warm performs the resolution it exists to perform.
-func TestChaos58_ControlWarmerActuallyResolves(t *testing.T) {
+func TestChaos59_ControlWarmerActuallyResolves(t *testing.T) {
 	eng := newGeoTestEngine(t)
 	calls, restore := stubResolver([]string{"203.0.113.17"}, nil)
 	defer restore()
@@ -493,10 +493,10 @@ func TestChaos58_ControlWarmerActuallyResolves(t *testing.T) {
 	}
 }
 
-// TestChaos58_ControlDisabledGeoIPDoesNothing pins the default posture: with
+// TestChaos59_ControlDisabledGeoIPDoesNothing pins the default posture: with
 // no GeoIP database loaded — the shipped default — the policy path performs no
 // resolution, spawns no goroutine and touches no counter.
-func TestChaos58_ControlDisabledGeoIPDoesNothing(t *testing.T) {
+func TestChaos59_ControlDisabledGeoIPDoesNothing(t *testing.T) {
 	newGeoTestEngine(t)
 	geoEnabledFn = func() bool { return false }
 	calls, restore := stubResolver([]string{"203.0.113.18"}, nil)
@@ -516,13 +516,13 @@ func TestChaos58_ControlDisabledGeoIPDoesNothing(t *testing.T) {
 
 // ── metrics surface ────────────────────────────────────────────────────────
 
-// TestChaos58_MetricsAppearOnlyWhenGeoIPIsLoaded pins both halves of the
+// TestChaos59_MetricsAppearOnlyWhenGeoIPIsLoaded pins both halves of the
 // exposition rule. The absent-when-unloaded half is the load-bearing one: a
 // flat `culvert_geo_warm_saturated 0` on a node that has no GeoIP database is
 // indistinguishable from a node whose geo rules have stopped enforcing, and
 // every paging rule on these series is `> 0` (the socks5 / cluster_ca
 // precedent).
-func TestChaos58_MetricsAppearOnlyWhenGeoIPIsLoaded(t *testing.T) {
+func TestChaos59_MetricsAppearOnlyWhenGeoIPIsLoaded(t *testing.T) {
 	series := []string{
 		"culvert_geo_warm_total",
 		"culvert_geo_warm_dropped_total",
@@ -549,14 +549,14 @@ func TestChaos58_MetricsAppearOnlyWhenGeoIPIsLoaded(t *testing.T) {
 	}
 }
 
-// TestChaos58_APanickingLeaderStillPublishes pins the single-flight's most
+// TestChaos59_APanickingLeaderStillPublishes pins the single-flight's most
 // dangerous failure mode. The leader owns the slot; if it can return without
 // publishing, every current follower blocks forever AND the slot stays
 // occupied, so every later caller for that hostname becomes a permanently
 // blocked follower too — one panic would take out that host for the life of
 // the process. The panic must still propagate; it must simply not strand
 // anyone on the way out.
-func TestChaos58_APanickingLeaderStillPublishes(t *testing.T) {
+func TestChaos59_APanickingLeaderStillPublishes(t *testing.T) {
 	_, restore := stubResolver(nil, nil)
 	defer restore()
 
@@ -609,7 +609,7 @@ func TestChaos58_APanickingLeaderStillPublishes(t *testing.T) {
 	}
 }
 
-// TestChaos58_OneHotHostCannotMonopolizeTheWarmPool pins the per-host
+// TestChaos59_OneHotHostCannotMonopolizeTheWarmPool pins the per-host
 // reservation. Raised by Codex against the first version of this fix (P1).
 //
 // The warmer's "is this host already being resolved?" check was a PRE-check:
@@ -630,7 +630,7 @@ func TestChaos58_APanickingLeaderStillPublishes(t *testing.T) {
 // pre-check is a scheduling coin flip, so a single trial passes a broken
 // build most of the time. The invariant asserted in each trial is exact —
 // one host, at most one slot — and only the number of trials is statistical.
-func TestChaos58_OneHotHostCannotMonopolizeTheWarmPool(t *testing.T) {
+func TestChaos59_OneHotHostCannotMonopolizeTheWarmPool(t *testing.T) {
 	newGeoTestEngine(t)
 	_, restore := stubResolver([]string{"203.0.113.40"}, nil)
 	defer restore()

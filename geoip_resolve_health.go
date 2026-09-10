@@ -8,7 +8,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// CHAOS-58 — the GeoIP resolution warmer and its health plane
+// CHAOS-59 — the GeoIP resolution warmer and its health plane
 //
 // The per-request policy path (matchDestNorm → geo.LookupCached) must answer
 // from cache only: it runs inside the request goroutine, holds the client
