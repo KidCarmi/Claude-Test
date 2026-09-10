@@ -134,7 +134,7 @@ EXPOSE 8080 9090
 # Readiness probe: /ready (200 when all subsystems operational, 503 otherwise)
 # Kubernetes: use /health for livenessProbe, /ready for readinessProbe
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
-  CMD wget -qO- http://localhost:8080/health || exit 1
+  CMD ["/bin/sh", "-c", "wget -qO- http://localhost:8080/health || exit 1"]
 
 ENTRYPOINT ["./culvert"]
 # All persistent state lives in /data (mount as a Docker volume):
