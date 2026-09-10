@@ -10,7 +10,7 @@ package storeguard
 // The engine's behaviour against a REAL corrupt BadgerDB — including the
 // uncatchable panic that is its whole reason for existing — is pinned by its
 // two consumers: internal/catdb/resilient_test.go (CHAOS-50) and
-// internal/logstore/resilient_chaos_test.go (CHAOS-57).
+// internal/logstore/resilient_chaos_test.go (CHAOS-59).
 
 import (
 	"errors"
@@ -254,7 +254,7 @@ func TestOpen_UnknownErrorDegrades(t *testing.T) {
 }
 
 // An exempted error must not be quarantined even though the shared table would
-// classify it as corruption — the CHAOS-57 case, at engine level.
+// classify it as corruption — the CHAOS-59 case, at engine level.
 func TestOpen_ExemptedErrorIsNeverQuarantined(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "store")
 	seedDir(t, dir)

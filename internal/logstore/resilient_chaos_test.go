@@ -1,6 +1,6 @@
 package logstore
 
-// resilient_chaos_test.go — CHAOS-57 gates for OpenResilientTTL.
+// resilient_chaos_test.go — CHAOS-59 gates for OpenResilientTTL.
 //
 // The headline claim (badger.Open panics from a goroutine badger spawns, so no
 // recover() at the call site can contain it) is proven LIVE against THIS store's
@@ -107,7 +107,7 @@ func garbleTables(t *testing.T, dir string) int {
 // admin_settings.json and re-applied on every boot, so run 2 is not a
 // hypothetical — it is what `restart: unless-stopped` does, forever, with no
 // admin UI left to turn the setting back off.
-func TestChaos57_SurvivesUncatchableOpenPanicOnNextRun(t *testing.T) {
+func TestChaos59_SurvivesUncatchableOpenPanicOnNextRun(t *testing.T) {
 	if dir := os.Getenv("CULVERT_LOGSTORE_PANIC_CHILD"); dir != "" {
 		runHistoryPanicChild(dir)
 		return
@@ -148,7 +148,7 @@ func TestChaos57_SurvivesUncatchableOpenPanicOnNextRun(t *testing.T) {
 // frame directly above it. If badger ever starts returning this error instead,
 // this test fails, and the gate above can no longer quietly prove less than it
 // claims.
-func TestChaos57_BareOpenTTLPanicIsUncatchableAtTheCallSite(t *testing.T) {
+func TestChaos59_BareOpenTTLPanicIsUncatchableAtTheCallSite(t *testing.T) {
 	if dir := os.Getenv("CULVERT_LOGSTORE_BAREOPEN_CHILD"); dir != "" {
 		runBareOpenChild(dir)
 		return
@@ -156,7 +156,7 @@ func TestChaos57_BareOpenTTLPanicIsUncatchableAtTheCallSite(t *testing.T) {
 	dir := seedHistory(t, 3000)
 	garbleTables(t, dir)
 
-	out, err := runChild(t, "TestChaos57_BareOpenTTLPanicIsUncatchableAtTheCallSite", "CULVERT_LOGSTORE_BAREOPEN_CHILD", dir)
+	out, err := runChild(t, "TestChaos59_BareOpenTTLPanicIsUncatchableAtTheCallSite", "CULVERT_LOGSTORE_BAREOPEN_CHILD", dir)
 	if err == nil {
 		t.Fatalf("bare OpenTTL survived a corrupt table — badger's behaviour changed; re-derive the guard's premise.\n%s", out)
 	}
@@ -218,7 +218,7 @@ func runBareOpenChild(dir string) {
 
 func runHistoryChild(t *testing.T, dir string) (string, error) {
 	t.Helper()
-	return runChild(t, "TestChaos57_SurvivesUncatchableOpenPanicOnNextRun", "CULVERT_LOGSTORE_PANIC_CHILD", dir)
+	return runChild(t, "TestChaos59_SurvivesUncatchableOpenPanicOnNextRun", "CULVERT_LOGSTORE_PANIC_CHILD", dir)
 }
 
 func runChild(t *testing.T, testName, envKey, dir string) (string, error) {
@@ -237,7 +237,7 @@ func runChild(t *testing.T, testName, envKey, dir string) (string, error) {
 
 // A torn MANIFEST is returned, not panicked. It must be identified as
 // corruption, quarantined, and the store re-created so history resumes.
-func TestChaos57_TornManifestIsQuarantinedAndReopened(t *testing.T) {
+func TestChaos59_TornManifestIsQuarantinedAndReopened(t *testing.T) {
 	dir := seedHistory(t, 50)
 	if err := os.WriteFile(filepath.Join(dir, "MANIFEST"), []byte("junk"), 0o600); err != nil {
 		t.Fatalf("scramble manifest: %v", err)
@@ -259,7 +259,7 @@ func TestChaos57_TornManifestIsQuarantinedAndReopened(t *testing.T) {
 // value. And because the salt sidecar is a SIBLING of the store directory, the
 // rename leaves it in place — so the evidence the operator is handed is
 // evidence they can actually read, with the key they already have.
-func TestChaos57_QuarantinedHistoryStaysReadableWithTheSameSalt(t *testing.T) {
+func TestChaos59_QuarantinedHistoryStaysReadableWithTheSameSalt(t *testing.T) {
 	dir := seedHistory(t, 50)
 	saltBefore, err := os.ReadFile(dir + ".salt")
 	if err != nil {
@@ -313,7 +313,7 @@ func TestChaos57_QuarantinedHistoryStaysReadableWithTheSameSalt(t *testing.T) {
 // exemption a configuration change would move the store aside and re-create it
 // empty, which for a store the operator is keeping ON PURPOSE is data loss
 // caused by the recovery mechanism.
-func TestChaos57_ChangedPassphraseIsNeverQuarantined(t *testing.T) {
+func TestChaos59_ChangedPassphraseIsNeverQuarantined(t *testing.T) {
 	dir := seedHistory(t, 50)
 
 	key, err := EncKey(dir, "a completely different passphrase")
@@ -347,7 +347,7 @@ func TestChaos57_ChangedPassphraseIsNeverQuarantined(t *testing.T) {
 // unacceptable one is destroying intact history on a config change. A real
 // KEYREGISTRY fault therefore degrades loudly (see the operator-contract row)
 // and the operator purges — one manual step, no silent data loss.
-func TestChaos57_ScrambledKeyRegistryDegradesRatherThanQuarantining(t *testing.T) {
+func TestChaos59_ScrambledKeyRegistryDegradesRatherThanQuarantining(t *testing.T) {
 	dir := seedHistory(t, 50)
 	kr := filepath.Join(dir, "KEYREGISTRY")
 	b, err := os.ReadFile(kr) //nolint:gosec // test fixture under t.TempDir()
@@ -378,7 +378,7 @@ func TestChaos57_ScrambledKeyRegistryDegradesRatherThanQuarantining(t *testing.T
 // structural exemption is the one that fires today; the textual one covers the
 // raw badger message, so a future change to that rewrite cannot silently
 // re-arm a quarantine over a passphrase change.
-func TestChaos57_BothPolicyLayersExemptEncryptionErrors(t *testing.T) {
+func TestChaos59_BothPolicyLayersExemptEncryptionErrors(t *testing.T) {
 	if got := storeguard.ClassifyOpenError(ErrEncMismatch, historyStorePolicy); got == storeguard.ClassCorrupt {
 		t.Error("the sentinel exemption does not hold: ErrEncMismatch classifies as corruption")
 	}
@@ -402,7 +402,7 @@ func TestChaos57_BothPolicyLayersExemptEncryptionErrors(t *testing.T) {
 // An environmental fault must never move the store: renaming fixes none of
 // them, and on the lock case it would move a LIVE store out from under its
 // owner.
-func TestChaos57_LiveOwnerIsNeverQuarantined(t *testing.T) {
+func TestChaos59_LiveOwnerIsNeverQuarantined(t *testing.T) {
 	dir := seedHistory(t, 20)
 	held, _, err := openHistory(t, dir)
 	if err != nil {
@@ -431,7 +431,7 @@ func TestChaos57_LiveOwnerIsNeverQuarantined(t *testing.T) {
 
 // A healthy store must be byte-identical to the pre-change behaviour: opened,
 // nothing moved, nothing reported.
-func TestChaos57_HealthyStoreIsUntouched(t *testing.T) {
+func TestChaos59_HealthyStoreIsUntouched(t *testing.T) {
 	dir := seedHistory(t, 20)
 	s, rec, err := openHistory(t, dir)
 	if err != nil {

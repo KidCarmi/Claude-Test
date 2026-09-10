@@ -1,6 +1,6 @@
 package main
 
-// logstore_chaos_test.go — CHAOS-57 gates for the composition root's half of
+// logstore_chaos_test.go — CHAOS-59 gates for the composition root's half of
 // the request-history recovery.
 //
 // The engine gates (internal/logstore) prove the store recovers. These prove
@@ -56,7 +56,7 @@ func seedRootHistory(t *testing.T, dir string) {
 
 // A damaged store must not stop the admin turning history on: it self-heals,
 // the outcome is recorded, and every surface says so.
-func TestChaos57_EnableRecoversDamagedStoreAndSurfacesIt(t *testing.T) {
+func TestChaos59_EnableRecoversDamagedStoreAndSurfacesIt(t *testing.T) {
 	dir := withHistoryStore(t)
 	seedRootHistory(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "MANIFEST"), []byte("junk"), 0o600); err != nil {
@@ -96,7 +96,7 @@ func TestChaos57_EnableRecoversDamagedStoreAndSurfacesIt(t *testing.T) {
 // A store that cannot be opened at all must DEGRADE — history off, process
 // alive, traffic unaffected — and be visible on every surface. Before this
 // change the visibility was one WARN log line.
-func TestChaos57_UnopenableStoreDegradesAndStaysVisible(t *testing.T) {
+func TestChaos59_UnopenableStoreDegradesAndStaysVisible(t *testing.T) {
 	dir := withHistoryStore(t)
 	seedRootHistory(t, dir)
 
@@ -137,7 +137,7 @@ func TestChaos57_UnopenableStoreDegradesAndStaysVisible(t *testing.T) {
 // The salt-loss condition reaches the admin as its OWN actionable message: the
 // history is recoverable by restoring one file, which is a different remedy
 // from the passphrase mismatch it used to be indistinguishable from.
-func TestChaos57_LostSaltIsReportedWithItsOwnRemedy(t *testing.T) {
+func TestChaos59_LostSaltIsReportedWithItsOwnRemedy(t *testing.T) {
 	dir := withHistoryStore(t)
 	seedRootHistory(t, dir)
 	if err := os.Remove(dir + ".salt"); err != nil {
@@ -161,7 +161,7 @@ func TestChaos57_LostSaltIsReportedWithItsOwnRemedy(t *testing.T) {
 
 // A healthy enable must stay byte-identical to the pre-change behaviour: no
 // recovery reported, nothing on disk, an ok row.
-func TestChaos57_HealthyEnableReportsNothing(t *testing.T) {
+func TestChaos59_HealthyEnableReportsNothing(t *testing.T) {
 	dir := withHistoryStore(t)
 
 	if err := enableLogStore(context.Background(), dir, 0, 0); err != nil {
@@ -179,7 +179,7 @@ func TestChaos57_HealthyEnableReportsNothing(t *testing.T) {
 // History saving off is a healthy posture, not a degradation — but an
 // unreconciled quarantine from an earlier incident still occupies the volume
 // and must stay visible after the admin turns saving off.
-func TestChaos57_DisabledIsOKButUnreconciledEvidenceStillWarns(t *testing.T) {
+func TestChaos59_DisabledIsOKButUnreconciledEvidenceStillWarns(t *testing.T) {
 	dir := withHistoryStore(t)
 
 	if err := enableLogStore(context.Background(), dir, 0, 0); err != nil {

@@ -1103,7 +1103,7 @@ culvert_catfeeddb_quarantined_copies %d
 		cfdb.ResidualCopies,
 	)
 
-	// CHAOS-57: request-history store health, the same triple for the same
+	// CHAOS-59: request-history store health, the same triple for the same
 	// reasons. `available` is 0 both when history saving is off and when the
 	// store failed to open — the `request_history` diagnostics row distinguishes
 	// them, while an alerting rule that only cares "is history being saved?"

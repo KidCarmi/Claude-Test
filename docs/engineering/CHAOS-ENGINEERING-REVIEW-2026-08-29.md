@@ -1,6 +1,6 @@
 # Chaos Engineering Review — 2026-08-29
 
-## CHAOS-57 — The request-history store under a damaged data volume
+## CHAOS-59 — The request-history store under a damaged data volume
 
 **Scope.** `internal/logstore` (the BadgerDB request-history store), its key
 derivation, and the composition-root lifecycle that opens it
@@ -247,14 +247,14 @@ shape**, not merely written after the fix:
 
 | Gate | Pre-fix result |
 |---|---|
-| `TestChaos57_SurvivesUncatchableOpenPanicOnNextRun` | FAIL — `abandoned markers after the panic = [], want exactly 1 — the next run cannot recover` |
-| `TestChaos57_TornManifestIsQuarantinedAndReopened` | FAIL — `open after torn MANIFEST: manifest has bad magic` |
-| `TestChaos57_QuarantinedHistoryStaysReadableWithTheSameSalt` | FAIL — `open: manifest has bad magic` |
-| `TestChaos57_TornSaltNeverMintsOverAnExistingStore` | FAIL — `EncKey minted a key over an existing store — the history is now permanently unreadable` |
-| `TestChaos57_MissingSaltNeverMintsOverAnExistingStore` | FAIL — `EncKey = <nil>, want ErrSaltUnusable` |
+| `TestChaos59_SurvivesUncatchableOpenPanicOnNextRun` | FAIL — `abandoned markers after the panic = [], want exactly 1 — the next run cannot recover` |
+| `TestChaos59_TornManifestIsQuarantinedAndReopened` | FAIL — `open after torn MANIFEST: manifest has bad magic` |
+| `TestChaos59_QuarantinedHistoryStaysReadableWithTheSameSalt` | FAIL — `open: manifest has bad magic` |
+| `TestChaos59_TornSaltNeverMintsOverAnExistingStore` | FAIL — `EncKey minted a key over an existing store — the history is now permanently unreadable` |
+| `TestChaos59_MissingSaltNeverMintsOverAnExistingStore` | FAIL — `EncKey = <nil>, want ErrSaltUnusable` |
 
 **Permanent DEFECT PROOF.**
-`TestChaos57_BareOpenTTLPanicIsUncatchableAtTheCallSite` re-exec's the test
+`TestChaos59_BareOpenTTLPanicIsUncatchableAtTheCallSite` re-exec's the test
 binary and asserts that plain `OpenTTL` — the call the composition root used to
 make — dies on a corrupt table *even with a `recover()` in the frame directly
 above it*, and that the panic came from `newLevelsController`. If badger ever
@@ -265,17 +265,17 @@ never quietly prove less than it claims. (Same discipline as CHAOS-56's
 **CONTROLS** — a passing gate must not be able to mean the mechanism simply
 stopped firing:
 
-- `TestChaos57_HealthyStoreIsUntouched` / `TestChaos57_HealthyEnableReportsNothing`
+- `TestChaos59_HealthyStoreIsUntouched` / `TestChaos59_HealthyEnableReportsNothing`
   — a healthy store is byte-identical to the pre-change behaviour.
-- `TestChaos57_SaltIsMintedWhenThereIsNothingToLose` — the refusal did not break
+- `TestChaos59_SaltIsMintedWhenThereIsNothingToLose` — the refusal did not break
   first-ever enable, the post-purge migration, or encryption-off.
 - `TestPolicy_OnlySubtracts` + the unkeyed-store control inside
-  `TestChaos57_BothPolicyLayersExemptEncryptionErrors` — the exemption narrowed
+  `TestChaos59_BothPolicyLayersExemptEncryptionErrors` — the exemption narrowed
   the table for THIS store, not for every store.
-- `TestChaos57_LiveOwnerIsNeverQuarantined` — the fix cannot move a live store.
+- `TestChaos59_LiveOwnerIsNeverQuarantined` — the fix cannot move a live store.
 
 **Counts.** 19 `internal/storeguard` (new, 84.4% statement coverage) · 13
-`internal/logstore` CHAOS-57 gates · 5 root wiring gates = **37 new gates**, plus
+`internal/logstore` CHAOS-59 gates · 5 root wiring gates = **37 new gates**, plus
 the 21 `internal/catdb` recovery gates (28 in that package overall) unchanged and
 green against the extracted engine. Full tree green,
 `-race` clean on the touched packages.
