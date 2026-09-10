@@ -1,6 +1,6 @@
 package main
 
-// CHAOS-57 gates — the Data Plane's cluster rate-limit broadcast under a
+// CHAOS-60 gates — the Data Plane's cluster rate-limit broadcast under a
 // Control Plane outage.
 //
 // The defect: clusterCountStore.Apply is reached ONLY from the DP gossip loop's
@@ -43,10 +43,10 @@ func withClusterRateLimiter(t *testing.T, limit int, window time.Duration) {
 
 // ── Defect gates ────────────────────────────────────────────────────────────
 
-// TestChaos57_StaleBroadcastNoLongerDeniesForever is THE defect gate. A
+// TestChaos60_StaleBroadcastNoLongerDeniesForever is THE defect gate. A
 // broadcast that put an IP at the limit, then aged past the rate-limit window,
 // must stop denying that IP. Pre-fix this loops false forever.
-func TestChaos57_StaleBroadcastNoLongerDeniesForever(t *testing.T) {
+func TestChaos60_StaleBroadcastNoLongerDeniesForever(t *testing.T) {
 	const limit = 10
 	window := time.Minute
 	withClusterRateLimiter(t, limit, window)
@@ -70,10 +70,10 @@ func TestChaos57_StaleBroadcastNoLongerDeniesForever(t *testing.T) {
 	}
 }
 
-// TestChaos57_FrozenBroadcastDoesNotShrinkTheLocalBudget covers the quieter
+// TestChaos60_FrozenBroadcastDoesNotShrinkTheLocalBudget covers the quieter
 // half of the same defect: even a remote count well BELOW the limit permanently
 // shrinks this node's local allowance once it can no longer be refreshed.
-func TestChaos57_FrozenBroadcastDoesNotShrinkTheLocalBudget(t *testing.T) {
+func TestChaos60_FrozenBroadcastDoesNotShrinkTheLocalBudget(t *testing.T) {
 	const limit = 10
 	window := time.Minute
 	withClusterRateLimiter(t, limit, window)
@@ -94,11 +94,11 @@ func TestChaos57_FrozenBroadcastDoesNotShrinkTheLocalBudget(t *testing.T) {
 
 // ── Control gates ───────────────────────────────────────────────────────────
 
-// TestChaos57_FreshBroadcastStillSuppresses is the control for the two defect
+// TestChaos60_FreshBroadcastStillSuppresses is the control for the two defect
 // gates: on a HEALTHY cluster the distributed limit must behave exactly as it
 // did before. A "fix" that simply ignored remote counts passes every defect
 // gate above and fails here.
-func TestChaos57_FreshBroadcastStillSuppresses(t *testing.T) {
+func TestChaos60_FreshBroadcastStillSuppresses(t *testing.T) {
 	const limit = 10
 	window := time.Minute
 	withClusterRateLimiter(t, limit, window)
@@ -119,10 +119,10 @@ func TestChaos57_FreshBroadcastStillSuppresses(t *testing.T) {
 	}
 }
 
-// TestChaos57_BroadcastAppliesForTheWholeWindow pins the boundary from the
+// TestChaos60_BroadcastAppliesForTheWholeWindow pins the boundary from the
 // other side: a broadcast is honoured right up to the window, not clipped early
 // by a shorter ad-hoc constant.
-func TestChaos57_BroadcastAppliesForTheWholeWindow(t *testing.T) {
+func TestChaos60_BroadcastAppliesForTheWholeWindow(t *testing.T) {
 	const limit = 10
 	window := time.Minute
 	withClusterRateLimiter(t, limit, window)
@@ -134,10 +134,10 @@ func TestChaos57_BroadcastAppliesForTheWholeWindow(t *testing.T) {
 	}
 }
 
-// TestChaos57_MaxAgeIsDerivedFromTheLimiterWindow proves the expiry rule tracks
+// TestChaos60_MaxAgeIsDerivedFromTheLimiterWindow proves the expiry rule tracks
 // the live limiter rather than a hardcoded minute: a longer window must keep a
 // broadcast applicable for longer.
-func TestChaos57_MaxAgeIsDerivedFromTheLimiterWindow(t *testing.T) {
+func TestChaos60_MaxAgeIsDerivedFromTheLimiterWindow(t *testing.T) {
 	const limit = 10
 	window := 10 * time.Minute
 	withClusterRateLimiter(t, limit, window)
@@ -157,9 +157,9 @@ func TestChaos57_MaxAgeIsDerivedFromTheLimiterWindow(t *testing.T) {
 	}
 }
 
-// TestChaos57_NeverAppliedBroadcastContributesNothing covers the cold-start
+// TestChaos60_NeverAppliedBroadcastContributesNothing covers the cold-start
 // node: no broadcast has ever landed, so there is nothing to add.
-func TestChaos57_NeverAppliedBroadcastContributesNothing(t *testing.T) {
+func TestChaos60_NeverAppliedBroadcastContributesNothing(t *testing.T) {
 	withClusterRateLimiter(t, 10, time.Minute)
 	if got := clusterCounts.FreshCount("203.0.113.5", time.Now(), time.Minute); got != 0 {
 		t.Fatalf("FreshCount on a node that never received a broadcast = %d, want 0", got)
@@ -176,10 +176,10 @@ func TestChaos57_NeverAppliedBroadcastContributesNothing(t *testing.T) {
 	}
 }
 
-// TestChaos57_ClockRollbackDegradesToLocal pins the fail-toward-local direction
+// TestChaos60_ClockRollbackDegradesToLocal pins the fail-toward-local direction
 // for a negative age: honouring a future-stamped broadcast would extend its life
 // by however far the clock moved back.
-func TestChaos57_ClockRollbackDegradesToLocal(t *testing.T) {
+func TestChaos60_ClockRollbackDegradesToLocal(t *testing.T) {
 	const limit = 10
 	withClusterRateLimiter(t, limit, time.Minute)
 
@@ -196,10 +196,10 @@ func TestChaos57_ClockRollbackDegradesToLocal(t *testing.T) {
 
 // ── Freshness reporting ─────────────────────────────────────────────────────
 
-// TestChaos57_StaleEpisodeIsCountedOncePerEpisode proves the transition is
+// TestChaos60_StaleEpisodeIsCountedOncePerEpisode proves the transition is
 // reported per EPISODE, not per gossip tick — the gossip loop calls this every
 // 5s, so a per-tick counter would report an hour-long outage as 720 episodes.
-func TestChaos57_StaleEpisodeIsCountedOncePerEpisode(t *testing.T) {
+func TestChaos60_StaleEpisodeIsCountedOncePerEpisode(t *testing.T) {
 	withClusterRateLimiter(t, 10, time.Minute)
 
 	clusterCounts.applyAtForTest(map[string]int{}, time.Now().Add(-2*time.Minute))
@@ -225,10 +225,10 @@ func TestChaos57_StaleEpisodeIsCountedOncePerEpisode(t *testing.T) {
 	}
 }
 
-// TestChaos57_FreshnessIsEvaluatedNotLatched proves recovery needs no explicit
+// TestChaos60_FreshnessIsEvaluatedNotLatched proves recovery needs no explicit
 // clearing path: the state is derived from the stamp on every read, so a gossip
 // loop that stops running entirely still reports the truth to /metrics.
-func TestChaos57_FreshnessIsEvaluatedNotLatched(t *testing.T) {
+func TestChaos60_FreshnessIsEvaluatedNotLatched(t *testing.T) {
 	withClusterRateLimiter(t, 10, time.Minute)
 
 	clusterCounts.applyAtForTest(map[string]int{}, time.Now().Add(-2*time.Minute))
@@ -242,10 +242,10 @@ func TestChaos57_FreshnessIsEvaluatedNotLatched(t *testing.T) {
 	}
 }
 
-// TestChaos57_MetricsOnlyOnAnArmedNode pins the emission rule: `remote_stale 0`
+// TestChaos60_MetricsOnlyOnAnArmedNode pins the emission rule: `remote_stale 0`
 // on a standalone proxy that never had a Control Plane is indistinguishable
 // from a healthy clustered node, and the paging rule is `== 1`.
-func TestChaos57_MetricsOnlyOnAnArmedNode(t *testing.T) {
+func TestChaos60_MetricsOnlyOnAnArmedNode(t *testing.T) {
 	withClusterRateLimiter(t, 10, time.Minute)
 
 	clusterRateLimitEnabled.Store(false)
@@ -297,12 +297,12 @@ func withClusterGossipButLimiterOff(t *testing.T) {
 	})
 }
 
-// TestChaos57_LimiterOffIsNeverReportedStale is the regression gate for the
+// TestChaos60_LimiterOffIsNeverReportedStale is the regression gate for the
 // false alarm: on a node that is not rate limiting, no remote count is ever
 // consulted (AllowClusterAware short-circuits), so nothing can be degraded —
 // yet a cluster-flag-only armed condition pinned every surface at "degraded"
 // permanently, on the DEFAULT posture.
-func TestChaos57_LimiterOffIsNeverReportedStale(t *testing.T) {
+func TestChaos60_LimiterOffIsNeverReportedStale(t *testing.T) {
 	withClusterGossipButLimiterOff(t)
 
 	st := clusterRateLimitFreshness()
@@ -326,10 +326,10 @@ func TestChaos57_LimiterOffIsNeverReportedStale(t *testing.T) {
 	}
 }
 
-// TestChaos57_LimiterOffStillReportsWhatArrived pins that suppressing the ALARM
+// TestChaos60_LimiterOffStillReportsWhatArrived pins that suppressing the ALARM
 // does not suppress the FACTS: a broadcast that did land is still reported, so
 // the surface stays diagnostic rather than going blank.
-func TestChaos57_LimiterOffStillReportsWhatArrived(t *testing.T) {
+func TestChaos60_LimiterOffStillReportsWhatArrived(t *testing.T) {
 	withClusterGossipButLimiterOff(t)
 	clusterCounts.applyAtForTest(map[string]int{"203.0.113.20": 5}, time.Now().Add(-2*time.Hour))
 
@@ -345,11 +345,11 @@ func TestChaos57_LimiterOffStillReportsWhatArrived(t *testing.T) {
 	}
 }
 
-// TestChaos57_ArmedNeedsBothHalves is the control: suppressing the false alarm
+// TestChaos60_ArmedNeedsBothHalves is the control: suppressing the false alarm
 // must not suppress the REAL one. Turning the limiter on — the other half of
 // the condition AllowAuto → AllowClusterAware requires — arms the surface and
 // the genuine degradation is reported again.
-func TestChaos57_ArmedNeedsBothHalves(t *testing.T) {
+func TestChaos60_ArmedNeedsBothHalves(t *testing.T) {
 	withClusterGossipButLimiterOff(t)
 	if clusterRateLimitFreshness().Armed {
 		t.Fatal("armed with the limiter off")
@@ -383,10 +383,10 @@ func TestChaos57_ArmedNeedsBothHalves(t *testing.T) {
 
 // ── Concurrency ─────────────────────────────────────────────────────────────
 
-// TestChaos57_FreshCountRacesApply runs the hot-path reader against the gossip
+// TestChaos60_FreshCountRacesApply runs the hot-path reader against the gossip
 // writer under -race: the stamp is an atomic outside the mutex, so the
 // publication order (map under the lock, stamp after) has to be correct.
-func TestChaos57_FreshCountRacesApply(t *testing.T) {
+func TestChaos60_FreshCountRacesApply(t *testing.T) {
 	withClusterRateLimiter(t, 100, time.Minute)
 
 	var wg sync.WaitGroup
@@ -413,9 +413,9 @@ func TestChaos57_FreshCountRacesApply(t *testing.T) {
 
 // ── The DP→CP audit push queue ──────────────────────────────────────────────
 
-// TestChaos57_AuditPushQueueOverflowIsCounted is the second defect gate. The
+// TestChaos60_AuditPushQueueOverflowIsCounted is the second defect gate. The
 // bound is correct; the silence was not. Pre-fix there is no counter at all.
-func TestChaos57_AuditPushQueueOverflowIsCounted(t *testing.T) {
+func TestChaos60_AuditPushQueueOverflowIsCounted(t *testing.T) {
 	restore := audit.ResetPendingForTest()
 	defer restore()
 
@@ -432,10 +432,10 @@ func TestChaos57_AuditPushQueueOverflowIsCounted(t *testing.T) {
 	}
 }
 
-// TestChaos57_AuditRequeueOverflowIsCounted covers the path an actual CP outage
+// TestChaos60_AuditRequeueOverflowIsCounted covers the path an actual CP outage
 // takes: Drain, push fails, Requeue — repeatedly. The requeued (older) events
 // are the ones discarded, and that loss must be charged too.
-func TestChaos57_AuditRequeueOverflowIsCounted(t *testing.T) {
+func TestChaos60_AuditRequeueOverflowIsCounted(t *testing.T) {
 	restore := audit.ResetPendingForTest()
 	defer restore()
 
@@ -469,10 +469,10 @@ func TestChaos57_AuditRequeueOverflowIsCounted(t *testing.T) {
 	}
 }
 
-// TestChaos57_AuditPushDropsSurfaceOnHealthz pins the operator surface: the
+// TestChaos60_AuditPushDropsSurfaceOnHealthz pins the operator surface: the
 // field appears only when non-zero, so an unaffected node's /healthz body is
 // byte-identical to before.
-func TestChaos57_AuditPushDropsSurfaceOnHealthz(t *testing.T) {
+func TestChaos60_AuditPushDropsSurfaceOnHealthz(t *testing.T) {
 	restore := audit.ResetPendingForTest()
 	defer restore()
 

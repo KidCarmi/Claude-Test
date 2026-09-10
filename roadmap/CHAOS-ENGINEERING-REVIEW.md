@@ -140,8 +140,18 @@ for the two cheapest wrong fixes (force-close at drain START — which passes ev
 being strictly worse than the defect — and a non-idempotent release, whose negative gauge restores
 the original blindness by accident). See rows PX-4/PX-8, §25 and
 `docs/operator/tunnel-drain-on-shutdown.md`.
-**2026-09-08 — CHAOS-57 sweep (the Data Plane's outbound cluster state under a Control
-Plane outage).** Register row **HA-1** records the deliberate posture for a DP that loses its
+**2026-09-08 — CHAOS-60 sweep (the Data Plane's outbound cluster state under a Control
+Plane outage).**
+*(Numbered CHAOS-60/§28 on merge. This sweep ran as `CHAOS-57`/§25 and collided with the
+hijacked-tunnel sweep, which merged first and kept the id; an intervening main-merge moved the
+SECTION to §27 and left the `CHAOS-` id colliding, so by the time this branch was rebased the
+tree carried TWO different sweeps stamped `CHAOS-57` — two `## ` sections here and two
+Architecture Notes in `CLAUDE.md`. That is the FIFTH occurrence of the collision this section's
+header warns about, and the second time the section-only renumber let the id survive its own
+remedy. Resolved by this section's established precedent: the already-merged sweep keeps the id
+and this one moved. The header's standing recommendation — allocate the id at the START of a
+sweep, in a committed placeholder row — would again have prevented it.)*
+Register row **HA-1** records the deliberate posture for a DP that loses its
 Control Plane — it keeps serving its last-known-good CONFIG — and that posture was reasoned about
 carefully. This sweep asked the adjacent question the row does not cover: what happens to the DP's
 other outbound cluster state, the per-tick loops that are not config sync at all. The same posture
@@ -167,9 +177,9 @@ the OLDEST unsent history: the beginning of whatever happened during the outage.
 expiry derived from the live limiter window (with a negative age — clock rollback — failing toward
 the local decision, a disagreement between the enforcement and reporting paths that the sweep's own
 gate caught inside the first version of the fix), a freshness health plane armed only on a
-clustered node, counted audit-push drops, and 16 gates with every defect gate verified failing
+clustered node, counted audit-push drops, and 17 gates with every defect gate verified failing
 against the pre-fix tree. No new alert event: a stale broadcast is always the CP link, which
-already alerts. See rows CL-20/CL-21, §25, and `docs/operator/cluster-rate-limit-freshness.md`.
+already alerts. See rows CL-20/CL-21, §28, and `docs/operator/cluster-rate-limit-freshness.md`.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -3254,7 +3264,7 @@ ACKs StartTLS and then never negotiates TLS hangs with `SetTimeout` armed.
 
 This was verified directly against the library, not assumed, and the check is
 kept as a permanent **defect proof**
-(`TestChaos57_SetTimeoutDoesNotBoundStartTLSHandshake`): it asserts that go-ldap
+(`TestChaos58_SetTimeoutDoesNotBoundStartTLSHandshake`): it asserts that go-ldap
 still behaves this way, so a future library release that fixes it fails the
 build rather than leaving a backstop silently guarding nothing — the role
 `BareGracefulStopIsUnboundedOnAWedgedStream` plays for CHAOS-56.
@@ -3652,7 +3662,8 @@ documented residuals. This sweep adds one about **fixes**:
 The corollary is a review question worth asking of every degradation fix in
 this register: *what signal did the old, worse behaviour emit, and what emits
 it now?*
-## 28. CHAOS-57 — The Data Plane's outbound cluster state under a Control Plane outage
+
+## 28. CHAOS-60 — The Data Plane's outbound cluster state under a Control Plane outage
 
 **Date:** 2026-09-08 · **Domain:** DP→CP gossip (`controlplane_client.go`), the
 distributed rate limiter (`security.go`), the DP→CP audit push queue
@@ -3768,7 +3779,7 @@ drop without charging `PendingDrops()`; surfaced as
   banner, and one log line per TRANSITION in each direction (the gossip loop
   ticks every 5s; a per-tick line would report an hour-long outage 720 times).
 * Counted audit push-queue drops with the package's first-failure-only log.
-* 16 gates in `cluster_ratelimit_freshness_chaos_test.go`. Every DEFECT gate was
+* 17 gates in `cluster_ratelimit_freshness_chaos_test.go`. Every DEFECT gate was
   verified failing against the pre-fix shape.
 
 **No new alert event.** A stale broadcast is always caused by the CP link,
@@ -3777,8 +3788,8 @@ event name for one root cause is two pages for one action.
 
 **The control gates are the point.** The cheapest way to pass every defect gate
 is to stop consulting remote counts at all — which would silently delete the
-distributed rate limiter. `TestChaos57_FreshBroadcastStillSuppresses` and
-`TestChaos57_BroadcastAppliesForTheWholeWindow` pin the healthy path from both
+distributed rate limiter. `TestChaos60_FreshBroadcastStillSuppresses` and
+`TestChaos60_BroadcastAppliesForTheWholeWindow` pin the healthy path from both
 sides, so a fix that passes by deleting the feature fails.
 
 ### 28.4b Review follow-up — a defect in the fix itself (Codex, PR #1346)

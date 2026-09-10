@@ -1144,7 +1144,7 @@ culvert_socks5_accept_backoff_seconds %g
 		)
 	}
 
-	// CHAOS-57: cluster rate-limit broadcast freshness. Emitted ONLY on a node
+	// CHAOS-60: cluster rate-limit broadcast freshness. Emitted ONLY on a node
 	// where cluster-wide rate limiting is armed — `remote_stale 0` on a
 	// standalone proxy that never had a Control Plane is indistinguishable from
 	// a healthy clustered node, and the paging rule is `== 1` (the

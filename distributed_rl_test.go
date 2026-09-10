@@ -103,7 +103,7 @@ func TestClusterCountStore_FreshCountApply(t *testing.T) {
 		t.Fatalf("Count() = %d, want 1", got)
 	}
 
-	// CHAOS-57: past maxAge the same broadcast contributes nothing, while
+	// CHAOS-60: past maxAge the same broadcast contributes nothing, while
 	// Count() still reports what was last received — the two answer different
 	// questions and the freshness surface is what separates them.
 	if got := cs.FreshCount("9.9.9.9", time.Now().Add(2*maxAge), maxAge); got != 0 {
@@ -164,7 +164,7 @@ func TestAllowClusterAware_CombinesRemote(t *testing.T) {
 
 	// Simulate 7 remote requests from other nodes. The broadcast has to be
 	// APPLIED (not just poked into the struct) so it carries a freshness stamp —
-	// CHAOS-57 made an unstamped store mean "nothing has ever arrived", which is
+	// CHAOS-60 made an unstamped store mean "nothing has ever arrived", which is
 	// exactly what a node that never reached its Control Plane should report.
 	oldCounts := clusterCounts
 	clusterCounts = &clusterCountStore{counts: map[string]int{}}

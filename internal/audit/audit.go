@@ -412,7 +412,7 @@ var (
 	pendingMu sync.Mutex
 	pending   []Entry
 
-	// CHAOS-57 — overflow of the DP→CP push queue is COUNTED, never silent.
+	// CHAOS-60 — overflow of the DP→CP push queue is COUNTED, never silent.
 	//
 	// The bound itself is correct: a Data Plane that cannot reach its Control
 	// Plane must not grow this queue without limit. What was missing is that

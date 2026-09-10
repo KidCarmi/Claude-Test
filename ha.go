@@ -1109,7 +1109,7 @@ func addRequestLogHealth(resp map[string]any) {
 	if n := auditWriteErrors(); n > 0 {
 		resp["auditLogWriteErrors"] = n
 	}
-	// CHAOS-57: the CLUSTER half of the same compliance record. A Data Plane
+	// CHAOS-60: the CLUSTER half of the same compliance record. A Data Plane
 	// that cannot reach its Control Plane drops the oldest unsent audit events
 	// once its bounded push queue fills, so the centralized log has a gap that
 	// the local file does not. Reported separately because the remedy differs:

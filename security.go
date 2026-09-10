@@ -838,7 +838,7 @@ type RateLimitBroadcast struct {
 // (other nodes' aggregated counts). Protected by its own mutex to avoid
 // contention with the hot-path Allow() sharded locks.
 //
-// CHAOS-57 — a broadcast EXPIRES. RemoteCounts is, by its own definition, "the
+// CHAOS-60 — a broadcast EXPIRES. RemoteCounts is, by its own definition, "the
 // total from other nodes IN THE CURRENT WINDOW": a broadcast received at T
 // describes request timestamps in [T-W, T], where W is the rate limiter's
 // sliding window. At now > T+W every timestamp it counted has aged out, so its
@@ -1044,7 +1044,7 @@ func (r *RateLimiter) AllowClusterAware(ip string) bool {
 
 	// Check local + remote cluster count against limit.
 	//
-	// CHAOS-57: the remote half is consulted only while the broadcast carrying
+	// CHAOS-60: the remote half is consulted only while the broadcast carrying
 	// it can still describe THIS window. Past that it is not a conservative
 	// estimate, it is a count of timestamps that have all aged out — so a
 	// Control-Plane outage degrades this node to plain local rate limiting
