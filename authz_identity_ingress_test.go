@@ -79,18 +79,63 @@ func logEntriesSince(prev []LogEntry) []LogEntry {
 	return cur
 }
 
-// assertNoIdentityAttributionSince scans the entries recorded after the ring
-// snapshot `prev` (taken immediately before the request under test) for the
-// given destination host and fails if any carries a non-empty identity: the
-// only identity source on these test paths would be the spoofed header.
-func assertNoIdentityAttributionSince(t *testing.T, destHost string, prev []LogEntry) {
+// identityAssertT is the subset of *testing.T the identity-attribution
+// assertion uses. It exists so the assertion's OWN failure behaviour can be
+// exercised by a control test with a recording stand-in: a gate that can only
+// ever be observed passing is not a gate.
+type identityAssertT interface {
+	Helper()
+	Errorf(format string, args ...any)
+}
+
+// assertNoIdentityAttributionIn is the window-scoped decision behind
+// assertNoIdentityAttributionSince, split out so both halves of its contract
+// can be driven directly.
+//
+// THE CONTRACT IS A CONJUNCTION, NOT A SEARCH FOR COUNTEREXAMPLES:
+//
+//	request under test
+//	  => an expected observation for destHost EXISTS
+//	  AND no observation for destHost carries an identity
+//
+// The second half alone is vacuously true whenever the window holds nothing
+// for destHost, so "the request produced no log entry" and "the request
+// produced a correctly unattributed log entry" used to serialise identically
+// — and the first of those proves nothing about the spoofing property while
+// reporting PASS. Every one of these requests IS logged (a policy denial is
+// still a request-log entry), so an empty scan means the fixture, the window
+// or the host key is wrong, and the assertion has to say so rather than
+// certify the absence of evidence as evidence of absence.
+func assertNoIdentityAttributionIn(t identityAssertT, destHost string, entries []LogEntry) {
 	t.Helper()
-	entries := logEntriesSince(prev)
+	observed := 0
 	for i := range entries { // index-based: LogEntry is a large struct (rangeValCopy)
-		if entries[i].Host == destHost && entries[i].Identity != "" {
+		if entries[i].Host != destHost {
+			continue
+		}
+		observed++
+		if entries[i].Identity != "" {
 			t.Errorf("log entry for %s attributed to identity %q — client-controlled header must never reach log attribution", destHost, entries[i].Identity)
 		}
 	}
+	if observed == 0 {
+		t.Errorf("no request-log entry for %s in the window recorded after the request under test: the attribution scan matched nothing, so it proves nothing about identity attribution (anti-vacuity)", destHost)
+	}
+}
+
+// assertNoIdentityAttributionSince scans the entries recorded after the ring
+// snapshot `prev` (taken immediately before the request under test) for the
+// given destination host, requires that the request under test actually
+// produced one, and fails if any carries a non-empty identity: the only
+// identity source on these test paths would be the spoofed header.
+//
+// Known limitation, inherited and deliberately not changed here: the ring is
+// bounded, so if more than MaxRing entries land between `prev` and this call,
+// logEntriesSince can no longer find prev[0] and widens to the whole ring.
+// That direction costs precision, never the anti-vacuity guarantee.
+func assertNoIdentityAttributionSince(t identityAssertT, destHost string, prev []LogEntry) {
+	t.Helper()
+	assertNoIdentityAttributionIn(t, destHost, logEntriesSince(prev))
 }
 
 // TestIdentityIngress_ExemptSpoofDenied: default-Exempt (open) posture with a
