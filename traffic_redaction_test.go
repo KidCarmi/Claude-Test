@@ -148,7 +148,7 @@ func TestTrafficRedaction_TopHostsRedacted(t *testing.T) {
 	swapDecRedact(t, true)
 	swapTrafficKey(t, []byte(testTrafficKey))
 	prev := topHosts
-	topHosts = &hostCounter{hosts: map[string]*int64{}}
+	topHosts = &hostCounter{}
 	t.Cleanup(func() { topHosts = prev })
 
 	const host = "patient-portal.example.com"

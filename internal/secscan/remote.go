@@ -27,6 +27,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/alerts"
 	"github.com/KidCarmi/Culvert/internal/hashcache"
 	"github.com/KidCarmi/Culvert/internal/obs"
+	"github.com/KidCarmi/Culvert/internal/redaction"
 )
 
 // ScanResponse is the JSON wire type between the scan sidecar and this
@@ -85,7 +86,9 @@ func (rs *RemoteScanner) Init(baseURL string) {
 		},
 	}
 	rs.enabled.Store(true)
-	obs.Printf("ScanSvc: remote scanner at %s", baseURL)
+	// Userinfo-redacted: the process log is a read surface too, and an
+	// operator URL may carry an embedded credential.
+	obs.Printf("ScanSvc: remote scanner at %s", redaction.URLUserinfo(baseURL))
 }
 
 // SetExclusions injects the admin-managed hash allowlist so the remote path
@@ -349,7 +352,7 @@ func (rs *RemoteScanner) Health() error {
 	rs.mu.RLock()
 	if !rs.enabled.Load() {
 		rs.mu.RUnlock()
-		return fmt.Errorf("remote scanner not configured")
+		return ErrNotConfigured
 	}
 	baseURL := rs.baseURL
 	client := rs.client
@@ -371,7 +374,7 @@ func (rs *RemoteScanner) Health() error {
 	// leaves the connection unusable and makes every admin poll open a new one.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxRemoteStatusResponse))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("health check returned HTTP %d", resp.StatusCode)
+		return &HTTPStatusError{Code: resp.StatusCode}
 	}
 	return nil
 }
@@ -381,7 +384,7 @@ func (rs *RemoteScanner) Status() (map[string]interface{}, error) {
 	rs.mu.RLock()
 	if !rs.enabled.Load() {
 		rs.mu.RUnlock()
-		return nil, fmt.Errorf("remote scanner not configured")
+		return nil, ErrNotConfigured
 	}
 	baseURL := rs.baseURL
 	client := rs.client
