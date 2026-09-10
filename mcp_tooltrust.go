@@ -161,6 +161,51 @@ func initMCPToolTrust(_ *startupState) {
 	startToolTrustReconcileLoop(resolveLifecycleCtx())
 }
 
+// mcpToolTrustLoop tracks the most recently started reconcile loop: its
+// cancel (so the owner of the coordinator can stop it) and a done channel
+// closed when the goroutine returns (so the stop can JOIN it). Production
+// starts the loop once at init and stops it only through the process
+// lifecycle context; the explicit stop exists so a test environment that
+// composes its own coordinator never leaves a previous environment's loop
+// ticking against it (the harness race found by the root -race gate).
+var mcpToolTrustLoop struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{} // closed when the loop goroutine returns
+}
+
+// stopToolTrustReconcileLoop cancels the most recently started reconcile loop
+// and waits for its goroutine to return. Idempotent; a no-op when none runs.
+func stopToolTrustReconcileLoop() {
+	mcpToolTrustLoop.mu.Lock()
+	cancel, done := mcpToolTrustLoop.cancel, mcpToolTrustLoop.done
+	mcpToolTrustLoop.cancel = nil
+	mcpToolTrustLoop.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+// toolTrustReconcileLoopRunning reports whether the most recently started
+// reconcile loop is still running (false when none was started).
+func toolTrustReconcileLoopRunning() bool {
+	mcpToolTrustLoop.mu.Lock()
+	done := mcpToolTrustLoop.done
+	mcpToolTrustLoop.mu.Unlock()
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
+}
+
 // mcpToolTrustReconcileInterval bounds how long an expired grant can keep a tool
 // Usable during an active Shadow experiment (no inventory read is guaranteed then).
 // A package var so a test can shorten it.
@@ -174,7 +219,16 @@ func startToolTrustReconcileLoop(ctx context.Context) bool {
 		return false
 	}
 	interval := mcpToolTrustReconcileInterval // read in the caller goroutine (ordered with tests)
+	// Exactly one loop per composition: a previous loop (a re-composition in
+	// tests) is stopped and joined before the new one starts.
+	stopToolTrustReconcileLoop()
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	mcpToolTrustLoop.mu.Lock()
+	mcpToolTrustLoop.cancel, mcpToolTrustLoop.done = cancel, done
+	mcpToolTrustLoop.mu.Unlock()
 	go func() {
+		defer close(done)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -399,6 +453,69 @@ func (c *mcpToolTrustCoordinator) RequestApproval(in toolTrustRequestInput) (*to
 	})
 }
 
+// RequestLiveApproval records a pending LIVE-execution trust request. It is the explicit,
+// dedicated live issue path (§3): it forces Purpose = live_execution so a live request can never
+// be confused for a shadow one, then reuses the same authoritative resolve→validate→create as
+// RequestApproval (exact current fingerprint + reviewed catalog revision). The store additionally
+// requires a live request to carry an explicit finite expiry within the short-TTL ceiling (§6);
+// four-eyes is enforced later, at ApproveLive. Issuing a request is NEVER a grant and arms nothing.
+func (c *mcpToolTrustCoordinator) RequestLiveApproval(in toolTrustRequestInput) (*tooltrust.ToolApproval, error) {
+	in.Purpose = tooltrust.PurposeLiveExecution
+	return c.RequestApproval(in)
+}
+
+// ApproveLive approves a pending LIVE-execution request under the stronger live governance, WITHOUT
+// touching the catalog (§14/§15). Unlike ApproveShadow it never promotes the tool to catalog.Usable:
+// live trust is ORTHOGONAL to Shadow usability — a live grant is consumed only by the Canary
+// activation preflight, never by evaluateShadowActivationPreflight. It re-loads the CURRENT target
+// under deriveMu (so a concurrent ingest cannot advance the revision between the load and the store
+// decision — the same optimistic-concurrency window ApproveShadow closes) and delegates to
+// store.Approve, which enforces exact-current-state (verifyTarget + revisionStale), FOUR-EYES
+// (approver distinct from the requester — both canonical authenticated principals supplied by the
+// admin surface), a mandatory expiry, and the ≤MaxLiveExecutionApprovalTTL ceiling measured from
+// the approval instant. Approving a live grant arms NOTHING: no executor, no live tier, no Canary
+// transition (§22). It refuses a non-live approval fail-closed so the shadow path is never reached
+// through it.
+func (c *mcpToolTrustCoordinator) ApproveLive(id, approver, tenant string) (*tooltrust.ToolApproval, error) {
+	store, err := c.getStore()
+	if err != nil {
+		return nil, err
+	}
+	existing, err := store.Get(id, tenant)
+	if err != nil {
+		return nil, err
+	}
+	if existing.Purpose != tooltrust.PurposeLiveExecution {
+		// Route mismatch: a shadow approval must be decided via ApproveShadow. Fail closed rather
+		// than silently approving a shadow grant without promotion (or a live grant with it).
+		return nil, mcperr.New(mcperr.ReasonApprovalPurposeUnsupported, "tooltrust.approve", "not a live_execution approval")
+	}
+	// Serialize the load→approve against ingest/reconcile/approve/revoke exactly as ApproveShadow
+	// does, so the exact-target optimistic-concurrency check runs against a revision that cannot be
+	// advanced underneath it. Taken before the store lock, never from under it.
+	c.deriveMu.Lock()
+	defer c.deriveMu.Unlock()
+	ti := c.loadTarget(existing.ServerID, existing.ToolName)
+	granted, err := store.Approve(id, approver, ti.target)
+	if err != nil {
+		return nil, err
+	}
+	// Deliberately NO promoteFor / catalog mutation: live trust never materializes catalog.Usable.
+	return granted, nil
+}
+
+// activeLiveApprovals returns copies of every active, unexpired live-execution grant across all
+// tenants for the Canary activation preflight to bind per scoped tool. It is a trusted in-process
+// read (never a tenant-scoped request path); an uncomposed coordinator yields nil (fail-closed:
+// no live approvals, so the live_execution_approval_invalid row stays unmet).
+func (c *mcpToolTrustCoordinator) activeLiveApprovals(now time.Time) []*tooltrust.ToolApproval {
+	store, err := c.getStore()
+	if err != nil {
+		return nil
+	}
+	return store.ActiveLiveApprovals(now)
+}
+
 // ApproveShadow approves a pending request (shadow purpose) after re-verifying the
 // bound target against freshly-loaded CURRENT facts, then materializes the trust by
 // promoting the tool to catalog.Usable. Commit order is durable-first (ADR-0034
@@ -416,6 +533,13 @@ func (c *mcpToolTrustCoordinator) ApproveShadow(id, approver, tenant string) (*t
 	existing, err := store.Get(id, tenant)
 	if err != nil {
 		return nil, err
+	}
+	// Route isolation (§3/§15): ApproveShadow is the SHADOW path — it promotes the tool to
+	// catalog.Usable. A live_execution approval must NEVER be approved here (that would both skip the
+	// live route's intent and, worse, materialize catalog.Usable from a live grant). Refuse it
+	// fail-closed; ApproveLive is its only decision path. Symmetric with ApproveLive's live-only guard.
+	if existing.Purpose != tooltrust.PurposeShadowEvaluation {
+		return nil, mcperr.New(mcperr.ReasonApprovalPurposeUnsupported, "tooltrust.approve", "not a shadow_evaluation approval")
 	}
 	// Serialize the approve+promote with reconcile/revoke so the durable transition and
 	// the catalog promotion are one critical section (no interleaving demote/promote).
@@ -705,9 +829,27 @@ func parseFingerprintHex(s string) (tooltrust.FingerprintDigest, error) {
 	return d, nil
 }
 
+// swapClockForTest installs an injected coordinator clock under the
+// coordinator's own mutex (the reconcile loop reads it under RLock) and
+// returns the restore. Test harness use only.
+func (c *mcpToolTrustCoordinator) swapClockForTest(fn func() time.Time) (restore func()) {
+	c.mu.Lock()
+	prev := c.nowFn
+	c.nowFn = fn
+	c.mu.Unlock()
+	return func() {
+		c.mu.Lock()
+		c.nowFn = prev
+		c.mu.Unlock()
+	}
+}
+
 // resetMCPToolTrustForTest restores the coordinator + reconcile hook to their
-// uncomposed defaults so a test can isolate the process-global singleton.
+// uncomposed defaults so a test can isolate the process-global singleton. It
+// first stops AND joins the reconcile loop of the previous composition, so
+// no goroutine of one test environment outlives it.
 func resetMCPToolTrustForTest() {
+	stopToolTrustReconcileLoop()
 	mcpToolTrust.mu.Lock()
 	mcpToolTrust.store = nil
 	mcpToolTrust.composed = false

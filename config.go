@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -426,7 +428,17 @@ func loadFileConfig(path string) (*FileConfig, error) {
 	dec := yaml.NewDecoder(f, yaml.DisallowUnknownField())
 	var fc FileConfig
 	if err := dec.Decode(&fc); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		// An empty, whitespace-only, or comment-only document is not
+		// malformed YAML — it is the same "nothing configured" shape as
+		// omitting -config entirely (goccy/go-yaml reports it as io.EOF
+		// rather than populating fc). An operator who reserves the path
+		// with `touch config.yaml`, or who copies the shipped template
+		// with every line commented out, must still get a booting proxy
+		// with all defaults — not a fatal "Cannot load config file" that
+		// looks like a syntax error in a file that has no syntax at all.
+		if !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
 	}
 	if err := fc.validate(); err != nil {
 		return nil, fmt.Errorf("validate %s: %w", path, err)

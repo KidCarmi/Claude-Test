@@ -45,7 +45,7 @@ func TestStartupSliceContract_PureAndDeterministic(t *testing.T) {
 			return resolveBackgroundServicesStartupConfig(fc)
 		}},
 		{"blocklist", func(fc *FileConfig) any { return resolveBlocklistStartupConfig(fc, "") }},
-		{"cdr", func(fc *FileConfig) any { return resolveCDRStartupConfig(fc, cdrCLIFlags{}) }},
+		{"cdr", func(fc *FileConfig) any { return resolveCDRStartupConfig(fc, defaultDataDir, cdrCLIFlags{}) }},
 		{"cluster", func(fc *FileConfig) any { return resolveClusterStartupConfig(fc, clusterCLIFlags{}) }},
 		{"conn_and_rate_limit", func(fc *FileConfig) any { return resolveConnAndRateLimitStartupConfig(fc, "", 0) }},
 		{"geoip", func(fc *FileConfig) any { return resolveGeoIPStartupConfig(fc, "") }},
@@ -54,6 +54,7 @@ func TestStartupSliceContract_PureAndDeterministic(t *testing.T) {
 		{"logstore", func(fc *FileConfig) any { return resolveLogStoreStartupConfig(fc, "", "", "") }},
 		{"metrics_token", func(fc *FileConfig) any { return resolveMetricsTokenStartupConfig(fc, "") }},
 		{"mcp_observe", func(fc *FileConfig) any { return resolveMCPObserveStartupConfig(fc) }},
+		{"mcp_live_production", func(_ *FileConfig) any { return resolveMCPLiveProductionConfig("", "") }},
 		{"mtls_ocsp", func(fc *FileConfig) any { return resolveMTLSOCSPStartupConfig(fc) }},
 		{"observability", func(fc *FileConfig) any {
 			return resolveObservabilityStartupConfig(fc, "", "", "", "", "", 0)
