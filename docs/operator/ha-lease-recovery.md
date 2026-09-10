@@ -69,7 +69,12 @@ Supporting series (same gating):
 | `culvert_ha_lease_reacquired_total` | recoveries that completed with no operator |
 
 The same posture is on `GET /api/cluster/ha` and `/healthz` as `lease_valid`,
-`epoch`, and `lease_recovering`, and on the admin UI's **Fencing Lease** card.
+`epoch`, and `lease_recovering` (plus `lease_reacquire_attempts` /
+`lease_reacquired_total`), and on the admin UI's **Fencing Lease** card, which
+shows an explicit "recovering…" (amber, with the attempt count) or "recovery
+not active" (red, pointing at `diagnose etcd` / this runbook) banner whenever
+this node holds the leader role without the fence — the same
+`unfenced=1 AND recovering=0` pair the alert in §2 pages on.
 
 **Alerts.** The existing `ha_resume_unfenced` (entering the state) and
 `ha_self_fenced` (standing down) still fire. A completed background recovery

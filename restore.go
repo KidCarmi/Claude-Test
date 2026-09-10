@@ -37,6 +37,36 @@ import (
 // logic; D1.3b.1 rejects any other value.
 const restoreSchemaVersion = 1
 
+// maxRestoreEntryBytes bounds a single tarball entry's declared (decompressed)
+// size, checked against the tar header BEFORE readTarball's io.ReadAll(tr)
+// allocates it. A highly compressible payload (e.g. all-zero bytes) lets a
+// tiny .tar.gz file declare an enormous Size in its tar header — a classic
+// decompression bomb — and readTarball is reachable from a plain `culvert
+// --restore <path>` dry-run (no --confirm needed), so a corrupted or hostile
+// backup file must not be able to drive an unbounded allocation.
+// runBackupWith documents that a real backup (admin-config JSON/text files
+// only — no logs, no feed DBs) is "well under 100MB"; 256 MiB leaves
+// generous headroom for growth (e.g. 50 retained config_versions) while
+// still bounding memory use. Mirrors the same per-entry declared-size guard
+// release_catalog_bundle.go applies (catalogMaxReadBytes) and the
+// total-decompressed guard support_validate.go applies to support bundles
+// (maxValidateDecompressed) — restore.go was the one tar/gzip consumer in
+// this codebase with no such bound.
+const maxRestoreEntryBytes = 256 << 20 // 256 MiB
+
+// maxRestoreTotalBytes bounds the SUM of declared entry sizes across the
+// whole tarball. maxRestoreEntryBytes alone stops a single oversized entry,
+// but a hostile archive can split its payload across many uniquely named
+// data/* entries each at or under that per-entry cap — manifest/presence
+// validation only runs after every entry is already loaded into `files`, so
+// per-entry bounding alone still leaves total allocation unbounded (Codex
+// review, PR #1344). Checked cumulatively against declared hdr.Size as each
+// header is read, so the offending entry is rejected before its body is
+// allocated. Twice the per-entry bound: generous enough that a normal
+// backup's largest single legitimate file is never the constraint, while
+// still bounding the aggregate.
+const maxRestoreTotalBytes = 2 * maxRestoreEntryBytes // 512 MiB
+
 // restoreSummary is the data shape printed by printRestoreSummary and
 // returned to tests for assertion.
 type restoreSummary struct {
@@ -51,6 +81,11 @@ type restoreSummary struct {
 	EnrolledDPCount   int    // from cluster.json (len(state.Nodes))
 	CAFingerprint     string // sha256 of cluster-ca.crt's parsed cert.Raw
 	CABundleEncrypted bool   // true if ca.bundle starts with caMagic
+	// 2F-D (C12): the manifest's credentialsOmitted marker and the exact
+	// number of upstream entries the restored node will boot into the
+	// requiresReplacement state (counted from the archived settings file).
+	CredentialsOmitted              bool
+	CredentialsRequiringReplacement int
 }
 
 // restoreMode selects which artifacts come from the tarball vs. are
@@ -206,6 +241,17 @@ func validateBackup(tarPath, _ /*dataDir*/, passphrase, backupPassphrase string)
 			summary.Tier2Files++
 		}
 	}
+	summary.CredentialsOmitted = manifest.CredentialsOmitted
+	if settings, ok := files[adminSettingsTarPath]; ok {
+		summary.CredentialsRequiringReplacement = countUpstreamCredentialsRequiringReplacement(settings)
+	}
+	// A node-local key must never be restored from an archive (it is never
+	// packed either; a hand-built tarball is refused rather than trusted).
+	for path := range files {
+		if isNodeLocalKeyArtifactPath(path) {
+			return nil, nil, nil, fmt.Errorf("restore: tarball carries node-local key material %q; refusing (keys are never archived or restored)", path)
+		}
+	}
 
 	if err := validateTier1Artifacts(files, passphrase, summary); err != nil {
 		return nil, nil, nil, err
@@ -259,6 +305,7 @@ func readTarball(path, backupPassphrase string) (map[string][]byte, []string, er
 	tr := tar.NewReader(gz)
 	files := map[string][]byte{}
 	var order []string
+	var totalDeclared int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -266,6 +313,19 @@ func readTarball(path, backupPassphrase string) (map[string][]byte, []string, er
 		}
 		if err != nil {
 			return nil, nil, fmt.Errorf("restore: tar read: %w", err)
+		}
+		// Decompression-bomb guards: reject an implausibly large declared size
+		// — per-entry and cumulative — before io.ReadAll(tr) below allocates
+		// it. Checked first — cheaper than every other guard and the one that
+		// matters before any bytes of the entry body are read. Per-entry alone
+		// is not enough: a hostile archive can split its payload across many
+		// uniquely named entries each under that cap (Codex review, PR #1344).
+		if hdr.Size > maxRestoreEntryBytes {
+			return nil, nil, fmt.Errorf("restore: tarball entry %q declares %d bytes, exceeding the %d-byte per-entry bound", hdr.Name, hdr.Size, maxRestoreEntryBytes)
+		}
+		totalDeclared += hdr.Size
+		if totalDeclared > maxRestoreTotalBytes {
+			return nil, nil, fmt.Errorf("restore: tarball declares %d bytes across entries (at %q), exceeding the %d-byte total bound", totalDeclared, hdr.Name, maxRestoreTotalBytes)
 		}
 		// Absolute-path guard: tar entries must be relative under the
 		// backup namespace. Reject anything starting with "/" so a
@@ -774,6 +834,8 @@ func printRestoreSummary(w io.Writer, s *restoreSummary, a *commitAnalysis) {
 		fmt.Fprintf(w, "  none.\n")
 	}
 
+	printRestoreUpstreamCredentials(w, s)
+
 	fmt.Fprintf(w, "\nValidation: PASS\n")
 	if s.AdminCount > 0 {
 		fmt.Fprintf(w, "  ui_users.json:                %d admin account(s) in restored manifest\n", s.AdminCount)
@@ -790,6 +852,25 @@ func printRestoreSummary(w io.Writer, s *restoreSummary, a *commitAnalysis) {
 
 	fmt.Fprintf(w, "\nThis was a dry-run. No files were written. /data unchanged.\n")
 	fmt.Fprintf(w, "D1.3b.2b will add --confirm to commit a restore.\n")
+}
+
+// printRestoreUpstreamCredentials is the 2F-D (C12) section of the dry-run
+// report: the manifest marker and the exact count of entries the restored
+// node will boot into requiresReplacement. Counts only.
+func printRestoreUpstreamCredentials(w io.Writer, s *restoreSummary) {
+	p := func(format string, a ...any) { _, _ = fmt.Fprintf(w, format, a...) }
+	p("\nUpstream credentials:\n")
+	if s.CredentialsOmitted {
+		p("  archive: credentials omitted (never archived)\n")
+	} else {
+		p("  archive: pre-2F-D backup (no credentialsOmitted marker)\n")
+	}
+	p("  credentials requiring replacement: %d\n", s.CredentialsRequiringReplacement)
+	if s.CredentialsRequiringReplacement > 0 {
+		p("  ⓘ Each affected parent proxy boots ineligible (requiresReplacement) until its credential is set again\n")
+		p("    through POST /api/upstream/entries/{id}/credential (replace) or cleared (clear). No parent is ever sent unauthenticated.\n")
+	}
+	p("  node-local credential key: never restored, deleted or overwritten\n")
 }
 
 // ─── D1.3b.2b: destructive commit path ──────────────────────────────────────
@@ -1075,9 +1156,12 @@ func stageArtifacts(stagingDir, dataDir string, files map[string][]byte, manifes
 			return relErr
 		}
 		tarballPath := "data/" + filepath.ToSlash(rel)
-		if mode.fromTarball(tarballPath) {
+		if mode.fromTarball(tarballPath) && !isNodeLocalKeyArtifactPath(tarballPath) {
 			// Tarball-source — pass 1 handled it (or it's a tarball
-			// path that simply isn't in current /data).
+			// path that simply isn't in current /data). Node-local key
+			// files are the exception in EVERY mode (2F-D, C12): they are
+			// never archived, so the node keeps its own — a restore must
+			// never delete or overwrite .upstream_cred_key (or a KEK).
 			return nil
 		}
 		if written[tarballPath] {
