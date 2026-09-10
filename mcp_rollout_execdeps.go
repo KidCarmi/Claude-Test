@@ -62,15 +62,45 @@ func markGatewayShadowDepsReady() { globalExecDeps.shadowGateway.Store(true) }
 // Management Shadow path is not composed in this phase.
 func markManagementShadowDepsReady() { globalExecDeps.shadowManagement.Store(true) }
 
-// markGatewayExecDepsReady is the registration hook the FUTURE live-execution
-// composition would call once it has composed the live executor, upstream client,
-// credential broker (with Materialize), event manager, and inspection/DLP plane for
-// the Gateway capability. It is intentionally UNCALLED in this build, so
-// Canary/Production stay fail-closed. Arming it is a separately-reviewed activation.
+// markGatewayExecDepsReady is the live-execution ARMING hook: it sets the Gateway live tier
+// armed so a Canary/Production MODE transition can be authorized (modeExecReady). It has
+// exactly ONE authoritative production caller — the live-tier arming path (mcp_live_tier.go's
+// arm → setLiveExecDepsArmed), pinned by the evolved execution-posture wall. Arming composes
+// no executor and reaches no upstream; it only flips this readiness bit. Setting it is a
+// deliberate, node-readiness-gated act, never a side effect of another change.
 func markGatewayExecDepsReady() { globalExecDeps.gateway.Store(true) }
 
 // markManagementExecDepsReady mirrors the Gateway live hook for Management.
 func markManagementExecDepsReady() { globalExecDeps.management.Store(true) }
+
+// clearGatewayExecDepsReady DISARMS the Gateway live tier (quiesce / restart fail-closed
+// posture). Once cleared, modeExecReady refuses every live-execution transition again. It is
+// safe to call redundantly.
+func clearGatewayExecDepsReady() { globalExecDeps.gateway.Store(false) }
+
+// clearManagementExecDepsReady mirrors the Gateway disarm for Management.
+func clearManagementExecDepsReady() { globalExecDeps.management.Store(false) }
+
+// setLiveExecDepsArmed is the single arm/disarm dispatcher the live-tier lifecycle uses to keep
+// the authoritative execdeps armed bit in lock-step with the lifecycle state. arm passes true
+// (→ markGateway/ManagementExecDepsReady), quiesce/restart pass false (→ the clear hooks). It
+// is the ONLY production path that toggles the live armed bit; the wall permits the arming file
+// to reach the underlying hooks through it.
+func setLiveExecDepsArmed(capb rollout.Capability, armed bool) {
+	if capb == rollout.CapabilityManagement {
+		if armed {
+			markManagementExecDepsReady()
+		} else {
+			clearManagementExecDepsReady()
+		}
+		return
+	}
+	if armed {
+		markGatewayExecDepsReady()
+	} else {
+		clearGatewayExecDepsReady()
+	}
+}
 
 // shadowDepsConfigured reports whether the non-executing Shadow evaluation plane for a
 // capability is composed. False (fail-closed) is the shipped default.
@@ -99,28 +129,28 @@ func liveExecDepsConfigured(capbManagement bool) bool {
 //   - Canary/Production require the LIVE tier (liveExecDepsConfigured).
 //   - Shadow requires only the SHADOW tier (shadowDepsConfigured).
 //   - Disabled/Observe require nothing.
-//   - ANY OTHER mode value is refused outright.
 //
-// The last arm is the fail-closed one and it is enumerated, not defaulted. A bare
-// `default: return true` reads as "everything else needs nothing", which admits an
-// UNKNOWN mode — the opposite of this gate's contract, and precisely the shape the
-// enum-vs-default rule exists to stop. The three callers (the admin transition, the
-// CP→DP apply, and the shared commit path) each reach this gate with a mode drawn from
-// a different source, and one of them — the startup reconcile of a RECOVERED envelope —
-// is documented as deliberately skipping full payload re-validation, so this gate must
-// not lean on someone else having proven the mode well-formed. Downstream
-// SignedConfig.Validate (Mode.Valid) does reject an unknown mode today, which is why
-// this is defense-in-depth rather than a live hole; enumerating the admissible modes
-// makes the gate independently correct instead of correct-by-collaborator.
+// Fail-closed on an UNRECOGNISED mode. The no-readiness-needed answer is given ONLY to
+// the two modes that genuinely need none — Disabled and Observe — never as a catch-all
+// default. The distinction is defence-in-depth rather than a live hole: every caller
+// today hands this a mode that is subsequently re-validated (SignedConfig.Validate
+// rejects !Mode.Valid(); rollout.Resolve blocks an unknown mode with
+// ReasonRolloutModeInvalid; ParseMode fails closed on the admin surface), so an unknown
+// mode is rejected downstream either way. But this is a security GATE, and a gate whose
+// default arm is "admit" is one refactor away from being the only thing standing between
+// an unrecognised mode value and an execution tier it never proved. Enumerating the
+// admitted modes makes a newly-added rollout.Mode fail closed here until it is
+// explicitly classified, which is the direction a readiness gate must err in.
 func modeExecReady(mode rollout.Mode, capbManagement bool) bool {
 	switch {
 	case mode.RequiresLiveExecution():
 		return liveExecDepsConfigured(capbManagement)
 	case mode == rollout.ModeShadow:
 		return shadowDepsConfigured(capbManagement)
-	case mode == rollout.ModeDisabled, mode == rollout.ModeObserve:
+	case mode == rollout.ModeDisabled || mode == rollout.ModeObserve:
+		// Neither touches the execution plane, so neither requires a readiness tier.
 		return true
 	default:
-		return false // unknown/invalid mode — never admit a tier we cannot name
+		return false
 	}
 }

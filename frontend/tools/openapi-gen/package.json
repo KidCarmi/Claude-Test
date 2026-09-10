@@ -12,5 +12,8 @@
   "devDependencies": {
     "openapi-typescript": "7.13.0",
     "typescript": "5.9.3"
+  },
+  "overrides": {
+    "js-yaml": "4.3.2"
   }
 }

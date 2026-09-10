@@ -142,8 +142,8 @@ func TestCaptureConfigBackup(t *testing.T) {
 	if snap == nil {
 		t.Fatal("captureConfigBackup returned nil")
 	}
-	if snap.Version != 1 {
-		t.Errorf("version = %d, want 1", snap.Version)
+	if snap.Version != configBackupVersion {
+		t.Errorf("version = %d, want %d", snap.Version, configBackupVersion)
 	}
 	if snap.ExportedAt == "" {
 		t.Error("exportedAt should not be empty")
@@ -298,6 +298,9 @@ func cleanupRuleMet(names ...string) {
 		}
 	}
 	ruleMet.order = clean
+	// The deletes above are in-place, so the lock-free read view still names the
+	// removed rules and RecordHit would resurrect their old counter cells.
+	ruleMet.publishViewLocked()
 }
 
 // ── Hit counter persistence (metrics.go) ────────────────────────────────────

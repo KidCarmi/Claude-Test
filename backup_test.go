@@ -587,3 +587,75 @@ func TestBackup_SaaSFeedOverrides_IncludedWithContent(t *testing.T) {
 		t.Errorf("saas_feed/overrides.json content mismatch in backup")
 	}
 }
+
+// TestBackup_IdPProfiles_IncludedWithContent guards against the same drift
+// class as the tests above, for a store that is arguably higher-severity
+// than any of them: idp_profiles.json (internal/auth_idp.go's IdPRegistry)
+// holds every configured OIDC/SAML/LDAP SSO provider — including OIDC client
+// secrets and LDAP bind credentials (config_surfaces.go's "idp_profiles" row
+// marks it Sensitive, ClusterSynced — the same first-class-config bar
+// alert_webhooks.json and decryption_profiles.json were added to backup at).
+// It is wired into the shipped docker-compose.yml via "-idp-profiles-file"
+// "/data/idp_profiles.json", and that same file's own header comment lists
+// "/data/idp_profiles.json" as "persisted across restarts" alongside
+// ui_users.json — which IS backed up. A backup taken today silently drops
+// it, so restoring onto a fresh volume/host loses every SSO integration: an
+// admin must re-discover and re-enter every OIDC/SAML/LDAP profile
+// (including secrets that may no longer be on hand), and any deployment
+// that relies on SSO for admin login is locked out until that is done.
+func TestBackup_IdPProfiles_IncludedWithContent(t *testing.T) {
+	dataDir := t.TempDir()
+	seedFile(t, dataDir, "ui_users.json", []byte(`{}`), 0o600)
+	body := []byte(`{"profiles":[{"id":"p1","type":"oidc","client_secret":"s3cr3t"}]}`)
+	seedFile(t, dataDir, "idp_profiles.json", body, 0o600)
+
+	out := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := runBackup(out, dataDir); err != nil {
+		t.Fatalf("runBackup: %v", err)
+	}
+	_, files, _ := readBackupTarball(t, out)
+	got, ok := files["data/idp_profiles.json"]
+	if !ok {
+		t.Fatalf("data/idp_profiles.json missing from tarball: %v", sortedNames(files))
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("idp_profiles.json content mismatch in backup")
+	}
+}
+
+// TestBackup_FileProfiles_IncludedWithContent guards against the same drift
+// class as the four tests above, for a store the earlier pass still missed:
+// globalProfileStore (internal/fileblock.FileProfileStore) is the named
+// file-type profile set (e.g. a custom "Executables" profile) that policy
+// rules reference by name via FileProfile (policy.go's
+// globalProfileStore.GetByName). It is admin-configurable via its own API
+// (ui_security.go Create/Update/Delete), is a first-class config_surfaces.go
+// entry ("file_profiles"), and is CP->DP synced — exactly the bar the other
+// four stores were added at — but is persisted to a SEPARATE file from
+// fileblock.json (the plain extension-list store, which IS backed up):
+// fileprofiles.json, the default path resolveFileBlockStartupConfig falls
+// back to when neither the --fileprofiles-file CLI flag nor
+// proxy.fileprofiles_file in config.yaml is set, and the exact path the
+// shipped docker-compose.yml wires via "-fileprofiles-file"
+// "/data/fileprofiles.json". A backup taken today silently drops any custom
+// file-type profile, so restoring onto a fresh volume/host leaves policy
+// rules referencing it unable to resolve the named profile.
+func TestBackup_FileProfiles_IncludedWithContent(t *testing.T) {
+	dataDir := t.TempDir()
+	seedFile(t, dataDir, "ui_users.json", []byte(`{}`), 0o600)
+	body := []byte(`{"profiles":[{"id":"p1","name":"Executables","extensions":[".exe",".bat"]}]}`)
+	seedFile(t, dataDir, "fileprofiles.json", body, 0o600)
+
+	out := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := runBackup(out, dataDir); err != nil {
+		t.Fatalf("runBackup: %v", err)
+	}
+	_, files, _ := readBackupTarball(t, out)
+	got, ok := files["data/fileprofiles.json"]
+	if !ok {
+		t.Fatalf("data/fileprofiles.json missing from tarball: %v", sortedNames(files))
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("fileprofiles.json content mismatch in backup")
+	}
+}
