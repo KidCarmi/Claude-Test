@@ -99,7 +99,7 @@ var logStoreEnableMu sync.Mutex
 // It goes through OpenResilientTTL, not OpenTTL, because a damaged store used
 // to be able to kill this process outright — badger.Open panics from a
 // goroutine it spawns on a corrupt table, so no recover() here could contain it
-// (CHAOS-59). The Recovery is returned alongside so the caller can report the
+// (CHAOS-60). The Recovery is returned alongside so the caller can report the
 // outcome ONCE, after it knows whether the replacement store actually opened.
 func openLogStore(dir string, retentionDays int, maxGB float64) (*logStore, storeguard.Recovery, error) {
 	var ttl time.Duration

@@ -197,7 +197,7 @@ var ErrSaltUnusable = errors.New("saved logs exist but their encryption salt is 
 // passphrase is configured (encryption disabled).
 //
 // A NEW SALT IS MINTED ONLY WHEN THERE IS NO STORE IT COULD LOCK US OUT OF
-// (CHAOS-59). Minting unconditionally on an unreadable sidecar looks like
+// (CHAOS-60). Minting unconditionally on an unreadable sidecar looks like
 // making the common case work, and is in fact a one-way destruction of key
 // material by the READ path: the derived key is a pure function of
 // (passphrase, salt), so overwriting a torn 32-byte sidecar next to an existing

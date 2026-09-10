@@ -3,7 +3,7 @@
 **Applies to:** any node with request-history saving switched on (Logs →
 Retention in the admin UI). The setting is durable, so it survives restarts.
 
-**Register item:** CHAOS-59.
+**Register item:** CHAOS-60.
 
 ---
 

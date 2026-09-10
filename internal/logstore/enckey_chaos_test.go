@@ -1,6 +1,6 @@
 package logstore
 
-// enckey_chaos_test.go — CHAOS-59 gates for the salt sidecar.
+// enckey_chaos_test.go — CHAOS-60 gates for the salt sidecar.
 //
 // The defect these pin is a one-way destruction of key material by the READ
 // path: EncKey used to mint and WRITE a fresh salt whenever the sidecar was
@@ -25,7 +25,7 @@ import (
 // The defect gate. A damaged sidecar beside an existing store must fail LOUD
 // and leave the sidecar alone, so restoring it from a backup still recovers the
 // history.
-func TestChaos59_TornSaltNeverMintsOverAnExistingStore(t *testing.T) {
+func TestChaos60_TornSaltNeverMintsOverAnExistingStore(t *testing.T) {
 	dir := seedHistory(t, 50)
 	good, err := os.ReadFile(dir + ".salt")
 	if err != nil {
@@ -77,7 +77,7 @@ func TestChaos59_TornSaltNeverMintsOverAnExistingStore(t *testing.T) {
 // A MISSING sidecar next to an existing store is the same condition — the
 // commonest way to reach it is restoring a backup that (correctly) excludes key
 // material.
-func TestChaos59_MissingSaltNeverMintsOverAnExistingStore(t *testing.T) {
+func TestChaos60_MissingSaltNeverMintsOverAnExistingStore(t *testing.T) {
 	dir := seedHistory(t, 20)
 	if err := os.Remove(dir + ".salt"); err != nil {
 		t.Fatalf("remove salt: %v", err)
@@ -93,7 +93,7 @@ func TestChaos59_MissingSaltNeverMintsOverAnExistingStore(t *testing.T) {
 // The other half of the rule: minting stays reachable whenever there is nothing
 // to lose, or the feature is off. Refusing here would break first-ever enable
 // and the documented purge-and-re-enable migration.
-func TestChaos59_SaltIsMintedWhenThereIsNothingToLose(t *testing.T) {
+func TestChaos60_SaltIsMintedWhenThereIsNothingToLose(t *testing.T) {
 	t.Run("no directory at all (first enable, or post-purge)", func(t *testing.T) {
 		dir := filepath.Join(t.TempDir(), "history")
 		key, err := EncKey(dir, chaosPass)
@@ -142,7 +142,7 @@ func TestChaos59_SaltIsMintedWhenThereIsNothingToLose(t *testing.T) {
 // An unreadable store directory answers "has content" so the refusal wins: the
 // alternative overwrites key material on a guess about a directory we could not
 // see. Skipped for root, which bypasses the permission bits.
-func TestChaos59_UnreadableStoreDirectoryRefusesRatherThanMinting(t *testing.T) {
+func TestChaos60_UnreadableStoreDirectoryRefusesRatherThanMinting(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: directory permissions are not enforced")
 	}

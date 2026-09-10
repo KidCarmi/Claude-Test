@@ -36,19 +36,32 @@ everything else is triaged below with a suggested PR and required tests for foll
 > rewriting identifiers three merged PRs already reference, so it is an OWNER
 > decision, not a unilateral edit — recorded here rather than silently "fixed".
 >
-> **`CHAOS-57` was very nearly the fourth occurrence, and was caught while it
-> was still cheap.** Two concurrent sweeps took the id independently: §25 (the
-> hijacked-tunnel plane on the way out) and §27 (the request-history store under
-> a damaged data volume). §25 merged first, so it KEEPS `CHAOS-57`; §27 was
-> still an open PR, so it renumbered to **`CHAOS-59`** (`CHAOS-58` having gone
-> to §26) before merge. That is the whole difference between this case and the
-> `CHAOS-50` one above: an id is rewritable for free right up until the first
-> merge, and unrewritable-without-owner-sign-off the moment after. **A sweep
-> that discovers its id already taken renumbers ITSELF if it is the unmerged
-> one — do not leave the collision for a later owner decision.** The durable
-> fix is still the one recorded above (allocate the id in a committed
-> placeholder row at the START of a sweep); until that exists, this is the
-> convention that keeps the cost bounded.
+> **The request-history sweep (§28) collided TWICE and renumbered itself both
+> times, while still unmerged.** It first took `CHAOS-57` alongside the
+> hijacked-tunnel sweep (§25); §25 merged first, so it kept the id and this one
+> moved to `CHAOS-59` (`CHAOS-58` having gone to §26). Within the same day the
+> intelligence-feed sweep (§27) landed on `CHAOS-59` too, so this one moved
+> again, to **`CHAOS-60`**. Counting the intelligence-feed sweep's own two
+> collisions (recorded in its revision-log entry below), that is **five
+> occurrences across three sweeps in one afternoon** — the pattern is not bad
+> luck, it is the default.
+>
+> Both sweeps independently arrived at the same rule, which is the one to
+> follow until the durable fix exists: **an id is rewritable for free right up
+> until its first merge, and needs owner sign-off the moment after — so the
+> sweep that is still an open PR renumbers ITSELF, and does not leave the
+> collision for a later owner decision.** That is the whole difference between
+> these cases and the `CHAOS-50` one above, where all three had already merged.
+>
+> Two further cautions this episode produced, both learned the expensive way.
+> **A merge-conflict resolver is not a substitute for allocating the id**: the
+> automatic main-merges renumbered the SECTION heading each time and left the
+> `CHAOS-` id colliding, so the document silently ended up with two §-numbers
+> claiming one id. And **the only reason any of these were caught is that all
+> three sweeps happened to edit THIS file** — sweeps touching disjoint code
+> merge cleanly and collide in silence. The durable fix is still the one
+> recorded above (allocate the id in a committed placeholder row at the START
+> of a sweep), and at five occurrences it is overdue.
 
 **2026-09-02 — CHAOS-58 sweep (the directory that accepts and then stops answering).**
 CHAOS-47 solved the *unreachable* directory: fail closed, arm a provider-wide cooldown, deny
@@ -154,7 +167,7 @@ for the two cheapest wrong fixes (force-close at drain START — which passes ev
 being strictly worse than the defect — and a non-idempotent release, whose negative gauge restores
 the original blindness by accident). See rows PX-4/PX-8, §25 and
 `docs/operator/tunnel-drain-on-shutdown.md`.
-**2026-08-29 — CHAOS-59 sweep (the request-history store under a damaged data volume).**
+**2026-08-29 — CHAOS-60 sweep (the request-history store under a damaged data volume).**
 §19.6 opened row **R-E** and marked it *"next sweep candidate"*: `internal/logstore` calls
 `badger.Open` with the same uncatchable-panic exposure CHAOS-50 had just fixed for the category
 store — a corrupt `.sst` panics from a goroutine badger spawns, so no `recover()` at any call site
@@ -1999,7 +2012,7 @@ pinned by `TestCheckCategoryFeedDB_RowCarriesNoRawCause`.
   semantics: quarantining it silently is an evidence decision, not a cache
   decision. **Next sweep candidate.**
 
-  > **CLOSED by CHAOS-59 (2026-08-29) — and both bounding clauses above were
+  > **CLOSED by CHAOS-60 (2026-08-29) — and both bounding clauses above were
   > WRONG.** "Quarantining it silently is an evidence decision" argues FOR the
   > fix: the CHAOS-05/07 contract moves aside and never deletes, so the evidence
   > survives either way; what this deferral preserved was a crash loop whose
@@ -3678,7 +3691,7 @@ documented residuals. This sweep adds one about **fixes**:
 The corollary is a review question worth asking of every degradation fix in
 this register: *what signal did the old, worse behaviour emit, and what emits
 it now?*
-## 28. CHAOS-59 — The request-history store under a damaged data volume
+## 28. CHAOS-60 — The request-history store under a damaged data volume
 
 **Date:** 2026-08-29 · **Domain:** storage / persistence (`internal/logstore`) ·
 **Status:** shipped · **Gates:** `internal/storeguard/storeguard_test.go` (19),
@@ -3711,7 +3724,7 @@ created by github.com/dgraph-io/badger/v4.newLevelsController in goroutine 21
 
 A `recover()` in the frame directly above `OpenTTL` never fires: the panic is
 raised on a goroutine badger spawns. This is kept as a permanent DEFECT PROOF
-(`TestChaos59_BareOpenTTLPanicIsUncatchableAtTheCallSite`) so a future badger
+(`TestChaos60_BareOpenTTLPanicIsUncatchableAtTheCallSite`) so a future badger
 change cannot let the recovery gate quietly prove less than it claims.
 
 The same run also produced the table that forced `storeguard.Policy` to exist —

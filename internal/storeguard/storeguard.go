@@ -24,7 +24,7 @@
 // store whose failure mode badger will not let us catch.
 //
 // This code shipped first as `internal/catdb/resilient.go` (CHAOS-50) for the
-// Layer-2 community category store. CHAOS-59 extracted it here unchanged so the
+// Layer-2 community category store. CHAOS-60 extracted it here unchanged so the
 // request-history store (`internal/logstore`) could reuse it. The alternative —
 // a second copy — would have duplicated the empirically-derived badger message
 // table, which is exactly the artefact that must never drift: it is pinned by a
@@ -120,7 +120,7 @@ const MaxQuarantinedCopies = 1
 // the same message additionally covers two conditions that are not corruption
 // at all and whose data is perfectly intact: the operator changed the
 // passphrase, or the key-derivation salt sidecar was lost. Measured on
-// badger v4.9.6, all three produce an indistinguishable error (CHAOS-59; see
+// badger v4.9.6, all three produce an indistinguishable error (CHAOS-60; see
 // `roadmap/CHAOS-ENGINEERING-REVIEW.md` §25.2). Quarantining on it would move a
 // healthy store aside over an ordinary configuration change.
 //
