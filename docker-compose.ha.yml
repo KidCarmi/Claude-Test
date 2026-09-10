@@ -112,7 +112,29 @@ services:
           ARGS="$$ARGS -cp-grpc-ca $$CP_CA"
         fi
         if [ -n "$$HA_JOIN" ]; then
-          ARGS="$$ARGS -cp-grpc-addr :50051 --ha-join $$HA_JOIN --ha-token $$HA_TOKEN"
+          # A well-formed but EMPTY --ha-token is not just cosmetically
+          # wrong: clusterStartupConfig.haJoinMode() (cluster_startup_config.go)
+          # requires BOTH --ha-join and --ha-token to be non-empty to treat
+          # this boot as a standby join. This same ARGS string also sets
+          # -cp-grpc-addr :50051, so an empty --ha-token=  makes loadCluster
+          # fall through to cpMode() instead — the container comes up
+          # HEALTHY as an independent, ACTIVE Control Plane that never joins
+          # or replicates from Server A (a silent split-brain, worse than
+          # the crash it replaces). Refuse to start rather than let that
+          # happen silently (Codex review, PR #1337).
+          if [ -z "$$HA_TOKEN" ]; then
+            echo "ERROR: HA_JOIN is set but HA_TOKEN is empty — refusing to start (would silently come up as an independent Control Plane instead of joining as a standby). Set HA_TOKEN from Server A'"'"'s \"Enable HA\" deploy command." >&2
+            exit 1
+          fi
+          # --ha-token uses the =value form (not a separate word): unquoted
+          # word-splitting on `exec $$ARGS` would otherwise drop an empty
+          # $$HA_TOKEN expansion entirely, leaving a dangling `--ha-token`
+          # with no value as the last argv token and making `./culvert`
+          # exit on "flag needs an argument: -ha-token" — the guard above
+          # now catches that case first, but the =value form is kept as
+          # defense in depth for any other way this string could end up
+          # empty here.
+          ARGS="$$ARGS -cp-grpc-addr :50051 --ha-join $$HA_JOIN --ha-token=$$HA_TOKEN"
         fi
 
         exec ./culvert $$ARGS

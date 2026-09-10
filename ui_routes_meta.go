@@ -214,11 +214,19 @@ var uiRoutes = []uiRouteMetadata{
 			{Method: "PUT", MinRole: RoleOperator, Mutating: true, AuditExpected: true},
 			{Method: "DELETE", MinRole: RoleOperator, Mutating: true, AuditExpected: true},
 		}},
+	{Path: "/api/fileblock/profiles/state", Handler: "apiFileblockProfilesState", Domain: "policy", Public: false,
+		Methods: []uiRouteMethod{
+			{Method: "GET", MinRole: RoleViewer, Note: "2D-C v2 coherent read: profiles + content-derived revision from one committed snapshot"},
+		}},
 	{Path: "/api/rewrite", Handler: "apiRewrite", Domain: "policy", Public: false,
 		Methods: []uiRouteMethod{
 			{Method: "GET", MinRole: RoleViewer, Note: "GET branch protected by uiAuthMiddleware; no explicit requireRole call observed"},
 			{Method: "POST", MinRole: RoleOperator, Mutating: true, AuditExpected: true},
 			{Method: "DELETE", MinRole: RoleOperator, Mutating: true, AuditExpected: true},
+		}},
+	{Path: "/api/rewrite/state", Handler: "apiRewriteState", Domain: "policy", Public: false,
+		Methods: []uiRouteMethod{
+			{Method: "GET", MinRole: RoleViewer, Note: "2D-C v2 coherent read: ordered rules + content-derived revision from one committed snapshot"},
 		}},
 	{Path: "/api/policy", Handler: "apiPolicy", Domain: "policy", Public: false,
 		Methods: []uiRouteMethod{
@@ -347,6 +355,8 @@ var uiRoutes = []uiRouteMetadata{
 			{Method: "PUT", MinRole: RoleOperator, Mutating: true, AuditExpected: true},
 			{Method: "DELETE", MinRole: RoleOperator, Mutating: true, AuditExpected: true},
 		}},
+	{Path: "/api/urlcat/state", Handler: "apiURLCatState", Domain: "policy", Public: false,
+		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleViewer, Note: "v2 read: categories + server-owned semantic revision (2D-B); no direct requireRole; protected by uiAuthMiddleware"}}},
 	{Path: "/api/urlcat/host", Handler: "apiURLCatHost", Domain: "policy", Public: false,
 		Methods: []uiRouteMethod{
 			{Method: "POST", MinRole: RoleOperator, Mutating: true, AuditExpected: true},
@@ -656,7 +666,17 @@ var uiRoutes = []uiRouteMetadata{
 	{Path: "/api/upstream/settings", Handler: "apiUpstreamSettings", Domain: "cluster", Public: false,
 		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleViewer, Note: "no direct requireRole; protected by uiAuthMiddleware"}}},
 	{Path: "/api/upstream/health", Handler: "apiUpstreamHealth", Domain: "cluster", Public: false,
-		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, Note: "force health check; no audit"}}},
+		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "2F-D: manual probe run — single-flight, 10s window (429 probe_in_flight|probe_rate_limited, no success audit), ≤5s per entry, audited upstream.probe.manual with counts + scope=node-local"}}},
+	{Path: "/api/upstream/entries", Handler: "apiUpstreamEntries", Domain: "cluster", Public: false,
+		Methods: []uiRouteMethod{
+			{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "2F-C: create a managed entry (server ULID; credential-free; document-revision fenced)"},
+		}},
+	{Path: "/api/upstream/entries/", Handler: "apiUpstreamEntryRouter", Domain: "cluster", Public: false,
+		Methods: []uiRouteMethod{
+			{Method: "PUT", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "2F-C: update {id} (entry-revision fenced; 409 credential_bound on authority change; 409 yaml_owned)"},
+			{Method: "DELETE", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "2F-C: delete {id} (?revision=; 409 credential_present)"},
+			{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "2F-C: {id}/credential replace (T2) / clear (T3, confirm=id); password write-only, sealed, never returned"},
+		}},
 
 	// ── Cluster: multi-node ───────────────────────────────────────────────
 	{Path: "/api/cluster/status", Handler: "apiClusterStatus", Domain: "cluster", Public: false,
@@ -724,7 +744,7 @@ var uiRoutes = []uiRouteMetadata{
 	{Path: "/api/cdr/config", Handler: "apiCDRConfig", Domain: "cdr", Public: false,
 		Methods: []uiRouteMethod{
 			{Method: "GET", MinRole: RoleViewer},
-			{Method: "PUT", MinRole: RoleAdmin, Mutating: true, Note: "no direct auditEvent observed"},
+			{Method: "PUT", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "audits via delegated apiCDRConfigToggle (auditEventDiff cdr.config.toggle)"},
 		}},
 	{Path: "/api/cdr/instances", Handler: "apiCDRInstances", Domain: "cdr", Public: false,
 		Methods: []uiRouteMethod{
@@ -733,6 +753,13 @@ var uiRoutes = []uiRouteMetadata{
 		}},
 	{Path: "/api/cdr/instances/enroll", Handler: "apiCDREnroll", Domain: "cdr", Public: false,
 		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true}}},
+	{Path: "/api/cdr/instances/enroll/recover", Handler: "apiCDREnrollRecover", Domain: "cdr", Public: false,
+		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "2E-C R8: fresh authoritative EnrollStatus resolution; mutates only the local recovery receipt"}}},
+	{Path: "/api/cdr/instances/enroll/receipts", Handler: "apiCDREnrollReceipts", Domain: "cdr", Public: false,
+		Methods: []uiRouteMethod{
+			{Method: "GET", MinRole: RoleViewer},
+			{Method: "DELETE", MinRole: RoleAdmin, Mutating: true, AuditExpected: true},
+		}},
 	{Path: "/api/cdr/instances/revoke", Handler: "apiCDRRevokeRPC", Domain: "cdr", Public: false,
 		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true}}},
 	{Path: "/api/cdr/policies", Handler: "apiCDRPolicies", Domain: "cdr", Public: false,
@@ -973,6 +1000,14 @@ var uiRoutes = []uiRouteMetadata{
 	{Path: "/api/mcp/rollout/rehearse-rollback", Handler: "apiMCPRolloutRehearse", Domain: "mcp", Public: false,
 		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true,
 			Note: "PR-11 record a rollback rehearsal (local evidence)"}}},
+	{Path: "/api/mcp/rollout/rehearse-rollback-authoritative", Handler: "apiMCPRolloutRehearseAuthoritative", Domain: "mcp", Public: false,
+		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true,
+			Note: "Canary-gate: run the AUTHORITATIVE rollback rehearsal through the real coordinator core (closes row 20; local evidence only)"}}},
+	{Path: "/api/mcp/canary/shadow-exit-review", Handler: "apiMCPShadowExitReview", Domain: "mcp", Public: false,
+		Methods: []uiRouteMethod{
+			{Method: "GET", MinRole: RoleViewer, Note: "Canary-gate: Shadow Exit Review attestation status"},
+			{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "Canary-gate: create durable Shadow Exit Review PASSED attestation"},
+			{Method: "DELETE", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "Canary-gate: revoke Shadow Exit Review attestation"}}},
 	{Path: "/api/mcp/executions", Handler: "apiMCPExecutions", Domain: "mcp", Public: false,
 		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleViewer,
 			Note: "PR-11 bounded execution history (counts only; no tenant/subject/argument/token)"}}},

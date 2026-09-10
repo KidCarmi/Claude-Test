@@ -104,16 +104,30 @@ type PolicyRule struct {
 	// above is a denormalized display cache kept honest by the rename cascade.
 	// Stamped name→id on write; omitempty so pre-migration rules are byte-unchanged.
 	DestCategoryGroupID string          `json:"destCategoryGroupId,omitempty"`
-	DestCountry         []string        `json:"destCountry"`                 // ISO 3166-1 alpha-2 country codes; empty = any
-	Schedule            *PolicySchedule `json:"schedule,omitempty"`          // nil = always active
-	SSLAction           SSLAction       `json:"sslAction"`                   // Inspect | Bypass
-	FileFiltering       bool            `json:"fileFiltering"`               // enable file-type scanning
-	FileProfile         FileProfileName `json:"fileProfile"`                 // named file-extension block profile
-	LogFullURI          bool            `json:"logFullUri"`                  // log the full request URL (path, no query) for traffic matching this rule; HTTPS requires SSLAction=Inspect
-	LogTraffic          *bool           `json:"logTraffic,omitempty"`        // log allowed traffic matching this rule (nil/true = log; false = count stats only, no feed entry). Blocks/threats are always logged.
-	TLSSkipVerify       bool            `json:"tlsSkipVerify"`               // skip upstream cert verification (use with caution)
-	StripALPN           *bool           `json:"stripAlpn,omitempty"`         // SSL-inspect only: nil (absent, pre-feature) or true => downgrade the inspected tunnel to HTTP/1.1 (today's behavior); false => native HTTP/2 inspection. Ignored when SSLAction==Bypass. Presence-aware so an upgrade never silently switches existing rules to H2 (resolveStripALPN). Superseded by DecryptionProfile.InspectHTTP2 when a profile is bound.
-	DecryptionProfile   string          `json:"decryptionProfile,omitempty"` // SSL-inspect only: name of a DecryptionProfile that governs HOW this tunnel is decrypted (InspectHTTP2, cert-verification, TLS floor/cap, stall). Empty = none. A dangling ref falls back to the inline StripALPN/TLSSkipVerify (fail-safe at eval).
+	DestCountry         []string        `json:"destCountry"`        // ISO 3166-1 alpha-2 country codes; empty = any
+	Schedule            *PolicySchedule `json:"schedule,omitempty"` // nil = always active
+	SSLAction           SSLAction       `json:"sslAction"`          // Inspect | Bypass
+	FileFiltering       bool            `json:"fileFiltering"`      // enable file-type scanning
+	FileProfile         FileProfileName `json:"fileProfile"`        // named file-extension block profile (denormalized display cache once FileProfileID is stamped; legacy-fallback input for un-migrated rules)
+	// FileProfileID is the AUTHORITATIVE, rename-safe link to the file profile
+	// (references-by-id, 2D-C promotion — same doctrine as DecryptionProfileID).
+	// Resolution is ID-FIRST; a rule with NO ID (legacy/un-migrated) resolves by
+	// name through the store and then the compiled legacy fileProfileExts map,
+	// byte-identical to the pre-promotion behavior. A NON-EMPTY ID that no longer
+	// resolves FAILS CLOSED for the file-control dimension (every
+	// extension-bearing transaction on the rule is blocked — 2D-C final §2)
+	// and deliberately does NOT retarget by name — an authoritative identity must
+	// never silently rebind to a different object that happens to carry the same
+	// name (2D-C anti-rebinding doctrine, stricter here than the group shape
+	// because the legacy built-in name space is compiled-in and collision-prone).
+	// Stamped name→id server-side on every interactive/import write; omitempty so
+	// pre-promotion rules are byte-unchanged.
+	FileProfileID     string `json:"fileProfileId,omitempty"`
+	LogFullURI        bool   `json:"logFullUri"`                  // log the full request URL (path, no query) for traffic matching this rule; HTTPS requires SSLAction=Inspect
+	LogTraffic        *bool  `json:"logTraffic,omitempty"`        // log allowed traffic matching this rule (nil/true = log; false = count stats only, no feed entry). Blocks/threats are always logged.
+	TLSSkipVerify     bool   `json:"tlsSkipVerify"`               // skip upstream cert verification (use with caution)
+	StripALPN         *bool  `json:"stripAlpn,omitempty"`         // SSL-inspect only: nil (absent, pre-feature) or true => downgrade the inspected tunnel to HTTP/1.1 (today's behavior); false => native HTTP/2 inspection. Ignored when SSLAction==Bypass. Presence-aware so an upgrade never silently switches existing rules to H2 (resolveStripALPN). Superseded by DecryptionProfile.InspectHTTP2 when a profile is bound.
+	DecryptionProfile string `json:"decryptionProfile,omitempty"` // SSL-inspect only: name of a DecryptionProfile that governs HOW this tunnel is decrypted (InspectHTTP2, cert-verification, TLS floor/cap, stall). Empty = none. A dangling ref falls back to the inline StripALPN/TLSSkipVerify (fail-safe at eval).
 	// DecryptionProfileID is the AUTHORITATIVE, rename-safe link to the profile
 	// (references-by-id, OBJECT-REFERENCES-BY-ID.md). Resolution prefers the ID
 	// and falls back to the name for un-migrated/dangling rules; the name above is
@@ -242,6 +256,36 @@ func (ps *PolicyStore) policyVersion() (int64, string) {
 func (ps *PolicyStore) bumpVersion() {
 	ps.version++
 	ps.updatedAt = time.Now().UTC().Format(time.RFC3339)
+}
+
+// seedVersion pins the version counter and timestamp — the draft-fork
+// continuity seam (2B.0a): the candidate's generation stream CONTINUES the
+// running stream it forked from, so a stale pre-fork running token can never
+// numerically collide with a post-fork candidate generation (the first staged
+// mutation lands at baseGen+1). Only the fork path may call this.
+func (ps *PolicyStore) seedVersion(v int64, updatedAt string) {
+	ps.mu.Lock()
+	ps.version = v
+	if updatedAt != "" {
+		ps.updatedAt = updatedAt
+	}
+	ps.mu.Unlock()
+}
+
+// ensureVersionAbove advances the version counter strictly past floor — the
+// candidate-RETIREMENT seam (2B.0a): when a draft is committed, reverted, or
+// reconciled away, the running counter jumps past every generation the
+// candidate ever exposed, so a stale candidate-era ?ifVersion= token can never
+// numerically equal a later running generation and silently pass the fence.
+// The only cost is a conservative false conflict for clients holding the
+// pre-draft running token after a revert (they reload; content unchanged).
+func (ps *PolicyStore) ensureVersionAbove(floor int64) {
+	ps.mu.Lock()
+	if ps.version <= floor {
+		ps.version = floor + 1
+		ps.updatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	ps.mu.Unlock()
 }
 
 var policyStore = &PolicyStore{}
@@ -439,6 +483,38 @@ func (ps *PolicyStore) SaveErr() error {
 func (ps *PolicyStore) List() []PolicyRule {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
+	return ps.listLocked()
+}
+
+// PolicyStoreSnapshot is one coherent read of a policy store: the published
+// rule copies plus the version fence that identifies EXACTLY that rulebase.
+// Captured under a single read lock so a concurrent staged/committed mutation
+// can never tear rules from version (fenced-read correction §§6–8: List() then
+// policyVersion() as two calls let an edit land in between, handing a client
+// generation-P rules with a generation-P+1 token — a stale later edit would
+// pass the optimistic fence).
+type PolicyStoreSnapshot struct {
+	Rules     []PolicyRule
+	Version   int64
+	UpdatedAt string
+}
+
+// SnapshotWithVersion captures rules + version + updatedAt under ONE
+// PolicyStore read lock. This is the only sanctioned way to pair a rule list
+// with its version fence; do not call List() and policyVersion() separately
+// for any surface that returns both.
+func (ps *PolicyStore) SnapshotWithVersion() PolicyStoreSnapshot {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return PolicyStoreSnapshot{
+		Rules:     ps.listLocked(),
+		Version:   ps.version,
+		UpdatedAt: ps.updatedAt,
+	}
+}
+
+// listLocked is List's body; the caller must hold ps.mu (read or write).
+func (ps *PolicyStore) listLocked() []PolicyRule {
 	out := make([]PolicyRule, len(ps.rules))
 	for i, r := range ps.rules {
 		out[i] = *clonePolicyRuleForPublication(r)
@@ -723,6 +799,97 @@ func (ps *PolicyStore) CascadeDestCategoryGroupRename(id, oldName, newName strin
 		ps.bumpVersion()
 	}
 	return n
+}
+
+// CascadeFileProfileRename refreshes the denormalized FileProfile name on
+// every rule that references the renamed file profile — by its stable ID
+// (migrated rules) or, for un-migrated name-only rules, by its OLD name
+// (which also stamps the ID, migrating them so the reference is ID-stable
+// henceforth). References-by-id (2D-C): the enforcement path resolves by ID,
+// so file blocking survives the rename regardless; this keeps the
+// human-readable denormalized copy honest for display/export/DP-sync.
+// Returns the number of rules touched; the caller persists via SaveErr.
+// Race-safe by pointer swap, like the other Cascade*Rename methods.
+func (ps *PolicyStore) CascadeFileProfileRename(id, oldName, newName string) int {
+	if id == "" {
+		return 0
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	next := append([]*PolicyRule(nil), ps.rules...)
+	n := 0
+	for i, rule := range next {
+		byID := rule.FileProfileID == id && string(rule.FileProfile) != newName
+		byName := rule.FileProfileID == "" && strings.EqualFold(string(rule.FileProfile), oldName)
+		if !byID && !byName {
+			continue
+		}
+		nr := *rule
+		nr.FileProfile = FileProfileName(newName)
+		nr.FileProfileID = id // stamp/keep the authoritative link
+		next[i] = &nr
+		n++
+	}
+	if n > 0 {
+		ps.rules = next
+		ps.sortLocked()
+		ps.bumpVersion()
+	}
+	return n
+}
+
+// RefreshObjectRefNames re-derives every rule's denormalized object display
+// names from the ID-authoritative object stores (boot reconciliation — the
+// deterministic recovery half of the 2D-A rename model; see
+// reconcileObjectRefNames). Only rules whose object-link ID resolves to a live
+// object AND whose cached name differs are touched; a dangling ID is left
+// alone (its stale name is the documented legacy/name-fallback input, so
+// rewriting it would change match semantics). Returns the number of rules
+// touched; the caller persists via SaveErr. Race-safe by pointer swap, like
+// the Cascade*Rename methods.
+func (ps *PolicyStore) RefreshObjectRefNames(groupNames, profileNames, fileProfileNames map[string]string) int {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	next := append([]*PolicyRule(nil), ps.rules...)
+	n := 0
+	for i, rule := range next {
+		nr, changed := refreshedObjectRefNames(rule, groupNames, profileNames, fileProfileNames)
+		if !changed {
+			continue
+		}
+		next[i] = &nr
+		n++
+	}
+	if n > 0 {
+		ps.rules = next
+		ps.sortLocked()
+		ps.bumpVersion()
+	}
+	return n
+}
+
+// refreshedObjectRefNames returns a copy of rule with every cached object
+// display name refreshed from the ID→name maps, and whether anything
+// changed. A dangling ID (absent from its map) is left alone.
+func refreshedObjectRefNames(rule *PolicyRule, groupNames, profileNames, fileProfileNames map[string]string) (PolicyRule, bool) {
+	nr := *rule
+	changed := false
+	if rule.DestCategoryGroupID != "" {
+		if cur, ok := groupNames[rule.DestCategoryGroupID]; ok && rule.DestCategoryGroup != cur {
+			nr.DestCategoryGroup, changed = cur, true
+		}
+	}
+	if rule.DecryptionProfileID != "" {
+		if cur, ok := profileNames[rule.DecryptionProfileID]; ok && rule.DecryptionProfile != cur {
+			nr.DecryptionProfile, changed = cur, true
+		}
+	}
+	if rule.FileProfileID != "" {
+		if cur, ok := fileProfileNames[rule.FileProfileID]; ok && string(rule.FileProfile) != cur {
+			nr.FileProfile, changed = FileProfileName(cur), true
+		}
+	}
+	return nr, changed
 }
 
 // DeleteByID removes the rule with the given stable ULID. Rename/reorder-safe
@@ -1629,14 +1796,30 @@ func matchCountry(countries []string, code string) bool {
 }
 
 // FileProfileBlocked returns true if the file extension of urlPath is blocked
-// by the rule's FileProfile, and FileFiltering is enabled.
-// Dynamic profiles from globalProfileStore take precedence over the legacy
-// hardcoded fileProfileExts map (backward-compatible fallback).
+// by the rule's file profile, and FileFiltering is enabled.
+//
+// Resolution (2D-C references-by-id): the STABLE ID is authoritative when
+// present — a stamped rule resolves via GetByID, so a profile rename never
+// changes which extensions this rule enforces. A non-empty ID that no longer
+// resolves FAILS CLOSED (2D-C final §2): the configured file control cannot
+// silently disappear, and it deliberately does NOT fall back to the name —
+// retargeting an authoritative identity to a same-named store or compiled
+// legacy profile is the rebinding hazard the promotion closes. The
+// fail-closed scope is exactly the set of transactions ANY profile could
+// block: paths carrying a file extension (an extension set can never match an
+// extension-less path, so blocking those would invent semantics, not restrict
+// them). Each unresolved-ID block is counted
+// (culvert_fileprofile_unresolved_block_total) and logged rate-limited so the
+// degradation is operator-visible.
+// Legacy rules with NO ID keep the exact pre-promotion resolution: dynamic
+// store by name first, then the compiled fileProfileExts map.
 func (r *PolicyRule) FileProfileBlocked(urlPath string) bool {
 	if !r.FileFiltering || r.FileProfile == FileProfileNone {
 		return false
 	}
-	// Resolve extension list: check dynamic store first, then legacy map.
+	if r.FileProfileID != "" {
+		return r.fileProfileBlockedByID(urlPath)
+	}
 	var exts []string
 	if p := globalProfileStore.GetByName(string(r.FileProfile)); p != nil {
 		exts = p.Extensions
@@ -1648,15 +1831,59 @@ func (r *PolicyRule) FileProfileBlocked(urlPath string) bool {
 	return matchFileExt(urlPath, exts)
 }
 
-// matchFileExt returns true if urlPath ends with one of the given extensions.
-func matchFileExt(urlPath string, exts []string) bool {
-	ext := ""
+// fileProfileBlockedByID is the authoritative-ID arm of FileProfileBlocked:
+// the profile is resolved by ID only (never by name — the anti-rebinding
+// doctrine), and a dangling ID fails CLOSED for file transactions.
+func (r *PolicyRule) fileProfileBlockedByID(urlPath string) bool {
+	p := globalProfileStore.GetByID(r.FileProfileID)
+	if p != nil {
+		return matchFileExt(urlPath, p.Extensions)
+	}
+	if pathFileExt(urlPath) == "" {
+		return false // no profile could ever block an extension-less path
+	}
+	noteFileProfileUnresolvedBlock(r.FileProfileID, string(r.FileProfile))
+	return true
+}
+
+// statFileProfileUnresolvedBlocked counts file transactions blocked because a
+// rule's authoritative FileProfileID no longer resolves (the fail-closed
+// branch above). Exported on /metrics; a non-zero value means a policy rule
+// references a file profile the store does not carry — restore the profile
+// store or re-point the rule.
+var (
+	statFileProfileUnresolvedBlocked int64
+	fileProfileUnresolvedLastLog     int64 // unix seconds, rate-limits the log line
+)
+
+// noteFileProfileUnresolvedBlock records the fail-closed degradation: always
+// counted, logged at most once per 5 minutes (this sits on the request path
+// of every transaction the broken rule matches).
+func noteFileProfileUnresolvedBlock(id, name string) {
+	atomic.AddInt64(&statFileProfileUnresolvedBlocked, 1)
+	now := time.Now().Unix()
+	last := atomic.LoadInt64(&fileProfileUnresolvedLastLog)
+	if now-last >= 300 && atomic.CompareAndSwapInt64(&fileProfileUnresolvedLastLog, last, now) {
+		logger.Printf("WARN Policy: file profile id=%q (cached name %q) is referenced by a rule but does not resolve — file-bearing transactions on that rule are BLOCKED (fail-closed) until the profile store is restored or the rule is re-pointed (%d blocked since boot)",
+			sanitizeLog(id), sanitizeLog(name), atomic.LoadInt64(&statFileProfileUnresolvedBlocked))
+	}
+}
+
+// pathFileExt extracts the lowercase file extension of the last path segment
+// ("" when the segment carries none) — the shared scope test for file-control
+// decisions.
+func pathFileExt(urlPath string) string {
 	for i := len(urlPath) - 1; i >= 0 && urlPath[i] != '/'; i-- {
 		if urlPath[i] == '.' {
-			ext = strings.ToLower(urlPath[i:])
-			break
+			return strings.ToLower(urlPath[i:])
 		}
 	}
+	return ""
+}
+
+// matchFileExt returns true if urlPath ends with one of the given extensions.
+func matchFileExt(urlPath string, exts []string) bool {
+	ext := pathFileExt(urlPath)
 	if ext == "" {
 		return false
 	}
