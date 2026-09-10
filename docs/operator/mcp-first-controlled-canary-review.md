@@ -1782,14 +1782,54 @@ fifteen reasons a GO is forbidden, not the prohibition.
 6. ~~**The budget does not bound physical upstream invocations (§9).**~~ **CLOSED** — see
    "Blocker 6 closure" below. Idempotent read retries could send the POST ~3× per single budget
    reservation; the Canary path is now retry-free and the bound is proven at the wire.
-7. ~~**Whole-Canary auto-abort is incomplete (§14/§16) — a product defect.**~~ **CLOSED** — see
-   "Blocker 7 closure" in §25a. Only `budget_exhausted`/`scope_escape` auto-tripped, the other eight
-   declared breaches did not, nothing reconciled the independent witness, and the time-box was
-   request-driven (Codex round 31), so an elapsed window stopped nothing if no further request
-   arrived. Every declared `AbortCanary` code now has a wired trip path onto the one
-   `AbortController`, the two rate detectors are reachable inside the 3-execution corpus, and the
-   deadline is absolute and self-enforcing. The latch revokes EXECUTION AUTHORITY; it does not demote
-   the node, which stays governed by blockers 10 and 12.
+7. **Whole-Canary auto-abort is incomplete (§14/§16) — a product defect.** **REOPENED; closure
+   pending a clean adversarial review round on the atomic-binding follow-up.** The first pass wired every declared `AbortCanary` code
+   onto the one `AbortController`, made both rate detectors reachable inside the 3-execution corpus,
+   and made the deadline absolute and self-enforcing — but it shipped with two open Round-19 P1
+   findings in the pre-admission drift path, and was merged in that state. It is recorded as
+   REOPENED rather than quietly amended, because for a release-readiness gate "CLOSED with two open
+   P1s" is not a status, it is a contradiction.
+
+   The defect both findings named is one thing: the activation generation was read AROUND an
+   unlocked trust observation and the two reads compared. Counter equality proves the value did not
+   CHANGE; it does not prove any activation was ACTIVE throughout — during the rollout publication
+   gap both reads are a stale value. Five review rounds produced a P1 against five different
+   arrangements of those reads, which is the signal that the invariant was not expressible that way.
+
+   It is now expressed by construction. `admitLiveExecution` verifies an armed activation, captures
+   its exact non-zero generation, evaluates live trust IN FULL — including the approval — latches an
+   authoritative drift against that generation, and reserves the budget, under ONE acquisition of
+   the activation lock, which it owns and never exposes. "Trust under G, reserve under G+1" is not a
+   race made unlikely; it is a state the code cannot express.
+
+   Three further review rounds reshaped the parts around that transaction, and each correction is
+   worth recording because each was a wrong turn taken in good faith:
+
+   - The pre-executor refusal was first left EVIDENCE-ONLY, on the reasoning that an observation
+     binding to no activation must not latch one. That reasoning was half right and the conclusion
+     was wrong: after a rug-pull, later requests resolve cleanly against the NEW fingerprint and are
+     denied for a missing approval — request-scoped, not drift — so nothing downstream ever latched
+     and a declared whole-Canary breach stopped nothing. The answer was to GIVE the observation a
+     binding, not to drop the latch: the pipeline reports the drift with its target, and the root
+     re-derives it live INSIDE the activation critical section.
+   - Consulting the durable approval store inside that section coupled automatic abort, demotion and
+     generation revalidation to disk health, because every approval mutation holds the store mutex
+     across an atomic file write. Hoisting the lookup out of the lock fixed that and bought a worse
+     defect — a revocation landing during the lock wait was missed, and no later boundary re-reads
+     approval status. The edge was removed at its source instead: `internal/mcp/tooltrust` publishes
+     a copy-on-write snapshot through an atomic pointer, so the read never takes the store mutex and
+     the whole predicate is evaluated under one lock.
+   - The latch is bound to the activation the observation was made under. The activation runtime
+     holds no scope, so a stale observation could otherwise stop a REPLACEMENT activation whose
+     scope excludes the target. The generation in force is captured before the rollout resolution
+     and compared inside the lock; generations are strictly monotonic, so a mismatch means an
+     activation intervened, and a mismatch skips the latch — the safe direction, since an in-scope
+     request under the new activation observes the same drift and latches it there.
+
+   Bounded pre-admission drift evidence is counted and surfaced read-only on `GET /api/mcp/rollout`
+   regardless of whether the latch fires, so an operator always learns the catalog moved under a
+   decision. The latch revokes EXECUTION AUTHORITY; it does not demote the node, which stays
+   governed by blockers 10 and 12.
 8. **Durable outcome evidence is incomplete/success-only, with an unclosable post-send crash window
    (§15/§18) — a product defect.** **STILL OPEN, narrowed** — see "Blocker 8 status" below. The
    internal half (terminal outcome on every exit path, durable send intent, orphan recovery,

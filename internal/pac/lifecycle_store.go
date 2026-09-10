@@ -9,13 +9,29 @@ package pac
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/KidCarmi/Culvert/internal/fileutil"
+	"github.com/google/uuid"
 )
+
+// newHistoryIncarnation mints the identity of a fresh history epoch (see
+// ProfileLifecycle.HistoryIncarnation).
+func newHistoryIncarnation() string { return uuid.NewString() }
+
+// hasHistoryContent reports whether a record carries operator history (a
+// saved draft, revisions, an intent) as opposed to being an epoch-identity
+// placeholder minted by ObserveActive/PrepareCreate for a profile nobody has
+// drafted against yet.
+func hasHistoryContent(lc *ProfileLifecycle) bool {
+	return lc.Draft.ID != "" || len(lc.Revisions) > 0 || lc.PendingOp != nil || lc.Ambiguous != nil || len(lc.Operations) > 0
+}
 
 // LifecycleStore persists per-profile ProfileLifecycle records keyed by
 // profile ID. Like the other stores, Set is tolerant; the zero value is a
@@ -25,9 +41,55 @@ type LifecycleStore struct {
 	byID    map[string]*ProfileLifecycle
 	path    string
 	modTime time.Time
+	reset   *HistoryReset // store-level history reset (see HistoryReset)
 }
 
-// Load reads the store from path; a missing file is a no-op.
+// HistoryReset is the durable, store-level record that the lifecycle file
+// was found corrupt and quarantined (2F-B correction, C1). The ACTIVE profile
+// store stays the sole authority; what was lost is the node-local history
+// (revisions, drafts, pending intents, decided operations). Every active
+// profile that existed at the reset is reported as historyState
+// history_reset and refuses publish/rollback until an admin acknowledges the
+// loss for that profile, bound to the active revision + ProfileSpecDigest it
+// reviewed. The record lives beside the store (<path minus .json>.reset.json)
+// so it survives restarts until acknowledged; it is written BEFORE the
+// corrupt file is moved aside, so a boot that cannot record the reset leaves
+// the corrupt file in place and repeats the attempt next time (fail-closed).
+type HistoryReset struct {
+	At            string `json:"at"`
+	QuarantinedTo string `json:"quarantinedTo"`
+	Cause         string `json:"cause"`
+	// Scoped is true once ActiveAtReset carries the profiles that were active
+	// when the reset was recorded; until then EVERY active profile is treated
+	// as affected (the conservative reading).
+	Scoped        bool                       `json:"scoped"`
+	ActiveAtReset []string                   `json:"activeAtReset"`
+	Acknowledged  map[string]HistoryResetAck `json:"acknowledged"`
+}
+
+// HistoryResetAck is one admin acknowledgement of a lost history.
+type HistoryResetAck struct {
+	OperationID      string `json:"operationId"`
+	By               string `json:"by"`
+	At               string `json:"at"`
+	ActiveRevision   int64  `json:"activeRevision"`
+	ActiveSpecDigest string `json:"activeSpecDigest"`
+}
+
+// ErrHistoryReset wraps the Load error returned when the lifecycle file was
+// quarantined into a history reset.
+var ErrHistoryReset = errors.New("pac lifecycle: history reset")
+
+func resetPathFor(path string) string {
+	if path == "" {
+		return ""
+	}
+	return strings.TrimSuffix(path, ".json") + ".reset.json"
+}
+
+// Load reads the store from path; a missing file is a no-op. A corrupt file
+// is quarantined into a durable HistoryReset (see the type) and the error
+// returned wraps ErrHistoryReset; the store then starts empty.
 func (s *LifecycleStore) Load(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -35,6 +97,7 @@ func (s *LifecycleStore) Load(path string) error {
 	if s.byID == nil {
 		s.byID = map[string]*ProfileLifecycle{}
 	}
+	s.loadResetRecordLocked()
 	data, err := os.ReadFile(path) // #nosec G304 -- operator-configured store path
 	if os.IsNotExist(err) {
 		return nil
@@ -44,21 +107,554 @@ func (s *LifecycleStore) Load(path string) error {
 	}
 	var loaded map[string]*ProfileLifecycle
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		// This is NODE-LOCAL operator history, not serving-critical config (the
-		// active served spec lives in pac_profiles.json). A corrupt/truncated
-		// file must NOT brick the proxy at startup — quarantine it and start
-		// with an empty store so serving comes up fail-open.
-		quarantine := path + ".corrupt"
-		_ = os.Rename(path, quarantine) //nolint:errcheck // best-effort; empty-start is the fallback
-		s.byID = map[string]*ProfileLifecycle{}
-		s.modTime = time.Now()
-		return fmt.Errorf("pac lifecycle: parse %s failed, quarantined to %s and started empty: %w", path, quarantine, err)
+		return s.quarantineLocked(path, err)
 	}
 	s.byID = loaded
 	if s.byID == nil {
 		s.byID = map[string]*ProfileLifecycle{}
 	}
+	// Pre-2F-A records carry no draft token; migrate them to 1 so every
+	// stored draft hands out a non-zero optimistic-concurrency token (an
+	// epoch-identity placeholder holds no draft and keeps 0).
+	for id, lc := range s.byID {
+		if lc == nil {
+			delete(s.byID, id)
+			continue
+		}
+		if lc.DraftRevision < 1 && hasHistoryContent(lc) {
+			lc.DraftRevision = 1
+		}
+	}
 	s.modTime = time.Now()
+	// Records that predate the history epoch identity (2F-E correction
+	// round 2) are minted one — PERSIST-BEFORE-SWAP (round 3): the minted
+	// identities are written into a candidate map and become visible ONLY
+	// once that write landed. An identity that is not durable is never
+	// advertised: the records keep an empty identity in memory, the
+	// lifecycle surfaces report it as unknown, and the next access retries
+	// the durable mint (ObserveActive).
+	next, minted := s.mintMissingIncarnations()
+	if !minted {
+		return nil
+	}
+	if err := s.persistMap(next); err != nil {
+		return fmt.Errorf("pac lifecycle: history epoch identities could not be persisted (%w); they stay UNKNOWN (not advertised) until a durable mint succeeds", err)
+	}
+	s.byID = next
+	return nil
+}
+
+// mintMissingIncarnations returns a candidate map in which every record
+// lacking an epoch identity carries a freshly minted one (clones — s.byID is
+// untouched) and whether any was minted.
+func (s *LifecycleStore) mintMissingIncarnations() (map[string]*ProfileLifecycle, bool) {
+	minted := false
+	next := make(map[string]*ProfileLifecycle, len(s.byID))
+	for id, lc := range s.byID {
+		if lc.HistoryIncarnation == "" {
+			cp := cloneLifecycle(lc)
+			cp.HistoryIncarnation = newHistoryIncarnation()
+			next[id] = cp
+			minted = true
+			continue
+		}
+		next[id] = lc
+	}
+	return next, minted
+}
+
+// ObserveActive consults profileID's history epoch against the AUTHORITATIVE
+// active identity (revision + ProfileSpecDigest; activeExists=false when no
+// active profile exists) and returns the epoch identity that is valid NOW —
+// "" when nothing durable can be said (no record and no profile, a finished
+// delete, or a write that failed). It is the single place an epoch is
+// minted, rotated or retired (2F-E correction round 3), always
+// persist-before-swap:
+//
+//   - no record, no profile        → "" (the history is missing altogether)
+//   - no record, profile present   → mint a record (identity + observation)
+//   - CreatePending, present       → finalize the create (the prepared
+//     identity becomes the epoch; evidence kept)
+//   - CreatePending, absent        → withdraw the create (flags cleared;
+//     identity and evidence untouched)
+//   - DeletePending, absent        → finish the delete: remove the record, ""
+//   - DeletePending, present       → rotate (the transition began; discard)
+//   - identity empty               → mint (a failed migration retries here)
+//   - profile absent               → the identity as recorded (no write)
+//   - no observation yet           → record the current identity (no verdict)
+//   - revision REWOUND, or the same revision with a DIFFERENT spec → rotate
+//   - moved forward / unchanged    → record when changed
+//
+// A rotation keeps every piece of evidence (revisions, decided operations,
+// the draft, intents); only the identity changes, so a client that reviewed
+// the earlier state is refused and one that reads the current state can
+// still resolve a retained operation. The returned rotated flag reports a
+// rotation performed by THIS call.
+func (s *LifecycleStore) ObserveActive(profileID string, activeRevision int64, activeSpecDigest string, activeExists bool) (incarnation string, rotated bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byID == nil {
+		s.byID = map[string]*ProfileLifecycle{}
+	}
+	cur, found := s.byID[profileID]
+	if !found {
+		if !activeExists {
+			return "", false, nil
+		}
+		inc, err := s.mintRecordLocked(&ProfileLifecycle{ProfileID: profileID}, activeRevision, activeSpecDigest, true)
+		return inc, false, err
+	}
+	if cur.CreatePending {
+		if activeExists {
+			rec := finalizeCreateRecord(cur, activeRevision, activeSpecDigest)
+			if err := s.swapRecordLocked(rec); err != nil {
+				return "", false, err
+			}
+			return rec.HistoryIncarnation, true, nil
+		}
+		inc, err := s.withdrawCreateLocked(cur)
+		return inc, false, err
+	}
+	if cur.DeletePending {
+		if !activeExists {
+			return "", false, s.removeRecordLocked(profileID)
+		}
+		rec := cloneLifecycle(cur)
+		rec.DeletePending = false
+		return s.rotateRecordLocked(rec, activeRevision, activeSpecDigest)
+	}
+	if cur.HistoryIncarnation == "" {
+		inc, err := s.mintRecordLocked(cloneLifecycle(cur), activeRevision, activeSpecDigest, activeExists)
+		return inc, false, err
+	}
+	if !activeExists {
+		return cur.HistoryIncarnation, false, nil
+	}
+	return s.observeLocked(cur, activeRevision, activeSpecDigest)
+}
+
+// observeLocked compares the recorded observation with the active identity
+// and records / rotates accordingly (see ObserveActive). Caller holds s.mu.
+func (s *LifecycleStore) observeLocked(cur *ProfileLifecycle, activeRevision int64, activeSpecDigest string) (incarnation string, rotated bool, err error) {
+	observed := cur.ObservedActiveRevision != 0 || cur.ObservedActiveSpecDigest != ""
+	if observed && cur.ObservedActiveRevision == activeRevision && cur.ObservedActiveSpecDigest == activeSpecDigest {
+		return cur.HistoryIncarnation, false, nil
+	}
+	rec := cloneLifecycle(cur)
+	rewound := observed && (activeRevision < cur.ObservedActiveRevision ||
+		(activeRevision == cur.ObservedActiveRevision && activeSpecDigest != cur.ObservedActiveSpecDigest))
+	if rewound {
+		return s.rotateRecordLocked(rec, activeRevision, activeSpecDigest)
+	}
+	rec.ObservedActiveRevision, rec.ObservedActiveSpecDigest = activeRevision, activeSpecDigest
+	if err := s.swapRecordLocked(rec); err != nil {
+		return "", false, err
+	}
+	return rec.HistoryIncarnation, false, nil
+}
+
+// mintRecordLocked gives rec (a private copy) a fresh epoch identity, records
+// the active observation when a profile exists, and persists it. Caller
+// holds s.mu.
+func (s *LifecycleStore) mintRecordLocked(rec *ProfileLifecycle, activeRevision int64, activeSpecDigest string, activeExists bool) (string, error) {
+	rec.HistoryIncarnation = newHistoryIncarnation()
+	if activeExists {
+		rec.ObservedActiveRevision, rec.ObservedActiveSpecDigest = activeRevision, activeSpecDigest
+	}
+	if err := s.swapRecordLocked(rec); err != nil {
+		return "", err
+	}
+	return rec.HistoryIncarnation, nil
+}
+
+// rotateRecordLocked discards rec's epoch identity for a fresh one (every
+// piece of evidence kept), records the active observation and persists it.
+// Caller holds s.mu.
+func (s *LifecycleStore) rotateRecordLocked(rec *ProfileLifecycle, activeRevision int64, activeSpecDigest string) (incarnation string, rotated bool, err error) {
+	rec.HistoryIncarnation = newHistoryIncarnation()
+	rec.ObservedActiveRevision, rec.ObservedActiveSpecDigest = activeRevision, activeSpecDigest
+	if err := s.swapRecordLocked(rec); err != nil {
+		return "", false, err
+	}
+	return rec.HistoryIncarnation, true, nil
+}
+
+// MarkDeletePending durably records that profileID's delete transition has
+// begun (see ProfileLifecycle.DeletePending). It is the FIRST write of a
+// profile delete and must succeed before the active profile is removed; a
+// record is created for a profile that has none. Persist-before-swap.
+func (s *LifecycleStore) MarkDeletePending(profileID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byID == nil {
+		s.byID = map[string]*ProfileLifecycle{}
+	}
+	var rec *ProfileLifecycle
+	if cur, ok := s.byID[profileID]; ok {
+		if cur.DeletePending {
+			return nil
+		}
+		rec = cloneLifecycle(cur)
+	} else {
+		rec = &ProfileLifecycle{ProfileID: profileID, HistoryIncarnation: newHistoryIncarnation()}
+	}
+	rec.DeletePending = true
+	return s.swapRecordLocked(rec)
+}
+
+// ClearDeletePending withdraws a recorded delete transition whose active
+// delete was PROVABLY refused (validation, or a persist-before-swap write
+// that returned an error: memory and file are unchanged), so an unchanged
+// profile keeps its epoch. Persist-before-swap; a failed write leaves the
+// flag, and the next access rotates the epoch conservatively.
+func (s *LifecycleStore) ClearDeletePending(profileID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.byID[profileID]
+	if !ok || !cur.DeletePending {
+		return nil
+	}
+	rec := cloneLifecycle(cur)
+	rec.DeletePending = false
+	return s.swapRecordLocked(rec)
+}
+
+// PrepareCreate durably records that a CREATE transition for profileID has
+// begun: the identity of the NEW epoch is minted into PreparedIncarnation
+// and CreatePending is set, while the existing identity and every piece of
+// evidence stay untouched (see ProfileLifecycle.CreatePending). It is the
+// FIRST write of a profile create and must succeed before the active profile
+// is created; a record left by a FINISHED delete (DeletePending beside the
+// absent profile a create requires) is discarded first — that evidence was
+// already released by the delete. Idempotent: a transition already prepared
+// keeps its prepared identity. Persist-before-swap.
+func (s *LifecycleStore) PrepareCreate(profileID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byID == nil {
+		s.byID = map[string]*ProfileLifecycle{}
+	}
+	var rec *ProfileLifecycle
+	switch cur, ok := s.byID[profileID]; {
+	case ok && cur.CreatePending && cur.PreparedIncarnation != "":
+		return cur.PreparedIncarnation, nil
+	case ok && !cur.DeletePending:
+		rec = cloneLifecycle(cur)
+	default:
+		rec = &ProfileLifecycle{ProfileID: profileID}
+	}
+	rec.CreatePending = true
+	rec.PreparedIncarnation = newHistoryIncarnation()
+	if err := s.swapRecordLocked(rec); err != nil {
+		return "", err
+	}
+	return rec.PreparedIncarnation, nil
+}
+
+// FinalizeCreate completes a prepared create once the active create is
+// PROVEN: the prepared identity becomes the epoch identity, the flags are
+// cleared, the observation is set — the evidence is kept. Idempotent (a
+// record no longer pending returns its identity). Persist-before-swap: on a
+// failed write the record stays pending and the next access finalizes it
+// (or reports no identity), never exposing the old epoch.
+func (s *LifecycleStore) FinalizeCreate(profileID string, activeRevision int64, activeSpecDigest string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.byID[profileID]
+	if !ok {
+		return "", errors.New("pac lifecycle: no create transition recorded")
+	}
+	if !cur.CreatePending {
+		return cur.HistoryIncarnation, nil
+	}
+	rec := finalizeCreateRecord(cur, activeRevision, activeSpecDigest)
+	if err := s.swapRecordLocked(rec); err != nil {
+		return "", err
+	}
+	return rec.HistoryIncarnation, nil
+}
+
+func finalizeCreateRecord(cur *ProfileLifecycle, activeRevision int64, activeSpecDigest string) *ProfileLifecycle {
+	rec := cloneLifecycle(cur)
+	if rec.PreparedIncarnation != "" {
+		rec.HistoryIncarnation = rec.PreparedIncarnation
+	} else if rec.HistoryIncarnation == "" {
+		rec.HistoryIncarnation = newHistoryIncarnation()
+	}
+	rec.CreatePending, rec.PreparedIncarnation = false, ""
+	rec.ObservedActiveRevision, rec.ObservedActiveSpecDigest = activeRevision, activeSpecDigest
+	return rec
+}
+
+// WithdrawCreate cancels a prepared create whose active create was PROVABLY
+// refused (validation, or a persist-before-swap write that returned an
+// error): the flags are cleared and the prior identity and evidence are kept
+// exactly as they were; a placeholder record that held nothing else is
+// removed. Persist-before-swap; on a failed write the flags stay and the
+// next access withdraws them (the profile is absent).
+func (s *LifecycleStore) WithdrawCreate(profileID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.byID[profileID]
+	if !ok || !cur.CreatePending {
+		return nil
+	}
+	_, err := s.withdrawCreateLocked(cur)
+	return err
+}
+
+// withdrawCreateLocked clears a pending create on cur (see WithdrawCreate)
+// and returns the identity that remains valid. Caller holds s.mu.
+func (s *LifecycleStore) withdrawCreateLocked(cur *ProfileLifecycle) (string, error) {
+	if cur.HistoryIncarnation == "" && !hasHistoryContent(cur) {
+		return "", s.removeRecordLocked(cur.ProfileID)
+	}
+	rec := cloneLifecycle(cur)
+	rec.CreatePending, rec.PreparedIncarnation = false, ""
+	if err := s.swapRecordLocked(rec); err != nil {
+		return "", err
+	}
+	return rec.HistoryIncarnation, nil
+}
+
+// PendingTransitions lists the profile ids whose delete or create
+// transition is recorded as begun (for the startup reconciliation).
+func (s *LifecycleStore) PendingTransitions() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var ids []string
+	for id, lc := range s.byID {
+		if lc.DeletePending || lc.CreatePending {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// swapRecordLocked persists a candidate map carrying rec (already a private
+// copy) and swaps it in on success. Caller holds s.mu.
+func (s *LifecycleStore) swapRecordLocked(rec *ProfileLifecycle) error {
+	next := make(map[string]*ProfileLifecycle, len(s.byID)+1)
+	for id, cur := range s.byID {
+		next[id] = cur
+	}
+	next[rec.ProfileID] = rec
+	if err := s.persistMap(next); err != nil {
+		return err
+	}
+	s.byID = next
+	s.modTime = time.Now()
+	return nil
+}
+
+// removeRecordLocked persists a candidate map without id and swaps it in on
+// success. Caller holds s.mu.
+func (s *LifecycleStore) removeRecordLocked(id string) error {
+	next := make(map[string]*ProfileLifecycle, len(s.byID))
+	for k, cur := range s.byID {
+		if k != id {
+			next[k] = cur
+		}
+	}
+	if err := s.persistMap(next); err != nil {
+		return err
+	}
+	s.byID = next
+	s.modTime = time.Now()
+	return nil
+}
+
+// loadResetRecordLocked reads the sidecar reset record. An unreadable record
+// means acknowledgements can no longer be verified, which is itself a reset
+// condition: it is replaced by a fresh, unscoped one (conservative).
+func (s *LifecycleStore) loadResetRecordLocked() {
+	rp := resetPathFor(s.path)
+	if rp == "" {
+		return
+	}
+	data, err := os.ReadFile(rp) // #nosec G304 -- derived from the operator-configured store path
+	if os.IsNotExist(err) {
+		s.reset = nil
+		return
+	}
+	var r HistoryReset
+	if err == nil {
+		err = json.Unmarshal(data, &r)
+	}
+	if err != nil {
+		r = s.replaceUnreadableResetLocked(rp, data, err)
+	}
+	if r.Acknowledged == nil {
+		r.Acknowledged = map[string]HistoryResetAck{}
+	}
+	s.reset = &r
+}
+
+// replaceUnreadableResetLocked supersedes an unreadable reset record with a
+// fresh, unscoped one WITHOUT ever leaving a window in which no durable
+// reset evidence exists (2F-B correction round 2, blocker 1): the unreadable
+// bytes are first COPIED aside as evidence, then the replacement is written
+// over the record path atomically (temp + rename — the original stays in
+// place until the rename lands). If the copy or the write fails, the
+// original record is left untouched so the next boot repeats this exact
+// path, and the reset stays fail-closed in memory meanwhile.
+func (s *LifecycleStore) replaceUnreadableResetLocked(rp string, data []byte, cause error) HistoryReset {
+	r := HistoryReset{
+		At: time.Now().UTC().Format(time.RFC3339), Cause: "history reset record unreadable: " + cause.Error(),
+		Acknowledged: map[string]HistoryResetAck{},
+	}
+	evidence := fmt.Sprintf("%s.corrupt.%d", rp, time.Now().UnixNano())
+	if data == nil {
+		// Unreadable rather than unparseable: nothing to copy; leave it.
+		return r
+	}
+	if err := fileutil.AtomicWrite(evidence, data, 0o600); err != nil {
+		return r // evidence not preserved → the original stays where it is
+	}
+	r.QuarantinedTo = evidence
+	if err := s.persistReset(&r); err != nil {
+		// The original (unreadable) record is still in place: durable reset
+		// evidence survives, and the next boot repeats this replacement.
+		return r
+	}
+	return r
+}
+
+// quarantineLocked records the reset durably, THEN moves the corrupt file
+// aside (never deletes it) and starts empty.
+func (s *LifecycleStore) quarantineLocked(path string, cause error) error {
+	quarantine := fmt.Sprintf("%s.corrupt.%d", path, time.Now().UnixNano())
+	r := &HistoryReset{
+		At: time.Now().UTC().Format(time.RFC3339), QuarantinedTo: quarantine,
+		Cause: "parse failed: " + cause.Error(), Acknowledged: map[string]HistoryResetAck{},
+	}
+	if err := s.persistReset(r); err != nil {
+		// The reset could not be recorded: leave the corrupt file where it is
+		// so the next boot repeats this exact path, and fail closed in memory.
+		s.reset = r
+		s.byID = map[string]*ProfileLifecycle{}
+		s.modTime = time.Now()
+		return fmt.Errorf("%w: parse %s failed (%v) and the reset record could not be written (%v); file left in place, publish/rollback refused until acknowledged", ErrHistoryReset, path, cause, err)
+	}
+	if err := os.Rename(path, quarantine); err != nil {
+		r.QuarantinedTo = ""
+		_ = s.persistReset(r) //nolint:errcheck // best-effort correction of the recorded location
+		s.reset = r
+		s.byID = map[string]*ProfileLifecycle{}
+		s.modTime = time.Now()
+		return fmt.Errorf("%w: parse %s failed (%v); could not move the file aside (%v); started empty, publish/rollback refused until acknowledged", ErrHistoryReset, path, cause, err)
+	}
+	s.reset = r
+	s.byID = map[string]*ProfileLifecycle{}
+	s.modTime = time.Now()
+	return fmt.Errorf("%w: parse %s failed (%v); quarantined to %s and started empty; publish/rollback refused for the affected profiles until acknowledged", ErrHistoryReset, path, cause, quarantine)
+}
+
+// ResetWriteHook is a TEST-ONLY fault-injection seam consulted immediately
+// before every durable write of the history-reset record; a non-nil error is
+// treated exactly like the underlying write failing. Production leaves it nil.
+var ResetWriteHook func(path string) error
+
+func (s *LifecycleStore) persistReset(r *HistoryReset) error {
+	rp := resetPathFor(s.path)
+	if rp == "" {
+		return nil
+	}
+	if h := ResetWriteHook; h != nil {
+		if err := h(rp); err != nil {
+			return err
+		}
+	}
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fileutil.AtomicWrite(rp, data, 0o600)
+}
+
+func cloneReset(r *HistoryReset) *HistoryReset {
+	if r == nil {
+		return nil
+	}
+	out := *r
+	out.ActiveAtReset = append([]string(nil), r.ActiveAtReset...)
+	out.Acknowledged = make(map[string]HistoryResetAck, len(r.Acknowledged))
+	for k, v := range r.Acknowledged {
+		out.Acknowledged[k] = v
+	}
+	return &out
+}
+
+// HistoryResetRecord returns a copy of the store-level reset record, or nil.
+func (s *LifecycleStore) HistoryResetRecord() *HistoryReset {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneReset(s.reset)
+}
+
+// NoteActiveAtReset scopes a fresh reset to the profiles that were active
+// when it was recorded (persist-before-swap). A no-op when there is no
+// reset or it is already scoped.
+func (s *LifecycleStore) NoteActiveAtReset(activeIDs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reset == nil || s.reset.Scoped {
+		return nil
+	}
+	next := cloneReset(s.reset)
+	next.Scoped = true
+	next.ActiveAtReset = append([]string{}, activeIDs...)
+	sort.Strings(next.ActiveAtReset)
+	if err := s.persistReset(next); err != nil {
+		return err
+	}
+	s.reset = next
+	return nil
+}
+
+// ResetAffects reports whether profileID (activeExists = an active profile
+// exists for it) is in history_reset: a reset is recorded, the profile is
+// in its scope (or the scope is unknown), and no acknowledgement exists.
+func (s *LifecycleStore) ResetAffects(profileID string, activeExists bool) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.resetAffectsLocked(profileID, activeExists)
+}
+
+func (s *LifecycleStore) resetAffectsLocked(profileID string, activeExists bool) bool {
+	r := s.reset
+	if r == nil || !activeExists {
+		return false
+	}
+	if _, acked := r.Acknowledged[profileID]; acked {
+		return false
+	}
+	if !r.Scoped {
+		return true
+	}
+	for _, id := range r.ActiveAtReset {
+		if id == profileID {
+			return true
+		}
+	}
+	return false
+}
+
+// AcknowledgeReset records an admin acknowledgement for profileID
+// (persist-before-swap): a failed write leaves the reset exactly as it was.
+func (s *LifecycleStore) AcknowledgeReset(profileID string, ack HistoryResetAck) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reset == nil {
+		return errors.New("pac lifecycle: no history reset to acknowledge")
+	}
+	next := cloneReset(s.reset)
+	next.Acknowledged[profileID] = ack
+	if err := s.persistReset(next); err != nil {
+		return err
+	}
+	s.reset = next
 	return nil
 }
 
@@ -92,9 +688,40 @@ func (s *LifecycleStore) Put(lc *ProfileLifecycle) error {
 	if s.byID == nil {
 		s.byID = map[string]*ProfileLifecycle{}
 	}
-	s.byID[lc.ProfileID] = cloneLifecycle(lc)
+	// The history epoch identity is never dropped by a write: a record
+	// written from a clone that predates the identity inherits the stored
+	// one; a brand-new record is minted its own.
+	if lc.HistoryIncarnation == "" {
+		if cur, ok := s.byID[lc.ProfileID]; ok && cur.HistoryIncarnation != "" {
+			lc.HistoryIncarnation = cur.HistoryIncarnation
+		} else {
+			lc.HistoryIncarnation = newHistoryIncarnation()
+		}
+	}
+	// The transition flags are owned by the delete/create paths and the
+	// observer (ObserveActive); an ordinary write never clears them.
+	if cur, ok := s.byID[lc.ProfileID]; ok {
+		if cur.DeletePending {
+			lc.DeletePending = true
+		}
+		if cur.CreatePending {
+			lc.CreatePending, lc.PreparedIncarnation = true, cur.PreparedIncarnation
+		}
+	}
+	// Persist-before-swap (2F-B, C1): write the candidate map durably first;
+	// memory is replaced only on success, so a failed write leaves the
+	// in-memory record exactly where it was.
+	next := make(map[string]*ProfileLifecycle, len(s.byID)+1)
+	for id, cur := range s.byID {
+		next[id] = cur
+	}
+	next[lc.ProfileID] = cloneLifecycle(lc)
+	if err := s.persistMap(next); err != nil {
+		return err
+	}
+	s.byID = next
 	s.modTime = time.Now()
-	return s.persistLocked()
+	return nil
 }
 
 // Delete removes a profile's lifecycle record (called when the profile is
@@ -105,16 +732,29 @@ func (s *LifecycleStore) Delete(id string) error {
 	if _, ok := s.byID[id]; !ok {
 		return nil
 	}
-	delete(s.byID, id)
-	s.modTime = time.Now()
-	return s.persistLocked()
+	return s.removeRecordLocked(id)
 }
 
-func (s *LifecycleStore) persistLocked() error {
+// LifecycleWriteHook is a TEST-ONLY fault-injection seam consulted
+// immediately before every durable write of the lifecycle store file, with
+// the candidate map about to be written; a non-nil error is treated exactly
+// like the underlying write failing. Production leaves it nil. (2F-E
+// correction round 3: the seam that lets a test prove what an epoch
+// transition does when one of its durable writes fails.)
+var LifecycleWriteHook func(path string, next map[string]*ProfileLifecycle) error
+
+// persistMap durably writes the given map (the candidate of a
+// persist-before-swap mutation) without touching s.byID.
+func (s *LifecycleStore) persistMap(m map[string]*ProfileLifecycle) error {
 	if s.path == "" {
 		return nil
 	}
-	data, err := json.MarshalIndent(s.byID, "", "  ")
+	if h := LifecycleWriteHook; h != nil {
+		if err := h(s.path, m); err != nil {
+			return err
+		}
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -126,6 +766,7 @@ type LifecycleState struct {
 	ByID    map[string]*ProfileLifecycle
 	Path    string
 	ModTime time.Time
+	Reset   *HistoryReset
 }
 
 // Snapshot returns the store state for -shuffle test hermeticity (pair with
@@ -137,7 +778,7 @@ func (s *LifecycleStore) Snapshot() LifecycleState {
 	for id, lc := range s.byID {
 		cp[id] = cloneLifecycle(lc)
 	}
-	return LifecycleState{ByID: cp, Path: s.path, ModTime: s.modTime}
+	return LifecycleState{ByID: cp, Path: s.path, ModTime: s.modTime, Reset: cloneReset(s.reset)}
 }
 
 // Restore resets the store to a captured state (test support).
@@ -150,6 +791,7 @@ func (s *LifecycleStore) Restore(st LifecycleState) {
 	}
 	s.path = st.Path
 	s.modTime = st.ModTime
+	s.reset = cloneReset(st.Reset)
 }
 
 func cloneLifecycle(lc *ProfileLifecycle) *ProfileLifecycle {
@@ -159,6 +801,20 @@ func cloneLifecycle(lc *ProfileLifecycle) *ProfileLifecycle {
 	copy(out.Revisions, lc.Revisions)
 	for i := range out.Revisions {
 		out.Revisions[i].Spec.Rules = append([]Rule(nil), lc.Revisions[i].Spec.Rules...)
+	}
+	if lc.PendingOp != nil {
+		op := *lc.PendingOp
+		op.CandidateSpec.Rules = append([]Rule(nil), lc.PendingOp.CandidateSpec.Rules...)
+		out.PendingOp = &op
+	}
+	if lc.Ambiguous != nil {
+		amb := *lc.Ambiguous
+		amb.Op.CandidateSpec.Rules = append([]Rule(nil), lc.Ambiguous.Op.CandidateSpec.Rules...)
+		out.Ambiguous = &amb
+	}
+	if lc.Operations != nil {
+		out.Operations = make([]DecidedOp, len(lc.Operations))
+		copy(out.Operations, lc.Operations)
 	}
 	return &out
 }
