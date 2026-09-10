@@ -60,7 +60,7 @@ func testReviewedTarget() canary.ReviewedTarget {
 		ToolName:          "tool-a",
 		Fingerprint:       tooltrust.FingerprintDigest{0xF1},
 		FingerprintFormat: 1,
-		ServerIdentity:    "spiffe://test/server-a",
+		ServerIdentity:    reviewedIdentity,
 	}
 }
 
@@ -93,12 +93,5 @@ const reviewedIdentity = "spiffe://test/server-a"
 func reviewedAt(fp tooltrust.FingerprintDigest) canary.ReviewedTarget {
 	t := testReviewedTarget()
 	t.Fingerprint = fp
-	return t
-}
-
-// reviewedWithIdentity returns the canonical reviewed target bound to a specific server identity.
-func reviewedWithIdentity(id string) canary.ReviewedTarget {
-	t := testReviewedTarget()
-	t.ServerIdentity = id
 	return t
 }

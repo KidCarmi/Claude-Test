@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -159,12 +160,32 @@ func TestCanaryReviewedTarget_NilSeamIsANoOp(t *testing.T) {
 // is read by the root inside the activation lock; a value computed out here cannot be attributed to
 // a generation, which is the lesson five review rounds on PR #1314 paid for. Pinning the SHAPE is
 // how that stays true: a field added here is a value the root would be tempted to trust.
+//
+// This is done by REFLECTION rather than by an exhaustive struct literal, because a literal proves
+// nothing — Go does not require one to be exhaustive, so adding a field leaves it compiling and the
+// gate silently stops guarding anything. (The literal form was written first and staticcheck's
+// S1021 is what sent it back for a second look; the lint was cosmetic, the defect underneath was
+// not.)
 func TestCanaryReviewedTarget_ObservationCarriesIdentityOnly(t *testing.T) {
-	var obs CanaryTargetObservation
-	// A compile-time exhaustive assignment: adding a field to the struct breaks this line, which is
-	// the point at which someone has to justify it.
-	obs = CanaryTargetObservation{Generation: 1, ServerID: "s", ToolName: "t"}
-	if obs.Generation != 1 || obs.ServerID != "s" || obs.ToolName != "t" {
-		t.Fatal("unexpected observation shape")
+	want := map[string]string{
+		"Generation": "uint64",
+		"ServerID":   "string",
+		"ToolName":   "string",
+	}
+	typ := reflect.TypeOf(CanaryTargetObservation{})
+	if typ.NumField() != len(want) {
+		t.Fatalf("CanaryTargetObservation has %d fields, want %d: a field added here is a value the "+
+			"root would be tempted to trust, and anything a latch rests on must be read inside the "+
+			"activation lock instead", typ.NumField(), len(want))
+	}
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		kind, ok := want[f.Name]
+		if !ok {
+			t.Fatalf("unexpected field %q on CanaryTargetObservation", f.Name)
+		}
+		if f.Type.String() != kind {
+			t.Fatalf("field %q is %s, want %s", f.Name, f.Type, kind)
+		}
 	}
 }
