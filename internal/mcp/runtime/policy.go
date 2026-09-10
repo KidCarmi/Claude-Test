@@ -37,6 +37,41 @@ const policyErrorCode = -32050
 // provider, or an upstream MCP server, and NEVER fabricates execution success:
 // even an ALLOW-class decision returns an execution-not-implemented result.
 func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Request, msg jsonrpc.Message, ident *identity.ResolvedContext, now time.Time) Outcome {
+	// Report the tool this request NAMES to the Canary reviewed-target sink FIRST, before
+	// any decision this function makes can end the request — and that placement is the
+	// whole point, twice over.
+	//
+	// A Canary scope pins the reviewed fingerprint in its tool selector, so a tool that
+	// moves F1→F2 puts every later request OUT of scope; resolveEnforcing then routes them
+	// to the shadow or record-only fallback, and the record-only branch returns without
+	// ever reaching dispatchExecute, the executor, or the activation transaction. Worse,
+	// the SAME F1→F2 change is what makes a new schema reject arguments the old one
+	// accepted, so semantic inspection hard-fails those requests and dispatchPolicy exits
+	// above the executor entirely (Codex P1, PR #1360, round 2). The snapshot-unavailable
+	// and budget-expired returns are the same shape. Reporting from any point downstream
+	// of one of those returns cannot see the one sequence the reviewed snapshot exists to
+	// catch: the experiment's reviewed target has changed underneath it and the change is
+	// exactly what hides the evidence.
+	//
+	// The identity is therefore derived from the request and the JSON-RPC message ALONE —
+	// no policy snapshot, no catalog record, no inspection verdict — so nothing this
+	// function can fail on is upstream of it.
+	//
+	// What is reported is an identity, not a verdict. The root compares the CURRENT
+	// authoritative target against the activation's reviewed snapshot under the activation
+	// lock, so a tool this activation was never reviewed for latches nothing, and a
+	// rejected request drifts a Canary only when its reviewed target really has moved.
+	obsServerID, obsToolName := p.canaryObservedTarget(req, msg)
+	p.deps.noteCanaryTargetObserved(p.capability.String(), CanaryTargetObservation{
+		// Read BEFORE any of the work below, so it names an activation at least as old as
+		// the one this request was decided under. The root refuses a superseded
+		// generation, so an activation landing mid-request costs evidence, never a latch
+		// against the wrong reviewed set.
+		Generation: p.deps.canaryGenerationAt(p.capability.String()),
+		ServerID:   obsServerID,
+		ToolName:   obsToolName,
+	})
+
 	snap := p.policy.PolicySnapshot(p.capability)
 	if snap == nil {
 		// Fail closed — never fall back to permissive observe mode.
@@ -100,25 +135,6 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 		// decision was actually made under. See Deps.CanaryGeneration.
 		genAtResolve := p.deps.canaryGenerationAt(p.capability.String())
 		res := p.executor.Resolve(ei)
-		// Report the tool this request named to the Canary reviewed-target sink, for EVERY
-		// disposition — and this placement, ABOVE the record-only branch, is the whole point.
-		//
-		// A Canary scope pins the reviewed fingerprint in its tool selector, so a tool that moves
-		// F1→F2 puts every later request OUT of scope; resolveEnforcing then routes them to the
-		// shadow or record-only fallback, and the record-only branch below returns without ever
-		// reaching dispatchExecute, the executor, or the activation transaction. Reporting from
-		// any point downstream of this line therefore cannot see the one sequence the reviewed
-		// snapshot exists to catch: the experiment's reviewed target has changed underneath it and
-		// the change is exactly what hides the evidence (Codex P1, PR #1360).
-		//
-		// What is reported is an identity, not a verdict. The root compares the current
-		// authoritative target against the activation's reviewed snapshot under the activation
-		// lock, so a tool this activation was never reviewed for latches nothing.
-		p.deps.noteCanaryTargetObserved(p.capability.String(), CanaryTargetObservation{
-			Generation: genAtResolve,
-			ServerID:   toolServerID(in),
-			ToolName:   toolName(in),
-		})
 		if res.Disposition != rollout.EffectRecordOnly {
 			return p.dispatchExecute(ctx, rb, ei, res, genAtResolve)
 		}
@@ -178,6 +194,28 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 // identity, the live registry/catalog snapshots and the operation. All facts are
 // read BEFORE evaluation (the evaluator itself does no I/O). It carries no raw
 // arguments — only the tool name (an operand identity) and one-way fingerprints.
+// canaryObservedTarget names the tool this request is FOR, derived from the request and
+// the JSON-RPC message ALONE. It deliberately reproduces the exact gate buildPolicyInput
+// uses to populate in.Tool — Gateway capability, tools/call, a params name — so the
+// identity reported to the Canary reviewed-target sink is the same one the executor path
+// would have reported, only reachable before anything in dispatchPolicy can fail.
+//
+// It must NOT consult the catalog: a tool whose catalog record is absent still reaches
+// buildPolicyInput as a named (quarantined) tool, and a reviewed target that has
+// DISAPPEARED is precisely a target the activation can no longer be executing against.
+// Any divergence between this gate and buildPolicyInput's is a silent hole, so the two
+// are pinned against each other by test.
+func (p *pipeline) canaryObservedTarget(req Request, msg jsonrpc.Message) (serverID, toolName string) {
+	if p.capability != protocol.Gateway || msg.Method != "tools/call" {
+		return "", ""
+	}
+	name := toolNameFromParams(msg.Params)
+	if name == "" {
+		return "", ""
+	}
+	return req.ServerID, name
+}
+
 func (p *pipeline) buildPolicyInput(req Request, msg jsonrpc.Message, ctx *identity.ResolvedContext, polRev policy.Revision, now time.Time) policy.DecisionInput {
 	capNS := policyCapability(p.capability)
 	in := policy.DecisionInput{
