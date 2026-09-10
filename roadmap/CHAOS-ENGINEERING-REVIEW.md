@@ -36,6 +36,30 @@ everything else is triaged below with a suggested PR and required tests for foll
 > rewriting identifiers three merged PRs already reference, so it is an OWNER
 > decision, not a unilateral edit — recorded here rather than silently "fixed".
 
+**2026-09-02 — CHAOS-58 sweep (the directory that accepts and then stops answering).**
+CHAOS-47 solved the *unreachable* directory: fail closed, arm a provider-wide cooldown, deny
+without dialing, recover on evidence. This sweep asked which faults can actually ARM that
+machinery, and the answer is the finding: **the cooldown is armed by an error that RETURNS**, so
+every mitigation it built sits downstream of a value a hung call never produces. `LDAPAuth.verify`
+dialed with a 10 s dialer timeout and then ran up to four blocking operations with no deadline of
+any kind — go-ldap defaults to `requestTimeout: 0`, which arms no timer at all, so `Bind` and
+`Search` wait on a bare channel receive. A directory that completes the TCP handshake and then goes
+silent (overloaded server, firewall dropping established flows, half-open socket after a peer
+reboot, hung VM) blocked the **request goroutine forever** — no error, no counter, no log, no health
+movement — pinning a goroutine, a socket, an FD and a per-IP connection slot per authenticating
+request, permanently. FD exhaustion is the recorded terminal state of PX-6/WK-11 and the entry point
+to CHAOS-54's SOCKS5 findings, so the fault feeds an amplifier this register already documents. The
+asymmetry that hid it: the ADMIN directory-test endpoint already called `conn.SetTimeout`; the
+per-request production path did not — the bounded path is the one clicked occasionally, the
+unbounded one is the one every request takes. Shipped: ONE 10 s end-to-end envelope, deliberately
+the same budget this process already gives one OIDC introspection (the CHAOS-53 "both back ends
+share one budget" rule, applied to the credential back ends), enforced in two NON-redundant layers —
+a per-message timeout, plus a connection watchdog for the post-StartTLS `tls.Handshake()` that
+go-ldap runs on the raw socket outside its own timer, verified against the library and kept as a
+permanent defect proof. No new metric, no new alert, no new operator vocabulary: a stall now
+produces exactly what a down directory produces. 9 gates; all six defect gates verified failing
+against the pre-fix tree. See rows AU-5 (re-scored M→H) and AU-14, §25, and
+`docs/operator/ldap-directory-stalls.md`.
 **2026-09-01 — CHAOS-57 sweep (the hijacked-tunnel plane on the way out).** CHAOS-56 bounded
 the shutdown sequence end to end and made the drain honour its phase deadline. It did not ask the
 prior question: **does the drain see what it is draining?** It does not. `drainActiveTunnels` waits
@@ -582,7 +606,8 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | AU-2 | In-flight SSO sessions **survive IdP deletion** — no `RevokeProvider`; cookies are self-contained and keep full access up to TTL (default 8h). User-delete *does* revoke. | GAP | H | `auth_idp.go:319-330`, `ui_auth.go:517-529` vs `ui_auth.go:245` |
 | AU-3 | Proxy-path Basic-auth bcrypt is **not rate-limited** — correct-username + N wrong-passwords is a cache miss every time → full ~100ms bcrypt per request → CPU starvation. The `loginLimiter` guards only the admin UI. | GAP | M | `store.go:440-444`, limiter only at `ui_auth.go:48,116`, proxy call `proxy.go:223` |
 | AU-4 | Lockout store is bounded + fail-closed, and TOTP failures now feed it. But it is **not persisted** (resets on restart) and **per-node** (attacker gets MaxAttempts per node in a cluster). | ✓ (+2 gaps) | M | `lockout.go:111-126,102-110`; per-node note `roadmap/edge-case-audit.md:138` |
-| AU-5 | LDAP proxy auth fails closed, but the 10s timeout covers only the **dial** — `Bind`/`Search` have no per-op deadline, so a server that accepts then stalls hangs the request goroutine. | GAP | M | `auth_ldap.go:128-180` |
+| AU-5 | LDAP proxy auth fails closed, but the 10s timeout covers only the **dial** — `Bind`/`Search` have no per-op deadline, so a server that accepts then stalls hangs the request goroutine. | GAP → **CLOSED** (CHAOS-58 §26: one 10s round-trip envelope, two non-redundant layers; re-scored **H** on discovery — the stall is unbounded, not slow, and it made the CHAOS-47 cooldown structurally unreachable) | ~~M~~ H | `auth_ldap.go` `verify`; gates `auth_ldap_stall_chaos_test.go` (9) |
+| AU-14 | The CHAOS-47 provider-wide cooldown is armed only by an error that RETURNS, so any identity-backend fault that HANGS is invisible to it by construction. Closed for LDAP by CHAOS-58; the OIDC leg is bounded by `http.Client{Timeout}` on every call, and SAML is browser-mediated. Recorded so the next backend added to the credential chain inherits the rule rather than rediscovering it. | GAP → **CLOSED for the shipped backends** (CHAOS-58 §26) | M | `auth_backend_health.go` `authProbeGate`; `noteVerifyError` `auth_ldap.go` |
 | AU-6 | SAML metadata & OIDC discovery fetched **once** at compile — no periodic refresh. IdP SAML signing-cert rotation breaks assertion validation until re-save/restart. (OIDC JWKs *do* auto-refresh every 15 min + serve-stale.) | GAP | M | `auth_saml.go:54-57,249-294`; JWKs OK `auth_oidc_flow.go:129-157` |
 | AU-7 | IdP 5xx / network error / expired token all collapse to fail-closed "auth fail" — correct posture, but an IdP outage is indistinguishable from a brute-force spike (no distinct `idp.unreachable` metric). | ✓ (obs gap) | L | `auth_oidc.go:152-162`, `auth_oidc_flow.go:623-636` |
 | AU-8 | Auth caches bounded at 5000 with eviction; HMAC-keyed keys (heap-dump safe); cached OK TTL capped at token `exp`. | ✓ | — | `store.go:236,241-258,268-285`, `auth_oidc.go:219-227` |
@@ -3116,7 +3141,183 @@ carries more authority than an unexamined gap — it tells the next reader the
 question was asked and answered — so a wrong one is worse than silence. The
 entry has been struck rather than quietly deleted, so the record shows the claim
 was made and refuted.
-## 26. CHAOS-58 — Destination-host DNS resolution on the policy path
+## 26. CHAOS-58 — The directory that accepts and then stops answering
+
+**Date:** 2026-09-02 · **Domain:** authentication / LDAP + Active Directory ·
+**Status:** shipped · **Gates:** `auth_ldap_stall_chaos_test.go` (9) ·
+**Closes:** AU-5 (re-scored M→H), AU-14 (new)
+
+### 26.1 Why this domain
+
+CHAOS-47 gave the identity backends a posture for an unreachable directory and
+built the machinery to make it cheap: fail closed, arm a provider-wide cooldown,
+deny without dialing, recover on observed evidence. CHAOS-49 extended the same
+primitives to the IdP registry rather than inventing a second dialect. Between
+them the *unreachable directory* is a solved problem in this codebase, with one
+health row, one metric family and one alert.
+
+This sweep asked a narrower question: **which faults can arm that machinery?**
+
+The answer is one sentence, and it is the finding. `authProbeGate` is armed from
+`noteVerifyError`, which runs on the error `verify()` returns. So the cooldown
+can only see a fault that **returns**. Every mitigation CHAOS-47 built is
+downstream of a value that a hung call never produces.
+
+### 26.2 The fault
+
+`LDAPAuth.verify` dialed with a 10 s dialer timeout and then ran up to four
+blocking operations — StartTLS, service bind, user search, user bind — with no
+deadline of any kind. go-ldap's `Conn` defaults to `requestTimeout: 0`, and its
+message loop arms a timer only `if requestTimeout > 0`, so **no timer existed at
+all**. `Bind` and `Search` wait on `<-msgCtx.responses`, a bare channel receive.
+
+A directory that completes the TCP handshake and then goes silent therefore
+blocked the **request goroutine forever**. Not slowly — permanently, with no
+error, no counter, no log line and no health-surface movement.
+
+That fault is ordinary, not exotic: an overloaded directory, a firewall that
+drops established flows without a reset, a half-open socket after a peer reboot,
+a hung VM, a storage stall on the directory host. In every one of them the dial
+**succeeds**, which is precisely why bounding the dial answered the wrong
+question.
+
+The blast radius is per request, not per outage. `verify()` is reached from the
+proxy's per-request credential loop (`proxy.go`, via
+`LDAPIdPProvider.ResolveIdentity` and `Config.VerifyAuth`), so every
+cache-missing authentication pinned a goroutine, a socket, an FD, the client's
+connection and a per-IP connection-limiter slot, permanently. FD exhaustion is
+the recorded terminal state of PX-6 and WK-11, and CHAOS-54 measured what an
+FD-exhausted node then does to the SOCKS5 accept loop — so this fault feeds an
+amplifier this register already documents rather than staying contained.
+
+**Reproduced before it was fixed** (a listener that accepts and never writes):
+`Verify` was still blocked when the gate gave up, and the six defect gates were
+each verified failing against the pre-fix tree.
+
+### 26.3 The asymmetry that made it easy to miss
+
+The correct pattern was already in the tree, one call away. The **admin
+directory-test** endpoint (`ui_auth_ldap.go`) calls `conn.SetTimeout(8s)`
+immediately after dialing. The **per-request production path** did not.
+
+So the bounded path is the one an admin clicks occasionally, and the unbounded
+path is the one every proxied request takes. That is the inversion worth
+recording: a safe pattern existing in the repository is not the same as it
+being applied where the load is.
+
+### 26.4 The second layer, and why it is not belt-and-braces
+
+Adding `SetTimeout` is the obvious fix and it is **not sufficient**.
+`Conn.StartTLS` waits for the extended response through the message loop — which
+the timer covers — and then runs `tls.Client(l.conn, config).Handshake()` on the
+**raw socket**, outside the message loop and outside the timer. A directory that
+ACKs StartTLS and then never negotiates TLS hangs with `SetTimeout` armed.
+
+This was verified directly against the library, not assumed, and the check is
+kept as a permanent **defect proof**
+(`TestChaos57_SetTimeoutDoesNotBoundStartTLSHandshake`): it asserts that go-ldap
+still behaves this way, so a future library release that fixes it fails the
+build rather than leaving a backstop silently guarding nothing — the role
+`BareGracefulStopIsUnboundedOnAWedgedStream` plays for CHAOS-56.
+
+The second layer is therefore a whole-envelope watchdog that **closes the
+connection**. Closing is what unblocks a deadline-less read — the same reason
+`idleCopyCounted` hard-closes both conns on idle (CHAOS-03) instead of trusting
+a deadline the blocked goroutine cannot observe. Two properties of go-ldap make
+it safe and were read rather than assumed: `Close` is idempotent via
+`setClosing`, and `messageMutex` is released before every network wait
+(`sendMessageWithFlags` unlocks before sending; the StartTLS handshake runs with
+it released), so a timer-goroutine close cannot deadlock the operation it is
+rescuing.
+
+The same gap exists on the admin test path — which set the per-message timeout
+and was therefore *more* obviously bounded while carrying the one stage that
+timeout cannot reach, on an endpoint that actuates an admin-supplied address on
+demand. It gets the same watchdog under its own, deliberately generous, envelope
+(a diagnostic should report a slow directory rather than clip it; its job is to
+guarantee the handler goroutine is released at all).
+
+### 26.5 The budget
+
+One directory round trip is bounded **end to end at 10 s** — an envelope, not a
+per-step allowance, so the historical 10 s dial timeout becomes the ceiling for
+the whole flow rather than for its first step. Summing four per-operation
+budgets would have produced a ~42 s worst case on a per-request path, which is
+not a bound anyone would act on.
+
+10 s is deliberately the **same** budget this process already gives one identity
+resolution against an OIDC IdP (`http.Client{Timeout: 10s}`, `auth_oidc.go` /
+`auth_oidc_flow.go`). Two identity backends answering the same question on the
+same request path must not disagree about how long that decision may take —
+CHAOS-53's rule for the two body-scan back ends, applied to the two credential
+back ends. It is a constant for the same reason the JWKS stale ceiling is: a
+per-deployment knob whose only use is widening it re-opens the fault.
+
+The bound is unreachable on a functioning deployment — roughly 50x a healthy WAN
+round trip, with authoritative answers cached for 5 minutes.
+
+### 26.6 What changes for the operator
+
+Nothing new to learn, which is the design goal. A stalled directory now produces
+exactly what a down one produces: an `ErrorNetwork` the existing classifier
+already reads as unreachable, so it arms the same cooldown, moves the same
+`identity_backend` diagnostics row, increments the same
+`culvert_auth_backend_*` series, and fires the same
+`identity_backend_unreachable` alert. One additional rate-limited log line names
+the backend and the budget, with a **bounded reason class only** — no directory
+address and no server-supplied diagnostic on a per-request path (the WK-12/RS-5
+rule).
+
+The outage therefore becomes self-limiting: one probe per 3 s cooldown instead
+of one permanently hung goroutine per request, recovering on observed evidence
+with no restart.
+
+Runbook: `docs/operator/ldap-directory-stalls.md`.
+
+### 26.7 Gates
+
+Nine, in three groups — the controls exist because a bound that fired on a
+healthy directory would pass every defect gate while being strictly worse than
+the defect it replaced.
+
+| Group | Gate | Pins |
+|---|---|---|
+| Defect | `StalledDirectoryReleasesTheRequestGoroutine` | the call returns inside its envelope, fail-closed |
+| Defect | `StalledDirectoryArmsTheUnreachableCooldown` | the fault is now visible to CHAOS-47 at all |
+| Defect | `ArmedCooldownDeniesAStalledDirectoryWithoutDialing` | the outage is self-limiting, not re-paid per request |
+| Defect | `StartTLSHandshakeStallIsBounded` | layer 2 is load-bearing (remove the watchdog and it hangs) |
+| Defect | `AdminDirectoryTestIsBoundedOnAStartTLSStall` | the admin handler goroutine is released too |
+| Defect | `ConcurrentStallsDoNotAccumulateGoroutines` | 12 concurrent stalls all return and unwind |
+| Proof | `SetTimeoutDoesNotBoundStartTLSHandshake` | the library assumption layer 2 exists for |
+| Control | `PromptDirectoryIsNeitherClippedNorGated` | a healthy directory is not clipped, and its deny does not arm the gate |
+| Control | `WatchdogStopsWhenTheRoundTripCompletes` | a cancelled watchdog never closes a live connection |
+
+All six defect gates were verified failing against the pre-fix shape; the proof
+and both controls pass in both trees, which is what makes them controls.
+
+### 26.8 Deliberately left
+
+- **AU-3** (proxy-path bcrypt is not rate-limited) and **AU-11** (the credential
+  provider loop is sequential, so N providers serialise their budgets on one
+  request) are untouched and remain open. AU-11's worst case is now bounded
+  rather than infinite, which lowers its severity without closing it.
+- **The fail-closed posture is unchanged.** A directory that cannot answer
+  denies; it never becomes an implicit allow.
+- **No new metric.** A stall is an unreachable backend, and it now lands on the
+  series that already means that. A second name for one operator action is the
+  thing CHAOS-47's `identity_backend` naming note warns against.
+
+### 26.9 The general rule this sweep produces
+
+> A cooldown, breaker, or health gate armed by a returned error is blind to
+> every fault that hangs. Bounding the call is what makes the mitigation
+> reachable — the mitigation is not the bound.
+
+Recorded as **AU-14** so the next backend added to the credential chain inherits
+it instead of rediscovering it. The shipped backends satisfy it today: OIDC by
+`http.Client{Timeout}` on every call, SAML because it is browser-mediated, and
+LDAP as of this sweep.
+## 27. CHAOS-58 — Destination-host DNS resolution on the policy path
 
 **Date:** 2026-09-04 · **Domain:** DNS (never previously swept) · **Code:**
 `geoip.go`, `dns_health.go`, `alerts.go` · **Runbook:**
@@ -3153,7 +3354,7 @@ was made and refuted.
 > sweep. Two concurrent sweeps in one week reproduced the fault again; catching
 > this one early was luck (a merge conflict forced someone to look), not process.
 
-### 26.1 Reachability
+### 27.1 Reachability
 
 Two conditions, both ordinary in an enterprise deployment:
 
@@ -3174,7 +3375,7 @@ That comment is correct and the mitigation it describes — releasing the
 evaluation lock before the scan — is the right fix for the *lock*. It is not a
 fix for the *request*, which still blocks.
 
-### 26.2 The three defects
+### 27.2 The three defects
 
 Each was reproduced against the pre-fix tree before any code was written.
 
@@ -3219,7 +3420,7 @@ takes over. **Geo blocking silently stops enforcing because DNS is slow.**
 And none of it was visible. No counter, no log line, no alert, no health row on
 this path — every probe stayed green.
 
-### 26.3 What shipped
+### 27.3 What shipped
 
 | Property | Mechanism | Why this shape |
 |---|---|---|
@@ -3249,7 +3450,7 @@ Two discipline points carried from the earlier sweeps:
   the episode; elapsed time never does. A gateway whose resolution failures stop
   because traffic stopped has not recovered.
 
-### 26.4 The alert-plane defect found alongside
+### 27.4 The alert-plane defect found alongside
 
 `fireDNSFailureAlert` passed the raw `err.Error()` as the alert Detail.
 `Store.Dispatch` dedups on `event + ":" + Detail`, and a `*net.DNSError`'s text
@@ -3262,7 +3463,7 @@ fabricate unbounded alert volume and write arbitrary strings into an operator's
 alert pipeline. Detail is now a bounded reason class; the full error was already
 logged at each of the four dial sites, so nothing is lost.
 
-### 26.5 Gates
+### 27.5 Gates
 
 `dns_resolve_chaos_test.go` (23). D1/D2/D3 were each reproduced against the
 pre-fix tree with the equivalent assertion before the fix was written. Two
@@ -3277,7 +3478,7 @@ pinned the synchronous-re-resolve-on-expiry behaviour, which is the defect. It
 now pins stale-serving, with `TestResolveHost_StaleCeilingForcesResolution`
 pinning the other end of the window.
 
-### 26.5a Review finding — stale serving is for POSITIVE entries only
+### 27.5a Review finding — stale serving is for POSITIVE entries only
 
 Codex review of PR #1312 (P1), verified and fixed before merge.
 
@@ -3310,7 +3511,7 @@ address) was applied to every case, and the sibling case turned it into the
 defect it was built to remove. A degradation path needs its rationale checked
 against each state it can be in, not only the one that motivated it.
 
-### 26.6 Residual risk (owner decisions, recorded not fixed)
+### 27.6 Residual risk (owner decisions, recorded not fixed)
 
 - **DNS-1 — the fall-through posture is unchanged.** An unresolvable destination
   still cannot match a geo rule in either direction. Making an unknown country
@@ -3333,7 +3534,7 @@ against each state it can be in, not only the one that motivated it.
   request on the dial path. That is inherent to dialling (each request really
   does need its own connection) and is recorded rather than changed.
 
-### 26.7 GEO-1 — a latent process-kill armed by a comment (recorded, not fixed)
+### 27.7 GEO-1 — a latent process-kill armed by a comment (recorded, not fixed)
 
 Found while sweeping the domain adjacent to CHAOS-58 and **not reachable in the
 current tree**, but recorded because of how it is armed.
