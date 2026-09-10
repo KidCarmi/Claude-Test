@@ -24,13 +24,12 @@ func resetMaintAgentStatusCache(t *testing.T) {
 	})
 }
 
-func callAPIMaintAgentStatus(t *testing.T) (int, map[string]any) {
+func callAPIMaintAgentStatus(t *testing.T) (status int, body map[string]any) {
 	t.Helper()
 	w := httptest.NewRecorder()
 	ctx := context.WithValue(context.Background(), uiRoleKey{}, RoleViewer)
 	r := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/maintenance-agent", http.NoBody)
 	apiMaintAgentStatus(w, r)
-	var body map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("response not JSON (%d): %s", w.Code, w.Body.String())
 	}
