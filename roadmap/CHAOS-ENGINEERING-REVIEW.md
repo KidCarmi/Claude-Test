@@ -140,7 +140,7 @@ for the two cheapest wrong fixes (force-close at drain START — which passes ev
 being strictly worse than the defect — and a non-idempotent release, whose negative gauge restores
 the original blindness by accident). See rows PX-4/PX-8, §25 and
 `docs/operator/tunnel-drain-on-shutdown.md`.
-**2026-09-04 — CHAOS-59 sweep (destination-host DNS resolution on the policy path).** The
+**2026-09-04 — CHAOS-60 sweep (destination-host DNS resolution on the policy path).** The
 sweep took the one failure domain the register had never entered: **DNS**, listed in the original
 scope and never swept, because it looks like somebody else's dependency. It is not — a
 `DestCountry` policy rule puts the customer's resolver on the critical path of every request that
@@ -177,7 +177,7 @@ destination this node cannot resolve — a bounded security gap traded for an un
 one), and the cgo resolver's uncancellable `getaddrinfo` (the deadline releases the request
 goroutine; the OS thread is bounded by Go's own 500-thread cap). Gates:
 `dns_resolve_chaos_test.go` (23, incl. two CONTROLS — a resolver that simply stopped resolving
-would pass every defect gate while being far worse than the defect). See §27 and
+would pass every defect gate while being far worse than the defect). See §28 and
 `docs/operator/dns-resolution-health.md`.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
@@ -3661,49 +3661,54 @@ documented residuals. This sweep adds one about **fixes**:
 The corollary is a review question worth asking of every degradation fix in
 this register: *what signal did the old, worse behaviour emit, and what emits
 it now?*
-## 28. CHAOS-59 — Destination-host DNS resolution on the policy path
+## 28. CHAOS-60 — Destination-host DNS resolution on the policy path
 
 **Date:** 2026-09-04 · **Domain:** DNS (never previously swept) · **Code:**
 `geoip.go`, `dns_health.go`, `alerts.go` · **Runbook:**
 `docs/operator/dns-resolution-health.md`
 
-> **Renumbered TWICE before merge — CHAOS-57 → CHAOS-58 → CHAOS-59.** This sweep
-> collided with a concurrently-developed sweep on `main` on two consecutive
-> merges, six days apart, and lost the id both times for the same reason.
+> **Renumbered THREE TIMES before merge — CHAOS-57 → CHAOS-58 → CHAOS-59 →
+> CHAOS-60.** This sweep collided with a concurrently-developed sweep on `main`
+> on three consecutive merges inside one week, and lost the id every time for the
+> same reason. Each rename picked the next id that was free *at that instant*, and
+> each time another in-flight branch merged that id first.
 >
-> The **first** collision was with §25 (the hijacked-tunnel plane), which took
-> `CHAOS-57` independently and merged on 2026-09-01: exactly the failure the
-> header records for `CHAOS-50`, and the third occurrence of it. The merge that
-> brought main into this branch resolved the duplicate SECTION number (25 → 26)
-> but left both sweeps stamped `CHAOS-57`, so this one was renamed to
-> `CHAOS-58` / §26.
+> | # | Date | Collided with | Which had taken | This sweep became |
+> |---|---|---|---|---|
+> | 1 | 2026-09-04 | §25 the hijacked-tunnel plane | `CHAOS-57` | `CHAOS-58` / §26 |
+> | 2 | 2026-09-10 | §26 the LDAP directory that stalls | `CHAOS-58` | `CHAOS-59` / §27 |
+> | 3 | 2026-09-10 | §27 the intelligence-feed plane | `CHAOS-59` | `CHAOS-60` / §28 |
 >
-> The **second** collision, on 2026-09-10, was with §26 (the LDAP directory that
-> accepts and then stops answering), which took `CHAOS-58` independently while
-> this branch was still in review and merged first. Renumbering to escape a
-> collision walked straight into the next free id — which was not free, only
-> unmerged at the time it was chosen. This sweep is now `CHAOS-59` / §27.
+> The first was already the THIRD occurrence of the class the header records for
+> `CHAOS-50`. Collisions 2 and 3 landed on the same day, hours apart, against two
+> different branches.
 >
-> **The rule applied both times, and it is not "last one loses".** The header
+> **The rule applied all three times, and it is not "last one loses".** The header
 > states renumbering is an owner decision *because* "identifiers three merged PRs
 > already reference" would have to be rewritten. That reason is **asymmetric**:
 > the MERGED side is referenced by merged code, gates and register rows, so it
 > keeps the id; the UNMERGED side has every reference inside one branch, where
 > changing them costs nothing. Renumbering the unmerged side is therefore not a
-> unilateral edit of shared history — it is the only moment at which the
-> collision is free to remove, and after merge it would be permanent. Applied to
-> §25 on 2026-09-04 and to §26 on 2026-09-10, with the other side's references
-> deliberately untouched in both passes (`metrics.go` carries one line from §25
-> and one from here).
+> unilateral edit of shared history — it is the only moment at which the collision
+> is free to remove, and after merge it would be permanent. The other side's
+> references were left untouched in every pass, so `metrics.go` now carries one
+> line from §25 and one from here, and `CLAUDE.md` carries §26's and §27's bullets
+> beside this sweep's.
 >
-> **The prevention the header already names is now overdue, and the second
-> collision is the argument for it**: allocate the id in a committed placeholder
-> row at the START of a sweep. Renaming at merge time cannot work, because the id
-> a rename picks is validated against `main` at the instant of the rename and
-> nothing holds it afterwards — which is precisely how the same branch lost the
-> id twice. Three concurrent sweeps in ten days reproduced the fault; catching
-> each one was luck (a merge conflict forced someone to look), not process. Until
-> a placeholder row exists, expect a fourth.
+> **Each of the three merges was resolved by someone who fixed the duplicate
+> SECTION number and left the duplicate ID in place**, which is why the collision
+> survived to recur: a section renumber makes the register read correctly while
+> two sweeps still answer to one name, and the second and third collisions were
+> found only because a later merge conflict forced someone to look again.
+>
+> **The prevention the header has named since `CHAOS-50` is now overdue, and this
+> sweep is the whole argument for it**: allocate the id in a committed placeholder
+> row at the START of a sweep. Renaming at merge time provably cannot work — the
+> id a rename picks is validated against `main` at the instant of the rename and
+> nothing reserves it afterwards, so the rename is itself a race. One branch lost
+> the same id three times in one week; catching each one was luck, not process.
+> **Owner action: add the placeholder-allocation row.** Until it exists, expect a
+> fourth.
 
 ### 28.1 Reachability
 
@@ -3847,7 +3852,7 @@ synchronous path for up to `hostIPCacheStaleMax`, leaving a country-scoped DENY
 rule dark for an **hour** after DNS recovered instead of the 30 s the negative
 TTL promises. Worse, `refreshAsync` SHEDS when the resolver pool is saturated,
 so under sustained load the bypass could persist for the full window. And it was
-a REGRESSION against the pre-CHAOS-59 behaviour, which re-resolved synchronously
+a REGRESSION against the pre-CHAOS-60 behaviour, which re-resolved synchronously
 the moment the negative TTL lapsed.
 
 Fixed by restricting the stale state to `e.ip != nil`. An expired negative is a
@@ -3887,7 +3892,7 @@ against each state it can be in, not only the one that motivated it.
 
 ### 28.7 GEO-1 — a latent process-kill armed by a comment (recorded, not fixed)
 
-Found while sweeping the domain adjacent to CHAOS-59 and **not reachable in the
+Found while sweeping the domain adjacent to CHAOS-60 and **not reachable in the
 current tree**, but recorded because of how it is armed.
 
 `internal/geoip.InitGeoDB` claimed:
