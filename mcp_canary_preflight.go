@@ -437,6 +437,36 @@ func mcpServerPinnedIdentity(serverID string) string {
 	return string(srv.PinnedIdentity)
 }
 
+// mcpCurrentAuthoritativeTarget reads the CURRENT authoritative target for one tool identity —
+// the same registry + catalog fusion the live-trust precheck uses, and the same pointer-published
+// inventory, so it carries the lock profile the §5 audit established and adds no new edge.
+//
+// It deliberately takes NO decision fingerprint and makes NO eligibility judgement. Its one caller
+// is the reviewed-target comparison, which asks "what is this tool NOW?" so it can be held against
+// what the activation was reviewed for. Folding an eligibility check in here would reintroduce the
+// defect that made this path necessary: eligibility is scope- and decision-relative, and a target
+// that moved is exactly the case those relations reject before the question can be asked.
+//
+// false means the tool does not resolve at all (absent from the catalog, or no inventory composed).
+// The caller treats that as "nothing to compare", never as drift.
+func mcpCurrentAuthoritativeTarget(serverID, toolName string) (canary.ReviewedTarget, bool) {
+	if mcpToolTrust == nil {
+		return canary.ReviewedTarget{}, false
+	}
+	ti := mcpToolTrust.loadTarget(serverID, toolName)
+	if !ti.found {
+		return canary.ReviewedTarget{}, false
+	}
+	return canary.ReviewedTarget{
+		Tenant:            ti.target.Tenant,
+		ServerID:          serverID,
+		ToolName:          toolName,
+		Fingerprint:       ti.target.Fingerprint,
+		FingerprintFormat: ti.target.FingerprintFormatVersion,
+		ServerIdentity:    mcpServerPinnedIdentity(serverID),
+	}, true
+}
+
 // reviewedTargetsFromBindings projects the approval bindings the activation preflight just PROVED
 // into the activation's reviewed-target snapshot (§3).
 //

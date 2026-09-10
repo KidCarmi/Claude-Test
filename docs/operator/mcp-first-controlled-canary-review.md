@@ -1788,7 +1788,7 @@ fifteen reasons a GO is forbidden, not the prohibition.
 
    | row | state | where it is proven |
    |---|---|---|
-   | atomic activation binding | COMPLETE | `admitLiveExecution` decides the whole predicate under ONE acquisition of `cr.mu`; `mcp_canary_atomic_binding_test.go` |
+   | atomic activation binding | COMPLETE | `admitLiveExecution` decides the whole predicate under ONE acquisition of `cr.mu`; `mcp_canary_atomic_binding_test.go`. The comparison is ALSO reached on a scope-independent path, because a Canary scope pins the reviewed fingerprint and a fingerprint move therefore removes the request from every scope-gated path — `Deps.CanaryTargetObserved` + `latchReviewedDriftUnderActivation`, proven reachable in `internal/mcp/runtime/canary_reviewed_target_test.go` (Codex P1, PR #1360) |
    | durable reviewed-target binding | COMPLETE | `canaryRuntimeState.ReviewedTargets` (schema 2), canonicalized before persistence; `mcp_canary_reviewed_durable_test.go` |
    | approval-lifetime independence | COMPLETE | drift is decided against the activation's own record, never against an approval; matrix cases 2/4/5 |
    | restart preservation | COMPLETE | restore re-canonicalizes and fails closed; matrix case 7 + the durable suite |

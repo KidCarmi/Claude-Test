@@ -100,6 +100,25 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 		// decision was actually made under. See Deps.CanaryGeneration.
 		genAtResolve := p.deps.canaryGenerationAt(p.capability.String())
 		res := p.executor.Resolve(ei)
+		// Report the tool this request named to the Canary reviewed-target sink, for EVERY
+		// disposition — and this placement, ABOVE the record-only branch, is the whole point.
+		//
+		// A Canary scope pins the reviewed fingerprint in its tool selector, so a tool that moves
+		// F1→F2 puts every later request OUT of scope; resolveEnforcing then routes them to the
+		// shadow or record-only fallback, and the record-only branch below returns without ever
+		// reaching dispatchExecute, the executor, or the activation transaction. Reporting from
+		// any point downstream of this line therefore cannot see the one sequence the reviewed
+		// snapshot exists to catch: the experiment's reviewed target has changed underneath it and
+		// the change is exactly what hides the evidence (Codex P1, PR #1360).
+		//
+		// What is reported is an identity, not a verdict. The root compares the current
+		// authoritative target against the activation's reviewed snapshot under the activation
+		// lock, so a tool this activation was never reviewed for latches nothing.
+		p.deps.noteCanaryTargetObserved(p.capability.String(), CanaryTargetObservation{
+			Generation: genAtResolve,
+			ServerID:   toolServerID(in),
+			ToolName:   toolName(in),
+		})
 		if res.Disposition != rollout.EffectRecordOnly {
 			return p.dispatchExecute(ctx, rb, ei, res, genAtResolve)
 		}

@@ -276,6 +276,11 @@ func assembleGatewayConfig(sc mcpObserveStartupConfig, modes gatewayModes, tlsCf
 		// fail-closed and unchanged; this seam counts it and then takes the whole-Canary latch
 		// where the latch can actually be attributed — see canaryPreAdmissionDrift.
 		CanaryDriftObserved: canaryPreAdmissionDrift,
+		// Scope-independent reviewed-target observation (Codex P1, PR #1360): a fingerprint move
+		// puts the drifted target OUT of the Canary scope, so the scope-gated paths above can no
+		// longer see it. This one is keyed on the tool identity and cannot be filtered out by the
+		// very change it exists to detect.
+		CanaryTargetObserved: canaryReviewedTargetObserved,
 		// Read BEFORE the rollout resolution and compared under the activation lock at latch
 		// time. It narrows which activation an observation may stop; it never proves one.
 		CanaryGeneration: canaryGenerationForCapability,

@@ -13,6 +13,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
 	"github.com/KidCarmi/Culvert/internal/mcp/registry"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
+	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
 
@@ -709,4 +710,214 @@ func TestReviewedBinding_AnUnrecognisedDenialClassFailsClosed(t *testing.T) {
 	if !ok.Admit {
 		t.Fatalf("control: an explicit grant must be admitted, reason=%s", ok.Reason.Code())
 	}
+}
+
+// ── the scope-independent path (Codex P1, PR #1360) ──────────────────────────────────────────
+//
+// The twelve cases above drive the admission gate directly, which proves the COMPARISON. They do
+// not prove it is REACHED, and in the sequence that matters most it was not: a Canary ScopeSpec
+// pins the reviewed fingerprint in its tool selector, so a tool that moves F1→F2 puts every later
+// request out of scope, `resolveEnforcing` routes them to the shadow/record-only fallback, and the
+// activation transaction is never entered. The premise of the experiment is violated and the
+// violation is exactly what hides the evidence.
+//
+// `canaryReviewedTargetObserved` is the path that cannot be hidden that way: it is keyed on the
+// tool IDENTITY, reported for every dispatched request whatever disposition it resolved to (proven
+// reachable in internal/mcp/runtime/canary_reviewed_target_test.go), and it compares against the
+// activation's reviewed snapshot inside the activation lock.
+
+// observeTarget drives the production sink for one tool identity at the activation's generation.
+func (r *reviewedRig) observeTarget(gen uint64) {
+	canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+		Generation: gen, ServerID: r.sid, ToolName: r.tool,
+	})
+}
+
+// THE GATE. The reviewed tool moves; no request ever reaches the admission transaction; the
+// experiment still stops.
+func TestReviewedBinding_ScopeIndependentPathLatchesDriftWithoutAdmission(t *testing.T) {
+	r := newReviewedRig(t)
+	// Control first: while the target is the reviewed one, observing it stops nothing. Without
+	// this, "the drift latched" below could mean the sink latches on everything.
+	r.observeTarget(r.gen)
+	if r.rt.abortedNow(r.capb) {
+		t.Fatal("control: observing the UNCHANGED reviewed target must not stop the Canary")
+	}
+
+	r.moveToF2(t)
+	r.observeTarget(r.gen)
+	if !r.rt.abortedNow(r.capb) {
+		t.Fatal("SECURITY: the reviewed tool moved and the whole Canary must stop — even though no " +
+			"request reached the admission transaction, because a fingerprint move puts every " +
+			"request out of the Canary scope and the scope-gated paths can no longer see it")
+	}
+	if code := r.rt.abortCodeNow(r.capb); code != "tool_fingerprint_drift" {
+		t.Fatalf("first cause = %q, want tool_fingerprint_drift", code)
+	}
+}
+
+// The same path, after the reviewing approval has expired — the full §7 sequence with nothing in
+// the approval store left to consult and nothing in scope to route the request through.
+func TestReviewedBinding_ScopeIndependentPathSurvivesApprovalExpiry(t *testing.T) {
+	r := newReviewedRig(t)
+	expired := r.now.Add(48 * time.Hour)
+	if r.request(r.fp1, expired) {
+		t.Fatal("premise: the approval must have expired")
+	}
+	if r.rt.abortedNow(r.capb) {
+		t.Fatal("premise: expiry alone must not have latched anything")
+	}
+
+	r.moveToF2(t)
+	r.observeTarget(r.gen)
+	if !r.rt.abortedNow(r.capb) {
+		t.Fatal("SECURITY: drift detection must survive BOTH the approval expiring and the target " +
+			"falling out of scope — the two conditions that arrive together in the sequence this " +
+			"whole change exists for")
+	}
+	if code := r.rt.abortCodeNow(r.capb); code != "tool_fingerprint_drift" {
+		t.Fatalf("first cause = %q, want tool_fingerprint_drift", code)
+	}
+}
+
+// A server identity rotation is caught on the same path, and classified as itself.
+func TestReviewedBinding_ScopeIndependentPathLatchesServerIdentityDrift(t *testing.T) {
+	r := newReviewedRig(t)
+	republishWithIdentity(t, r.sid, r.tool, "id-rotated-by-an-attacker", `{"type":"object"}`)
+	r.observeTarget(r.gen)
+	if !r.rt.abortedNow(r.capb) {
+		t.Fatal("SECURITY: a rotated server identity must stop the Canary on this path too")
+	}
+	if code := r.rt.abortCodeNow(r.capb); code != "server_identity_drift" {
+		t.Fatalf("first cause = %q, want server_identity_drift", code)
+	}
+}
+
+// THE COUNTERWEIGHT, and it is the reason this path may fire for every request at all.
+//
+// The sink is called for tools the experiment never reviewed. Latching for one of those would let
+// any unrelated catalog change stop the Canary — the direction a safety control must never err in,
+// and the exact hazard the previous design avoided only by the `canaryScoped` proxy that a
+// fingerprint move defeats. The reviewed set decides it EXACTLY: an unreviewed key is out of scope,
+// request-scoped, and latches nothing.
+func TestReviewedBinding_ScopeIndependentPathIgnoresUnreviewedTools(t *testing.T) {
+	r := newReviewedRig(t)
+
+	// A tool that RESOLVES but was never reviewed is the case that matters, and it is the one an
+	// earlier version of this test missed: every identity it named was absent from the catalog, so
+	// the sink returned "nothing to compare" before the reviewed comparison was ever reached and
+	// the gate proved nothing about it. The inventory therefore gains a second, real tool on the
+	// same server, with the reviewed tool republished UNCHANGED beside it.
+	const otherTool = "sibling"
+	publishTwoToolInventory(t, r.sid, r.tool, otherTool)
+	if _, ok := mcpCurrentAuthoritativeTarget(r.sid, otherTool); !ok {
+		t.Fatal("premise: the sibling tool must resolve to a real authoritative target")
+	}
+	if cur, ok := mcpCurrentAuthoritativeTarget(r.sid, r.tool); !ok || cur.Fingerprint != mustDigest(t, r.fp1) {
+		t.Fatal("premise: republishing must have left the REVIEWED tool exactly as reviewed")
+	}
+
+	for _, tc := range []struct {
+		name, sid, tool string
+		resolves        bool
+	}{
+		{"a resolvable sibling tool on the reviewed server", r.sid, otherTool, true},
+		{"a tool that does not resolve at all", r.sid, "no-such-tool", false},
+		{"another server", "some-other-server", r.tool, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := mcpCurrentAuthoritativeTarget(tc.sid, tc.tool); ok != tc.resolves {
+				t.Fatalf("premise: resolvability = %v, want %v", !tc.resolves, tc.resolves)
+			}
+			canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+				Generation: r.gen, ServerID: tc.sid, ToolName: tc.tool,
+			})
+			if r.rt.abortedNow(r.capb) {
+				t.Fatalf("SECURITY: a catalog observation for a tool this activation never reviewed "+
+					"must not stop it (abort code %q)", r.rt.abortCodeNow(r.capb))
+			}
+			// And it must produce NO DRIFT VERDICT at all, not merely fail to latch. The abort
+			// taxonomy would refuse to latch an unrecognised code anyway, so asserting only on
+			// abortedNow lets this path quietly report drift for a tool nobody reviewed — bounded
+			// evidence an operator would then have to explain. The verdict itself is the contract.
+			latch := r.rt.latchReviewedDriftUnderActivation(r.capb, r.gen, r.now,
+				func() (canary.ReviewedTarget, bool) {
+					return mcpCurrentAuthoritativeTarget(tc.sid, tc.tool)
+				})
+			if latch.DriftCode != "" || latch.Latched {
+				t.Fatalf("SECURITY: an unreviewed tool produced drift verdict %q (latched=%v) — an "+
+					"activation must report drift only about the targets it was reviewed for",
+					latch.DriftCode, latch.Latched)
+			}
+		})
+	}
+	// And the experiment is still genuinely alive afterwards.
+	if !r.request(r.fp1, r.now) {
+		t.Fatal("the Canary must still admit its own reviewed target")
+	}
+}
+
+// publishTwoToolInventory republishes the server carrying the reviewed tool UNCHANGED plus one
+// additional real tool, so a test can observe an identity that resolves but was never reviewed.
+func publishTwoToolInventory(t *testing.T, sid, reviewedTool, otherTool string) {
+	t.Helper()
+	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + ttTenant + `","servers":[
+	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"id","enabled":true,
+	   "tools":[{"name":"` + reviewedTool + `","input_schema":{"type":"object"}},
+	            {"name":"` + otherTool + `","input_schema":{"type":"object","properties":{"z":{"type":"string"}}}}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("decode inventory: %v", err)
+	}
+	reg, cat, err := seedInventory(doc, limits.DefaultCatalog())
+	if err != nil {
+		t.Fatalf("seed inventory: %v", err)
+	}
+	publishMCPInventory(mcpInvLoaded, "", reg, cat)
+}
+
+// The generation rules are the same as every other latch on this runtime, and they are what stop a
+// stale observation from reaching an activation it was never made under.
+func TestReviewedBinding_ScopeIndependentPathHonoursGenerationRules(t *testing.T) {
+	t.Run("generation zero latches nothing", func(t *testing.T) {
+		r := newReviewedRig(t)
+		r.moveToF2(t)
+		r.observeTarget(0)
+		if r.rt.abortedNow(r.capb) {
+			t.Fatal("SECURITY: an observation naming no activation must never be read as 'whatever " +
+				"is current' — that wildcard belongs only to the unbound entry point")
+		}
+	})
+	t.Run("a superseded generation latches nothing", func(t *testing.T) {
+		r := newReviewedRig(t)
+		stale := r.gen
+		if err := r.rt.demoteCanary(r.capb); err != nil {
+			t.Fatalf("demote: %v", err)
+		}
+		fp2 := r.moveToF2(t)
+		genNew := armReviewedActivation(t, r.rt, r.capb, r.sid, r.tool, fp2)
+		if genNew == stale {
+			t.Fatal("premise: the re-activation must have bumped the generation")
+		}
+		// The stale observation names the OLD activation; the one in force was explicitly
+		// reviewed against F2 and is healthy.
+		r.observeTarget(stale)
+		if r.rt.abortedNow(r.capb) {
+			t.Fatal("SECURITY: an observation made under a superseded activation must not stop the " +
+				"one that replaced it — its reviewed set may legitimately differ")
+		}
+	})
+	t.Run("a demoted runtime latches nothing", func(t *testing.T) {
+		r := newReviewedRig(t)
+		gen := r.gen
+		if err := r.rt.demoteCanary(r.capb); err != nil {
+			t.Fatalf("demote: %v", err)
+		}
+		r.moveToF2(t)
+		r.observeTarget(gen)
+		if r.rt.abortedNow(r.capb) {
+			t.Fatal("SECURITY: with no live activation there is nothing to stop, and nothing an " +
+				"observation may be charged to")
+		}
+	})
 }

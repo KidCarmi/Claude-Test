@@ -140,7 +140,22 @@ the NEW fingerprint could make a moved target look authorized to a generation th
 reviewed for it. The snapshot is immutable for the life of its generation (a same-mode update that
 would rebind it is refused; changing it requires demote → re-activate), an activation that cannot
 supply one fails CLOSED, and a durable record that cannot prove what it was reviewed for does not
-restore executable authority:
+restore executable authority.
+
+**And the comparison runs on a path the drift cannot hide from.** A Canary `ScopeSpec` pins the
+reviewed FINGERPRINT in its tool selector, so the moment a tool moves F1→F2 every request naming it
+is out of scope, `resolveEnforcing` routes it to the shadow/record-only fallback, and the admission
+transaction is never entered — the experiment's premise is violated and the violation is exactly
+what filters out the evidence (Codex P1, PR #1360). So a THIRD latch site exists, keyed on the tool
+IDENTITY rather than on scope membership or fingerprint agreement: the runtime reports, for every
+dispatched request that names a tool and whatever disposition it resolved to, WHICH tool it named
+(`Deps.CanaryTargetObserved`, emitted above the record-only branch), and the root compares the
+current authoritative target against the reviewed snapshot inside the activation lock. A tool the
+activation was never reviewed for is request-scoped and latches nothing — which is both what makes
+reporting every request safe and how the round-15 rule below is now enforced EXACTLY, rather than
+through the `canaryScoped` proxy that a fingerprint move defeats.
+
+The three sites:
 
 - the ATOMIC admission transaction (`admitLiveExecution`), which evaluates live trust in full —
   including the approval, so a revocation racing the lock cannot be missed — and latches an

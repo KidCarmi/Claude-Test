@@ -405,6 +405,88 @@ func (rt *canaryRuntime) latchDriftUnderActivation(capb rollout.Capability, want
 	}
 }
 
+// latchReviewedDriftUnderActivation compares the CURRENT authoritative target for one tool
+// identity against the activation's immutable reviewed-target snapshot, under the activation lock,
+// and latches the whole Canary when the reviewed target has moved.
+//
+// It exists because the reviewed comparison inside admitLiveExecution is, by itself, unreachable in
+// the sequence that matters most. A Canary ScopeSpec pins the reviewed FINGERPRINT in its tool
+// selector, so the moment the tool moves F1→F2 every request naming it is out of scope,
+// resolveEnforcing routes it to the shadow/record-only fallback, and the admission transaction is
+// never entered. The premise of the experiment has been violated and the violation is precisely
+// what filters out the evidence (Codex P1, PR #1360). This path is keyed on the tool IDENTITY
+// (tenant, server, tool) rather than on scope membership, so a fingerprint move cannot hide it.
+//
+// Everything the latch rests on is read HERE, inside the lock: the caller supplies an identity and
+// a generation, never a verdict. The generation rules are the same as latchDriftUnderActivation's
+// and are load-bearing for the same reasons — a zero latches nothing, the publication gap latches
+// nothing, and an activation that moved under the observation latches nothing.
+//
+// A tool this activation was never reviewed for returns ReviewedOutOfScope and latches nothing.
+// That is what makes it safe to call for EVERY request: a catalog change to an unrelated tool
+// cannot stop an experiment that never reviewed it (the round-15 rule), and unlike the
+// `canaryScoped` proxy that rule used to be enforced with, the reviewed set decides it exactly.
+func (rt *canaryRuntime) latchReviewedDriftUnderActivation(capb rollout.Capability, wantGen uint64, now time.Time, current func() (canary.ReviewedTarget, bool)) canaryDriftLatch {
+	if wantGen == 0 {
+		return canaryDriftLatch{}
+	}
+	cr := rt.capRuntime(capb)
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if !cr.active || cr.aborter == nil || cr.generation == 0 {
+		return canaryDriftLatch{}
+	}
+	if cr.generation != wantGen {
+		return canaryDriftLatch{Active: true, Generation: cr.generation}
+	}
+	gen := cr.generation
+	if current == nil {
+		return canaryDriftLatch{Active: true, Generation: gen}
+	}
+	cur, ok := current()
+	if !ok {
+		// The tool no longer resolves to an authoritative target at all. That is NOT read as drift
+		// here: a tool absent from the catalog is refused per-request upstream of this point, and
+		// a transient inventory gap must not stop the experiment on evidence this path cannot
+		// distinguish from one. Fail-safe in the direction that costs availability, not safety.
+		return canaryDriftLatch{Active: true, Generation: gen}
+	}
+	switch v := cr.reviewed.Compare(cur); v {
+	case canary.ReviewedMatches, canary.ReviewedOutOfScope:
+		return canaryDriftLatch{Active: true, Generation: gen}
+	default:
+		res := rt.tripLockedForGeneration(cr, capb, string(v), gen, now)
+		return canaryDriftLatch{
+			Active: true, Generation: gen, DriftCode: string(v),
+			Latched: res == canary.TripCanaryLatched,
+		}
+	}
+}
+
+// canaryReviewedTargetObserved is the composition-root sink for the reviewed-target observation the
+// runtime makes for every dispatched request that names a tool, whatever disposition it resolved to.
+//
+// It is deliberately CHEAP AND SILENT on the overwhelmingly common path: a tool outside the
+// activation's reviewed set takes the activation lock once, compares, and returns. Only a reviewed
+// target that has actually moved does anything, and what it does is stop the experiment.
+func canaryReviewedTargetObserved(capability string, obs mcpruntime.CanaryTargetObservation) {
+	capb, err := rollout.ParseCapability(capability)
+	if err != nil {
+		return
+	}
+	latch := globalCanaryRuntime.latchReviewedDriftUnderActivation(capb, obs.Generation, time.Now(),
+		func() (canary.ReviewedTarget, bool) {
+			// Read inside the lock, from the same pointer-published inventory every other probe on
+			// this path uses (§5: local control-plane state only, no durable store, no I/O).
+			return mcpCurrentAuthoritativeTarget(obs.ServerID, obs.ToolName)
+		})
+	if latch.DriftCode != "" {
+		// Same bounded evidence vocabulary as the pre-admission path, so an operator sees one
+		// dialect for one fact however the drift was discovered.
+		noteCanaryPreAdmissionDrift(capability, latch.DriftCode)
+	}
+}
+
 // canaryPreAdmissionDrift is the composition-root sink for an authoritative drift the runtime
 // pipeline observed BEFORE the executor was reached. It does two separable things, in this order:
 //
