@@ -53,13 +53,23 @@ func newAuxGate(s *auxSeams) *mcpLiveSideEffectGate {
 		},
 		admitOpen: func() bool { return s.admitOpen },
 		readFirst: func(policy.OperationClass) bool { s.readCalls++; return true },
-		trustOK: func(string, string, string, string, time.Time) bool {
+		// The trust and activation seams are wired ONLY so the tests below can prove
+		// AdmitAuxiliary never reaches them. Main's gate splits trust revalidation into a
+		// lock-free precheck plus a blocking approval read and folds reservation into the
+		// activation-bound transaction, so the counters moved with the seams; the assertion
+		// they support ("auxiliary traffic binds no tool and takes no budget slot") is
+		// unchanged.
+		trustPrecheck: func(string, string, string, string) liveTrustPrecheck {
 			s.trustCalls++
-			return true
+			return liveTrustPrecheck{Eligible: true}
 		},
-		reserve: func(time.Time, canary.ExecutionIdentity) (canary.BudgetOutcome, uint64) {
+		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
+			s.trustCalls++
+			return true, ""
+		},
+		admitUnderActivation: func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 			s.resCalls++
-			return canary.BudgetGranted, 7
+			return canaryAdmission{Active: true, Generation: 7, Trusted: true}
 		},
 		releaseBudget: func(uint64) { s.relBudget++ },
 	}
