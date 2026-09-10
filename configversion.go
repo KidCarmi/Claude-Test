@@ -25,14 +25,17 @@ import (
 
 	"github.com/KidCarmi/Culvert/internal/configver"
 	"github.com/KidCarmi/Culvert/internal/pac"
+	"github.com/KidCarmi/Culvert/internal/urlcat"
 )
 
 // ConfigVersion is metadata for a stored config snapshot.
 type ConfigVersion = configver.Meta
 
-// configVersions is the process-wide snapshot store. Tests redirect it via
-// SetDirForTest/SetSeqForTest (production code never does).
-var configVersions = configver.New("/data/config_versions", 0)
+// configVersions is the process-wide snapshot store. It is re-bound to the
+// effective persisted-state root by rebindDataDirPaths (CULVERT_DATA_DIR)
+// before anything reads it; tests redirect it via SetDirForTest/
+// SetSeqForTest or swap the variable.
+var configVersions = configver.New(defaultDataDir+"/config_versions", 0)
 
 func initConfigVersioning() {
 	configVersions.Init()
@@ -45,7 +48,7 @@ func captureConfigBackup() *configBackup {
 	pc := pacStore.Get()
 	profCfg := pacProfiles.Get() // single Get: a torn two-call capture could carry dangling pool refs
 	return &configBackup{
-		Version:             1,
+		Version:             configBackupVersion,
 		ExportedAt:          time.Now().UTC().Format(time.RFC3339),
 		BlocklistMode:       bl.Mode(),
 		Blocklist:           bl.List(),
@@ -173,18 +176,47 @@ func saveConfigVersion(actor, action string) {
 // persist the commit comment into the config-version timeline ("why this
 // change"), so it survives alongside the rollback snapshot.
 func saveConfigVersionNote(actor, action, note string) {
+	_ = saveConfigVersionNoteResult(actor, action, note)
+}
+
+// errConfigVersionRefused marks a capture refused by a documented gate (the
+// rewrite management-identity degradation), as opposed to a failed write.
+var errConfigVersionRefused = errors.New("config version capture refused")
+
+// saveConfigVersionNoteResult is the error-returning core of
+// saveConfigVersionNote (2F-B correction round 2): callers that track the
+// capture as a REQUIRED effect (the PAC lifecycle's post-commit progress)
+// learn whether a version was actually written, instead of assuming it. The
+// logging and every gate are unchanged; the compatibility wrapper above keeps
+// every best-effort caller as it was.
+func saveConfigVersionNoteResult(actor, action, note string) error {
 	saveConfigVersionMu.Lock()
 	defer saveConfigVersionMu.Unlock()
+
+	// While the rewrite management-identity degradation is latched,
+	// captureConfigBackup would record the KNOWN-ephemeral StableIDs into a
+	// durable artifact a later rollback treats as authoritative (valid UUIDs
+	// pass the rollback identity gate and install through
+	// installRewriteRulesDurable). The triggering mutation itself has already
+	// completed and stays best-effort-complete; only the version capture is
+	// refused, with named operator evidence.
+	if d := rewriteIdentityDegraded(); d != nil {
+		logger.Printf("ConfigVersion: capture refused — rewrite identity non-durable (%s); actor=%q action=%q",
+			d.reason, sanitizeLog(actor), sanitizeLog(action))
+		return fmt.Errorf("%w: rewrite identity non-durable (%s)", errConfigVersionRefused, d.reason)
+	}
 
 	snap := captureConfigBackup()
 	raw, err := json.Marshal(snap)
 	if err != nil {
 		logger.Printf("ConfigVersion: marshal error: %v", err)
-		return
+		return fmt.Errorf("config version marshal: %w", err)
 	}
 	if _, err := configVersions.SaveWithNote(actor, action, snap.ExportedAt, note, raw); err != nil {
 		logger.Printf("ConfigVersion: write error: %v", err)
+		return fmt.Errorf("config version write: %w", err)
 	}
+	return nil
 }
 
 // ── API Handlers ───────────────────────────────────────────────────────────
@@ -249,6 +281,21 @@ func rollbackConfigVersion(w http.ResponseWriter, r *http.Request) {
 	warnings := validateConfigBackup(&target)
 
 	if req.DryRun {
+		// While the rewrite management-identity degradation is latched, the
+		// preview would diff the target against captureConfigBackup()'s live
+		// rewriter.List() — and diffRewriteRules is identity-aware, so the
+		// KNOWN-ephemeral StableIDs would ride out in its added/removed/
+		// changed arrays through a healthy 200. Answer the ONE structured
+		// rewrite-identity 503 instead (authorization already happened in
+		// apiConfigVersions); never blank IDs, substitute process-local
+		// values, or emit a misleading partial diff. The REAL rollback below
+		// stays available: it applies a durable historical artifact (a
+		// legitimate recovery door) and its response carries no live-identity
+		// diff.
+		if d := rewriteIdentityDegraded(); d != nil {
+			writeRewriteIdentityDegraded(w, d)
+			return
+		}
 		// Compare against current config for a preview diff.
 		current := captureConfigBackup()
 		changes := diffConfigs(current, &target)
@@ -263,6 +310,40 @@ func rollbackConfigVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// URL-category hard gate (Blocker C): the stored version's taxonomy must
+	// satisfy the canonical per-category host cap BEFORE anything applies —
+	// the WHOLE rollback is refused (400, nothing mutated), never truncated
+	// and never a partial taxonomy. A stored version can only carry an
+	// over-cap category if it predates the cap (or was created through a
+	// pre-correction bulk path); restoring it would have a runtime mutation
+	// re-create what startup Load merely grandfathers. Remedy: split the
+	// category, then re-capture.
+	if err := urlcat.ValidateEntries(target.URLCategories); err != nil {
+		http.Error(w, "rollback refused: "+sanitizeLog(err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	// Bulk candidate reference integrity (§17): construct the candidate this
+	// rollback would restore — per-field nil-skip semantics, a nil section
+	// keeps the live objects — and validate its whole object graph BEFORE any
+	// apply. A dangling reference refuses the ENTIRE rollback (truthful 400,
+	// nothing applied): a historical snapshot capturing rules whose referenced
+	// group/profile/category section is absent from that version would
+	// otherwise restore DENY/DROP rules that silently stop matching.
+	if err := validateRestoredCandidateRefs(&target); err != nil {
+		http.Error(w, "rollback refused, dangling object reference: "+sanitizeLog(err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	// Rewrite identity uniqueness (2D-C §22/§36): a historical candidate
+	// carrying duplicate stable rewrite identities is corrupt — refuse the
+	// WHOLE rollback before any slice applies rather than silently
+	// re-identifying one of the claimants.
+	if err := validateRewriteStableIDs(target.RewriteRules); err != nil {
+		http.Error(w, "rollback refused: "+sanitizeLog(err.Error()), http.StatusBadRequest)
+		return
+	}
+
 	// CHAOS-27 / F-12: the apply is unconditional, but a persistence failure
 	// during it is no longer swallowed. The running config IS rolled back
 	// either way; what changes is that the operator is told when the result
@@ -270,17 +351,16 @@ func rollbackConfigVersion(w http.ResponseWriter, r *http.Request) {
 	// apply that silently reverts on the next restart.
 	persistErr := applyConfigBackup(&target)
 
-	// Feed scalars persist ONLY via admin_settings.json (SaveAdminSettings) —
-	// unlike the versioned stores (blocklist/overrides) that persist themselves
-	// inside applyConfigBackup. A feed-carrying rollback must therefore save, else
-	// a restart reloads the pre-rollback values, silently undoing this slice of the
-	// rollback (Codex P2). Rollback runs on an authoritative CP/standalone node, so
-	// admin_settings.json IS the source of truth here (unlike a follower DP).
-	if target.SaaSFeedProtocol != "" {
-		if err := SaveAdminSettings(); err != nil {
-			logger.Printf("ConfigRollback: SaaS feed persist failed: %v", err)
-		}
-	}
+	// Feed scalars persist ONLY via admin_settings.json — and since the
+	// Blocker E writer-domain correction the feed slice of applyConfigBackup
+	// installs through installSaaSFeedDurable, which persists the target
+	// INSIDE the same adminSettingsMu transaction that publishes it to the
+	// holder (rollback runs on an authoritative CP/standalone node, so
+	// admin_settings.json IS the source of truth here — unlike a follower
+	// DP). The old post-apply SaveAdminSettings call here was the unlocked
+	// second half of that write and is gone: a persist failure now means the
+	// feed target was never applied at all, keeping runtime and disk in
+	// agreement (the original Codex P2 durability concern stays closed).
 
 	actor := sessionAdmin(r)
 	auditDetail := fmt.Sprintf("rolled back to version %d (from %s by %s)",
@@ -369,9 +449,13 @@ func rollbackConfigVersion(w http.ResponseWriter, r *http.Request) {
 // Whether rollback SHOULD persist these (by extending the apply path to
 // admin-settings durability) is an owner decision recorded as CHAOS-46, not a
 // change to make silently inside an observability fix.
+// rewrite_rules left this list in the 2D-C final correction (§17): the
+// rollback rewrite slice installs through installRewriteRulesDurable (the
+// AdminSettings owner, persist-before-publish), so a successful rewrite
+// rollback DOES survive restart — reporting it runtime-only was stale
+// operator information.
 var rollbackRuntimeOnlySurfaces = []string{
 	"default_action",
-	"rewrite_rules",
 	"ip_filter_mode",
 	"ip_list",
 	"rate_limit_rpm",
@@ -455,6 +539,13 @@ func restoreBlocklistFromBackup(b *configBackup) {
 // scoped collector rather than from return values (see storage_health.go for
 // the scope's time-window semantics).
 func applyConfigBackup(b *configBackup) error {
+	// Blocker B (exclusive side): a rollback both REMOVES shared objects and
+	// INSTALLS references wholesale, so it must not interleave with either
+	// side of the reference-integrity gate. Acquired OUTERMOST, before
+	// configRollbackMu (gate → configRollbackMu → adminSettingsMu — acyclic;
+	// nothing under those locks acquires the gate).
+	refScanDeleteLock()
+	defer refScanDeleteUnlock()
 	configRollbackMu.Lock()
 	defer configRollbackMu.Unlock()
 	finishScope := beginStorageWriteScope()
@@ -543,8 +634,19 @@ func applyConfigBackup(b *configBackup) error {
 	policyStore.Save()
 	setDefaultPolicyAction(b.DefaultAction)
 
-	// Rewrite rules: replace all.
-	rewriter.SetRules(b.RewriteRules)
+	// Rewrite rules: replace all, DURABLY through the AdminSettings owner
+	// (2D-C §24/§38 — the Blocker-E feed precedent): the restored set persists
+	// INSIDE the same adminSettingsMu transaction that publishes it, so a
+	// rollback's rewrite slice can no longer be runtime-only and silently
+	// revert on restart. Restored stable IDs are preserved verbatim (a config
+	// version must never create fresh rewrite identities merely because it was
+	// restored); pre-2D-C captured versions without stable IDs are backfilled
+	// at publication — the documented one-time legacy migration. A persist
+	// failure means the slice was never applied (durable-or-nothing) and is
+	// collected by the storage-write scope.
+	if err := installRewriteRulesDurable(b.RewriteRules); err != nil {
+		logger.Printf("ConfigVersion: rewrite slice not applied (persist failed): %v", err)
+	}
 
 	applyScanStoresFromBackup(b)
 
@@ -567,7 +669,7 @@ func applyConfigBackup(b *configBackup) error {
 		rl.ReplaceExemptions(b.RateLimitExempt)
 	}
 
-	applyPACFromBackup(b)
+	pacErr := applyPACFromBackup(b)
 
 	// Close the scope here (not only via the defer) so its result is available
 	// to the caller. finishScope is once-guarded; the deferred call above is
@@ -575,7 +677,11 @@ func applyConfigBackup(b *configBackup) error {
 	if failed := finishScope(); len(failed) > 0 {
 		return &configPersistError{Files: failed}
 	}
-	return nil
+	// 2F-E correction round 7: a PAC profiles slice that was NOT applied
+	// because a pending lifecycle intent of a profile it changes could not
+	// be settled durably is reported to the caller (audit + response), the
+	// same way a persistence failure is — the rollback is otherwise applied.
+	return pacErr
 }
 
 // configPersistError reports the durable writes that failed while a config
@@ -666,7 +772,7 @@ func applyScanStoresFromBackup(b *configBackup) {
 // applyPACFromBackup restores PAC configuration and the PAC profile/pool set
 // from a snapshot. Split out of applyConfigBackup for cyclop only — behaviour
 // and ordering are unchanged.
-func applyPACFromBackup(b *configBackup) {
+func applyPACFromBackup(b *configBackup) error {
 	// PAC configuration: replace entirely from snapshot.
 	_ = pacStore.Set(PACConfig{
 		ProxyHost:  b.PACProxyHost,
@@ -677,32 +783,67 @@ func applyPACFromBackup(b *configBackup) {
 	// PAC profiles/pools (PAC initiative PR 2): nil → snapshot predates the
 	// feature, skip; [] → explicit wipe; populated → wholesale replace.
 	// Tolerant Set — rollback must never reject historical data.
+	// 2F-E correction round 4: inside the shared PAC writer transaction
+	// boundary (pacProfilesWriterLock — lock order gate → configRollbackMu →
+	// pacProfilesAPIMu), so a lifecycle publish parked between its intent and
+	// its commit can neither interleave with nor overwrite the restore.
+	// 2F-E correction round 7: a pending lifecycle intent of every profile
+	// the rollback CHANGES is settled durably before the write
+	// (pacSettlePendingBeforeWrite); if that cannot be persisted the PAC
+	// profiles slice is deferred (not applied) and reported.
+	var pacErr error
 	if b.PACProfiles != nil || b.PACPools != nil {
-		cur := pacProfiles.Get()
-		if b.PACProfiles != nil {
-			cur.Profiles = b.PACProfiles
-		}
-		if b.PACPools != nil {
-			cur.Pools = b.PACPools
-		}
-		_ = pacProfiles.Set(cur)
+		pacErr = applyPACProfilesFromBackup(b)
 	}
 
 	// SaaS feed config (F3a-2): applied only when the snapshot carries it
 	// (SaaSFeedProtocol set — capture always sets it, a pre-extension snapshot does
 	// not), then unconditionally within that gate (like DefaultAction). This
 	// restores the exact captured feed configuration WITHOUT touching the
-	// node-local floor/active-generation state (those are off every surface). It
-	// publishes to the durable holder only — no downloader/legacy-syncer call.
+	// node-local floor/active-generation state (those are off every surface).
+	// Blocker E: the install goes through installSaaSFeedDurable — read,
+	// durable AdminSettings write, and holder publish in ONE adminSettingsMu
+	// transaction — so rollback serializes against the fenced settings PUT
+	// (lock order configRollbackMu → adminSettingsMu, acyclic). A persist
+	// failure means the target was never applied; the failed file is also
+	// captured by the surrounding storage-write scope. No downloader/legacy-
+	// syncer call.
 	if b.SaaSFeedProtocol != "" {
-		d := getSaaSFeedDurable()
-		d.Managed = b.SaaSFeedManaged
-		d.Enabled = b.SaaSFeedEnabled
-		d.URL = b.SaaSFeedURL
-		d.Protocol = b.SaaSFeedProtocol
-		d.RefreshSeconds = b.SaaSFeedRefreshSeconds
-		setSaaSFeedDurable(d)
+		if err := installSaaSFeedDurable(func(cur saasFeedDurable) saasFeedDurable {
+			cur.Managed = b.SaaSFeedManaged
+			cur.Enabled = b.SaaSFeedEnabled
+			cur.URL = b.SaaSFeedURL
+			cur.Protocol = b.SaaSFeedProtocol
+			cur.RefreshSeconds = b.SaaSFeedRefreshSeconds
+			return cur
+		}); err != nil {
+			logger.Printf("ConfigRollback: saas feed settings persist failed, target never applied: %v", err)
+		}
 	}
+	return pacErr
+}
+
+// applyPACProfilesFromBackup is the rollback's PAC profiles/pools write
+// inside the shared writer boundary (the mutex is released before the
+// SaaS-feed slice — lock order configRollbackMu → pacProfilesAPIMu, and
+// adminSettingsMu is never taken under it).
+func applyPACProfilesFromBackup(b *configBackup) error {
+	unlock := pacProfilesWriterLock()
+	defer unlock()
+	before := pacProfiles.Get()
+	cur := pacProfiles.Get()
+	if b.PACProfiles != nil {
+		cur.Profiles = b.PACProfiles
+	}
+	if b.PACPools != nil {
+		cur.Pools = b.PACPools
+	}
+	if err := pacSettlePendingBeforeWrite(before, cur); err != nil {
+		logger.Printf("ConfigRollback: PAC profiles slice not applied: %v", err)
+		return fmt.Errorf("PAC profiles not applied: %w", err)
+	}
+	_ = pacProfiles.Set(cur)
+	return nil
 }
 
 // configChange is a single field-level difference between two config versions.
@@ -960,34 +1101,97 @@ func diffPolicyRules(a, b []PolicyRule, out *[]configChange) {
 	}
 }
 
-// diffRewriteRules compares rewrite rules by host.
+// diffRewriteRules compares rewrite rules IDENTITY-aware (2D-C final §18):
+// with StableID durable it detects add/remove by identity, operation/host
+// changes on the SAME identity, and pure ordering changes (evaluation order
+// is semantics). Legacy history entries without StableIDs get a CONSERVATIVE
+// fallback — any difference in the ordered (host, operations) sequence is
+// reported as changed, so a same-host operation-only edit can never read as
+// "no change". Backend truth only; the change entry shape stays the existing
+// {Field, From, To} envelope.
 func diffRewriteRules(a, b []RewriteRule, out *[]configChange) {
-	setA := make(map[string]struct{}, len(a))
-	for i := range a {
-		setA[a[i].Host] = struct{}{}
+	mapA, okA := rewriteRuleStableIDs(a)
+	mapB, okB := rewriteRuleStableIDs(b)
+	if !okA || !okB {
+		diffRewriteRulesLegacy(a, b, out)
+		return
 	}
-	setB := make(map[string]struct{}, len(b))
+
+	var added, removed, changed []string
 	for i := range b {
-		setB[b[i].Host] = struct{}{}
-	}
-	var added, removed []string
-	for i := range b {
-		if _, ok := setA[b[i].Host]; !ok {
-			added = append(added, b[i].Host)
+		id := b[i].StableID
+		ai, ok := mapA[id]
+		switch {
+		case !ok:
+			added = append(added, id)
+		case a[ai].Host != b[i].Host || !rewriteRuleContentEqual(a[ai], b[i]):
+			changed = append(changed, id)
 		}
 	}
 	for i := range a {
-		if _, ok := setB[a[i].Host]; !ok {
-			removed = append(removed, a[i].Host)
+		if _, ok := mapB[a[i].StableID]; !ok {
+			removed = append(removed, a[i].StableID)
 		}
 	}
-	if len(added) > 0 || len(removed) > 0 {
+	reordered := len(added) == 0 && len(removed) == 0 && rewriteRulesReordered(a, b)
+	if len(added) > 0 || len(removed) > 0 || len(changed) > 0 || reordered {
 		*out = append(*out, configChange{
 			Field: "rewrite_rules",
 			From:  map[string]any{"count": len(a), "removed": removed},
-			To:    map[string]any{"count": len(b), "added": added},
+			To:    map[string]any{"count": len(b), "added": added, "changed": changed, "reordered": reordered},
 		})
 	}
+}
+
+// rewriteRuleStableIDs indexes rules by StableID. ok is false when any rule
+// lacks an identity or two rules share one — the caller then falls back to
+// the conservative ordered comparison.
+func rewriteRuleStableIDs(rules []RewriteRule) (map[string]int, bool) {
+	m := make(map[string]int, len(rules))
+	for i := range rules {
+		if rules[i].StableID == "" {
+			return nil, false
+		}
+		m[rules[i].StableID] = i
+	}
+	return m, len(m) == len(rules) // duplicates ⇒ fall back conservatively
+}
+
+// diffRewriteRulesLegacy is the legacy/partial-identity path of
+// diffRewriteRules: a conservative ordered content comparison that never
+// claims "no change" when the actual rewrite set changed.
+func diffRewriteRulesLegacy(a, b []RewriteRule, out *[]configChange) {
+	same := len(a) == len(b)
+	if same {
+		for i := range a {
+			if a[i].Host != b[i].Host || !rewriteRuleContentEqual(a[i], b[i]) {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		return
+	}
+	*out = append(*out, configChange{
+		Field: "rewrite_rules",
+		From:  map[string]any{"count": len(a)},
+		To:    map[string]any{"count": len(b), "note": "rewrite set changed (legacy entries without stable identity — content compared conservatively)"},
+	})
+}
+
+// rewriteRulesReordered reports whether two same-membership rule lists differ
+// only in order (evaluation order is semantics).
+func rewriteRulesReordered(a, b []RewriteRule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].StableID != b[i].StableID {
+			return true
+		}
+	}
+	return false
 }
 
 // diffPACObjects is the shared ID-keyed differ for PAC profiles and pools

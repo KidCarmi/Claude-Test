@@ -14,8 +14,23 @@ import { AuthGate } from "../features/auth/AuthGate";
 import { OverviewPage } from "../features/overview/OverviewPage";
 import { TrafficPage } from "../features/monitor/TrafficPage";
 import { AuditPage } from "../features/monitor/AuditPage";
+import { HistoryPage } from "../features/monitor/HistoryPage";
 import { DiagnosticsPage } from "../features/diagnostics/DiagnosticsPage";
 import { GovernancePage } from "../features/governance/GovernancePage";
+import { AccessRulesPage } from "../features/policy/AccessRulesPage";
+import { AuthRulesPage } from "../features/policy/AuthRulesPage";
+import { TesterPage } from "../features/policy/TesterPage";
+import { PolicyLearningPage } from "../features/learning/PolicyLearningPage";
+import { HeaderRewritePage } from "../features/policy/HeaderRewritePage";
+import { CategoryGroupsPage } from "../features/objects/CategoryGroupsPage";
+import { UrlCategoriesPage } from "../features/objects/UrlCategoriesPage";
+import { DecryptionProfilesPage } from "../features/objects/DecryptionProfilesPage";
+import { FileProfilesPage } from "../features/objects/FileProfilesPage";
+import { ContentSecurityPage } from "../features/security/ContentSecurityPage";
+import { DecryptionPage } from "../features/security/DecryptionPage";
+import { CDRPage } from "../features/security/CDRPage";
+import { PACPage } from "../features/network/pac/PACPage";
+import { UpstreamPage } from "../features/network/upstream/UpstreamPage";
 
 function NotFoundPage(): JSX.Element {
   return (
@@ -39,6 +54,54 @@ export function createAppRouter(): ReturnType<typeof createBrowserRouter> {
           { index: true, element: <OverviewPage /> },
           { path: "monitor/traffic", element: <TrafficPage /> },
           { path: "monitor/audit", element: <AuditPage /> },
+          { path: "monitor/history", element: <HistoryPage /> },
+          { path: "policies/access-rules", element: <AccessRulesPage /> },
+          {
+            path: "policies/authentication-rules",
+            element: <AuthRulesPage />,
+          },
+          { path: "policies/tester", element: <TesterPage /> },
+          {
+            path: "policies/header-rewrite",
+            element: <HeaderRewritePage />,
+          },
+          {
+            path: "objects/url-categories",
+            element: <UrlCategoriesPage />,
+          },
+          {
+            path: "objects/category-groups",
+            element: <CategoryGroupsPage />,
+          },
+          {
+            path: "objects/decryption-profiles",
+            element: <DecryptionProfilesPage />,
+          },
+          {
+            path: "objects/file-profiles",
+            element: <FileProfilesPage />,
+          },
+          { path: "policies/learning", element: <PolicyLearningPage /> },
+          {
+            path: "security/content-security",
+            element: <ContentSecurityPage />,
+          },
+          {
+            path: "security/decryption",
+            element: <DecryptionPage />,
+          },
+          {
+            path: "security/cdr",
+            element: <CDRPage />,
+          },
+          {
+            path: "network/pac",
+            element: <PACPage />,
+          },
+          {
+            path: "network/upstream",
+            element: <UpstreamPage />,
+          },
           { path: "diagnostics", element: <DiagnosticsPage /> },
           { path: "governance", element: <GovernancePage /> },
           {

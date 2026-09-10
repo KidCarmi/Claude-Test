@@ -514,7 +514,7 @@ routes:
     visibility: admin-supported
     min_role: "admin"
     mutating: true
-    audit_expected: false
+    audit_expected: true
     danger_level: medium
     documented: true
   - route: "/api/cdr/health"
@@ -556,6 +556,36 @@ routes:
     mutating: true
     audit_expected: true
     danger_level: high
+    documented: true
+  - route: "/api/cdr/instances/enroll/receipts"
+    method: "GET"
+    handler: "apiCDREnrollReceipts"
+    domain: "cdr"
+    visibility: admin-supported
+    min_role: "viewer"
+    mutating: false
+    audit_expected: false
+    danger_level: none
+    documented: true
+  - route: "/api/cdr/instances/enroll/receipts"
+    method: "DELETE"
+    handler: "apiCDREnrollReceipts"
+    domain: "cdr"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: medium
+    documented: true
+  - route: "/api/cdr/instances/enroll/recover"
+    method: "POST"
+    handler: "apiCDREnrollRecover"
+    domain: "cdr"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: medium
     documented: true
   - route: "/api/cdr/instances/revoke"
     method: "POST"
@@ -1487,6 +1517,16 @@ routes:
     audit_expected: false
     danger_level: none
     documented: true
+  - route: "/api/fileblock/profiles/state"
+    method: "GET"
+    handler: "apiFileblockProfilesState"
+    domain: "policy"
+    visibility: admin-supported
+    min_role: "viewer"
+    mutating: false
+    audit_expected: false
+    danger_level: none
+    documented: true
   - route: "/api/fileblock/profiles"
     method: "POST"
     handler: "apiFileblockProfiles"
@@ -1912,6 +1952,7 @@ routes:
     method: "GET"
     handler: "apiPACProfileItem"
     openapi_path: "/api/pac/profiles/{name}"
+    openapi_extra_paths: ["/api/pac/profiles/{name}/lifecycle"]
     domain: "pac"
     visibility: admin-supported
     min_role: "viewer"
@@ -2161,6 +2202,16 @@ routes:
     mutating: true
     audit_expected: true
     danger_level: high
+    documented: true
+  - route: "/api/rewrite/state"
+    method: "GET"
+    handler: "apiRewriteState"
+    domain: "policy"
+    visibility: admin-supported
+    min_role: "viewer"
+    mutating: false
+    audit_expected: false
+    danger_level: none
     documented: true
   - route: "/api/security"
     method: "GET"
@@ -2955,6 +3006,49 @@ routes:
     audit_expected: true
     danger_level: medium
     documented: true
+  - route: "/api/upstream/entries"
+    method: "POST"
+    handler: "apiUpstreamEntries"
+    domain: "cluster"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: medium
+    documented: true
+  - route: "/api/upstream/entries/"
+    method: "PUT"
+    handler: "apiUpstreamEntryRouter"
+    openapi_path: "/api/upstream/entries/{id}"
+    domain: "cluster"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: medium
+    documented: true
+  - route: "/api/upstream/entries/"
+    method: "DELETE"
+    handler: "apiUpstreamEntryRouter"
+    openapi_path: "/api/upstream/entries/{id}"
+    domain: "cluster"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: medium
+    documented: true
+  - route: "/api/upstream/entries/"
+    method: "POST"
+    handler: "apiUpstreamEntryRouter"
+    openapi_path: "/api/upstream/entries/{id}/credential"
+    domain: "cluster"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: high
+    documented: true
   - route: "/api/upstream/health"
     method: "POST"
     handler: "apiUpstreamHealth"
@@ -2962,7 +3056,7 @@ routes:
     visibility: admin-supported
     min_role: "admin"
     mutating: true
-    audit_expected: false
+    audit_expected: true
     danger_level: medium
     documented: true
   - route: "/api/upstream/settings"
@@ -3034,6 +3128,16 @@ routes:
     mutating: true
     audit_expected: true
     danger_level: high
+    documented: true
+  - route: "/api/urlcat/state"
+    method: "GET"
+    handler: "apiURLCatState"
+    domain: "policy"
+    visibility: admin-supported
+    min_role: "viewer"
+    mutating: false
+    audit_expected: false
+    danger_level: none
     documented: true
   - route: "/api/urlcat/lookup"
     method: "GET"
