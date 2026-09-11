@@ -62,6 +62,7 @@ func restoreGlobalRosterPath(t *testing.T) {
 // merely-unreadable file with a single fresh admin account — destroying
 // every other admin/operator/viewer account and TOTP enrollment with no
 // error, no quarantine copy, and no way back.
+
 func TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten(t *testing.T) {
 	restoreGlobalRosterPath(t)
 	dir := t.TempDir()
