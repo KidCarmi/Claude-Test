@@ -8,6 +8,8 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1705,4 +1707,151 @@ func TestReviewedBinding_C24Control_AHealthyAnchorStillReportsTenantDrift(t *tes
 		})
 		assertCause(t, r, "reviewed_target_tenant_drift")
 	})
+}
+
+// publishVariant republishes the reviewed server/tool with every dimension the two latch paths can
+// read stated explicitly. It is the state constructor C25 enumerates over.
+func publishVariant(t *testing.T, sid, tool, tenant, identity, schema string, enabled bool) {
+	t.Helper()
+	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + tenant + `","servers":[
+	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"` + identity + `","enabled":` +
+		strconv.FormatBool(enabled) + `,
+	   "tools":[{"name":"` + tool + `","input_schema":` + schema + `}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("decode inventory: %v", err)
+	}
+	reg, cat, err := seedInventory(doc, limits.DefaultCatalog())
+	if err != nil {
+		t.Fatalf("seed inventory: %v", err)
+	}
+	publishMCPInventory(mcpInvLoaded, "", reg, cat)
+}
+
+// ── 25 ───────────────────────────────────────────────────────────────────────────────────────
+// CROSS-PRODUCT PARITY — the two latch paths agree on EVERY reachable published state, not on a
+// list of states someone thought to write down.
+//
+// This exists because C23 and C24 are both enumerations and both were defeated by the thing they
+// did not enumerate. C23 walked each transition alone; round 30 needed two at once. C24 then
+// covered exactly one of the ten pairs — the one that had already been found. Writing down pairs
+// is the same error one level up, and the next combination would have been found by review rather
+// than by a test again.
+//
+// So this enumerates the STATE SPACE rather than the transitions: every combination of the five
+// facts the two paths can read — owning tenant, the identity the catalog record was ingested
+// against, the tool's schema (hence its fingerprint), whether the server is enabled, and whether
+// the registry pins something the catalog record does not. 32 states, each driven through BOTH
+// paths from a fresh activation, each required to record the SAME first cause.
+//
+// It asserts PARITY rather than a per-state expected code, deliberately. The correct cause for a
+// given state is a design decision that has moved three times during this PR (rounds 3, 4 and 30);
+// pinning 32 of them here would freeze today's answers and turn a future correction into 32 test
+// edits. What must never change is that ONE published state produces ONE recorded cause, whichever
+// path observed it — an operator reads the code without knowing which path produced it, so a
+// disagreement makes the evidence for an irreversible stop a property of the request rather than
+// of the state. The known causes stay pinned by C14-C24, which are about specific verdicts.
+func TestReviewedBinding_C25_BothPathsAgreeOnEveryPublishedState(t *testing.T) {
+	const (
+		baseSchema  = `{"type":"object"}`
+		movedSchema = `{"type":"object","properties":{"moved":{"type":"string"}}}`
+	)
+	type dim struct {
+		name string
+		on   bool
+	}
+	// Each state is five booleans: deviate-or-not on each dimension.
+	for mask := 0; mask < 32; mask++ {
+		otherTenant := mask&1 != 0
+		rotatedID := mask&2 != 0
+		movedFP := mask&4 != 0
+		disabled := mask&8 != 0
+		repinned := mask&16 != 0
+
+		name := "baseline"
+		if mask != 0 {
+			parts := []string{}
+			for _, d := range []dim{
+				{"tenant", otherTenant}, {"identity", rotatedID}, {"fingerprint", movedFP},
+				{"disabled", disabled}, {"repin", repinned},
+			} {
+				if d.on {
+					parts = append(parts, d.name)
+				}
+			}
+			name = strings.Join(parts, "+")
+		}
+
+		apply := func(t *testing.T, r *reviewedRig) {
+			t.Helper()
+			tenant, identity, schema := ttTenant, "id", baseSchema
+			if otherTenant {
+				tenant = "other-tenant"
+			}
+			if rotatedID {
+				identity = "rotated"
+			}
+			if movedFP {
+				schema = movedSchema
+			}
+			if mask != 0 {
+				publishVariant(t, r.sid, r.tool, tenant, identity, schema, !disabled)
+			}
+			if repinned {
+				reg, _ := mcpInventory.sharedInventory()
+				if reg == nil {
+					t.Fatal("premise: a shared registry must be published")
+				}
+				// A pin the catalog record was NOT built against, whatever the record now carries.
+				pin := registry.Identity("registry-only")
+				if _, err := reg.Repin(registry.ServerID(r.sid), pin, canaryRuntimeTestNow); err != nil {
+					t.Fatalf("repin: %v", err)
+				}
+			}
+		}
+
+		t.Run(name, func(t *testing.T) {
+			var viaAdmission, viaObservation string
+
+			r := newReviewedRig(t)
+			apply(t, r)
+			if r.request(r.fp1, r.now) && mask != 0 {
+				t.Fatal("SECURITY: a deviating published state must not be admitted")
+			}
+			if r.rt.abortedNow(r.capb) {
+				viaAdmission = r.rt.abortCodeNow(r.capb)
+			}
+
+			r2 := newReviewedRig(t)
+			apply(t, r2)
+			canaryReviewedTargetObserved(r2.capb.String(), mcpruntime.CanaryTargetObservation{
+				Generation: r2.gen, ServerID: r2.sid, ToolName: r2.tool,
+			})
+			if r2.rt.abortedNow(r2.capb) {
+				viaObservation = r2.rt.abortCodeNow(r2.capb)
+			}
+
+			// Non-vacuity: parity alone would be satisfied by two paths that both stayed silent.
+			// Every mask here deviates the reviewed record in at least one dimension the review
+			// bound, so every one of them must stop the experiment.
+			if mask != 0 && viaAdmission == "" {
+				t.Fatal("SECURITY: a published state that deviates from the reviewed record did not " +
+					"stop the experiment on EITHER path — parity held only because both were silent")
+			}
+			if viaAdmission != viaObservation {
+				t.Fatalf("the two latch paths disagree on ONE published state: admission recorded %q, "+
+					"the observation sink recorded %q. An operator reads one abort code and cannot tell "+
+					"which path produced it, so the cause of an irreversible stop must be a property of "+
+					"the state, not of which request happened to observe it",
+					nameOrSilent(viaAdmission), nameOrSilent(viaObservation))
+			}
+		})
+	}
+}
+
+func nameOrSilent(code string) string {
+	if code == "" {
+		return "(no latch)"
+	}
+	return code
 }
