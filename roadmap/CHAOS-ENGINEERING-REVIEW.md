@@ -488,7 +488,7 @@ no `MaxHeaderBytes`, so one request with a 200 KB host writes 204,899 bytes to t
 204,812-byte `Host` field to the request log, on a port every client can reach. Recorded OPEN as
 **PX-21** rather than bundled: rejecting an over-long host is probably the right fix and is a
 data-plane behaviour change that needs its own review. See §31.
-**2026-09-04 — CHAOS-63 sweep (destination-host DNS resolution on the policy path).** The
+**2026-09-04 — CHAOS-64 sweep (destination-host DNS resolution on the policy path).** The
 sweep took the one failure domain the register had never entered: **DNS**, listed in the original
 scope and never swept, because it looks like somebody else's dependency. It is not — a
 `DestCountry` policy rule puts the customer's resolver on the critical path of every request that
@@ -5327,7 +5327,7 @@ documented residuals. This sweep adds one about **health planes**:
 > every instrument stays green. When a component names the outcome it is
 > protecting against, check whether the instrument it built can see that outcome
 > arrive by any other road.
-## 33. CHAOS-63 — Destination-host DNS resolution on the policy path
+## 33. CHAOS-64 — Destination-host DNS resolution on the policy path
 
 > Same finding as §28, reached from the other end. §28 entered through the
 > GeoIP accessor and fixed the WARM path (cache-only accessor + bounded,
@@ -5341,9 +5341,10 @@ documented residuals. This sweep adds one about **health planes**:
 `geoip.go`, `dns_health.go`, `alerts.go` · **Runbook:**
 `docs/operator/dns-resolution-health.md`
 
-> **Renumbered SIX TIMES before merge — CHAOS-57 → CHAOS-58 → CHAOS-59 →
-> CHAOS-60 → CHAOS-61 → CHAOS-62 → CHAOS-63.** This sweep collided with a
-> concurrently-developed sweep on `main` on six merges inside eight days, and
+> **Renumbered SEVEN TIMES before merge — CHAOS-57 → CHAOS-58 → CHAOS-59 →
+> CHAOS-60 → CHAOS-61 → CHAOS-62 → CHAOS-63 → CHAOS-64.** This sweep collided
+> with a concurrently-developed sweep on `main` on seven merges inside eight
+> days, and
 > lost the id every time for the same reason. Each rename picked the next id that
 > was free *at that instant*, and each time another in-flight branch merged that
 > id first.
@@ -5356,33 +5357,45 @@ documented residuals. This sweep adds one about **health planes**:
 > | 4 | 2026-09-11 | §28 the GeoIP resolution chain | `CHAOS-60` | `CHAOS-61` / §29 |
 > | 5 | 2026-09-11 | §30 the DP outbound cluster state | `CHAOS-61` | `CHAOS-62` / §31 |
 > | 6 | 2026-09-11 | §31 the request-history store | `CHAOS-62` | `CHAOS-63` / §32 |
+> | 7 | 2026-09-11 | §32 the admin-login username bound | `CHAOS-63` | `CHAOS-64` / §33 |
 >
 > The first was already the THIRD occurrence of the class the header records for
 > `CHAOS-50`. Collisions 2 and 3 landed on the same day, hours apart, against two
-> different branches. Collisions 4, 5 and 6 all landed on the same day, hours
-> apart, against three more.
+> different branches. Collisions 4, 5, 6 and 7 all landed on the same day,
+> hours apart, against four more.
 >
 > **Between collisions 4 and 5 the section ALSO moved twice without a rename**
 > (§29 → §30 → §31): an unrelated newly-merged sweep was inserted ahead of it
 > each time, displacing the section while leaving the id alone. Column five
 > records what each RENAME produced at the time, so rows 4 and 5 keep their
 > then-current locations and the displacements are not rows. The current location
-> is §32, and every pointer outside the register (`CLAUDE.md`, the runbook,
+> is §33, and every pointer outside the register (`CLAUDE.md`, the runbook,
 > `internal/geoip/geoip.go`) was repointed with it each time. **A section move and
 > an id collision are different events and the table must not conflate them** —
 > the first costs a pointer sweep, the second costs a rename of every gate,
 > metric and comment naming the sweep.
 >
-> **Collision 6 is the first time the two coincided in ONE merge.** The
+> **Collisions 6 and 7 each arrived as a displacement AND a rename in ONE
+> merge**, where the first five had kept the two events separate. The
 > request-history-store sweep was inserted ahead of this section AND had taken
 > the id this section was holding, so a single fetch delivered both a
 > displacement (§31 → §32) and a rename (`CHAOS-62` → `CHAOS-63`). The
 > distinction above still holds and is worth more, not less, for having been
 > collapsed once: the displacement cost a pointer sweep of three files, the
-> collision cost 62 identifier renames across ten. Nothing about the merge
-> announced which of the two had happened — both surface as the same
-> conflict-free fast-forward, and the duplicate id is visible only to a
+> collision cost 62 identifier renames across ten. Nothing about either merge
+> announced which of the two had happened — both surfaced as the same
+> conflict-free fast-forward, and the duplicate id was visible only to a
 > `uniq -d` over the section headers.
+>
+> **Collision 7 is the one that closes the argument.** It landed on the same day
+> as collisions 4, 5 and 6, against a sweep whose own commit message reads
+> *"renumber to CHAOS-63/§32 — the fifth collision, caused by the fourth fix"* —
+> so a sweep renaming itself to escape a collision took the id this sweep had
+> renamed itself into hours earlier, and both were racing the same free-id
+> scan. That is the mechanism stated as plainly as it can be: when two branches
+> both pick "the next free id" against `main`, the winner is decided by merge
+> order, which neither can observe. There is no version of renaming-at-merge
+> that survives this; only allocation does.
 >
 > **Collision 4 is the one the previous note predicted in writing, and it is the
 > sharpest case of all**: §28 is the sibling half of THIS finding — the same
@@ -5395,7 +5408,7 @@ documented residuals. This sweep adds one about **health planes**:
 > distinguish them — a parenthetical is not an identifier, and that is the same
 > half-fix (correct the SECTION, leave the ID) recorded for collisions 1–3.
 >
-> **The rule applied all six times, and it is not "last one loses".** The header
+> **The rule applied all seven times, and it is not "last one loses".** The header
 > states renumbering is an owner decision *because* "identifiers three merged PRs
 > already reference" would have to be rewritten. That reason is **asymmetric**:
 > the MERGED side is referenced by merged code, gates and register rows, so it
@@ -5406,12 +5419,12 @@ documented residuals. This sweep adds one about **health planes**:
 > references were left untouched in every pass, so `metrics.go` now carries one
 > line from §25, one from §28 and one from here, `CLAUDE.md` carries §26's, §27's
 > and §28's bullets beside this sweep's, and `geoip.go` carries both halves of the
-> §28/§32 pair.
+> §28/§33 pair.
 >
-> **Each of the six merges was resolved by someone who fixed the duplicate
+> **Each of the seven merges was resolved by someone who fixed the duplicate
 > SECTION number and left the duplicate ID in place**, which is why the collision
 > survived to recur: a section renumber makes the register read correctly while
-> two sweeps still answer to one name, and collisions 2–6 were found only because
+> two sweeps still answer to one name, and collisions 2–7 were found only because
 > a later merge conflict forced someone to look again. Collision 6 did not even
 > produce a conflict — the merge was a clean fast-forward, and the duplicate would
 > have merged silently had this branch not re-run the `uniq -d` check by habit.
@@ -5421,7 +5434,7 @@ documented residuals. This sweep adds one about **health planes**:
 > row at the START of a sweep. Renaming at merge time provably cannot work — the
 > id a rename picks is validated against `main` at the instant of the rename and
 > nothing reserves it afterwards, so the rename is itself a race. One branch lost
-> the id SIX times in eight days; catching each one was luck, not process.
+> the id SEVEN times in eight days; catching each one was luck, not process.
 > Each revision of this note has predicted the next occurrence in writing and each
 > prediction has been met within the day — *"expect a fourth"* was followed by a
 > fourth from a sibling sweep on this very branch, the note that recorded the
@@ -5437,7 +5450,7 @@ documented residuals. This sweep adds one about **health planes**:
 > **A SEPARATE duplicate is already ON `main` and no branch can resolve it.** §29 — the
 > credential-verification-cost sweep, merged 2026-09-11 — is stamped `CHAOS-57`,
 > which §25 has held since 2026-09-04. Both are merged, so the asymmetry that
-> resolved collisions 1–6 does not apply: neither side is free to move, and
+> resolved collisions 1–7 does not apply: neither side is free to move, and
 > whichever is renumbered rewrites identifiers that merged PRs already reference.
 > It is also the first collision to reach the CODE: both sweeps name their gates
 > `TestChaos57_*` in the same `package main`, and the tree compiles only because
@@ -5591,7 +5604,7 @@ synchronous path for up to `hostIPCacheStaleMax`, leaving a country-scoped DENY
 rule dark for an **hour** after DNS recovered instead of the 30 s the negative
 TTL promises. Worse, `refreshAsync` SHEDS when the resolver pool is saturated,
 so under sustained load the bypass could persist for the full window. And it was
-a REGRESSION against the pre-CHAOS-63 behaviour, which re-resolved synchronously
+a REGRESSION against the pre-CHAOS-64 behaviour, which re-resolved synchronously
 the moment the negative TTL lapsed.
 
 Fixed by restricting the stale state to `e.ip != nil`. An expired negative is a
@@ -5631,7 +5644,7 @@ against each state it can be in, not only the one that motivated it.
 
 ### 33.7 GEO-1 — a latent process-kill armed by a comment (recorded, not fixed)
 
-Found while sweeping the domain adjacent to CHAOS-63 and **not reachable in the
+Found while sweeping the domain adjacent to CHAOS-64 and **not reachable in the
 current tree**, but recorded because of how it is armed.
 
 `internal/geoip.InitGeoDB` claimed:
