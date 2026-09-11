@@ -547,7 +547,7 @@ func (c *DataPlaneClient) rateLimitGossipLoop(ctx context.Context, interval time
 			clusterRateLimitEnabled.Store(false)
 			return
 		case <-ticker.C:
-			// CHAOS-60: evaluate broadcast freshness on EVERY tick, including the
+			// CHAOS-61: evaluate broadcast freshness on EVERY tick, including the
 			// ones whose RPC fails — reporting only from the success branch
 			// would mean the state is never reported during the outage that
 			// causes it.

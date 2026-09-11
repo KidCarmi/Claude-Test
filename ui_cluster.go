@@ -365,7 +365,7 @@ func apiClusterRateLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodes, hotIPs := globalRLAggregator.Stats()
-	// CHAOS-60: remote_ips is the SIZE of the last applied broadcast, which says
+	// CHAOS-61: remote_ips is the SIZE of the last applied broadcast, which says
 	// nothing about whether it is still being applied. The freshness fields are
 	// what distinguish "no hot IPs anywhere in the fleet" from "a broadcast this
 	// node stopped consulting because the Control Plane went away" — the second

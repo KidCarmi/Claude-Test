@@ -22,7 +22,7 @@ nodes. The Data Plane then decides:
 localCount + remoteCount >= limit  →  deny
 ```
 
-`remoteCount` comes from the last broadcast the node received. Until CHAOS-60
+`remoteCount` comes from the last broadcast the node received. Until CHAOS-61
 that broadcast **never expired**. It is applied only on a *successful*
 `SyncRateLimits` call, so the moment the Control Plane became unreachable the
 last values froze in memory and kept being added to every local count for the

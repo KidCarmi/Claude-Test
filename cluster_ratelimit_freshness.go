@@ -1,6 +1,6 @@
 package main
 
-// CHAOS-60 — the freshness health plane for cluster-wide rate limiting.
+// CHAOS-61 — the freshness health plane for cluster-wide rate limiting.
 //
 // The defect this file exists to make visible is in security.go: the DP applied
 // the Control Plane's RemoteCounts broadcast and then enforced it forever,

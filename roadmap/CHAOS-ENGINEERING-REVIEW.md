@@ -252,17 +252,23 @@ enforcement owns its own populator; and six `culvert_geo_*` series, of which
 `culvert_geo_policy_unresolved_total` is the first signal an operator has ever
 had that a geo rule is evaluating against an unknown country. The first-request
 window is unchanged and recorded as an owner decision (WK-3c). See §28.
-**2026-09-08 — CHAOS-60 sweep (the Data Plane's outbound cluster state under a Control
+**2026-09-08 — CHAOS-61 sweep (the Data Plane's outbound cluster state under a Control
 Plane outage).**
-*(Numbered CHAOS-60/§28 on merge. This sweep ran as `CHAOS-57`/§25 and collided with the
-hijacked-tunnel sweep, which merged first and kept the id; an intervening main-merge moved the
-SECTION to §27 and left the `CHAOS-` id colliding, so by the time this branch was rebased the
-tree carried TWO different sweeps stamped `CHAOS-57` — two `## ` sections here and two
-Architecture Notes in `CLAUDE.md`. That is the FIFTH occurrence of the collision this section's
-header warns about, and the second time the section-only renumber let the id survive its own
-remedy. Resolved by this section's established precedent: the already-merged sweep keeps the id
-and this one moved. The header's standing recommendation — allocate the id at the START of a
-sweep, in a committed placeholder row — would again have prevented it.)*
+*(Numbered CHAOS-61/§29 on merge, at the THIRD attempt. This sweep ran as `CHAOS-57`/§25 and
+collided with the hijacked-tunnel sweep, which merged first and kept the id; an intervening
+main-merge moved the SECTION to §27 and left the `CHAOS-` id colliding, so the tree carried TWO
+different sweeps stamped `CHAOS-57` — two `## ` sections here and two Architecture Notes in
+`CLAUDE.md`. Renumbered to `CHAOS-60`/§28 — and within a day collided AGAIN, with the GeoIP
+resolution sweep that took `CHAOS-60` concurrently and merged first; that merge once more moved
+the SECTION (§28→§29) and left the id colliding, so two sweeps shared `CHAOS-60` and, in the same
+package, a `TestChaos60_` test-name prefix. Those are the FIFTH and SIXTH occurrences of the
+collision this section's header warns about, the second and third time a section-only renumber let
+the id survive its own remedy, and the second time it happened to THIS sweep specifically — a
+renumber is not a fix, because the next free id is exactly what every other concurrent sweep is
+also taking. Resolved both times by this section's established precedent: the already-merged sweep
+keeps the id and this one moved. The header's standing recommendation — allocate the id at the
+START of a sweep, in a committed placeholder row — would have prevented all six, and this sweep
+having to move twice is the clearest evidence yet that renumbering-on-merge cannot converge.)*
 Register row **HA-1** records the deliberate posture for a DP that loses its
 Control Plane — it keeps serving its last-known-good CONFIG — and that posture was reasoned about
 carefully. This sweep asked the adjacent question the row does not cover: what happens to the DP's
@@ -291,7 +297,7 @@ the local decision, a disagreement between the enforcement and reporting paths t
 gate caught inside the first version of the fix), a freshness health plane armed only on a
 clustered node, counted audit-push drops, and 17 gates with every defect gate verified failing
 against the pre-fix tree. No new alert event: a stale broadcast is always the CP link, which
-already alerts. See rows CL-20/CL-21, §28, and `docs/operator/cluster-rate-limit-freshness.md`.
+already alerts. See rows CL-20/CL-21, §29, and `docs/operator/cluster-rate-limit-freshness.md`.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -4089,7 +4095,7 @@ still reading it. Production never reassigns those vars, so this is harness-only
 but `stubResolver` now waits for in-flight warms before restoring: a seam must
 outlive its users.
 
-## 29. CHAOS-60 — The Data Plane's outbound cluster state under a Control Plane outage
+## 29. CHAOS-61 — The Data Plane's outbound cluster state under a Control Plane outage
 
 **Date:** 2026-09-08 · **Domain:** DP→CP gossip (`controlplane_client.go`), the
 distributed rate limiter (`security.go`), the DP→CP audit push queue
@@ -4214,8 +4220,8 @@ event name for one root cause is two pages for one action.
 
 **The control gates are the point.** The cheapest way to pass every defect gate
 is to stop consulting remote counts at all — which would silently delete the
-distributed rate limiter. `TestChaos60_FreshBroadcastStillSuppresses` and
-`TestChaos60_BroadcastAppliesForTheWholeWindow` pin the healthy path from both
+distributed rate limiter. `TestChaos61_FreshBroadcastStillSuppresses` and
+`TestChaos61_BroadcastAppliesForTheWholeWindow` pin the healthy path from both
 sides, so a fix that passes by deleting the feature fails.
 
 ### 29.4b Review follow-up — a defect in the fix itself (Codex, PR #1346)
