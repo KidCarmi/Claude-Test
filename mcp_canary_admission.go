@@ -291,8 +291,9 @@ var mcpCanaryPreAdmissionDrift = struct {
 // canaryPreAdmissionDriftCodes bounds the key space to the taxonomy's drift codes, so a caller can
 // never grow the map with arbitrary strings.
 var canaryPreAdmissionDriftCodes = map[string]struct{}{
-	"tool_fingerprint_drift": {},
-	"server_identity_drift":  {},
+	"tool_fingerprint_drift":       {},
+	"server_identity_drift":        {},
+	"reviewed_target_tenant_drift": {},
 }
 
 // noteCanaryPreAdmissionDrift records one pre-admission drift observation. Unrecognised codes are

@@ -469,6 +469,24 @@ run_mutation M35 \
   . "$ADM" \
   's/\tif !obs\.Usable \|\| obs\.RegistryPinDiverged \{/\tif !obs.Usable \{/'
 
+# ── (15) ROUND 28: THE TRANSITION WINDOW AFTER THE OBSERVATION ─────────────
+# A reviewed pair reassigned A→B between the early observation and the live-gate callback made the
+# request ineligible, and reporting that as "nothing resolves" discarded the evidence the reviewed
+# comparison needs. Plus: a new drift verdict that is not a named evidence key is recorded as
+# "other" — the abort happens, the reason does not.
+
+run_mutation M36 \
+  'the resolved-but-other-tenant target is discarded, so admission never compares' \
+  'TestReviewedBinding_C21_TenantReassignmentLatchesAtAdmission' \
+  . mcp_live_gate.go \
+  's/\t\t\tif live\.Resolved \{\n\t\t\t\treturn canaryTrustObservation\{Found: true, Current: live\.Authoritative\}\n\t\t\t\}\n//'
+
+run_mutation M37 \
+  'the tenant-drift code is dropped from the evidence allowlist (abort with no named cause)' \
+  'TestReviewedBinding_C20_EveryDriftVerdictIsANamedEvidenceKey' \
+  . "$ADM" \
+  's/\t"reviewed_target_tenant_drift": \{\},\n//'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

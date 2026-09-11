@@ -162,9 +162,18 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 			return canaryTrustObservation{DriftCode: live.DriftCode}
 		}
 		if !live.Eligible {
-			// Request-scoped: the request names a target that does not resolve to this tenant's
-			// current one. Reported as "not found" so the transaction never compares — and never
-			// latches — on a request that carries no evidence about the reviewed target.
+			// Ineligible splits in two, and collapsing them loses a breach.
+			//
+			// If the (server, tool) RESOLVES — just not to this request's tenant — that is evidence
+			// about the reviewed target: it may be the reviewed pair under a new owner. Report it so
+			// the transaction can compare, with Trusted false so nothing is authorized by it. An
+			// unrelated target simply compares out-of-scope and stays request-scoped.
+			//
+			// If nothing resolves at all, there is nothing to compare and a transient inventory gap
+			// must not stop the experiment (Codex P1, PR #1360, round 6).
+			if live.Resolved {
+				return canaryTrustObservation{Found: true, Current: live.Authoritative}
+			}
 			return canaryTrustObservation{}
 		}
 		// The CURRENT authoritative target, including the pinned server identity, for the
@@ -351,6 +360,20 @@ type liveTrustPrecheck struct {
 	// the decision's fingerprint. False with an empty DriftCode is a request-scoped denial.
 	Eligible bool
 	Target   canary.LiveTarget
+	// Resolved reports that the (server, tool) resolves to an authoritative target AT ALL —
+	// independently of whether that target belongs to the REQUESTING tenant. Authoritative carries
+	// it when true.
+	//
+	// The two facts are separate because conflating them loses a breach. A reviewed (server, tool)
+	// reassigned from tenant A to B makes an A-request ineligible, and reporting that as "nothing
+	// resolves" discards the very evidence the reviewed comparison needs: the target IS the
+	// reviewed one, under a different owner. Admission would then issue a request-scoped denial,
+	// never compare, and reassigning back to A would resume the activation with nothing latched
+	// (Codex P1, PR #1360, round 6).
+	Resolved bool
+	// Authoritative is the CURRENT authoritative target, from the SAME loadTarget snapshot as
+	// every other field here — never a second read. Meaningful only when Resolved.
+	Authoritative canary.ReviewedTarget
 	// ServerIdentity is the server's PINNED, verified identity as currently published. It rides
 	// along here rather than in Target because Target is canary.LiveTarget — the key an approval is
 	// matched on — and approvals record no identity, so widening it would break exact-target
@@ -382,10 +405,25 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 		return liveTrustPrecheck{}
 	}
 	ti := mcpToolTrust.loadTarget(serverID, toolName)
-	if !ti.found || ti.target.Tenant == "" || ti.target.Tenant != tenant {
-		// Request-scoped: this request names a target that is not this tenant's reviewed one. A
-		// Canary that correctly refuses such a request is a Canary working, not a breach.
+	if !ti.found {
+		// Nothing resolves. Not drift: indistinguishable from a transient inventory gap.
 		return liveTrustPrecheck{}
+	}
+	// Resolved BEFORE the tenant gate, so a target that exists under another owner is still
+	// reported to the caller. See the Resolved/Authoritative field comments.
+	authoritative := canary.ReviewedTarget{
+		Tenant:            ti.target.Tenant,
+		ServerID:          serverID,
+		ToolName:          toolName,
+		Fingerprint:       ti.target.Fingerprint,
+		FingerprintFormat: ti.target.FingerprintFormatVersion,
+		ServerIdentity:    ti.pinnedIdentity,
+	}
+	if ti.target.Tenant == "" || ti.target.Tenant != tenant {
+		// Request-scoped for AUTHORIZATION — this request is not the owner — but the target is
+		// carried out so the reviewed comparison can still see that the reviewed pair changed
+		// hands. Eligible stays false, so nothing here authorizes anything.
+		return liveTrustPrecheck{Resolved: true, Authoritative: authoritative}
 	}
 	// The reviewed server must still be usable at the boundary (P1b): an operator disable or a lost
 	// identity verification after runExecute snapshotted in.Server fails closed here.

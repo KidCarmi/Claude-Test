@@ -61,6 +61,8 @@ import (
 //	17  the reviewed pair reassigned to another tenant → reviewed_target_tenant_drift + latch
 //	18  the repin window (registry I2, catalog I1)     → detected, charged as identity drift
 //	19  that window on the OBSERVATION path            → latched there too, not only in the precheck
+//	20  every drift verdict is a named evidence key     → wall, not habit
+//	21  A→B reassignment seen at ADMISSION              → latched; an unresolvable tool stays silent
 
 // reviewedRig is one armed activation over the REAL inventory, the REAL approval store and the
 // REAL admission gate. Everything the matrix asserts flows through production code.
@@ -1289,4 +1291,108 @@ func TestReviewedBinding_C19_ObservationPathLatchesTheRepinWindow(t *testing.T) 
 		Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
 	})
 	r.assertLatched(t, "server_identity_drift")
+}
+
+// ── 20 ───────────────────────────────────────────────────────────────────────────────────────
+// Every drift verdict the reviewed engine can produce is a KNOWN key in the evidence counter.
+//
+// noteCanaryPreAdmissionDrift folds an unrecognised code into "other" so a caller can never grow
+// the map with arbitrary strings — correct, and the reason this needs a wall rather than a habit:
+// adding a verdict without adding it to the allowlist silently renames the operator-visible cause.
+// The abort still happens, so nothing fails; the evidence surface just stops saying why, which is
+// the opposite of the "one fact, one dialect" rule the drift codes exist to serve.
+//
+// That is exactly what happened to reviewed_target_tenant_drift (Codex P2, PR #1360, round 6), and
+// it is the same shape as the round-5 P1 — a new fact wired into some of its consumers. A wall is
+// the only version of "remember to update both" that survives.
+func TestReviewedBinding_C20_EveryDriftVerdictIsANamedEvidenceKey(t *testing.T) {
+	// The engine's verdicts that mean DRIFT — everything except the two non-breach outcomes.
+	for _, v := range []canary.ReviewedVerdict{
+		canary.ReviewedFingerprintDrift,
+		canary.ReviewedServerIdentityDrift,
+		canary.ReviewedTenantDrift,
+	} {
+		if _, ok := canaryPreAdmissionDriftCodes[string(v)]; !ok {
+			t.Fatalf("reviewed verdict %q is not a named key in canaryPreAdmissionDriftCodes, so an "+
+				"abort charged to it is recorded as \"other\" — the experiment stops without the "+
+				"evidence surface saying why", v)
+		}
+	}
+	// CONTROL: the non-breach verdicts must NOT be evidence keys. Without this the test would pass
+	// just as well if the allowlist were widened to everything, which would let a genuinely
+	// unrecognised code through as a named cause.
+	for _, v := range []canary.ReviewedVerdict{canary.ReviewedMatches, canary.ReviewedOutOfScope} {
+		if _, ok := canaryPreAdmissionDriftCodes[string(v)]; ok {
+			t.Fatalf("non-breach verdict %q must not be an evidence key", v)
+		}
+	}
+}
+
+// ── 21 ───────────────────────────────────────────────────────────────────────────────────────
+// A reviewed pair reassigned to another tenant latches at ADMISSION too, not only via the
+// observation path.
+//
+// C17 covers the observation sink. This is the window after it: ownership changes A→B between the
+// early observation and the live-gate callback, so mcpLiveTrustPrecheck finds the request's tenant
+// (A) no longer owns the target. It used to report that as "nothing resolves", which discarded the
+// very evidence the comparison needs — the target IS the reviewed pair, under a new owner — so
+// admission issued a request-scoped denial, never compared, and reassigning back to A would resume
+// the activation with nothing latched (Codex P1, PR #1360, round 6).
+//
+// The target is now carried across the tenant gate with Trusted false: nothing is authorized by it,
+// and the reviewed comparison can still see what happened.
+func TestReviewedBinding_C21_TenantReassignmentLatchesAtAdmission(t *testing.T) {
+	r := newReviewedRig(t)
+	republishUnderTenant(t, r.sid, r.tool, "other-tenant")
+
+	// The precheck must now report the target as RESOLVED-but-ineligible for the original tenant.
+	live := mcpLiveTrustPrecheck(ttTenant, r.sid, r.tool, r.fp1)
+	if live.Eligible {
+		t.Fatal("premise: the original tenant must no longer be eligible for the reassigned target")
+	}
+	if !live.Resolved {
+		t.Fatal("SECURITY: the target still resolves — under a new owner — and discarding that is " +
+			"what made the reassignment invisible to the reviewed comparison")
+	}
+	if live.Authoritative.Tenant == ttTenant {
+		t.Fatalf("premise: the authoritative target must carry the NEW tenant, got %q", live.Authoritative.Tenant)
+	}
+
+	// Drive the real admission gate with a request from the ORIGINAL tenant.
+	d := r.g.AdmitSideEffect(driftGateInput(r.sid, r.tool, r.fp1, r.now))
+	if d.Release != nil {
+		d.Release()
+	}
+	if d.Admit {
+		t.Fatal("SECURITY: a request whose tenant no longer owns the target must not be admitted")
+	}
+	r.assertLatched(t, "reviewed_target_tenant_drift")
+}
+
+// CONTROL for C21: a tool that does not resolve AT ALL is still silent at admission — the
+// fail-safe direction this path deliberately preserves, since an absence is indistinguishable from
+// a transient inventory gap.
+//
+// Scope of this control, stated precisely because the obvious stronger claim is FALSE: it does NOT
+// catch a mutation that reports every ineligible request as resolved. Measured — that form is
+// behaviourally inert, because the zero ReviewedTarget it would carry compares as
+// ReviewedOutOfScope and stays silent anyway. What this pins is the property that matters (an
+// unresolvable tool never stops the experiment), not a claim about every wrong shape.
+func TestReviewedBinding_C21Control_AnUnresolvableToolIsStillSilent(t *testing.T) {
+	r := newReviewedRig(t)
+	live := mcpLiveTrustPrecheck(ttTenant, r.sid, "no-such-tool", r.fp1)
+	if live.Resolved || live.Eligible {
+		t.Fatalf("premise: a non-existent tool must resolve to nothing, got %+v", live)
+	}
+	d := r.g.AdmitSideEffect(driftGateInput(r.sid, "no-such-tool", r.fp1, r.now))
+	if d.Release != nil {
+		d.Release()
+	}
+	if d.Admit {
+		t.Fatal("a request for a non-existent tool must not be admitted")
+	}
+	if r.rt.abortedNow(r.capb) {
+		t.Fatalf("SECURITY: a tool that does not resolve must not stop the experiment (code %q) — "+
+			"this path cannot tell an absence from a transient inventory gap", r.rt.abortCodeNow(r.capb))
+	}
 }
