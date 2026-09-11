@@ -156,19 +156,54 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		Principal: in.Principal,
 		Tool:      in.ToolName,
 		Server:    in.ServerID,
-	}, func() (bool, string) {
+	}, func() canaryTrustObservation {
 		live := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
-		if live.DriftCode != "" {
-			return false, live.DriftCode
+		if !live.Eligible && live.Resolved {
+			// RESOLVED BUT NOT AUTHORIZED, in one shape for all three reasons — the anchor is
+			// gone, the target changed hands, or this request's decision fingerprint is not the
+			// one in force. Every fact the transaction needs is carried and none of them is
+			// pre-classified: canaryDriftCause decides scope first and cause second, and Trusted
+			// stays false so nothing here authorizes anything.
+			return canaryTrustObservation{
+				DriftCode: live.DriftCode, Found: true,
+				Current: live.Authoritative, AnchorLost: live.AnchorLost,
+			}
 		}
 		if !live.Eligible {
-			return false, ""
+			// NOTHING RESOLVED — the only ineligible case left, because the branch above already
+			// reported every one that did. There is nothing to compare against, and a transient
+			// inventory gap must not stop the experiment (Codex P1, PR #1360, round 6).
+			//
+			// Round 31 left a second, unreachable copy of the resolved case here. It was harmless
+			// in production (the branch above returns first) and NOT harmless in the campaign: the
+			// mutation that deletes the live branch was still satisfied by the dead one, so M36
+			// survived while claiming to prove that a target under a new owner is carried out.
+			return canaryTrustObservation{}
 		}
-		return g.approvalOK(live.Target, in.Now)
+		// The CURRENT authoritative target, including the pinned server identity, for the
+		// transaction to compare against the activation's reviewed record. The identity read is
+		// the same pointer-published inventory the precheck just used.
+		cur := canary.ReviewedTarget{
+			Tenant:            live.Target.Tenant,
+			ServerID:          live.Target.ServerID,
+			ToolName:          live.Target.ToolName,
+			Fingerprint:       live.Target.Fingerprint,
+			FingerprintFormat: live.Target.FingerprintFormat,
+			ServerIdentity:    live.ServerIdentity,
+		}
+		trusted, _ := g.approvalOK(live.Target, in.Now)
+		return canaryTrustObservation{Found: true, Current: cur, Trusted: trusted}
 	})
 	// The denial class is read from an EXPLICIT field, never inferred from which other field is
 	// zero: an already-aborted Canary and an untrusted request both leave Trusted false, and
 	// inferring from that reported a stopped experiment to the client as a trust failure.
+	//
+	// The switch is EXHAUSTIVE BY CONSTRUCTION: only canaryAdmitGranted continues to the admitted
+	// path, and any denial class this gate does not recognise falls to a fail-CLOSED default. An
+	// earlier shape listed the known denials and let everything else fall through to "admitted",
+	// so adding a denial to the transaction silently ADMITTED the requests it was written to
+	// refuse — a new refusal reason arriving as a grant is the one direction this boundary must
+	// never fail in.
 	switch adm.Denial {
 	case canaryAdmitNoActivation:
 		// No activation owned this transaction — the rollout publication gap, a demotion, or an
@@ -186,6 +221,12 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	case canaryAdmitUntrusted:
 		releaseAdmit()
 		return deny(mcperr.ReasonLiveTrustRevalidationFailed)
+	case canaryAdmitNotReviewed:
+		// The activation was never reviewed for this target. Request-scoped (nothing latched, per
+		// the transaction), and reported as a trust-revalidation failure: from the caller's side
+		// the target it named is not one this experiment is authorized to execute.
+		releaseAdmit()
+		return deny(mcperr.ReasonLiveTrustRevalidationFailed)
 	case canaryAdmitAborted, canaryAdmitBudget:
 		releaseAdmit()
 		return deny(mcperr.ReasonRolloutBudgetExhausted)
@@ -199,6 +240,13 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		// upstream call: every existing class is handled above, so this branch
 		// changes nothing today and is the whole point — the boundary must deny
 		// what it cannot classify, not admit it.
+		//
+		// This branch and canaryAdmitNotReviewed above arrived from two sides at
+		// once: main closed the fall-through generically (PR #1298) while this
+		// branch hit it concretely, by adding a denial class the switch did not
+		// list and watching the requests it was written to refuse be ADMITTED.
+		// Both halves are kept — the new class is handled explicitly, and the
+		// default still catches the next one.
 		releaseAdmit()
 		return deny(mcperr.ReasonRolloutModeInvalid)
 	}
@@ -316,6 +364,32 @@ type liveTrustPrecheck struct {
 	// the decision's fingerprint. False with an empty DriftCode is a request-scoped denial.
 	Eligible bool
 	Target   canary.LiveTarget
+	// Resolved reports that the (server, tool) resolves to an authoritative target AT ALL —
+	// independently of whether that target belongs to the REQUESTING tenant. Authoritative carries
+	// it when true.
+	//
+	// The two facts are separate because conflating them loses a breach. A reviewed (server, tool)
+	// reassigned from tenant A to B makes an A-request ineligible, and reporting that as "nothing
+	// resolves" discards the very evidence the reviewed comparison needs: the target IS the
+	// reviewed one, under a different owner. Admission would then issue a request-scoped denial,
+	// never compare, and reassigning back to A would resume the activation with nothing latched
+	// (Codex P1, PR #1360, round 6).
+	Resolved bool
+	// AnchorLost reports that the trust anchor is no longer in force — the server is not usable,
+	// or the registry pins an identity the catalog record was not built against. It is a FACT, not
+	// a verdict: whether it may stop the activation depends on the reviewed set, which only the
+	// admission transaction can consult (canaryDriftCause). Pre-classifying it here as a drift
+	// code is what let an unreviewed target's disabled server abort a healthy Canary.
+	AnchorLost bool
+	// Authoritative is the CURRENT authoritative target, from the SAME loadTarget snapshot as
+	// every other field here — never a second read. Meaningful only when Resolved.
+	Authoritative canary.ReviewedTarget
+	// ServerIdentity is the server's PINNED, verified identity as currently published. It rides
+	// along here rather than in Target because Target is canary.LiveTarget — the key an approval is
+	// matched on — and approvals record no identity, so widening it would break exact-target
+	// approval matching. It is what makes server_identity_drift decidable against what was
+	// REVIEWED rather than only against "is the server usable right now".
+	ServerIdentity string
 }
 
 // mcpLiveTrustPrecheck decides everything the whole-Canary latch depends on, reading ONLY
@@ -341,22 +415,65 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 		return liveTrustPrecheck{}
 	}
 	ti := mcpToolTrust.loadTarget(serverID, toolName)
-	if !ti.found || ti.target.Tenant == "" || ti.target.Tenant != tenant {
-		// Request-scoped: this request names a target that is not this tenant's reviewed one. A
-		// Canary that correctly refuses such a request is a Canary working, not a breach.
+	if !ti.found {
+		// Nothing resolves. Not drift: indistinguishable from a transient inventory gap.
 		return liveTrustPrecheck{}
 	}
-	// The reviewed server must still be usable at the boundary (P1b): an operator disable or a lost
-	// identity verification after runExecute snapshotted in.Server fails closed here.
+	// Resolved BEFORE the tenant gate, so a target that exists under another owner is still
+	// reported to the caller. See the Resolved/Authoritative field comments.
+	authoritative := canary.ReviewedTarget{
+		Tenant:            ti.target.Tenant,
+		ServerID:          serverID,
+		ToolName:          toolName,
+		Fingerprint:       ti.target.Fingerprint,
+		FingerprintFormat: ti.target.FingerprintFormatVersion,
+		ServerIdentity:    ti.pinnedIdentity,
+	}
+	// ANCHOR STATE IS CHECKED BEFORE THE TENANT GATE, and the order is the finding.
 	//
-	// WHOLE-CANARY. This one signal conflates two causes — an operator disabling the server and the
-	// server losing identity verification — and they are not separable from the data available
-	// here (a distinguishable peer-freshness source is blocker #11). The conservative reading is
-	// taken deliberately: in BOTH cases the trust anchor the experiment was authorized against is
-	// no longer the one in force, and the safe response to "the approved anchor is gone" is to stop
-	// changing reality, not to keep going because one of the two possible causes was benign.
+	// Both of the branches below say the same thing — the trust anchor the experiment was
+	// authorized against is no longer the one in force — and the scope-independent observation
+	// path (latchReviewedDriftUnderActivation) has always checked exactly these two facts BEFORE
+	// its reviewed comparison, on the recorded reasoning that an absent anchor outranks whatever
+	// the target happens to compare as. This path returned at the tenant gate first, so for ONE
+	// published state carrying BOTH transitions — a reviewed pair reassigned A→B whose registry
+	// identity is then repinned before the catalog re-ingests — admission compared the carried
+	// target and latched reviewed_target_tenant_drift while the observation sink latched
+	// server_identity_drift. Whichever request arrived first decided the immutable first cause
+	// (Codex P2, PR #1360, round 30).
+	//
+	// Neither branch carries Resolved/Authoritative, deliberately: reviewedFirstCause can only
+	// sharpen a cause when a target rides along, and here there is nothing to sharpen TO — an
+	// anchor-class cause already outranks every verdict Compare could return, so carrying the
+	// target could only downgrade it.
+	//
+	// This does not widen what latches. The observation sink runs for every dispatched request
+	// naming a tool and already latches this state; only the recorded cause differed.
+	//
+	// WHOLE-CANARY. The usability signal conflates two causes — an operator disabling the server
+	// and the server losing identity verification — and they are not separable from the data
+	// available here (a distinguishable peer-freshness source is blocker #11). The conservative
+	// reading is taken deliberately: in BOTH cases the approved anchor is gone, and the safe
+	// response is to stop changing reality, not to keep going because one of the two possible
+	// causes was benign. An operator disable or a lost identity verification after runExecute
+	// snapshotted in.Server fails closed here (P1b).
 	if !ti.target.ServerUsable {
-		return liveTrustPrecheck{DriftCode: "server_identity_drift"}
+		return liveTrustPrecheck{Resolved: true, Authoritative: authoritative, AnchorLost: true}
+	}
+	// The registry currently pins an identity the catalog record was NOT built against — the
+	// repin/re-ingest window. A request would be routed to the registry's pin while every approval
+	// and reviewed record describes the catalog's, so the workload about to be called is not the
+	// one that was reviewed. Same code, same reason as an unusable anchor: the approved anchor is
+	// not the one in force (Codex P1, PR #1360, round 4).
+	if ti.registryPinDiverged {
+		return liveTrustPrecheck{Resolved: true, Authoritative: authoritative, AnchorLost: true}
+	}
+	// The anchor is sound; only now does ownership decide. Request-scoped for AUTHORIZATION — this
+	// request is not the owner — but the target is carried out so the reviewed comparison can still
+	// see that the reviewed pair changed hands. Eligible stays false, so nothing here authorizes
+	// anything.
+	if ti.target.Tenant == "" || ti.target.Tenant != tenant {
+		return liveTrustPrecheck{Resolved: true, Authoritative: authoritative}
 	}
 	// Bind trust to the DECISION's fingerprint, not merely whichever fingerprint is current (P1a): the
 	// current target must STILL equal the fingerprint this request was decided against, so an
@@ -370,7 +487,15 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 		return liveTrustPrecheck{}
 	}
 	if hex.EncodeToString(ti.target.Fingerprint[:]) != decisionFP {
-		return liveTrustPrecheck{DriftCode: "tool_fingerprint_drift"}
+		// Resolved/Authoritative ride along with the code. The code alone says only what THIS
+		// request could see — its decision fingerprint against current inventory — and that is not
+		// always the strongest available statement about the breach. Carrying the target lets the
+		// activation's own reviewed record speak too, so the recorded first cause is decided from
+		// state rather than from which transition window the request landed in. See
+		// reviewedFirstCause in mcp_canary_admission.go (Codex P2, PR #1360, round 29).
+		return liveTrustPrecheck{
+			DriftCode: "tool_fingerprint_drift", Resolved: true, Authoritative: authoritative,
+		}
 	}
 	return liveTrustPrecheck{
 		Eligible: true,
@@ -381,52 +506,46 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 			Fingerprint:       ti.target.Fingerprint,
 			FingerprintFormat: ti.target.FingerprintFormatVersion,
 		},
+		// From the SAME snapshot loadTarget resolved the fingerprint from, never a second lookup:
+		// a Registry.Repin landing between two reads composes an (F1, I2) pair that was never
+		// simultaneously authoritative. See the pinnedIdentity field comment in mcp_tooltrust.go.
+		ServerIdentity: ti.pinnedIdentity,
 	}
 }
 
-// mcpLiveApprovalSatisfied answers the APPROVAL half of live-execution trust, and reports the one
-// condition in it that is an authoritative whole-Canary drift rather than an ordinary denial.
+// mcpLiveApprovalSatisfied answers the APPROVAL half of live-execution trust: is THIS request
+// authorized right now?
 //
-// WHY THE DRIFT VERDICT LIVES HERE. A rug-pull landing before a request's policy resolution is
-// refused upstream of this gate, and every request AFTER it resolves cleanly against the NEW
-// fingerprint — so the comparison in mcpLiveTrustPrecheck sees F2 == F2, reports no drift, and the
-// request is denied merely for lacking an approval. Read that way an authoritative breach is
-// indistinguishable from ordinary unauthorized traffic and stops nothing (Codex rounds 20 and 23).
+// It reports authorization and nothing else. It used to also report a drift verdict — an approval
+// that was valid in every respect except that it pinned a different fingerprint for this exact
+// (tenant, server, tool) was read as the rug-pull. That inference was correct whenever it fired,
+// and it was the wrong instrument, because it could only fire while such an approval still
+// EXISTED. An activation may run for FirstCanaryMaxWindowCeiling (7 days) and an approval may live
+// at most MaxInitialCanaryApprovalTTL (24 hours), so once the reviewing approval expired the
+// evidence was simply gone: a later F2 request read as an ordinary missing-approval denial, and a
+// later F2 approval could resume execution across an intervening breach (Round-24 P1).
 //
-// The evidence is right here, though: an approval that is ACTIVE, live-purpose and valid in every
-// respect EXCEPT that it pins a different fingerprint for this exact (tenant, server, tool) is
-// precisely the taxonomy's rug-pull — the executed tool is not the reviewed tool. Detecting it at
-// this point puts the whole-Canary latch inside the ATOMIC admission transaction, which already
-// owns the activation lock and charges an exact generation. It is activation-bound BY
-// CONSTRUCTION, needing no generation carried from elsewhere, no scope lookup, and no argument
-// about which activation an observation belongs to.
+// Drift is now decided against the ACTIVATION's own immutable reviewed-target snapshot, inside the
+// same atomic admission transaction, which is independent of approval lifetime by construction —
+// see internal/mcp/canary/reviewed.go and admitLiveExecution step (5). The two questions are
+// separate security facts and are no longer conflated:
 //
-// Anything else — no approval at all, expired, revoked, wrong tenant, never granted — stays
-// REQUEST-SCOPED: a Canary correctly refusing an unauthorized request is a Canary working.
+//	approval   — is this request authorized NOW?
+//	activation — is this still the exact target the experiment was reviewed against?
 //
-// The store read is LOCK-FREE (tooltrust publishes a copy-on-write snapshot through an atomic
-// pointer), which is what makes it legal inside the critical section at all — see §5.
+// The driftCode result is retained as always-empty so the seam's shape is unchanged for callers
+// and a future authorization-scoped drift has somewhere to go; nothing produces one today.
 func mcpLiveApprovalSatisfied(tgt canary.LiveTarget, now time.Time) (satisfied bool, driftCode string) {
 	if mcpToolTrust == nil {
 		return false, ""
 	}
-	reviewedElsewhere := false
 	for _, a := range mcpToolTrust.activeLiveApprovals(now) {
 		if canary.SatisfiesLiveExecution(a, tgt, now) == canary.TrustOK {
 			return true, ""
 		}
-		// Same reviewed tool, DIFFERENT reviewed fingerprint. Evaluated over the same approval set
-		// at the same instant as the branch above, so it can never contradict it.
-		if a.Tenant == tgt.Tenant && a.ServerID == tgt.ServerID && a.ToolName == tgt.ToolName &&
-			a.Fingerprint != tgt.Fingerprint {
-			reviewedElsewhere = true
-		}
 	}
-	if reviewedElsewhere {
-		return false, "tool_fingerprint_drift"
-	}
-	// No satisfying approval and nothing saying the reviewed target moved: request-scoped. This
-	// request simply is not authorized (expired, revoked, never granted).
+	// No satisfying approval: request-scoped. This request simply is not authorized (expired,
+	// revoked, never granted).
 	return false, ""
 }
 

@@ -210,19 +210,19 @@ run_mutation M01 \
   'the activation lock is released around the trust observation' \
   'TestAtomicBinding_TrustProbeRunsUnderTheActivationLock' \
   . "$ADM" \
-  's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\tcr\.mu\.Unlock\(\)\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/'
+  's/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\}\n/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tcr\.mu\.Unlock\(\)\n\t\tobs = trust\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/'
 
 run_mutation M02 \
   'counter equality either side of an unlocked observation is substituted for locking' \
   'TestAtomicBinding_TrustProbeRunsUnderTheActivationLock' \
   . "$ADM" \
-  's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\tcr\.mu\.Unlock\(\)\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\tif cr\.generation != gen \{\n\t\t\treturn canaryAdmission\{Denial: canaryAdmitNoActivation\}\n\t\t\}\n\t\}\n/'
+  's/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\}\n/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tcr\.mu\.Unlock\(\)\n\t\tobs = trust\(\)\n\t\tcr\.mu\.Lock\(\)\n\t\tif cr\.generation != gen \{\n\t\t\treturn canaryAdmission\{Denial: canaryAdmitNoActivation\}\n\t\t\}\n\t\}\n/'
 
 run_mutation M08 \
   'the lock is released after the observation and the latch stops re-verifying the generation' \
   'TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation' \
   . "$ADM" \
-  's/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\}\n/\ttrusted, driftCode := false, ""\n\tif trust != nil \{\n\t\ttrusted, driftCode = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \
+  's/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\}\n/\tvar obs canaryTrustObservation\n\tif trust != nil \{\n\t\tobs = trust\(\)\n\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\}\n/' \
   's/\tif !cr\.active \|\| cr\.aborter == nil \|\| cr\.generation != gen \{\n\t\treturn canary\.TripCanaryLatched\n\t\}\n//'
 
 
@@ -246,13 +246,13 @@ run_mutation M06 \
   'an authoritative drift denies the request but never latches the active generation' \
   'TestAtomicBinding_A_DriftLatchesTheActiveGeneration' \
   . "$ADM" \
-  's/\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, gen, now\)/\t\tres := canary\.TripRequestScoped\n\t\t_ = res/'
+  's/\tres := rt\.tripLockedForGeneration\(cr, capb, code, gen, now\)\n\treturn canaryAdmission\{/\tres := canary\.TripRequestScoped\n\treturn canaryAdmission\{/'
 
 run_mutation M07 \
   'the drift is latched against whatever generation is current at trip time' \
   'TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation' \
   . "$ADM" \
-  's/\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, gen, now\)/\t\tcr\.mu\.Unlock\(\)\n\t\ttime\.Sleep\(100 \* time\.Millisecond\)\n\t\tcr\.mu\.Lock\(\)\n\t\tres := rt\.tripLockedForGeneration\(cr, capb, driftCode, cr\.generation, now\)/'
+  's/\tres := rt\.tripLockedForGeneration\(cr, capb, code, gen, now\)\n\treturn canaryAdmission\{/\tcr\.mu\.Unlock\(\)\n\ttime\.Sleep\(100 \* time\.Millisecond\)\n\tcr\.mu\.Lock\(\)\n\tres := rt\.tripLockedForGeneration\(cr, capb, code, cr\.generation, now\)\n\treturn canaryAdmission\{/'
 
 # ── (4) THE RESERVATION ─────────────────────────────────────────────────────
 
@@ -291,13 +291,13 @@ run_mutation M11 \
   'the pre-executor path counts the drift as evidence and never latches' \
   'TestPreAdmissionDrift_E2E_ServerIdentityDriftStopsTheActivation' \
   . "$ADM" \
-  's/\tglobalCanaryRuntime\.latchDriftUnderActivation\(.*?\n\t\}\)\n/\t_ = capb\n\t_ = now\n/s'
+  's/\tlatch := globalCanaryRuntime\.latchDriftUnderActivation\(.*?\n\t\}\)\n/\tlatch := canaryDriftLatch\{\}\n\t_ = capb\n\t_ = now\n/s'
 
 run_mutation M12 \
   'the latch trusts the callers unlocked verdict instead of re-deriving under the lock' \
   'TestAtomicBinding_I_PreExecutorLatchNeverInventsABreach' \
   . "$ADM" \
-  's/\tcode := ""\n\tif trust != nil \{\n\t\t_, code = trust\(\)\n\t\}\n/\tcode := "tool_fingerprint_drift"\n/'
+  's/\t\tcode = canaryDriftCause\(cr\.reviewed, trust\(\)\)/\t\tcode = "tool_fingerprint_drift"/'
 
 run_mutation M13 \
   'a pre-executor drift seen in the publication gap latches the next activation' \
@@ -320,7 +320,8 @@ run_mutation M16 \
   'the approval verdict is read before the lock and cached across it' \
   'TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction' \
   . mcp_live_gate.go \
-  's/\tadm := g\.admitUnderActivation\(in\.Now, canary\.ExecutionIdentity\{/\tpreHoist := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)\n\thoistOK, hoistCode := false, ""\n\tif preHoist.Eligible \{ hoistOK, hoistCode = g.approvalOK(preHoist.Target, in.Now) \}\n\tadm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{/; s/\t\treturn g\.approvalOK\(live\.Target, in\.Now\)/\t\treturn hoistOK, hoistCode/'
+  's/\tadm := g\.admitUnderActivation\(in\.Now, canary\.ExecutionIdentity\{/\tpreHoist := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)\n\thoistOK := false\n\tif preHoist.Eligible \{ hoistOK, _ = g.approvalOK(preHoist.Target, in.Now) \}\n\tadm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{/' \
+  's/\t\ttrusted, _ := g\.approvalOK\(live\.Target, in\.Now\)/\t\ttrusted := hoistOK/'
 
 run_mutation M18 \
   'the live-approval read takes the durable store lock again' \
@@ -377,22 +378,194 @@ run_mutation M24 \
 # evidence, and it is available where the transaction already owns the activation lock.
 
 run_mutation M25 \
-  'the rug-pull reason is dropped, so the breach reads as a missing approval' \
-  'TestLiveTrustRevalidate_RugPullReportsDriftNotMissingApproval' \
-  . mcp_live_gate.go \
-  's/\tif reviewedElsewhere \{\n\t\treturn false, "tool_fingerprint_drift"\n\t\}\n/\t_ = reviewedElsewhere\n/'
+  'a moved reviewed target is downgraded to a request-scoped denial and latches nothing' \
+  'TestReviewedBinding_C03_FingerprintDriftWithLiveApprovalLatches' \
+  . "$ADM" \
+  's/\tif code := canaryDriftCause\(cr\.reviewed, obs\); code != "" \{\n\t\treturn rt\.latchDriftLocked\(cr, capb, code, gen, now\)\n\t\}/\tif code := canaryDriftCause(cr.reviewed, obs); code != "" \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitUntrusted, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid\}\n\t\}/'
 
 run_mutation M26 \
-  'EVERY approval failure is classified as drift (the control)' \
-  'TestLiveTrustRevalidate_UnapprovedIsNotDrift' \
-  . mcp_live_gate.go \
-  's/\tif reviewedElsewhere \{/\tif reviewedElsewhere || true \{/'
+  'EVERY non-matching reviewed verdict is classified as drift (the control)' \
+  'TestReviewedBinding_C13_UnreviewedTargetIsRequestScopedNotDrift' \
+  . "$ADM" \
+  's/\tcase v == canary\.ReviewedOutOfScope:\n\t\treturn ""\n/\tcase v == canary.ReviewedOutOfScope:\n\t\treturn "tool_fingerprint_drift"\n/'
 
 run_mutation M27 \
   'the lock-free view hands out its shared records instead of copies' \
   'TestLiveView_ReturnedRecordsAreCallerOwned' \
   ./internal/mcp/tooltrust/ internal/mcp/tooltrust/store.go \
   's/caller-owned records keeps that contract exactly \(Codex round 23\)\.\n\t\t\tout = append\(out, a\.clone\(\)\)/caller-owned records keeps that contract exactly (Codex round 23).\n\t\t\tout = append(out, a)/'
+
+# ── (11) THE REVIEWED-TARGET OBSERVATION IS ABOVE EVERY EARLY RETURN ───────
+# Round 24: dispatchPolicy returns from three places above the executor, and the F1→F2
+# republish this mechanism exists to catch is commonly a schema change — which hard-fails
+# inspection for every request still sending the old argument shape. Emitting below that
+# return means the change hides its own evidence.
+
+run_mutation M28 \
+  'the reviewed-target observation is emitted below the inspection hard-fail return' \
+  'TestCanaryReviewedTarget_(ReportedWhenInspectionHardFails|EmissionIsAboveEveryReturnInDispatchPolicy)' \
+  ./internal/mcp/runtime/ internal/mcp/runtime/policy.go \
+  's/\tp\.observeCanaryReviewedTarget\(req, msg\)\n//' \
+  's/\td, _, _ := p\.policyEngine\.Evaluate/\tp.observeCanaryReviewedTarget(req, msg)\n\td, _, _ := p.policyEngine.Evaluate/'
+
+# ── (12) ONE SNAPSHOT, AND AN UNUSABLE ANCHOR IS A BREACH ──────────────────
+# Round 25: the scope-independent observation path runs for EVERY dispatched request, so it is
+# the path that has to carry both verdicts. It carried neither: it re-read the pinned identity
+# from a fresh inventory lookup (tearing (F1,I2) across a Registry.Repin), and it ignored server
+# usability entirely, so a disable that settled before the request latched nothing.
+
+run_mutation M29 \
+  'an unusable reviewed server compares as ReviewedMatches and latches nothing' \
+  'TestReviewedBinding_C1[45]' \
+  . "$ADM" \
+  's/\t\tAnchorLost: !obs\.Usable \|\| obs\.RegistryPinDiverged,/\t\tAnchorLost: obs.RegistryPinDiverged,/'
+
+run_mutation M30 \
+  'the pinned identity is re-read from a second inventory lookup (the torn (F1,I2) pair)' \
+  'TestReviewedBinding_C16_IdentityAndFingerprintComeFromOneSnapshot' \
+  . mcp_canary_preflight.go \
+  's/\t"github\.com\/KidCarmi\/Culvert\/internal\/mcp\/rollout"/\t"github.com\/KidCarmi\/Culvert\/internal\/mcp\/registry"\n\t"github.com\/KidCarmi\/Culvert\/internal\/mcp\/rollout"/' \
+  's/\t\t\tServerIdentity: ti\.pinnedIdentity,/\t\t\tServerIdentity: func() string \{ reg, _ := mcpInventory.sharedInventory(); if reg == nil \{ return "" \}; s, ok := reg.Current().Get(registry.ServerID(serverID)); if !ok \{ return "" \}; return string(s.PinnedIdentity) \}(),/'
+
+# ── (13) ROUND 26: THE THREE REMAINING TRANSITION-DEPENDENCIES ─────────────
+# The through-line for four rounds: detection kept depending on a request arriving to notice a
+# change, and the thing that moves is what stops the change being observable. M33 is the one
+# that matters most — the anchor-loss latch was UNREACHABLE on real traffic because
+# identity.Resolve rejects a disabled server above dispatchPolicy, and the round-3 gates passed
+# because they drove the sink rather than the pipeline.
+
+run_mutation M31 \
+  'a reviewed target reassigned to another tenant reads as an unrelated target' \
+  'TestReviewedBinding_C17_TenantReassignmentOfAReviewedTargetLatches' \
+  . internal/mcp/canary/reviewed.go \
+  's/\tif tenantMoved \{/\tif false \&\& tenantMoved \{/'
+
+run_mutation M32 \
+  'the identity is taken from the registry pin again, recomposing the hybrid (F1,I2)' \
+  'TestReviewedBinding_C18_RepinWindowIsDetectedAsDrift' \
+  . mcp_tooltrust.go \
+  's/\t\tpinned = string\(rec\.Fingerprint\.Identity\)\n\t\tdiverged = sok \&\& rec\.Fingerprint\.Identity != srv\.PinnedIdentity/\t\tif sok \{ pinned = string(srv.PinnedIdentity) \}/'
+
+run_mutation M33 \
+  'the observation is dropped on the server-unavailable rejection (the unreachable-latch defect)' \
+  'TestCanaryReviewedTarget_ReportedWhenTheServerIsNoLongerUsable' \
+  ./internal/mcp/runtime/ internal/mcp/runtime/pipeline.go \
+  's/\t\tif reason == mcperr\.ReasonRegistryServerUnavailable \{\n\t\t\tp\.observeCanaryReviewedTarget\(req, msg\)\n\t\t\}\n//'
+
+run_mutation M34 \
+  'the observation fires on EVERY auth failure, reachable without credentials (the control)' \
+  'TestCanaryReviewedTarget_UnauthenticatedFailureReportsNothing' \
+  ./internal/mcp/runtime/ internal/mcp/runtime/pipeline.go \
+  's/\t\tif reason == mcperr\.ReasonRegistryServerUnavailable \{/\t\tif true \{/'
+
+# ── (14) ROUND 27: ONE FACT, BOTH CONSUMERS ───────────────────────────────
+# RegistryPinDiverged was added to the observation and taught to mcpLiveTrustPrecheck only. The
+# scope-independent path — the one an inspection/policy/scope rejection leaves as the ONLY
+# observer — ignored it, and inside the window the target compares as a genuine match.
+
+run_mutation M35 \
+  'the observation path ignores a divergent registry pin (taught to one consumer only)' \
+  'TestReviewedBinding_C19_ObservationPathLatchesTheRepinWindow' \
+  . "$ADM" \
+  's/\t\tAnchorLost: !obs\.Usable \|\| obs\.RegistryPinDiverged,/\t\tAnchorLost: !obs.Usable,/'
+
+# ── (15) ROUND 28: THE TRANSITION WINDOW AFTER THE OBSERVATION ─────────────
+# A reviewed pair reassigned A→B between the early observation and the live-gate callback made the
+# request ineligible, and reporting that as "nothing resolves" discarded the evidence the reviewed
+# comparison needs. Plus: a new drift verdict that is not a named evidence key is recorded as
+# "other" — the abort happens, the reason does not.
+
+run_mutation M36 \
+  'the resolved-but-other-tenant target is discarded, so admission never compares' \
+  'TestReviewedBinding_C21_TenantReassignmentLatchesAtAdmission' \
+  . mcp_live_gate.go \
+  's/\t\tif !live\.Eligible \&\& live\.Resolved \{.*?\n\t\t\}\n/\t\tif false \{\n\t\t\treturn canaryTrustObservation\{\}\n\t\t\}\n/s'
+
+run_mutation M37 \
+  'the tenant-drift code is dropped from the evidence allowlist (abort with no named cause)' \
+  'TestReviewedBinding_C20_EveryDriftVerdictIsANamedEvidenceKey' \
+  . "$ADM" \
+  's/\t"reviewed_target_tenant_drift": \{\},\n//'
+
+# ── (16) ROUND 29: THE FIRST CAUSE MUST NOT BE AN ARTIFACT OF TIMING ───────
+# Repin and re-ingest are two publications. After BOTH land, the registry and the catalog agree,
+# so the probe can only see the stale decision fingerprint while the activation's reviewed record
+# still pins the old identity. Charging the probe's view verbatim made the immutable first cause
+# depend on which window the request arrived in — and the opposite error (letting the reviewed
+# verdict REPLACE the code rather than sharpen it) silently admits a stale-decision request.
+
+run_mutation M38 \
+  'the admission transaction charges the probe verdict verbatim (timing decides the cause)' \
+  'TestReviewedBinding_C22_FirstCauseDoesNotDependOnTheTransitionWindow' \
+  . "$ADM" \
+  's/\tcase canary\.IsDriftVerdict\(v\):\n\t\treturn string\(v\)/\tcase canary.IsDriftVerdict(v):\n\t\treturn obs.DriftCode/'
+
+run_mutation M39 \
+  'the pre-executor path charges the probe verdict verbatim (two paths, two causes, one state)' \
+  'TestReviewedBinding_C22B_TheObservationPathAgreesOnTheFirstCause' \
+  . "$ADM" \
+  's/\t\tcode = canaryDriftCause\(cr\.reviewed, trust\(\)\)/\t\tcode = trust().DriftCode/'
+
+run_mutation M40 \
+  'the reviewed verdict REPLACES the probe code, so a reviewed match silences a real breach' \
+  'TestReviewedBinding_C22Control2_AReviewedMatchNeverSilencesTheProbe' \
+  . "$ADM" \
+  's/\tdefault:\n\t\t\/\/ ReviewedMatches — the reviewed target is intact, so only the probe can still object\.\n\t\treturn obs\.DriftCode/\tdefault:\n\t\treturn ""/'
+
+run_mutation M41 \
+  'the stale-fingerprint branch drops the authoritative target, so nothing can sharpen the cause' \
+  'TestReviewedBinding_C22_FirstCauseDoesNotDependOnTheTransitionWindow' \
+  . mcp_live_gate.go \
+  's/\t\t\tDriftCode: "tool_fingerprint_drift", Resolved: true, Authoritative: authoritative,/\t\t\tDriftCode: "tool_fingerprint_drift",/'
+
+# ── (17) ROUND 30: TWO TRANSITIONS AT ONCE ─────────────────────────────────
+# Each transition on its own agreed across both latch paths; the COMBINATION did not. A reviewed
+# pair reassigned A→B whose registry identity is then repinned before the catalog re-ingests made
+# the precheck return at the tenant gate before it ever looked at the anchor facts, so the cause
+# depended on which path observed it.
+
+run_mutation M42 \
+  'the tenant gate returns before the anchor facts are consulted (cause decided by path)' \
+  'TestReviewedBinding_C24_AnchorLossOutranksTenantDriftOnBothPaths' \
+  . mcp_live_gate.go \
+  's/\tif !ti\.target\.ServerUsable \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative, AnchorLost: true\}\n\t\}\n/\tif ti.target.Tenant == "" || ti.target.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative\}\n\t\}\n\tif !ti.target.ServerUsable \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative, AnchorLost: true\}\n\t\}\n/'
+
+run_mutation M43 \
+  'every wrong-tenant request reads as anchor loss, erasing the tenant-drift verdict' \
+  'TestReviewedBinding_C24Control_AHealthyAnchorStillReportsTenantDrift' \
+  . mcp_live_gate.go \
+  's/\tif ti\.target\.Tenant == "" \|\| ti\.target\.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative\}\n\t\}/\tif ti.target.Tenant == "" || ti.target.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{DriftCode: "server_identity_drift"\}\n\t\}/'
+
+# ── (18) ROUND 31: SCOPE DECIDES WHETHER, ANCHOR DECIDES WHICH ─────────────
+# Both paths checked the anchor facts before the reviewed comparison could return OutOfScope, so a
+# resolvable tool on ANY disabled or repinned server aborted the Canary — the round-15 rule
+# inverted, made reachable by round 26's server-unavailable pipeline hook. And the pre-admission
+# evidence counter recorded the pre-lock observation, so the admin surface and auto_stop reported
+# different causes for one event.
+
+run_mutation M44 \
+  'anchor state is charged before scope, so an unreviewed target stops the experiment' \
+  'TestReviewedBinding_C26_AnchorLossOnAnUnreviewedTargetLatchesNothing' \
+  . "$ADM" \
+  's/\tcase v == canary\.ReviewedOutOfScope:\n\t\treturn ""\n\tcase obs\.AnchorLost:/\tcase obs.AnchorLost:/'
+
+run_mutation M45 \
+  'anchor loss stops being a cause at all (the round-3 defect restored)' \
+  'TestReviewedBinding_C26Control_TheReviewedTargetStillLatchesAnchorLoss' \
+  . "$ADM" \
+  's/\tcase obs\.AnchorLost:\n\t\treturn "server_identity_drift"\n//'
+
+run_mutation M46 \
+  'the evidence counter records the pre-lock observation, not the cause that was latched' \
+  'TestReviewedBinding_C27_EvidenceCounterRecordsTheLatchedCause' \
+  . "$ADM" \
+  's/\tif latch\.DriftCode != "" \{\n\t\tnoteCanaryPreAdmissionDrift\(capability, latch\.DriftCode\)\n\t\treturn\n\t\}\n\tnoteCanaryPreAdmissionDrift\(capability, obs\.Code\)/\t_ = latch\n\tnoteCanaryPreAdmissionDrift(capability, obs.Code)/'
+
+run_mutation M47 \
+  'a drift code is emitted with no target, so scope cannot be established and it is dropped' \
+  'TestReviewedBinding_C28_ADriftCodeAlwaysCarriesItsTarget' \
+  . mcp_live_gate.go \
+  's/\t\t\tDriftCode: "tool_fingerprint_drift", Resolved: true, Authoritative: authoritative,/\t\t\tDriftCode: "tool_fingerprint_drift", Authoritative: authoritative,/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"

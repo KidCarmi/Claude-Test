@@ -93,6 +93,30 @@ type Deps struct {
 	// intervened; a mismatch simply skips the latch, which is the safe direction (an in-scope
 	// request under the new activation observes the same drift and latches it there).
 	CanaryGeneration func(capability string) uint64
+	// CanaryTargetObserved is the OPTIONAL narrow seam for reporting, for EVERY dispatched
+	// request that names a tool, WHICH tool it named — independent of the rollout disposition
+	// that request resolved to. Nil ⇒ nothing composed and nothing reported (the
+	// disabled-by-default posture).
+	//
+	// WHY IT CANNOT BE FOLDED INTO CanaryDriftObserved, which is the mistake that made it
+	// necessary. That seam fires only from refuseOnToolDrift, i.e. only when the DECISION's
+	// fingerprint disagrees with the live catalog — the in-flight window. It therefore cannot see
+	// the sequence that matters most: once the catalog has moved to F2, every NEW request is
+	// decided under F2, the decision agrees with the catalog, and no drift is reported at all.
+	//
+	// And the rollout scope cannot report it either, because the scope is part of the problem: a
+	// Canary ScopeSpec pins the reviewed FINGERPRINT in its tool selector, so the moment the tool
+	// moves F1→F2 every request naming it falls OUT of scope and resolveEnforcing routes it to the
+	// shadow/record-only fallback — never reaching the executor, the live gate, or the activation
+	// transaction. The experiment's premise has been violated and the one signal that would say so
+	// has been filtered out by the very fact that it was violated (Codex P1, PR #1360).
+	//
+	// So this seam reports the target's IDENTITY only — server and tool — and nothing else. It
+	// makes no claim about drift, scope, or authorization. The root reads the current authoritative
+	// target for that identity and compares it against the ACTIVATION's immutable reviewed-target
+	// snapshot inside the activation critical section; a tool the activation was never reviewed for
+	// is request-scoped and latches nothing, which is what makes reporting every request safe.
+	CanaryTargetObserved func(capability string, obs CanaryTargetObservation)
 	// Clock is injected for deterministic tests; nil ⇒ time.Now.
 	Clock func() time.Time
 }
@@ -111,6 +135,28 @@ type CanaryDriftTarget struct {
 	ServerID   string
 	ToolName   string
 	DecisionFP string
+}
+
+// CanaryTargetObservation names the tool one dispatched request referred to, for the root's
+// reviewed-target comparison. It carries an IDENTITY and an activation generation — never a
+// verdict, a fingerprint, or a scope fact — because everything a latch may rest on is read inside
+// the activation critical section by the root, not here.
+type CanaryTargetObservation struct {
+	// Generation is the activation generation in force when this request's rollout disposition was
+	// resolved. The root refuses to latch unless it is non-zero and still current under the
+	// activation lock, on exactly the reasoning recorded for CanaryDriftTarget.Generation.
+	Generation uint64
+	ServerID   string
+	ToolName   string
+}
+
+// noteCanaryTargetObserved reports the tool a dispatched request named, when a sink is composed.
+// Nil-safe, and a request naming no tool reports nothing: there is no identity to compare.
+func (d Deps) noteCanaryTargetObserved(capability string, obs CanaryTargetObservation) {
+	if d.CanaryTargetObserved == nil || obs.ServerID == "" || obs.ToolName == "" {
+		return
+	}
+	d.CanaryTargetObserved(capability, obs)
 }
 
 // noteCanaryDriftObserved reports a pre-executor drift observation when a sink is composed.

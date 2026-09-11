@@ -76,7 +76,7 @@ func TestCanaryRuntime_BudgetExhaustionTripsWholeCanaryAbort(t *testing.T) {
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
 	const N = 4
-	gen, err := rt.beginCanaryActivation(capb, runtimeTestBudget(N), now)
+	gen, err := testBeginActivation(rt, capb, runtimeTestBudget(N), now)
 	if err != nil {
 		t.Fatalf("beginCanaryActivation: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestCanaryRuntime_WindowExpiryEndsEligibility(t *testing.T) {
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
 	b := runtimeTestBudget(100) // plenty of total slots remain; only the window will end eligibility
-	if _, err := rt.beginCanaryActivation(capb, b, now); err != nil {
+	if _, err := testBeginActivation(rt, capb, b, now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Inside the window (Window == 1h): eligible, with slots to spare.
@@ -150,7 +150,7 @@ func TestCanaryRuntime_ThrottleEndsEligibility(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	b := runtimeTestBudget(100) // plenty of total/window; concurrency is the binding gate
 	b.MaxConcurrentExecutions = 1
-	if _, err := rt.beginCanaryActivation(capb, b, now); err != nil {
+	if _, err := testBeginActivation(rt, capb, b, now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if !rt.executionEligible(capb, now) {
@@ -176,7 +176,7 @@ func TestCanaryRuntime_PerRequestTripDoesNotStopCanary(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(10), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(10), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if r := rt.tripCanaryAbort(capb, "policy_deny", now); r != canary.TripRequestScoped {
@@ -199,7 +199,7 @@ func TestCanaryRuntime_RestartPreservesSpendAndAbort(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	for i := 0; i < 3; i++ {
@@ -233,7 +233,7 @@ func TestCanaryRuntime_RestartPreservesAbortLatch(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(10), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(10), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	rt.tripCanaryAbort(capb, "credential_safety_failure", now)
@@ -254,7 +254,7 @@ func TestCanaryRuntime_BuildMismatchDisarms(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v1.0.0")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Restart under a DIFFERENT build.
@@ -280,7 +280,7 @@ func TestCanaryRuntime_CommitMismatchDisarms(t *testing.T) {
 	buildCommit = "aaaa1111aaaa" // the build that ARMS the activation (hex commit; overrides the helper)
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Restart under the SAME version tag but a DIFFERENT commit.
@@ -304,7 +304,7 @@ func TestCanaryRuntime_DemotionInvalidatesOldGeneration(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	gen1, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now)
+	gen1, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now)
 	if err != nil {
 		t.Fatalf("begin1: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestCanaryRuntime_DemotionInvalidatesOldGeneration(t *testing.T) {
 	if rt.executionEligible(capb, now) {
 		t.Fatal("a demoted Canary must not be execution-eligible")
 	}
-	gen2, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now)
+	gen2, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now)
 	if err != nil {
 		t.Fatalf("begin2: %v", err)
 	}
@@ -343,7 +343,7 @@ func TestCanaryRuntime_RestartAfterDemotionStaysDisarmed(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := rt.demoteCanary(capb); err != nil {
@@ -371,7 +371,7 @@ func TestCanaryRuntime_CapabilityIsolation(t *testing.T) {
 	gw, mg := rollout.CapabilityGateway, rollout.CapabilityManagement
 
 	// Arm ONLY the Management runtime.
-	if _, err := rt.beginCanaryActivation(mg, runtimeTestBudget(2), now); err != nil {
+	if _, err := testBeginActivation(rt, mg, runtimeTestBudget(2), now); err != nil {
 		t.Fatalf("begin(management): %v", err)
 	}
 	if rt.currentGeneration(gw) != 0 {
@@ -415,7 +415,7 @@ func TestCanaryRuntime_FailedDemoteDoesNotReviveOnRestart(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Sanity: the durable record is active — a naive restart would revive it.
@@ -457,7 +457,7 @@ func TestCanaryRuntime_BeginPersistFailureDisarms(t *testing.T) {
 	}
 	t.Cleanup(func() { canaryRuntimePersist = prev })
 
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err == nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err == nil {
 		t.Fatal("begin must return the persist error")
 	}
 	if rt.executionEligible(capb, now) {
@@ -479,7 +479,7 @@ func TestCanaryRuntime_AbortPersistFailureRemovesState(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Inject a persist failure for the abort trip (leaves the pre-abort active record on disk).
@@ -515,7 +515,7 @@ func TestCanaryRuntime_ReserveAbortPersistFailureRemovesState(t *testing.T) {
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
 	// A total budget of exactly 1: the 2nd reserve exhausts the blast radius → whole-Canary abort.
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(1), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(1), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if o, _ := rt.reserveCanaryExecution(capb, now, rtIdent); o != canary.BudgetGranted {
@@ -566,7 +566,7 @@ func TestCanaryRuntime_ReserveNotSyncedPersistDeniesGrant(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Inject a not-synced replacement for the next persist (the real persistLocked runs).
@@ -613,7 +613,7 @@ func TestCanaryRuntime_BeginNotSyncedPersistRemovesRecord(t *testing.T) {
 	}
 	t.Cleanup(func() { canaryAtomicWrite = prevWrite })
 
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(5), now); err == nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(5), now); err == nil {
 		t.Fatal("a begin whose persist is not durably synced must return an error")
 	}
 	// Begin must have removed the visible-but-unsynced record.
@@ -640,7 +640,7 @@ func TestCanaryRuntime_PersistFailureReleasesConcurrencySlot(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	b := runtimeTestBudget(100)
 	b.MaxConcurrentExecutions = 1 // one leaked slot would deny every later reserve on concurrency
-	if _, err := rt.beginCanaryActivation(capb, b, now); err != nil {
+	if _, err := testBeginActivation(rt, capb, b, now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	// Reserve #1: the enforcer grants, but the persist fails → the grant becomes a denial.
@@ -745,7 +745,7 @@ func TestCanaryRuntime_StaleReleaseDoesNotFreeNewGeneration(t *testing.T) {
 	b := runtimeTestBudget(100)
 	b.MaxConcurrentExecutions = 1
 
-	gen1, err := rt.beginCanaryActivation(capb, b, now)
+	gen1, err := testBeginActivation(rt, capb, b, now)
 	if err != nil {
 		t.Fatalf("begin1: %v", err)
 	}
@@ -756,7 +756,7 @@ func TestCanaryRuntime_StaleReleaseDoesNotFreeNewGeneration(t *testing.T) {
 	if err := rt.demoteCanary(capb); err != nil {
 		t.Fatalf("demote: %v", err)
 	}
-	gen2, err := rt.beginCanaryActivation(capb, b, now)
+	gen2, err := testBeginActivation(rt, capb, b, now)
 	if err != nil {
 		t.Fatalf("begin2: %v", err)
 	}
@@ -830,7 +830,8 @@ func TestCanaryRuntime_RestoreReconcileDisarmsWithoutLiveMode(t *testing.T) {
 		AbortSnapshot:  canary.AbortSnapshot{Generation: 1},
 		// The real persist path always writes this, and restore now REFUSES a record without it
 		// (an activation that cannot prove it is within threshold does not resume).
-		HealthSnapshot: canary.HealthSnapshot{Generation: 1},
+		HealthSnapshot:  canary.HealthSnapshot{Generation: 1},
+		ReviewedTargets: []canary.ReviewedTarget{testReviewedTarget()},
 	}
 	raw, err := json.Marshal(st)
 	if err != nil {

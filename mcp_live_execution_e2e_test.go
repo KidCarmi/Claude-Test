@@ -11,6 +11,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
+	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
 
 // End-to-end controlled live execution + the CANARY-ROLLBACK-LIVE-QUIESCE-REHEARSAL (§15).
@@ -79,7 +80,7 @@ func armCanaryLiveTier(t *testing.T, up *recordingUpstream, trustOK bool, budget
 		t.Fatalf("arm: %v", err)
 	}
 	// Begin the Canary runtime budget (the gate reserves against it).
-	if _, err := globalCanaryRuntime.beginCanaryActivation(rollout.CapabilityGateway, runtimeTestBudget(budgetTotal), time.Unix(0, 1)); err != nil {
+	if _, err := testBeginActivation(globalCanaryRuntime, rollout.CapabilityGateway, runtimeTestBudget(budgetTotal), time.Unix(0, 1)); err != nil {
 		t.Fatalf("beginCanaryActivation: %v", err)
 	}
 	return cfg
@@ -160,6 +161,29 @@ func TestLiveE2E_ControlOperationRejectedByReadFirst(t *testing.T) {
 // stubTrustPrecheckEligible is the LOCK-FREE trust half for tests that control trust through the
 // approval seam alone: the target is present, this tenant's, usable and fingerprint-matched, so no
 // authoritative drift is reported. Tests that exercise DRIFT supply their own precheck.
+// stubTrustPrecheckEligible reports an eligible target that is EXACTLY the canonical synthetic
+// reviewed target (testReviewedTarget). That correspondence is load-bearing: the admission
+// transaction now compares the observed target against the activation's reviewed set, so a stub
+// returning a zero target would make every gate test using it deny with canaryAdmitNotReviewed and
+// stop exercising whatever it was actually about.
 func stubTrustPrecheckEligible(string, string, string, string) liveTrustPrecheck {
-	return liveTrustPrecheck{Eligible: true}
+	rt := testReviewedTarget()
+	return liveTrustPrecheck{
+		Eligible: true,
+		Target: canary.LiveTarget{
+			Tenant: rt.Tenant, ServerID: rt.ServerID, ToolName: rt.ToolName,
+			Fingerprint: rt.Fingerprint, FingerprintFormat: rt.FingerprintFormat,
+		},
+		ServerIdentity: rt.ServerIdentity,
+	}
+}
+
+// stubTrustPrecheckAt is stubTrustPrecheckEligible with a DIFFERENT current fingerprint — the
+// catalog after a rug-pull, with everything else (tenant, server, tool, identity) unchanged.
+func stubTrustPrecheckAt(fp tooltrust.FingerprintDigest) func(string, string, string, string) liveTrustPrecheck {
+	return func(string, string, string, string) liveTrustPrecheck {
+		p := stubTrustPrecheckEligible("", "", "", "")
+		p.Target.Fingerprint = fp
+		return p
+	}
 }

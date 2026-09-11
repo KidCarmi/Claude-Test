@@ -23,7 +23,7 @@ func TestAutoStopConc01_BreachVersusSimultaneousReservation(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(9), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(9), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	start := make(chan struct{})
@@ -49,7 +49,7 @@ func TestAutoStopConc02_BreachWhileManyAwaitAdmission(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(64), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(64), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	rt.tripCanaryAbort(capb, "outcome_evidence_loss", now)
@@ -86,7 +86,7 @@ func TestAutoStopConc03_TwoBreachesRaceForFirstCause(t *testing.T) {
 		rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 		capb := rollout.CapabilityGateway
 		now := canaryRuntimeTestNow
-		if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(3), now); err != nil {
+		if _, err := testBeginActivation(rt, capb, runtimeTestBudget(3), now); err != nil {
 			t.Fatalf("begin: %v", err)
 		}
 		start := make(chan struct{})
@@ -117,7 +117,7 @@ func TestAutoStopConc04_DeadlineVersusReservation(t *testing.T) {
 	nowP := start
 	swapCanaryClockVar(t, &nowP)
 	fireIndex, _, _ := swapCanaryTimer(t)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(9), start); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(9), start); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	nowP = start.Add(runtimeTestBudget(9).Window)
@@ -146,7 +146,7 @@ func TestAutoStopConc05_DeadlineVersusRestart(t *testing.T) {
 	start := canaryRuntimeTestNow
 	nowP := start
 	swapCanaryClockVar(t, &nowP)
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(9), start); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(9), start); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	nowP = start.Add(runtimeTestBudget(9).Window)
@@ -174,7 +174,7 @@ func TestAutoStopConc06to08_BreachVersusNextRequest(t *testing.T) {
 			rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 			capb := rollout.CapabilityGateway
 			now := canaryRuntimeTestNow
-			if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(9), now); err != nil {
+			if _, err := testBeginActivation(rt, capb, runtimeTestBudget(9), now); err != nil {
 				t.Fatalf("begin: %v", err)
 			}
 			f := &canarySafetyFunnel{rt: rt, capb: capb}
@@ -225,7 +225,7 @@ func TestAutoStopConc10_StatusReadUnderConcurrentTrip(t *testing.T) {
 	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
 	capb := rollout.CapabilityGateway
 	now := canaryRuntimeTestNow
-	if _, err := rt.beginCanaryActivation(capb, runtimeTestBudget(64), now); err != nil {
+	if _, err := testBeginActivation(rt, capb, runtimeTestBudget(64), now); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	stop := make(chan struct{})

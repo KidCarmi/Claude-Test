@@ -13,7 +13,7 @@ func TestAbortConditions_ClassificationIsComplete(t *testing.T) {
 	}
 	wantCanary := map[string]bool{
 		"out_of_scope_execution": true, "scope_escape": true, "tool_fingerprint_drift": true,
-		"server_identity_drift": true, "outcome_evidence_loss": true, "credential_safety_failure": true,
+		"server_identity_drift": true, "reviewed_target_tenant_drift": true, "outcome_evidence_loss": true, "credential_safety_failure": true,
 		"budget_exhausted": true, "elevated_error_rate": true, "latency_pathology": true,
 		"unexpected_upstream_response": true,
 		// independent_witness_mismatch: authoritative reconciliation contradicting Culvert's own

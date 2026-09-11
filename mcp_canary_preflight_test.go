@@ -77,6 +77,9 @@ func validCanaryActivationInput(now time.Time) CanaryActivationInput {
 		// One live_execution approval bound to the EXACT scoped tool (server+name+fingerprint).
 		ToolApprovals: []canary.ToolApprovalBinding{{
 			Target: canary.LiveTarget{Tenant: "t1", ServerID: "srv-canary", ToolName: "echo", Fingerprint: digest, FingerprintFormat: 1},
+			// Explicit synthetic server identity: production reads it from the registry in the
+			// same pass that resolves the target, and an activation with none fails closed.
+			ServerIdentity: "spiffe://test/srv-canary",
 			Approval: &tooltrust.ToolApproval{
 				Tenant: "t1", ServerID: "srv-canary", ToolName: "echo",
 				Fingerprint: digest, FingerprintFormatVersion: 1,

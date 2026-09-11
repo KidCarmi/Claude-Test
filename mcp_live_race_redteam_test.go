@@ -235,7 +235,7 @@ func TestLiveRedTeam_OldGenerationNotResurrectedOnRestore(t *testing.T) {
 	resetLiveTierGlobals(t)
 	setDataDirForTest(t, t.TempDir())
 	capb := rollout.CapabilityGateway
-	if _, err := globalCanaryRuntime.beginCanaryActivation(capb, runtimeTestBudget(10), time.Unix(0, 1)); err != nil {
+	if _, err := testBeginActivation(globalCanaryRuntime, capb, runtimeTestBudget(10), time.Unix(0, 1)); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := globalCanaryRuntime.demoteCanary(capb); err != nil {
@@ -279,7 +279,7 @@ func armCanaryLiveTierTrust(t *testing.T, up *recordingUpstream, trust func() bo
 	if err := mcpLiveTierFor(rollout.CapabilityGateway).arm(true, "armed"); err != nil {
 		t.Fatalf("arm: %v", err)
 	}
-	if _, err := globalCanaryRuntime.beginCanaryActivation(rollout.CapabilityGateway, runtimeTestBudget(budgetTotal), time.Unix(0, 1)); err != nil {
+	if _, err := testBeginActivation(globalCanaryRuntime, rollout.CapabilityGateway, runtimeTestBudget(budgetTotal), time.Unix(0, 1)); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	return cfg
