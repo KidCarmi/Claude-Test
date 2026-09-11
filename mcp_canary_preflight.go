@@ -99,6 +99,7 @@ func canaryNodeFactsWith(capb rollout.Capability, emergencyKillClear, rollbackHe
 		// budget (Codex P2, PR #1249).
 		ScopeBounded:           false,
 		ScopeReadFirst:         false,
+		ScopeExactFirstCanary:  false,
 		LiveApprovalValid:      false,
 		ServerUsable:           false,
 		ToolFingerprintCurrent: false,
@@ -343,6 +344,18 @@ func evaluateCanaryActivationPreflightLocked(r *mcpRollout, in CanaryActivationI
 func evaluateActivationOnFacts(f canary.Facts, in CanaryActivationInput) canary.Readiness {
 	f.ScopeBounded = canary.ValidateScope(in.Scope, in.ScopeRev) == canary.ScopeOK
 	f.ScopeReadFirst = canary.ScopeReadFirst(in.Scope)
+	// EXACT FIRST-CANARY SHAPE (blocker #5). ScopeBounded proves the scope is within the
+	// Canary ARCHITECTURE's caps, which deliberately admit more than the one reviewed
+	// experiment. This is the separate, narrower question: is the SIGNED scope exactly one
+	// tenant / one server / one fully-pinned tool / one explicitly named principal, and
+	// nothing else? It is evaluated HERE, in the authoritative activation preflight that
+	// every caller (the locked commit gate and the restart reconcile) routes through, so a
+	// wider signed scope yields Ready:false and can never activate — rather than being
+	// caught later by a runtime side-effect gate, which would mean a Canary had already
+	// gone live. in.Scope is the SIGNED activation scope (cfg.Scope on the commit path,
+	// the restored config on the reconcile path): never a request value, never a
+	// runtime observation, never narrowed by what happened to be called.
+	f.ScopeExactFirstCanary = canary.ValidateFirstCanaryScope(in.Scope, in.ScopeRev) == canary.FirstCanaryScopeOK
 	// LiveApprovalValid is true only when EVERY scoped tool has its own valid live_execution
 	// approval bound to that exact tool identity — never a single unconstrained approval.
 	f.LiveApprovalValid = canary.ValidateScopeApprovals(in.Scope, in.ToolApprovals, in.Now) == canary.ScopeApprovalOK
@@ -415,6 +428,32 @@ func mcpCanaryStatus() map[string]any {
 			"max_window_hours":       int(canary.FirstCanaryMaxWindowCeiling.Hours()),
 			"max_approval_ttl_hours": int(canary.MaxInitialCanaryApprovalTTL.Hours()),
 			"read_first":             true,
+		},
+		// The EXACT first-experiment shape (blocker #5), distinct from first_canary_bounds
+		// above. Those are the Canary ARCHITECTURE's caps, which a later graduation phase may
+		// raise; this is the narrower shape the FIRST experiment was reviewed as, enforced in
+		// the activation preflight (canary_scope_not_exact_first_canary). Surfacing both keeps
+		// the difference visible to an operator: a scope inside the bounds can still be far
+		// wider than the one reviewed experiment, and will not activate.
+		"first_canary_exact_scope": map[string]any{
+			"tenants":                1,
+			"servers":                1,
+			"tools":                  1,
+			"principals":             1,
+			"clients":                0,
+			"agents":                 0,
+			"groups":                 0,
+			"environments":           0,
+			"bare_tool_fingerprints": 0,
+			"exclusions":             0,
+			"percent":                0,
+			"duplicates_allowed":     false,
+			"wildcard_identifiers":   false,
+			"identity_counted_by":    "principals_only",
+			"validated_from":         "signed_activation_scope",
+			"enforced_in":            "canary_activation_preflight",
+			"rejection_reasons":      firstCanaryScopeReasonStrings(),
+			"unmet_readiness_reason": string(canary.ReasonScopeNotExactFirstCanary),
 		},
 	}
 }
@@ -517,6 +556,19 @@ func reviewedTargetsFromBindings(bindings []canary.ToolApprovalBinding) []canary
 			FingerprintFormat: t.FingerprintFormat,
 			ServerIdentity:    bindings[i].ServerIdentity,
 		})
+	}
+	return out
+}
+
+// firstCanaryScopeReasonStrings renders the complete exact-first-Canary rejection vocabulary
+// for the read-only status surface, so an operator can see every way a signed scope can fail
+// the exact-shape gate without reading the source. Values only — the vocabulary is fixed and
+// never carries tenant, host, or error text.
+func firstCanaryScopeReasonStrings() []string {
+	all := canary.AllFirstCanaryScopeReasons()
+	out := make([]string, 0, len(all))
+	for _, r := range all {
+		out = append(out, string(r))
 	}
 	return out
 }

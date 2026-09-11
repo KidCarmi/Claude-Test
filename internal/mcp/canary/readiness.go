@@ -19,6 +19,14 @@ const (
 	// ReasonScopeNotReadFirst — the requested Canary scope admits an operation class beyond
 	// read/discovery (write/destructive/control), which the first Canary forbids.
 	ReasonScopeNotReadFirst Reason = "canary_scope_not_read_first"
+	// ReasonScopeNotExactFirstCanary — the requested Canary scope is a valid, bounded,
+	// read-first Canary scope but is NOT the ONE exact first experiment: exactly one tenant,
+	// one server, one fully-pinned tool on that server, and one explicitly named principal,
+	// with every other selector class empty. The broader bounds ValidateScope enforces belong
+	// to the Canary ARCHITECTURE (which a later graduation phase may use); the FIRST Canary is
+	// narrower, and this row is what makes a wider signed scope unable to activate at all.
+	// See ValidateFirstCanaryScope.
+	ReasonScopeNotExactFirstCanary Reason = "canary_scope_not_exact_first_canary"
 	// ReasonLiveExecutorAbsent — the live-execution plane (executor) is not composed. This
 	// is the shipped-default blocker: liveExecDepsConfigured is false and the execution
 	// posture wall pins that no live executor exists.
@@ -94,6 +102,11 @@ type Facts struct {
 
 	ScopeBounded   bool // ValidateScope returned no error
 	ScopeReadFirst bool // the scope admits only read/discovery operation classes
+	// ScopeExactFirstCanary — ValidateFirstCanaryScope returned no reason: the SIGNED
+	// activation scope is the one exact reviewed experiment. It is a SEPARATE fact from
+	// ScopeBounded, never a substitute: a scope can be bounded (≤ the architecture's caps)
+	// and still authorize two tools or two principals, which the first experiment forbids.
+	ScopeExactFirstCanary bool
 
 	LiveExecutorComposed      bool // liveExecDepsConfigured(gateway) — the live tier is armed
 	UpstreamCallerPresent     bool // an authoritative bounded UpstreamCaller is wired
@@ -150,13 +163,14 @@ type readinessCheck struct {
 }
 
 // readinessChecks is the canonical-ordered prerequisite table (matches the Reason declaration
-// order) and the SINGLE source of truth for both Evaluate and EvaluateNode. The six
+// order) and the SINGLE source of truth for both Evaluate and EvaluateNode. The seven
 // activation-level rows are exactly the facts a caller resolves from a requested scope/
 // approval/budget/target; every other row is node-level.
 var readinessChecks = []readinessCheck{
 	{func(f Facts) bool { return f.ShadowExitReviewPassed }, ReasonShadowExitNotPassed, factNode},
 	{func(f Facts) bool { return f.ScopeBounded }, ReasonScopeNotBounded, factActivation},
 	{func(f Facts) bool { return f.ScopeReadFirst }, ReasonScopeNotReadFirst, factActivation},
+	{func(f Facts) bool { return f.ScopeExactFirstCanary }, ReasonScopeNotExactFirstCanary, factActivation},
 	{func(f Facts) bool { return f.LiveExecutorComposed }, ReasonLiveExecutorAbsent, factNode},
 	{func(f Facts) bool { return f.UpstreamCallerPresent }, ReasonUpstreamCallerAbsent, factNode},
 	{func(f Facts) bool { return f.CredentialPathReady }, ReasonCredentialPathNotReady, factNode},
@@ -191,7 +205,7 @@ func Evaluate(f Facts) Readiness { return evaluate(f, false) }
 // live approval, server usability, tool fingerprint, budget) as unmet. This is the operator
 // dry-run surface consumed before any scope is chosen — a node that has satisfied every
 // node-level prerequisite reports node_ready true even though no activation input has been
-// supplied yet, instead of being permanently not-ready because the six activation facts
+// supplied yet, instead of being permanently not-ready because the seven activation facts
 // default false (Codex P2, PR #1249). The complete verdict is Evaluate, driven by the
 // activation preflight once a scope/approval/budget exist.
 func EvaluateNode(f Facts) Readiness { return evaluate(f, true) }
@@ -221,6 +235,7 @@ func AllReasons() []Reason {
 		ReasonShadowExitNotPassed,
 		ReasonScopeNotBounded,
 		ReasonScopeNotReadFirst,
+		ReasonScopeNotExactFirstCanary,
 		ReasonLiveExecutorAbsent,
 		ReasonUpstreamCallerAbsent,
 		ReasonCredentialPathNotReady,
