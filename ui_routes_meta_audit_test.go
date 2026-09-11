@@ -226,7 +226,7 @@ func analyzeHandler(fn *ast.FuncDecl) *handlerBehavior {
 			switch id.Name {
 			case "auditEvent", "auditEventDiff", "auditEventDiffID":
 				beh.callsAudit = true
-			case "requireRole":
+			case "requireRole", "requireRoleJSON":
 				if role := extractRequireRoleArg(x); role != "" {
 					beh.minRole.rolesSeen = append(beh.minRole.rolesSeen, role)
 					if !beh.minRole.confident || rolePriorityOf(role) < rolePriorityOf(beh.minRole.minRole) {
@@ -587,7 +587,7 @@ func collectMethodCalls(node ast.Node, method string, beh *handlerBehavior) {
 		switch id.Name {
 		case "auditEvent", "auditEventDiff", "auditEventDiffID":
 			beh.recordAudit(method)
-		case "requireRole":
+		case "requireRole", "requireRoleJSON":
 			if role := extractRequireRoleArg(call); role != "" {
 				beh.recordRole(method, role)
 			}

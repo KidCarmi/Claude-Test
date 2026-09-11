@@ -56,21 +56,26 @@ func legacyLDAPYAMLConfig() *LDAPConfig {
 // explicit "Import legacy LDAP configuration" migration.
 func apiIdPLegacyLDAP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	if !requireRole(w, r, RoleViewer) {
+	if !requireRoleJSON(w, r, RoleViewer) {
 		return
 	}
 	c := legacyLDAPYAMLConfig()
 	if c == nil {
-		jsonOK(w, map[string]any{"present": false})
+		out := map[string]any{"present": false, "retired": legacyLDAPRetired(), "scope": "node-local"}
+		if rec := legacyLDAPCutover(); rec != nil {
+			out["cutover"] = rec
+		}
+		jsonOK(w, out)
 		return
 	}
 	_, legacyActive := cfg.snapshotAuthBackend().provider.(*LDAPAuth)
-	jsonOK(w, map[string]any{
+	out := map[string]any{
 		"present": true,
 		"active":  legacyActive,
+		"scope":   "node-local",
 		// retired = the DURABLE authority cutover (survives registry
 		// disable/delete + restarts); shadowed = retired or an enabled
 		// registry LDAP profile currently exists (the GUI banner condition).
@@ -85,7 +90,13 @@ func apiIdPLegacyLDAP(w http.ResponseWriter, r *http.Request) {
 		"startTls":                 c.StartTLS,
 		"tlsSkipVerify":            c.TLSSkipVerify,
 		"cacheTtlSeconds":          int(c.CacheTTL / time.Second),
-	})
+	}
+	// FE-6A.0 R7: the DURABLE, operation-identified cutover record (actor,
+	// operationId, the enabling profile + registry revision it was bound to).
+	if rec := legacyLDAPCutover(); rec != nil {
+		out["cutover"] = rec
+	}
+	jsonOK(w, out)
 }
 
 // ─── POST /api/idp/legacy-ldap/import ────────────────────────────────────────
@@ -97,15 +108,15 @@ func apiIdPLegacyLDAP(w http.ResponseWriter, r *http.Request) {
 // file is never modified.
 func apiIdPLegacyLDAPImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	if !requireRole(w, r, RoleAdmin) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
 		return
 	}
 	c := legacyLDAPYAMLConfig()
 	if c == nil {
-		http.Error(w, "no legacy YAML ldap configuration is present", http.StatusNotFound)
+		writeRefusal(w, http.StatusNotFound, refusalNotFound, "no legacy YAML ldap configuration is present", nil)
 		return
 	}
 	p := &IdPProfile{
@@ -115,10 +126,12 @@ func apiIdPLegacyLDAPImport(w http.ResponseWriter, r *http.Request) {
 		LDAP:    legacyLDAPToProfileConfig(c),
 	}
 	if err := idpRegistry.Upsert(p); err != nil {
-		http.Error(w, "legacy ldap config cannot be imported: "+err.Error(), idpMutationErrorStatus(err))
+		writeIdPRefusal(w, err)
 		return
 	}
-	_ = publishCurrentConfigSnapshot()
+	if err := publishCurrentConfigSnapshot(); err != nil {
+		logger.Printf("UI: legacy LDAP import published locally but the cluster snapshot was refused: %v", err)
+	}
 	auditEventDiff(r, "idp.import", p.ID, "imported legacy YAML LDAP configuration", nil, auditIdPProfile(p))
 	logger.Printf("UI: legacy YAML LDAP imported as IdP profile id=%q (disabled; test-then-enable)", sanitizeLog(p.ID))
 	jsonOK(w, publicIdPProfile(p))
@@ -220,33 +233,33 @@ type apiIdPTestRequest struct {
 // apiIdPTest runs the staged, candidate-based directory test.
 func apiIdPTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	if !requireRole(w, r, RoleAdmin) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
 		return
 	}
 	var body apiIdPTestRequest
 	if err := decodeJSON(r, &body); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
 		return
 	}
 	p := body.Profile
 	if p == nil {
-		http.Error(w, "profile is required", http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "profile is required", nil)
 		return
 	}
 	if p.Type != IdPTypeLDAP {
-		http.Error(w, "only ldap profiles support the directory test", http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "only ldap profiles support the directory test", nil)
 		return
 	}
 	if p.LDAP == nil {
-		http.Error(w, "ldap config is required", http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "ldap config is required", nil)
 		return
 	}
 	resolveTestBindCredential(p)
 	if err := validateLDAPProfileConfig(p.LDAP); err != nil {
-		http.Error(w, "ldap: "+err.Error(), http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "ldap: "+err.Error(), nil)
 		return
 	}
 	report := runLDAPDirectoryTest(p.LDAP, body.TestUsername, body.TestPassword)

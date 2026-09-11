@@ -40,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -60,14 +61,14 @@ func fe6aBrokenPath(t *testing.T, name string) string {
 
 // fe6aSwapRegistry installs a fresh PERSISTED registry at path (a temp file
 // when path == "") and restores the previous singleton afterwards.
-func fe6aSwapRegistry(t *testing.T, path string) (*IdPRegistry, string) {
+func fe6aSwapRegistry(t *testing.T, path string) (reg *IdPRegistry, regPath string) {
 	t.Helper()
 	orig := idpRegistry
 	t.Cleanup(func() { idpRegistry = orig })
 	if path == "" {
 		path = filepath.Join(t.TempDir(), "idp_profiles.json")
 	}
-	reg := &IdPRegistry{live: make(map[string]IdentityProvider)}
+	reg = &IdPRegistry{live: make(map[string]IdentityProvider)}
 	if err := reg.Load(path); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -87,14 +88,14 @@ func fe6aSwapConfigStore(t *testing.T) *ConfigStore {
 // fe6aSwapCfg installs a fresh admin roster persisted at usersPath (temp when
 // "") with one bootstrap admin, isolates the session revocation list and the
 // login limiter, and restores everything afterwards.
-func fe6aSwapCfg(t *testing.T, usersPath string) (*Config, string) {
+func fe6aSwapCfg(t *testing.T, usersPath string) (c *Config, path string) {
 	t.Helper()
 	orig := cfg
 	t.Cleanup(func() { cfg = orig })
 	if usersPath == "" {
 		usersPath = filepath.Join(t.TempDir(), "ui_users.json")
 	}
-	c := newTestConfig()
+	c = newTestConfig()
 	c.SetUIUsersFile(usersPath)
 	if err := c.SetAuth("root", "RootPass1"); err != nil {
 		t.Fatalf("SetAuth: %v", err)
@@ -133,8 +134,8 @@ func fe6aRegistryFromDisk(t *testing.T, path string) []*IdPProfile {
 func fe6aReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return nil // absent — including a deliberately broken parent path
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -188,7 +189,9 @@ func fe6aCurrentRevision(t *testing.T, m map[string]any) int64 {
 // on length).
 func fe6aAssertNoAudit(t *testing.T, since int64, actions ...string) {
 	t.Helper()
-	for _, e := range auditGet() {
+	entries := auditGet()
+	for i := range entries {
+		e := &entries[i]
 		if e.TS < since {
 			continue
 		}
@@ -203,7 +206,9 @@ func fe6aAssertNoAudit(t *testing.T, since int64, actions ...string) {
 // fe6aFindAudit returns the newest entry with action at or after since.
 func fe6aFindAudit(since int64, action string) *auditEntryView {
 	var found *auditEntryView
-	for _, e := range auditGet() {
+	entries := auditGet()
+	for i := range entries {
+		e := &entries[i]
 		if e.TS >= since && e.Action == action {
 			cp := auditEntryView{Actor: e.Actor, Object: e.Object, Detail: e.Detail, Before: e.Before, After: e.After}
 			found = &cp
@@ -213,6 +218,18 @@ func fe6aFindAudit(since int64, action string) *auditEntryView {
 }
 
 type auditEntryView struct{ Actor, Object, Detail, Before, After string }
+
+// fe6aCountAudit counts entries with action at or after since.
+func fe6aCountAudit(since int64, action string) int {
+	n := 0
+	entries := auditGet()
+	for i := range entries {
+		if entries[i].TS >= since && entries[i].Action == action {
+			n++
+		}
+	}
+	return n
+}
 
 // fe6aIdPRevision reads the entry revision from GET /api/idp/{id}.
 func fe6aIdPRevision(t *testing.T, id string) int64 {
@@ -612,8 +629,8 @@ func TestFE6A0_R6_SecretConfiguredIndicatorsOnRead(t *testing.T) {
 		t.Fatal("oidc.clientSecretConfigured must be false when no secret is stored")
 	}
 	saml, _ := get("saml-xml")["saml"].(map[string]any)
-	if v, _ := saml["metadataXmlConfigured"].(bool); !v {
-		t.Fatalf("saml.metadataXmlConfigured must be true for inline metadata; saml=%v", saml)
+	if v, _ := saml["inlineMetadataConfigured"].(bool); !v {
+		t.Fatalf("saml.inlineMetadataConfigured must be true for inline metadata; saml=%v", saml)
 	}
 }
 
@@ -711,8 +728,9 @@ func TestFE6A0_R7_CutoverIsOperationIdentifiedAndAtMostOnce(t *testing.T) {
 	if pid, _ := cut["profileId"].(string); pid != id {
 		t.Fatalf("cutover.profileId = %q, want the enabling profile %q", pid, id)
 	}
-	// At-most-once: a second enabling write re-emits nothing.
-	since2 := time.Now().UnixMilli()
+	// At-most-once: a second enabling write re-emits nothing (counted, so the
+	// check is exact even when both writes land inside one millisecond).
+	before := fe6aCountAudit(since, "idp.legacy_ldap.retired")
 	rev := fe6aIdPRevision(t, id)
 	body["name"] = "Registry AD (renamed)"
 	w = httptest.NewRecorder()
@@ -720,7 +738,9 @@ func TestFE6A0_R7_CutoverIsOperationIdentifiedAndAtMostOnce(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("second enable = %d: %s", w.Code, w.Body.String())
 	}
-	fe6aAssertNoAudit(t, since2, "idp.legacy_ldap.retired")
+	if after := fe6aCountAudit(since, "idp.legacy_ldap.retired"); after != before {
+		t.Fatalf("cutover audit emitted again on a repeat enable (%d → %d)", before, after)
+	}
 }
 
 // ─── R8 — corrupt registry: degraded posture + fenced repair ─────────────────

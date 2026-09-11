@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -186,11 +185,17 @@ func TestLoadUIAccessPolicy_IdPProfilesParseErrorSurfaces(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("write bad json: %v", err)
 	}
+	// FE-6A.0 R8: a malformed registry file is quarantined and the loader
+	// DEGRADES instead of failing the boot (no crash loop over the one auth
+	// store an admin can only repair through the UI it would have killed).
+	origReg := idpRegistry
+	idpRegistry = &IdPRegistry{live: make(map[string]IdentityProvider)}
+	t.Cleanup(func() { idpRegistry = origReg })
 	err := loadUIAccessPolicy(uiAccessPolicyStartupConfig{IdPProfilesFile: path})
-	if err == nil {
-		t.Fatal("expected error from malformed IdP file; got nil")
+	if err != nil {
+		t.Fatalf("malformed IdP file must degrade, not fail the boot: %v", err)
 	}
-	if !strings.Contains(err.Error(), "IdP profiles load error:") {
-		t.Errorf("error prefix mismatch: %v", err)
+	if idpRegistry.Degraded() == nil {
+		t.Fatal("registry must report the degraded posture after a corrupt load")
 	}
 }

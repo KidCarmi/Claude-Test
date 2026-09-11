@@ -235,7 +235,7 @@ func TestOpenLDAPInterop_PreflightSucceedsThenPersistFails(t *testing.T) {
 		},
 	}
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/"+p.ID+"?preflight=connection", body)
+	r := jsonReq(http.MethodPut, fencedIdPPath(p.ID, "preflight=connection"), body)
 	apiIdPItem(w, r, p.ID)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("preflight-then-persist-failure: status = %d, want 500 (body=%s)", w.Code, w.Body.String())

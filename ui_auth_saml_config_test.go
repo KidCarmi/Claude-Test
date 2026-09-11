@@ -59,7 +59,7 @@ func TestAPIIdPItem_PutRejectsBadSAMLConfigWithoutReplacingProfile(t *testing.T)
 
 	largeBadMetadata := "<not-saml-metadata>" + strings.Repeat("x", 4096)
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/api-stable-id", map[string]any{
+	r := jsonReq(http.MethodPut, fencedIdPPath("api-stable-id"), map[string]any{
 		"name":    "Broken API Profile",
 		"type":    "saml",
 		"enabled": true,
@@ -92,7 +92,7 @@ func TestAPIIdPItem_PutPreservesInlineSAMLMetadataWhenRedactedFromForm(t *testin
 	}
 
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/api-inline-id", map[string]any{
+	r := jsonReq(http.MethodPut, fencedIdPPath("api-inline-id"), map[string]any{
 		"name":         "Renamed Inline Metadata Profile",
 		"type":         "saml",
 		"enabled":      false,
@@ -140,7 +140,7 @@ func TestAPIIdPItem_PutClearsInlineSAMLMetadataWhenExplicitlyEmptyWithURL(t *tes
 	}
 
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/api-inline-url-id", map[string]any{
+	r := jsonReq(http.MethodPut, fencedIdPPath("api-inline-url-id"), map[string]any{
 		"name":    "URL Metadata Profile",
 		"type":    "saml",
 		"enabled": false,
@@ -177,7 +177,7 @@ func TestAPIIdPItem_PutURLMetadataClearsInlineSAMLMetadataWhenXMLIsOmitted(t *te
 	}
 
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/api-inline-url-omitted-id", map[string]any{
+	r := jsonReq(http.MethodPut, fencedIdPPath("api-inline-url-omitted-id"), map[string]any{
 		"name":    "URL Metadata Profile",
 		"type":    "saml",
 		"enabled": false,
@@ -241,7 +241,7 @@ func TestAPIIdPItem_PutRejectsInvalidSAMLMetadataSourcesWithoutReplacingProfile(
 			}
 
 			w := httptest.NewRecorder()
-			r := jsonReq(http.MethodPut, "/api/idp/"+tt.id, map[string]any{
+			r := jsonReq(http.MethodPut, fencedIdPPath(tt.id), map[string]any{
 				"name":    "Broken Metadata Profile",
 				"type":    "saml",
 				"enabled": false,

@@ -60,8 +60,10 @@ func TestPublicIdPProfile_ProjectionParity(t *testing.T) {
 		"LDAP.BindPassword": true,
 	}
 	derived := map[string]bool{
-		// Recomputed from BindPassword presence, never copied from input.
+		// Recomputed from the stored secret's presence, never copied from input.
 		"LDAP.BindCredentialConfigured": true,
+		"OIDC.ClientSecretConfigured":   true,
+		"SAML.InlineMetadataConfigured": true,
 	}
 
 	in := &IdPProfile{}
@@ -84,7 +86,7 @@ func fillProjectionSentinels(t *testing.T, v reflect.Value, path string, ctr *in
 			f.SetString(fmt.Sprintf("sentinel-%d", *ctr))
 		case reflect.Bool:
 			f.SetBool(true)
-		case reflect.Int:
+		case reflect.Int, reflect.Int64:
 			f.SetInt(int64(*ctr))
 		case reflect.Slice:
 			if f.Type().Elem().Kind() != reflect.String {
@@ -175,7 +177,7 @@ func TestAPIIdPItem_PutPreservesLDAPBindPasswordWhenOmitted(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	// Edit an unrelated field; bindPassword field entirely absent from body.
-	r := jsonReq(http.MethodPut, "/api/idp/ldap-preserve", ldapProfileBodyForPut("Renamed AD", nil))
+	r := jsonReq(http.MethodPut, fencedIdPPath("ldap-preserve"), ldapProfileBodyForPut("Renamed AD", nil))
 	apiIdPItem(w, r, "ldap-preserve")
 	assertStatus(t, w, http.StatusOK)
 
@@ -199,7 +201,7 @@ func TestAPIIdPItem_PutReplacesLDAPBindPassword(t *testing.T) {
 	seedLDAPProfile(t, "ldap-replace")
 
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/ldap-replace",
+	r := jsonReq(http.MethodPut, fencedIdPPath("ldap-replace"),
 		ldapProfileBodyForPut("Corporate AD", map[string]any{"bindPassword": "new-secret"}))
 	apiIdPItem(w, r, "ldap-replace")
 	assertStatus(t, w, http.StatusOK)
@@ -218,7 +220,7 @@ func TestAPIIdPItem_PutExplicitEmptyClearsLDAPBindPassword(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	// Field PRESENT and empty = deliberate clear (distinguishable from omission).
-	r := jsonReq(http.MethodPut, "/api/idp/ldap-clear",
+	r := jsonReq(http.MethodPut, fencedIdPPath("ldap-clear"),
 		ldapProfileBodyForPut("Corporate AD", map[string]any{"bindPassword": ""}))
 	apiIdPItem(w, r, "ldap-clear")
 	assertStatus(t, w, http.StatusOK)

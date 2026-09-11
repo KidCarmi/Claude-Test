@@ -6439,10 +6439,12 @@ let _editingUsername = null; // null = new user, else username being edited
 let _pwdComplexRe; try { _pwdComplexRe = {u:new RegExp('\\p{Lu}','u'),l:new RegExp('\\p{Ll}','u'),d:new RegExp('\\p{Nd}','u')}; } catch(e){}
 const meetsPasswordComplexity = p => _pwdComplexRe ? _pwdComplexRe.u.test(p)&&_pwdComplexRe.l.test(p)&&_pwdComplexRe.d.test(p) : /[A-Z]/.test(p)&&/[a-z]/.test(p)&&/[0-9]/.test(p);
 
+let _usersRevision = 0; // FE-6A.0: the loaded roster revision, echoed on PUT/DELETE (fence)
 async function fetchUsers() {
   if (uiRole !== 'admin') return;
   try {
     const d = await api('/api/auth/users');
+    _usersRevision = d.revision || 0;
     renderUsersTable(d.users || []);
   } catch (_) {}
 }
@@ -6512,15 +6514,22 @@ async function saveUser() {
   try {
     const body = {username, role};
     if (password) body.password = password;
-    await api('/api/auth/users', {
-      method: 'POST',
+    // FE-6A.0: create is POST (409 when the name is taken); an edit is a
+    // fenced PUT echoing the roster revision the list was loaded with.
+    const path = isEdit ? '/api/auth/users?revision=' + encodeURIComponent(_usersRevision) : '/api/auth/users';
+    const res = await api(path, {
+      method: isEdit ? 'PUT' : 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(body)
     });
     closeUserModal();
+    if (res && res.selfAffected) {
+      toast('Your own account changed — please sign in again', 'info');
+    }
     fetchUsers();
   } catch (err) {
     showUserErr(err.message || 'Save failed.');
+    fetchUsers();
   }
   btn.disabled = false; btn.textContent = 'Save';
 }
@@ -6534,10 +6543,11 @@ function showUserErr(msg) {
 async function deleteUser(username) {
   if (!await confirmAction('Delete User', `Delete user "${username}"? This cannot be undone.`)) return;
   try {
-    await api('/api/auth/users?username=' + encodeURIComponent(username), {method:'DELETE'});
+    await api('/api/auth/users?username=' + encodeURIComponent(username) + '&revision=' + encodeURIComponent(_usersRevision), {method:'DELETE'});
     fetchUsers();
   } catch (err) {
     toast('Delete failed: ' + err.message, 'error');
+    fetchUsers();
   }
 }
 
@@ -8214,9 +8224,19 @@ async function api(path, opts={}) {
   }
   const r = await fetch(BASE + path, o);
   if (r.status === 401) { showLoginOverlay(); throw new Error('Unauthorized'); }
-  if (!r.ok) throw new Error(await r.text());
+  if (!r.ok) throw new Error(apiErrorText(await r.text()));
   if (r.status === 204) return null;
   return r.json();
+}
+
+// apiErrorText - FE-6A.0: refusals on the IdP/Administrators surfaces are
+// typed JSON {error, code}; show the human text instead of the raw JSON.
+function apiErrorText(text) {
+  try {
+    const j = JSON.parse(text);
+    if (j && typeof j === 'object' && typeof j.error === 'string') return j.error;
+  } catch (_) {}
+  return text;
 }
 
 // apiFetch - like api() but returns the Response so callers can check ok/status.
@@ -13846,9 +13866,11 @@ function idpGoBack() {
   document.getElementById('idp-modal-title').textContent = 'Add Identity Provider';
 }
 
+let _idpEditRevision = 0; // FE-6A.0: the loaded entry revision, echoed on PUT (fence)
 function openIdPModal(p) {
   _idpWizardBaseURL = window.location.protocol + '//' + window.location.host;
   document.getElementById('idp-edit-id').value = p ? p.id : '';
+  _idpEditRevision = p && p.revision ? p.revision : 0;
   document.getElementById('idp-enabled').checked = p ? p.enabled : true;
   document.getElementById('idp-known-groups').value = (p && p.knownGroups ? p.knownGroups : []).join('\n');
   document.getElementById('idp-xml-filename').textContent = 'No file chosen';
@@ -14118,7 +14140,7 @@ async function loadLegacyLDAPBanner() {
 
 async function importLegacyLDAP() {
   const res = await apiFetch('/api/idp/legacy-ldap/import', { method: 'POST' });
-  if (!res.ok) { toast('Import failed: ' + await res.text(), 'error'); return; }
+  if (!res.ok) { toast('Import failed: ' + apiErrorText(await res.text()), 'error'); return; }
   const p = await res.json();
   toast('Imported as a disabled provider - test it, then enable', 'success');
   loadIdPList();
@@ -14232,10 +14254,15 @@ async function saveIdP() {
   }
   const method = id ? 'PUT' : 'POST';
   let url      = id ? `/api/idp/${id}` : '/api/idp';
+  const q = [];
+  // FE-6A.0 fence: a PUT must echo the entry revision it was loaded with
+  // (428 without it, 409 stale when another admin changed the profile).
+  if (id) q.push('revision=' + encodeURIComponent(_idpEditRevision));
   // Safe activation (ADR-0027): enabling an LDAP provider runs a live
   // connection preflight server-side BEFORE anything persists — a broken
   // candidate can never replace a working enabled provider.
-  if (type === 'ldap' && body.enabled) url += '?preflight=connection';
+  if (type === 'ldap' && body.enabled) q.push('preflight=connection');
+  if (q.length) url += '?' + q.join('&');
   const res = await apiFetch(url, { method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
   if (!res.ok) {
     if (res.status === 422) {
@@ -14249,7 +14276,13 @@ async function saveIdP() {
       }
       return;
     }
-    toast('Error: ' + await res.text(), 'error');
+    if (res.status === 409 || res.status === 428) {
+      toast('Error: ' + apiErrorText(await res.text()) + ' — the list has been reloaded', 'error');
+      closeIdPModal();
+      loadIdPList();
+      return;
+    }
+    toast('Error: ' + apiErrorText(await res.text()), 'error');
     return;
   }
   closeIdPModal();
@@ -14258,8 +14291,12 @@ async function saveIdP() {
 
 async function deleteIdP(id, name) {
   if (!await confirmAction('Delete Provider', `Delete provider "${name}"? Users authenticating through this provider will be affected.`)) return;
-  const res = await apiFetch(`/api/idp/${id}`, { method: 'DELETE' });
-  if (!res.ok) { toast('Delete failed: ' + await res.text(), 'error'); return; }
+  // FE-6A.0 fence: read the CURRENT entry revision and echo it on DELETE.
+  const cur = await apiFetch(`/api/idp/${id}`);
+  if (!cur.ok) { toast('Delete failed: ' + apiErrorText(await cur.text()), 'error'); loadIdPList(); return; }
+  const p = await cur.json();
+  const res = await apiFetch(`/api/idp/${id}?revision=${encodeURIComponent(p.revision || 0)}`, { method: 'DELETE' });
+  if (!res.ok) { toast('Delete failed: ' + apiErrorText(await res.text()), 'error'); loadIdPList(); return; }
   loadIdPList();
 }
 

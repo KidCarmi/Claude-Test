@@ -146,7 +146,7 @@ func TestAPIIdPItem_PreflightFailureNeverReplacesWorkingProvider(t *testing.T) {
 	if m, ok := body["ldap"].(map[string]any); ok {
 		m["url"] = "ldap://192.0.2.1:1"
 	}
-	r := jsonReq(http.MethodPut, "/api/idp/ldap-live?preflight=connection", body)
+	r := jsonReq(http.MethodPut, fencedIdPPath("ldap-live", "preflight=connection"), body)
 	w := httptest.NewRecorder()
 	apiIdPItem(w, r, "ldap-live")
 	assertStatus(t, w, http.StatusUnprocessableEntity)
@@ -169,7 +169,7 @@ func TestAPIIdPItem_PutWithoutPreflightKeepsExistingSemantics(t *testing.T) {
 	// No preflight param: a validation-clean edit persists without any dial.
 	start := time.Now()
 	w := httptest.NewRecorder()
-	apiIdPItem(w, jsonReq(http.MethodPut, "/api/idp/ldap-nopreflight", ldapProfileBodyForPut("Renamed", nil)), "ldap-nopreflight")
+	apiIdPItem(w, jsonReq(http.MethodPut, fencedIdPPath("ldap-nopreflight"), ldapProfileBodyForPut("Renamed", nil)), "ldap-nopreflight")
 	assertStatus(t, w, http.StatusOK)
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("PUT without preflight performed network I/O")

@@ -148,7 +148,7 @@ func TestIdPRegistryTxn_APIMutationsReport500AndAuditNothing(t *testing.T) {
 
 	// PUT update → 500, old provider authoritative.
 	w := httptest.NewRecorder()
-	apiIdPItem(w, jsonReq(http.MethodPut, "/api/idp/ldap-live", ldapProfileBodyForPut("Renamed", nil)), "ldap-live")
+	apiIdPItem(w, jsonReq(http.MethodPut, fencedIdPPath("ldap-live"), ldapProfileBodyForPut("Renamed", nil)), "ldap-live")
 	assertStatus(t, w, http.StatusInternalServerError)
 	assertOldStateAuthoritative(t, reg, liveBefore, 1)
 
@@ -159,7 +159,7 @@ func TestIdPRegistryTxn_APIMutationsReport500AndAuditNothing(t *testing.T) {
 
 	// DELETE → 500 (NOT 404 — the profile exists; the appliance failed).
 	w = httptest.NewRecorder()
-	r := jsonReq(http.MethodDelete, "/api/idp/ldap-live", nil)
+	r := jsonReq(http.MethodDelete, fencedIdPPath("ldap-live"), nil)
 	apiIdPItem(w, r, "ldap-live")
 	assertStatus(t, w, http.StatusInternalServerError)
 	assertOldStateAuthoritative(t, reg, liveBefore, 1)

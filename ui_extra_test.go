@@ -177,11 +177,9 @@ func TestAPIAuthUsers_Delete_Success(t *testing.T) {
 	}()
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodDelete, "/api/auth/users?username=admin-to-delete", http.NoBody)
-	r.RemoteAddr = "127.0.0.1:9999"
-	r = adminCtx(r)
+	r := fencedDeleteReq(fencedUsersPath("username=admin-to-delete"))
 	apiAuthUsers(w, r)
-	assertStatus(t, w, http.StatusNoContent)
+	assertStatus(t, w, http.StatusOK)
 }
 
 func TestAPIAuthUsers_Delete_MissingUsername(t *testing.T) {

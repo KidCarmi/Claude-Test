@@ -810,6 +810,13 @@ type Config struct {
 	// Empty = in-memory only (auth resets on every restart).
 	uiUsersFile string
 
+	// rosterRevision is the SERVER-MINTED fencing token of the admin roster
+	// (FE-6A.0 C2): advanced by every durable roster commit (commitRoster),
+	// persisted in the ui_users.json envelope so it survives restarts, and
+	// echoed by every fenced PUT/DELETE on /api/auth/users. 0 = never
+	// committed (read as 1 on the wire so a fence can always be echoed).
+	rosterRevision int64
+
 	// saveUIUsersMu serializes SaveUIUsersFile's snapshot+write sequence
 	// end-to-end. mu alone is not enough: SaveUIUsersFile only holds mu
 	// (RLock) while snapshotting the roster, then releases it before the
@@ -870,7 +877,11 @@ func (c *Config) SetAuth(user, pass string) error {
 	if c.uiUsers == nil {
 		c.uiUsers = map[string]*uiAdminUser{}
 	}
-	c.uiUsers[user] = &uiAdminUser{passHash: hash, role: RoleAdmin}
+	if existing := c.uiUsers[user]; existing != nil {
+		existing.passHash, existing.role = hash, RoleAdmin // TOTP enrollment preserved
+	} else {
+		c.uiUsers[user] = &uiAdminUser{passHash: hash, role: RoleAdmin}
+	}
 	c.cache.clear()
 	c.mu.Unlock()
 	return nil
@@ -1236,30 +1247,65 @@ func validatePasswordComplexity(password string) error {
 	return nil
 }
 
-// SetUIUser creates or updates an admin UI user with the given role.
-// Call with empty password to update only the role (password unchanged).
+// SetUIUser creates or updates an admin UI user with the given role
+// (IN-MEMORY; the admin API commits through commitRoster). Call with empty
+// password to update only the role (password unchanged).
+//
+// FE-6A.0: a password set REPLACES ONLY the credential — TOTP enrollment
+// (secret, backup codes, replay counter) is preserved (R9), and demoting
+// the LAST admin is refused (R12: the guard lives with the mutation, not
+// only in the handler).
 func (c *Config) SetUIUser(username, password string, role UIRole) error {
+	var hash []byte
+	if password != "" {
+		if err := validatePasswordComplexity(password); err != nil {
+			return err
+		}
+		h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			return err
+		}
+		hash = h
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.uiUsers == nil {
 		c.uiUsers = map[string]*uiAdminUser{}
 	}
-	existing := c.uiUsers[username]
-	if password != "" {
-		if err := validatePasswordComplexity(password); err != nil {
-			return err
-		}
-		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-		if err != nil {
-			return err
-		}
-		c.uiUsers[username] = &uiAdminUser{passHash: hash, role: role}
-	} else if existing != nil {
-		existing.role = role
-	} else {
+	return applyRosterSet(c.uiUsers, username, hash, role)
+}
+
+// applyRosterSet is the shared create-or-update step over a roster map
+// (the live map under c.mu, or commitRoster's candidate copy). hash == nil
+// means "keep the password" (role-only update; refused for a new user).
+func applyRosterSet(users map[string]*uiAdminUser, username string, hash []byte, role UIRole) error {
+	existing := users[username]
+	switch {
+	case existing == nil && hash == nil:
 		return fmt.Errorf("password is required to create a new user")
+	case existing == nil:
+		users[username] = &uiAdminUser{passHash: hash, role: role}
+		return nil
 	}
+	if existing.role == RoleAdmin && role != RoleAdmin && rosterAdminCount(users) <= 1 {
+		return errRosterLastAdmin
+	}
+	if hash != nil {
+		existing.passHash = hash // TOTP enrollment untouched (R9)
+	}
+	existing.role = role
 	return nil
+}
+
+// rosterAdminCount counts RoleAdmin entries.
+func rosterAdminCount(users map[string]*uiAdminUser) int {
+	n := 0
+	for _, u := range users {
+		if u != nil && u.role == RoleAdmin {
+			n++
+		}
+	}
+	return n
 }
 
 // DeleteUIUser removes a UI admin user.
@@ -1267,20 +1313,50 @@ func (c *Config) SetUIUser(username, password string, role UIRole) error {
 func (c *Config) DeleteUIUser(username string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	u := c.uiUsers[username]
-	if u != nil && u.role == RoleAdmin {
-		adminCount := 0
-		for _, usr := range c.uiUsers {
-			if usr.role == RoleAdmin {
-				adminCount++
-			}
-		}
-		if adminCount <= 1 {
-			return fmt.Errorf("cannot delete the last admin user")
+	if err := applyRosterDelete(c.uiUsers, username); err != nil {
+		return err
+	}
+	c.syncLegacyMirrorLocked()
+	return nil
+}
+
+// applyRosterDelete is the shared delete step (last-admin guarded).
+func applyRosterDelete(users map[string]*uiAdminUser, username string) error {
+	u := users[username]
+	if u != nil && u.role == RoleAdmin && rosterAdminCount(users) <= 1 {
+		return errRosterLastAdmin
+	}
+	delete(users, username)
+	return nil
+}
+
+// syncLegacyMirrorLocked keeps the legacy single-user mirror (c.user /
+// c.passHash — what AuthEnabled/IsConfigured/LoginNameConfigured and the
+// VerifyUIUser fallback read) TRUTHFUL after a roster commit (FE-6A.0 R10/
+// R11): a deleted mirrored user must not keep authenticating through the
+// fallback, a changed password is reflected, and the mirror is re-pointed to
+// another admin (deterministically, lowest username) so a delete of the
+// bootstrap admin never flips setup back to "incomplete". Caller holds c.mu.
+func (c *Config) syncLegacyMirrorLocked() {
+	if c.user == "" {
+		return
+	}
+	if u := c.uiUsers[c.user]; u != nil {
+		c.passHash = u.passHash
+		return
+	}
+	var names []string
+	for name, u := range c.uiUsers {
+		if u != nil && u.role == RoleAdmin {
+			names = append(names, name)
 		}
 	}
-	delete(c.uiUsers, username)
-	return nil
+	if len(names) == 0 {
+		c.user, c.passHash = "", nil
+		return
+	}
+	sort.Strings(names)
+	c.user, c.passHash = names[0], c.uiUsers[names[0]].passHash
 }
 
 // ListUIUsers returns a snapshot of all admin UI users (without password hashes).
@@ -1329,6 +1405,9 @@ type uiUsersFileEnvelope struct {
 	// even if the two conflict. Not part of the active architecture.
 	UnauthMode bool           `json:"unauth_mode,omitempty"`
 	Users      []uiUserRecord `json:"users"`
+	// RosterRevision is the durable roster fencing token (FE-6A.0); absent
+	// on a pre-FE-6A file (read as 0 → floor 1). Older binaries ignore it.
+	RosterRevision int64 `json:"roster_revision,omitempty"`
 }
 
 // LoadUIUsersFile reads persisted UI users from disk and populates the roster.
@@ -1373,6 +1452,9 @@ func (c *Config) LoadUIUsersFile() error {
 	c.authRevision++
 	c.cache.clear()
 	c.defaultAuthOutcome = resolved
+	if env.RosterRevision > c.rosterRevision {
+		c.rosterRevision = env.RosterRevision
+	}
 	if c.uiUsers == nil {
 		c.uiUsers = map[string]*uiAdminUser{}
 	}
@@ -1419,11 +1501,22 @@ func (c *Config) SaveUIUsersFile() error {
 		outcome = OutcomeDefault
 	}
 	authoritative := string(outcome)
-	env := uiUsersFileEnvelope{
-		DefaultAuthOutcome: &authoritative,
-		Users:              make([]uiUserRecord, 0, len(c.uiUsers)),
+	env := rosterEnvelope(c.uiUsers, authoritative, c.rosterRevision)
+	c.mu.RUnlock()
+	if path == "" {
+		return nil
 	}
-	for name, u := range c.uiUsers {
+	return writeRosterEnvelope(path, env)
+}
+
+// rosterEnvelope serialises a roster map (live or candidate) for disk.
+func rosterEnvelope(users map[string]*uiAdminUser, outcome string, revision int64) uiUsersFileEnvelope {
+	env := uiUsersFileEnvelope{
+		DefaultAuthOutcome: &outcome,
+		Users:              make([]uiUserRecord, 0, len(users)),
+		RosterRevision:     revision,
+	}
+	for name, u := range users {
 		env.Users = append(env.Users, uiUserRecord{
 			Username:        name,
 			PassHash:        hex.EncodeToString(u.passHash),
@@ -1433,18 +1526,19 @@ func (c *Config) SaveUIUsersFile() error {
 			TOTPLastCounter: u.totpLastCounter,
 		})
 	}
-	c.mu.RUnlock()
-	if path == "" {
-		return nil
-	}
+	return env
+}
+
+// writeRosterEnvelope writes the envelope atomically. AtomicWrite (unique
+// temp + fsync) rather than a fixed ".tmp" + rename: concurrent admin
+// mutations save from separate handler goroutines, and a shared temp name
+// lets two writers interleave into the same file before one renames the
+// torn result over the roster.
+func writeRosterEnvelope(path string, env uiUsersFileEnvelope) error {
 	data, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
 		return err
 	}
-	// AtomicWrite (unique temp + fsync) rather than a fixed ".tmp" +
-	// rename: concurrent admin mutations save from separate handler
-	// goroutines, and a shared temp name lets two writers interleave into
-	// the same file before one renames the torn result over the roster.
 	return fileutil.AtomicWrite(path, data, 0o600)
 }
 

@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"sync"
 )
 
@@ -68,6 +71,12 @@ type IdPProfile struct {
 	// the authoritative source.
 	KnownGroups []string `json:"knownGroups,omitempty"`
 
+	// Revision is the SERVER-MINTED per-entry fencing token (FE-6A.0 C2):
+	// 1 on create, +1 on every replace; a fenced PUT/DELETE must echo it
+	// (428 when absent, 409 stale when it moved). Caller-supplied values are
+	// ignored on write; persisted so it survives restarts; carried CP→DP.
+	Revision int64 `json:"revision,omitempty"`
+
 	// Only one of OIDC/SAML/LDAP is populated depending on Type.
 	OIDC *OIDCProfileConfig `json:"oidc,omitempty"`
 	SAML *SAMLProfileConfig `json:"saml,omitempty"`
@@ -81,7 +90,11 @@ type OIDCProfileConfig struct {
 	Issuer string `json:"issuer"`
 
 	ClientID     string `json:"clientId"`
-	ClientSecret string `json:"clientSecret"` // never logged
+	ClientSecret string `json:"clientSecret,omitempty"` // never logged; WRITE-ONLY (never on a read model)
+
+	// ClientSecretConfigured is READ-ONLY response metadata (FE-6A.0 R6):
+	// whether a client secret is currently stored. Ignored on write.
+	ClientSecretConfigured bool `json:"clientSecretConfigured,omitempty"`
 
 	// Scopes to request. Defaults to ["openid","email","profile"].
 	// Add "groups" for Okta / Azure AD group support.
@@ -110,7 +123,11 @@ type OIDCProfileConfig struct {
 type SAMLProfileConfig struct {
 	// Exactly one of MetadataURL or MetadataXML must be provided.
 	MetadataURL string `json:"metadataUrl,omitempty"`
-	MetadataXML string `json:"metadataXml,omitempty"` // raw XML (admin upload)
+	MetadataXML string `json:"metadataXml,omitempty"` // raw XML (admin upload); WRITE-ONLY
+
+	// InlineMetadataConfigured is READ-ONLY response metadata (FE-6A.0 R6):
+	// whether inline metadata XML is currently stored. Ignored on write.
+	InlineMetadataConfigured bool `json:"inlineMetadataConfigured,omitempty"`
 
 	// NameIDFormat requested in AuthnRequest.
 	// Common values: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
@@ -138,6 +155,16 @@ type SAMLProfileConfig struct {
 
 // IdPRegistry stores and manages IdP profiles.  It is the authoritative
 // source of truth for all configured identity providers.
+//
+// LOCKING (FE-6A.0, R1): r.mu guards ONLY the published state (profiles +
+// live) and is held for pointer swaps and reads — never across a compile
+// (OIDC discovery / SAML metadata fetch are network I/O with 10–15 s
+// budgets) and never across a disk write. Every mutation is a transaction
+// serialised on idpMutationMu (admin-rate): compile OUTSIDE both locks →
+// build the candidate → persist it → run the optional pre-publish step
+// (the legacy-LDAP cutover sentinel) → swap under r.mu. A reader on the
+// proxy request path (RouteByDomain, EnabledProviders, …) is therefore
+// never queued behind a slow identity provider.
 type IdPRegistry struct {
 	mu       sync.RWMutex
 	profiles []*IdPProfile
@@ -145,11 +172,65 @@ type IdPRegistry struct {
 
 	// live holds compiled/initialised provider instances keyed by profile ID.
 	live map[string]IdentityProvider
+
+	// degraded is non-nil while the on-disk registry was found corrupt at
+	// load (quarantined beside the store, R8): the registry runs EMPTY and
+	// refuses every admin mutation until the operator acknowledges the
+	// quarantine evidence through the fenced repair (or a CP snapshot
+	// rebuilds the DP's copy).
+	degraded *idpRegistryDegradation
 }
+
+// idpRegistryDegradation is the read-only degraded posture (R8).
+type idpRegistryDegradation struct {
+	Reason         string `json:"reason"`
+	QuarantinePath string `json:"quarantinePath,omitempty"`
+	Detail         string `json:"detail"`
+}
+
+// idpMutationMu serialises every registry mutation transaction (admin API,
+// legacy import, CP→DP sync, repair). Readers never take it.
+var idpMutationMu sync.Mutex
 
 var idpRegistry = &IdPRegistry{live: make(map[string]IdentityProvider)}
 
-// Load reads IdP profiles from the JSON file.  Silent no-op when path is empty.
+// Sentinel errors of the mutation contract (mapped to typed refusals by
+// the handlers; see ui_refusal.go).
+var (
+	// errIdPPersistFailed marks a registry mutation that failed at the
+	// PERSIST step. The transactional model guarantees nothing published
+	// changed when this is returned; API handlers map it to 500.
+	errIdPPersistFailed = errors.New("idp: persisting the profile registry failed; no change was applied")
+	// errIdPOutcomeUnknown marks a split durable outcome: the registry
+	// candidate was persisted, the pre-publish step failed, and rolling the
+	// registry file back ALSO failed. Nothing was published; the next boot
+	// reconciles from disk. NON-terminal (500 outcome_unknown).
+	errIdPOutcomeUnknown = errors.New("idp: outcome unknown — registry file persisted, sentinel not durable, rollback failed; nothing published")
+	// errIdPVanished: a fenced write named an id that no longer exists.
+	errIdPVanished = errors.New("idp: profile vanished")
+	// errIdPRegistryDegraded: mutations refused while the store is degraded.
+	errIdPRegistryDegraded = errors.New("idp: registry degraded — the profile file was quarantined; repair first")
+	// errIdPNotDegraded: repair called on a healthy registry.
+	errIdPNotDegraded = errors.New("idp: registry is not degraded")
+	// errIdPRepairUnavailable: the corrupt file could not be quarantined, so
+	// no acknowledgeable evidence exists — restore the file and restart.
+	errIdPRepairUnavailable = errors.New("idp: repair unavailable — the corrupt file could not be moved aside; restore it or a backup and restart")
+	// errIdPRepairMismatch: the confirm word did not name the quarantine.
+	errIdPRepairMismatch = errors.New("idp: repair confirm does not name the quarantined file")
+)
+
+// idpStaleError carries the authoritative revision a stale fenced write
+// must reload (409 stale).
+type idpStaleError struct{ Current int64 }
+
+func (e *idpStaleError) Error() string {
+	return fmt.Sprintf("idp: stale revision (current %d)", e.Current)
+}
+
+// Load reads IdP profiles from the JSON file.  Silent no-op when path is
+// empty. A CORRUPT file never fails the boot (R8): it is quarantined beside
+// the store (CHAOS-05 convention, `<path>.corrupt.<unixnano>`), the registry
+// starts EMPTY in the degraded posture, and Load returns nil.
 func (r *IdPRegistry) Load(path string) error {
 	if path == "" {
 		return nil
@@ -157,6 +238,7 @@ func (r *IdPRegistry) Load(path string) error {
 	r.mu.Lock()
 	r.path = path
 	r.mu.Unlock()
+	noteResidualQuarantine("idp_profiles", path)
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil // first run — empty registry
@@ -166,7 +248,20 @@ func (r *IdPRegistry) Load(path string) error {
 	}
 	var profiles []*IdPProfile
 	if err := json.Unmarshal(data, &profiles); err != nil {
-		return fmt.Errorf("idp registry: parse %s: %w", path, err)
+		qpath := quarantineCorruptStateFile("idp_profiles", path, err)
+		d := &idpRegistryDegradation{Reason: "corrupt_quarantined", QuarantinePath: qpath,
+			Detail: "the identity-provider registry file was corrupt and has been moved aside; the registry is EMPTY and refuses changes until the quarantine is acknowledged (POST /api/idp/repair) or the file is restored and the node restarted"}
+		if qpath == "" {
+			d.Reason = "corrupt_not_quarantined"
+			d.Detail = "the identity-provider registry file is corrupt and could not be moved aside; the registry is EMPTY and refuses changes — restore the file or a backup and restart"
+		}
+		r.mu.Lock()
+		r.profiles = nil
+		r.live = make(map[string]IdentityProvider)
+		r.degraded = d
+		r.mu.Unlock()
+		logger.Printf("IdP: registry DEGRADED — %s", sanitizeLog(d.Detail))
+		return nil
 	}
 	// Drop profiles whose ID/name collides with the reserved authSource
 	// namespace, fail-closed (hand-edited or pre-guard files only — Upsert and
@@ -179,41 +274,78 @@ func (r *IdPRegistry) Load(path string) error {
 			logWarnf("IdP: dropping profile on load — %v", err)
 			continue
 		}
+		if p.Revision <= 0 {
+			p.Revision = 1 // pre-revision file: server-minted floor
+		}
 		kept = append(kept, p)
 	}
 	profiles = kept
-	r.mu.Lock()
-	r.profiles = profiles
-	r.mu.Unlock()
-
-	// Initialise live providers for enabled profiles.
+	// Initialise live providers for enabled profiles BEFORE publishing (no
+	// network I/O under the lock).
+	live := make(map[string]IdentityProvider)
 	for _, p := range profiles {
 		if p.Enabled {
-			if err := r.compile(p); err != nil {
+			prov, err := compileIdPProfile(p)
+			if err != nil {
 				logger.Printf("IdP %q compile error: %v", p.ID, err)
+				continue
 			}
+			live[p.ID] = prov
 		}
 	}
+	r.mu.Lock()
+	r.profiles = profiles
+	r.live = live
+	r.degraded = nil
+	r.mu.Unlock()
 	return nil
 }
 
-// errIdPPersistFailed marks a registry mutation that failed at the PERSIST
-// step. The transactional mutation model (P1-3) guarantees nothing published
-// changed when this is returned; API handlers map it to 500 (the request was
-// valid — the appliance could not store it) rather than 400.
-var errIdPPersistFailed = errors.New("idp: persisting the profile registry failed; no change was applied")
+// Degraded returns a copy of the degraded posture, or nil when healthy.
+func (r *IdPRegistry) Degraded() *idpRegistryDegradation {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.degraded == nil {
+		return nil
+	}
+	cp := *r.degraded
+	return &cp
+}
 
-// persist writes the CANDIDATE profile set to the JSON file (called under
-// lock, BEFORE the candidate is published — see the mutation model below).
-// The write is atomic (temp file + fsync + rename) so a crash mid-write can
-// never truncate or corrupt the on-disk registry — Load fails startup on
-// corrupt JSON, so a torn write would brick the proxy at next boot.
+// Repair acknowledges the quarantine evidence (confirm = the quarantined
+// file's base name, the fenced T2 word) and clears the degraded posture.
+// The registry stays EMPTY — the operator has reviewed the moved-aside copy
+// and chosen to start over. Nothing is written.
+func (r *IdPRegistry) Repair(confirm string) error {
+	idpMutationMu.Lock()
+	defer idpMutationMu.Unlock()
+	d := r.Degraded()
+	switch {
+	case d == nil:
+		return errIdPNotDegraded
+	case d.QuarantinePath == "":
+		return errIdPRepairUnavailable
+	case confirm == "" || confirm != filepath.Base(d.QuarantinePath):
+		return errIdPRepairMismatch
+	}
+	r.mu.Lock()
+	r.degraded = nil
+	r.mu.Unlock()
+	return nil
+}
+
+// persist writes the CANDIDATE profile set to the JSON file (called inside
+// the mutation transaction, BEFORE the candidate is published). The write is
+// atomic (temp file + fsync + rename) so a crash mid-write can never
+// truncate or corrupt the on-disk registry.
 //
-// TRANSACTIONAL MUTATION MODEL (P1-3, shared by Upsert/Delete/ReplaceAll):
+// TRANSACTIONAL MUTATION MODEL (P1-3 + FE-6A.0, shared by every mutation):
 //
-//	build next candidate profiles → validate → compile next live set
+//	compile next live set (NO lock) → build next candidate profiles
 //	    → persist(next) atomically
-//	    → ONLY on persist success: publish profiles+live under the lock
+//	    → optional pre-publish step (legacy-LDAP cutover sentinel), with a
+//	      compensating persist(prev) when it fails
+//	    → ONLY then: publish profiles+live under r.mu
 //
 // A persistence failure therefore leaves the old profiles, old live
 // providers, and old credentials fully authoritative — the API reports
@@ -221,7 +353,10 @@ var errIdPPersistFailed = errors.New("idp: persisting the profile registry faile
 // state that does not exist. In deliberate in-memory mode (path == "") the
 // warning is kept and the publish proceeds — explicit pre-existing behavior.
 func (r *IdPRegistry) persist(profiles []*IdPProfile) error {
-	if r.path == "" {
+	r.mu.RLock()
+	path := r.path
+	r.mu.RUnlock()
+	if path == "" {
 		logger.Printf("IdP: WARNING — profile change is in-memory only and will be LOST on restart; set -idp-profiles-file (or proxy.idp_profiles_file) to persist")
 		return nil
 	}
@@ -229,10 +364,45 @@ func (r *IdPRegistry) persist(profiles []*IdPProfile) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", errIdPPersistFailed, err)
 	}
-	if err := atomicWriteFile(r.path, data, 0o600); err != nil {
+	if err := atomicWriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("%w: %v", errIdPPersistFailed, err)
 	}
 	return nil
+}
+
+// readPersisted returns the current registry file bytes (hadFile=false when
+// absent or in-memory mode).
+func (r *IdPRegistry) readPersisted() ([]byte, bool) {
+	r.mu.RLock()
+	path := r.path
+	r.mu.RUnlock()
+	if path == "" {
+		return nil, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// restorePersisted is the compensating write of a failed pre-publish step:
+// the prior bytes are written back atomically, or the file is removed when
+// none existed before.
+func (r *IdPRegistry) restorePersisted(prev []byte, hadFile bool) error {
+	r.mu.RLock()
+	path := r.path
+	r.mu.RUnlock()
+	if path == "" {
+		return nil
+	}
+	if !hadFile {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return atomicWriteFile(path, prev, 0o600)
 }
 
 // Persisted reports whether profile changes are written to disk. False means
@@ -242,6 +412,62 @@ func (r *IdPRegistry) Persisted() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.path != ""
+}
+
+// idpCandidate is what a mutation's build step returns: the candidate
+// profile set and the candidate live map. Both must be FRESH values —
+// the published slice/map are never mutated in place.
+type idpCandidate struct {
+	profiles []*IdPProfile
+	live     map[string]IdentityProvider
+}
+
+// mutate runs one registry transaction (see persist). build receives the
+// CURRENT published profiles (read-only) and a COPY of the live map, and
+// returns the candidate. beforePublish, when non-nil, runs after the
+// candidate is durable and before it is published; its failure rolls the
+// registry file back to cur (a failed rollback is errIdPOutcomeUnknown).
+// allowDegraded lets the CP→DP sync rebuild a degraded DP registry.
+func (r *IdPRegistry) mutate(allowDegraded bool, build func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error), beforePublish func(next []*IdPProfile) error) error {
+	idpMutationMu.Lock()
+	defer idpMutationMu.Unlock()
+
+	r.mu.RLock()
+	cur := r.profiles
+	curLive := make(map[string]IdentityProvider, len(r.live)+1)
+	for id, prov := range r.live {
+		curLive[id] = prov
+	}
+	degraded := r.degraded != nil
+	r.mu.RUnlock()
+	if degraded && !allowDegraded {
+		return errIdPRegistryDegraded
+	}
+	next, err := build(cur, curLive)
+	if err != nil {
+		return err
+	}
+	// Snapshot the prior file BYTES so a compensating rollback restores the
+	// exact durable state (including "no file yet"), not a re-serialisation.
+	prevBytes, hadFile := r.readPersisted()
+	if err := r.persist(next.profiles); err != nil {
+		return err // old profiles + old live providers stay authoritative
+	}
+	if beforePublish != nil {
+		if err := beforePublish(next.profiles); err != nil {
+			if rbErr := r.restorePersisted(prevBytes, hadFile); rbErr != nil {
+				return fmt.Errorf("%w: %v (rollback: %v)", errIdPOutcomeUnknown, err, rbErr)
+			}
+			return err
+		}
+	}
+	r.mu.Lock()
+	r.profiles, r.live = next.profiles, next.live
+	if allowDegraded {
+		r.degraded = nil
+	}
+	r.mu.Unlock()
+	return nil
 }
 
 // compile initialises a live IdentityProvider from a profile.
@@ -255,7 +481,6 @@ func (r *IdPRegistry) compile(p *IdPProfile) error {
 	return nil
 }
 
-// Upsert adds or replaces a profile and saves to disk.
 // validateUpsertProfile validates an admin-supplied profile on the Upsert path.
 // Kept separate from validateIdPProfile (the ReplaceAll/Load path) to preserve
 // Upsert's exact, slightly-looser semantics (it does not require an OIDC config
@@ -295,66 +520,131 @@ func validateUpsertProfile(p *IdPProfile) error {
 
 // normalizeIdPProfileWriteInput strips response-only metadata a client may
 // echo back on write (the GET projection is round-trippable by design). The
-// stored profile must never carry the derived BindCredentialConfigured bit —
-// publicIdPProfile recomputes it from the stored credential on every read.
+// stored profile must never carry the derived configured-indicator bits or a
+// caller-asserted revision — publicIdPProfile recomputes the indicators from
+// the stored secrets on every read and the registry mints every revision.
 func normalizeIdPProfileWriteInput(p *IdPProfile) {
-	if p != nil && p.LDAP != nil {
+	if p == nil {
+		return
+	}
+	p.Revision = 0
+	if p.LDAP != nil {
 		p.LDAP.BindCredentialConfigured = false
+	}
+	if p.OIDC != nil {
+		p.OIDC.ClientSecretConfigured = false
+	}
+	if p.SAML != nil {
+		p.SAML.InlineMetadataConfigured = false
 	}
 }
 
+// prepareProfile validates the write input and compiles the live provider
+// OUTSIDE every registry lock (network I/O). compiled is nil for a disabled
+// profile.
+func prepareProfile(p *IdPProfile) (IdentityProvider, error) {
+	normalizeIdPProfileWriteInput(p)
+	if err := validateUpsertProfile(p); err != nil {
+		return nil, err
+	}
+	if !p.Enabled {
+		return nil, nil
+	}
+	prov, err := compileIdPProfile(p)
+	if err != nil {
+		return nil, fmt.Errorf("idp compile error: %w", err)
+	}
+	return prov, nil
+}
+
+// Upsert adds or replaces a profile (create-or-replace, UNFENCED — the
+// legacy import and internal callers). The admin API's fenced update is
+// Update. A created profile gets revision 1; a replaced one advances.
 func (r *IdPRegistry) Upsert(p *IdPProfile) error {
 	if p.ID == "" {
 		b := make([]byte, 6)
 		rand.Read(b) //nolint:errcheck // crypto/rand.Read never returns an error on supported platforms
 		p.ID = hex.EncodeToString(b)
 	}
-	normalizeIdPProfileWriteInput(p)
-	if err := validateUpsertProfile(p); err != nil {
+	compiled, err := prepareProfile(p)
+	if err != nil {
 		return err
 	}
+	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+		return applyProfileCandidate(cur, live, p, compiled), nil
+	}, nil)
+}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	var compiled IdentityProvider
-	if p.Enabled {
-		prov, err := compileIdPProfile(p)
-		if err != nil {
-			return fmt.Errorf("idp compile error: %w", err)
-		}
-		compiled = prov
+// Create adds a NEW profile (id minted by the registry) and runs
+// beforePublish between the durable write and the publication (the
+// legacy-LDAP cutover hook of an enabling create).
+func (r *IdPRegistry) Create(p *IdPProfile, beforePublish func(next []*IdPProfile) error) error {
+	b := make([]byte, 6)
+	rand.Read(b) //nolint:errcheck // crypto/rand.Read never returns an error on supported platforms
+	p.ID = hex.EncodeToString(b)
+	compiled, err := prepareProfile(p)
+	if err != nil {
+		return err
 	}
+	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+		return applyProfileCandidate(cur, live, p, compiled), nil
+	}, beforePublish)
+}
 
-	// Build the CANDIDATE state on copies — the published slice/map must not
-	// be touched until persistence succeeds (P1-3 transactional model).
-	nextProfiles := make([]*IdPProfile, len(r.profiles))
-	copy(nextProfiles, r.profiles)
+// Update replaces the profile p.ID under the revision fence: the target must
+// exist (errIdPVanished) and expectedRev must equal its current revision
+// (*idpStaleError with the authoritative value). The fence is decided INSIDE
+// the transaction, never against a value the caller read earlier. The
+// candidate carries the next revision.
+func (r *IdPRegistry) Update(p *IdPProfile, expectedRev int64, beforePublish func(next []*IdPProfile) error) error {
+	compiled, err := prepareProfile(p)
+	if err != nil {
+		return err
+	}
+	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+		existing := findIdPProfile(cur, p.ID)
+		if existing == nil {
+			return idpCandidate{}, errIdPVanished
+		}
+		if expectedRev != idpEntryRevision(existing) {
+			return idpCandidate{}, &idpStaleError{Current: idpEntryRevision(existing)}
+		}
+		return applyProfileCandidate(cur, live, p, compiled), nil
+	}, beforePublish)
+}
+
+// applyProfileCandidate builds the candidate for a create/replace of p,
+// minting its revision from the current entry (1 for a new id).
+func applyProfileCandidate(cur []*IdPProfile, live map[string]IdentityProvider, p *IdPProfile, compiled IdentityProvider) idpCandidate {
+	nextProfiles := make([]*IdPProfile, len(cur))
+	copy(nextProfiles, cur)
 	found := false
 	for i, existing := range nextProfiles {
 		if existing.ID == p.ID {
+			p.Revision = idpEntryRevision(existing) + 1
 			nextProfiles[i] = p
 			found = true
 			break
 		}
 	}
 	if !found {
+		p.Revision = 1
 		nextProfiles = append(nextProfiles, p)
 	}
-	nextLive := make(map[string]IdentityProvider, len(r.live)+1)
-	for id, prov := range r.live {
-		nextLive[id] = prov
-	}
-	if p.Enabled {
-		nextLive[p.ID] = compiled
+	if p.Enabled && compiled != nil {
+		live[p.ID] = compiled
 	} else {
-		delete(nextLive, p.ID)
+		delete(live, p.ID)
 	}
+	return idpCandidate{profiles: nextProfiles, live: live}
+}
 
-	if err := r.persist(nextProfiles); err != nil {
-		return err // old profiles + old live providers stay authoritative
+func findIdPProfile(profiles []*IdPProfile, id string) *IdPProfile {
+	for _, p := range profiles {
+		if p != nil && p.ID == id {
+			return p
+		}
 	}
-	r.profiles, r.live = nextProfiles, nextLive
 	return nil
 }
 
@@ -398,31 +688,40 @@ func compileIdPProfile(p *IdPProfile) (IdentityProvider, error) {
 	}
 }
 
-// Delete removes a profile by ID (transactional: persisted before published,
-// so a persist failure leaves the profile and its live provider active).
+// Delete removes a profile by ID (UNFENCED — internal callers and tests;
+// the admin API uses DeleteFenced). Transactional: persisted before
+// published, so a persist failure leaves the profile and its live provider
+// active.
 func (r *IdPRegistry) Delete(id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i, p := range r.profiles {
-		if p.ID != id {
-			continue
-		}
-		nextProfiles := make([]*IdPProfile, 0, len(r.profiles)-1)
-		nextProfiles = append(nextProfiles, r.profiles[:i]...)
-		nextProfiles = append(nextProfiles, r.profiles[i+1:]...)
-		nextLive := make(map[string]IdentityProvider, len(r.live))
-		for lid, prov := range r.live {
-			if lid != id {
-				nextLive[lid] = prov
+	return r.deleteWhere(id, nil)
+}
+
+// DeleteFenced removes a profile under the revision fence (errIdPVanished /
+// *idpStaleError), decided inside the transaction.
+func (r *IdPRegistry) DeleteFenced(id string, expectedRev int64) error {
+	return r.deleteWhere(id, &expectedRev)
+}
+
+func (r *IdPRegistry) deleteWhere(id string, expectedRev *int64) error {
+	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+		for i, p := range cur {
+			if p.ID != id {
+				continue
 			}
+			if expectedRev != nil && *expectedRev != idpEntryRevision(p) {
+				return idpCandidate{}, &idpStaleError{Current: idpEntryRevision(p)}
+			}
+			nextProfiles := make([]*IdPProfile, 0, len(cur)-1)
+			nextProfiles = append(nextProfiles, cur[:i]...)
+			nextProfiles = append(nextProfiles, cur[i+1:]...)
+			delete(live, id)
+			return idpCandidate{profiles: nextProfiles, live: live}, nil
 		}
-		if err := r.persist(nextProfiles); err != nil {
-			return err // the profile stays stored AND live
+		if expectedRev != nil {
+			return idpCandidate{}, errIdPVanished
 		}
-		r.profiles, r.live = nextProfiles, nextLive
-		return nil
-	}
-	return fmt.Errorf("idp %q not found", id)
+		return idpCandidate{}, fmt.Errorf("idp %q not found", id)
+	}, nil)
 }
 
 // Get returns the profile with the given ID (nil if not found).
@@ -437,23 +736,51 @@ func (r *IdPRegistry) Get(id string) *IdPProfile {
 	return nil
 }
 
-// All returns a copy of all profiles.
+// All returns a copy of all profiles. NEVER nil: an empty registry is an
+// empty slice, so the CP→DP wire carries an explicit `idp_profiles: []` and
+// a DP observes the last delete (R5).
 func (r *IdPRegistry) All() []*IdPProfile {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return cloneIdPProfiles(r.profiles)
 }
 
-// ReplaceAll atomically swaps the registry to match profiles. Enabled
-// providers are compiled before the swap so callers never observe a
-// half-applied IdP snapshot, and the candidate is PERSISTED before it is
-// published (P1-3): a persistence failure rejects the whole replacement and
-// the previous set — including on a DP applying a CP snapshot — stays live.
+// DocumentRevision is the content-derived revision of the whole registry
+// (every id + entry revision, sorted), the fence a list-level consumer
+// compares. Identical across restarts for identical content.
+func (r *IdPRegistry) DocumentRevision() string {
+	r.mu.RLock()
+	parts := make([]string, 0, len(r.profiles))
+	for _, p := range r.profiles {
+		if p != nil {
+			parts = append(parts, p.ID+"@"+strconv.FormatInt(idpEntryRevision(p), 10))
+		}
+	}
+	r.mu.RUnlock()
+	sort.Strings(parts)
+	return contentSecRevision(append([]string{"idp-registry"}, parts...)...)
+}
+
+// ReplaceAll atomically swaps the registry to match profiles (the CP→DP
+// application path). Enabled providers are compiled BEFORE the transaction
+// so callers never observe a half-applied IdP snapshot, and the candidate is
+// PERSISTED before it is published (P1-3): a persistence failure rejects the
+// whole replacement and the previous set stays live. A degraded DP registry
+// is rebuilt (and un-degraded) by a valid snapshot — the CP's set is the
+// authoritative repair on a data plane.
 func (r *IdPRegistry) ReplaceAll(profiles []*IdPProfile) error {
 	nextProfiles := cloneIdPProfiles(profiles)
+	if nextProfiles == nil {
+		nextProfiles = []*IdPProfile{}
+	}
 	nextLive := make(map[string]IdentityProvider)
 	for _, p := range nextProfiles {
+		rev := p.Revision
 		normalizeIdPProfileWriteInput(p)
+		p.Revision = rev
+		if p.Revision <= 0 {
+			p.Revision = 1
+		}
 		if err := validateIdPProfile(p); err != nil {
 			return err
 		}
@@ -466,15 +793,9 @@ func (r *IdPRegistry) ReplaceAll(profiles []*IdPProfile) error {
 		}
 		nextLive[p.ID] = prov
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.persist(nextProfiles); err != nil {
-		return err // the previous profile set + live providers stay authoritative
-	}
-	r.profiles = nextProfiles
-	r.live = nextLive
-	return nil
+	return r.mutate(true, func([]*IdPProfile, map[string]IdentityProvider) (idpCandidate, error) {
+		return idpCandidate{profiles: nextProfiles, live: nextLive}, nil
+	}, nil)
 }
 
 // validateReservedIdPNaming rejects IdP profile IDs and names that collide with
@@ -588,32 +909,39 @@ func publicIdPProfile(p *IdPProfile) *IdPProfile {
 		Enabled:      p.Enabled,
 		Priority:     p.Priority,
 		KnownGroups:  append([]string(nil), p.KnownGroups...),
+		Revision:     idpEntryRevision(p),
 	}
 	if p.OIDC != nil {
 		cp.OIDC = &OIDCProfileConfig{
 			Issuer:   p.OIDC.Issuer,
 			ClientID: p.OIDC.ClientID,
-			// ClientSecret: write-only input, redacted.
-			Scopes:                append([]string(nil), p.OIDC.Scopes...),
-			GroupsClaim:           p.OIDC.GroupsClaim,
-			RequiredScope:         p.OIDC.RequiredScope,
-			RequiredAudience:      p.OIDC.RequiredAudience,
-			TLSSkipVerify:         p.OIDC.TLSSkipVerify,
-			AuthorizationEndpoint: p.OIDC.AuthorizationEndpoint,
-			TokenEndpoint:         p.OIDC.TokenEndpoint,
-			IntrospectionEndpoint: p.OIDC.IntrospectionEndpoint,
-			UserinfoEndpoint:      p.OIDC.UserinfoEndpoint,
-			JWKsURI:               p.OIDC.JWKsURI,
+			// ClientSecret: write-only input, redacted. Read surfaces expose
+			// only the derived ClientSecretConfigured metadata bit.
+			ClientSecretConfigured: p.OIDC.ClientSecret != "",
+			Scopes:                 append([]string(nil), p.OIDC.Scopes...),
+			GroupsClaim:            p.OIDC.GroupsClaim,
+			RequiredScope:          p.OIDC.RequiredScope,
+			RequiredAudience:       p.OIDC.RequiredAudience,
+			TLSSkipVerify:          p.OIDC.TLSSkipVerify,
+			AuthorizationEndpoint:  p.OIDC.AuthorizationEndpoint,
+			TokenEndpoint:          p.OIDC.TokenEndpoint,
+			IntrospectionEndpoint:  p.OIDC.IntrospectionEndpoint,
+			UserinfoEndpoint:       p.OIDC.UserinfoEndpoint,
+			JWKsURI:                p.OIDC.JWKsURI,
 		}
 	}
 	if p.SAML != nil {
 		cp.SAML = &SAMLProfileConfig{
 			MetadataURL: p.SAML.MetadataURL,
-			// MetadataXML: write-only admin upload, redacted.
-			NameIDFormat:    p.SAML.NameIDFormat,
-			GroupsAttribute: p.SAML.GroupsAttribute,
-			EmailAttribute:  p.SAML.EmailAttribute,
-			NameAttribute:   p.SAML.NameAttribute,
+			// MetadataXML: write-only admin upload, redacted. Read surfaces
+			// expose only the derived InlineMetadataConfigured metadata bit
+			// (named without the "metadataXml" stem so secret-absence scans
+			// for that key never false-positive on the indicator).
+			InlineMetadataConfigured: p.SAML.MetadataXML != "",
+			NameIDFormat:             p.SAML.NameIDFormat,
+			GroupsAttribute:          p.SAML.GroupsAttribute,
+			EmailAttribute:           p.SAML.EmailAttribute,
+			NameAttribute:            p.SAML.NameAttribute,
 		}
 	}
 	if p.LDAP != nil {
@@ -678,6 +1006,16 @@ func (r *IdPRegistry) RouteByDomain(domain string) IdentityProvider {
 		}
 	}
 	return bestProv
+}
+
+// idpEntryRevision is the fencing token of a stored entry, floored at 1:
+// every persisted/minted revision is ≥1, and a directly-seeded in-memory
+// profile (tests, pre-revision loads) still exposes an echoable token.
+func idpEntryRevision(p *IdPProfile) int64 {
+	if p == nil || p.Revision <= 0 {
+		return 1
+	}
+	return p.Revision
 }
 
 // effectivePriority returns the priority for sorting (0 → max int).

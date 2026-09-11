@@ -127,6 +127,12 @@ type AdminSettings struct {
 	// (documented in docs/operator/ldap-identity-provider.md).
 	LegacyLDAPRetired bool `json:"legacy_ldap_retired"`
 
+	// LegacyLDAPCutover is the operation-identified record of the cutover
+	// above (FE-6A.0 R7): candidate binding (profile id + registry document
+	// revision), actor, trigger and instant. Same row/scope as the sentinel;
+	// absent on nodes that never cut over.
+	LegacyLDAPCutover *LegacyLDAPCutover `json:"legacy_ldap_cutover,omitempty"`
+
 	// Session
 	SessionTimeoutHours int `json:"session_timeout_hours,omitempty"`
 
@@ -579,6 +585,10 @@ func applyBlocklistFeeds(s *AdminSettings) {
 func applyLegacyLDAPRetirement(s *AdminSettings) {
 	if s.LegacyLDAPRetired {
 		legacyLDAPRetiredFlag.Store(true)
+		if s.LegacyLDAPCutover != nil {
+			rec := *s.LegacyLDAPCutover
+			legacyLDAPCutoverRec.Store(&rec)
+		}
 	}
 	enforceLegacyLDAPShadowing()
 	if legacyLDAPRetired() && !s.LegacyLDAPRetired {
@@ -884,6 +894,13 @@ type adminSaveOverrides struct {
 	// Rewriter; on a persist failure it is never published — durable-or-nothing,
 	// so an unacknowledged rewrite rule can never stay active in memory.
 	rewriteMutate func(current []RewriteRule) ([]RewriteRule, error)
+	// legacyCutover, when set, records the legacy-LDAP authority cutover as
+	// the durable TARGET (FE-6A.0 R7): the file records legacy_ldap_retired
+	// = true + this record while the runtime sentinel is still false;
+	// applyOnSuccess flips the runtime only after the write landed, so a
+	// persist failure leaves the legacy authenticator wired and the
+	// enabling registry write is refused with nothing published.
+	legacyCutover *LegacyLDAPCutover
 	// precondition, when set, runs INSIDE adminSettingsMu before anything is
 	// snapshotted or written; a non-nil error aborts the save untouched and is
 	// returned to the caller. This is what makes an optimistic-revision fence
@@ -989,6 +1006,11 @@ func saveAdminSettingsWithOverrides(ov adminSaveOverrides) error {
 		TrustedProxyCIDRs:      ListTrustedProxyCIDRs(),
 		TrustedProxyCIDRsSaved: true, // once saved, the persisted list is authoritative (incl. empty)
 		LegacyLDAPRetired:      legacyLDAPRetired(),
+		LegacyLDAPCutover:      legacyLDAPCutover(),
+	}
+	if ov.legacyCutover != nil {
+		rec := *ov.legacyCutover
+		s.LegacyLDAPRetired, s.LegacyLDAPCutover = true, &rec
 	}
 
 	snapshotAdminEndpoints(&s)

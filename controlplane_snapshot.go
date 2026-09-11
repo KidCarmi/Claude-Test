@@ -93,7 +93,10 @@ type ConfigSnapshot struct {
 
 	// IdP profile sync: full OIDC/SAML provider config for DP-local auth.
 	// Redacted from unauthenticated GetConfig callers alongside SessionHMAC.
-	IdPProfiles []*IdPProfile `json:"idp_profiles,omitempty"`
+	// IdPProfiles has NO omitempty (FE-6A.0 R5, WireWipeCapable): an EMPTY
+	// registry must reach the DPs as an explicit [] so deleting the last
+	// profile clears their copies; nil (a pre-FE-6A CP) still reads as skip.
+	IdPProfiles []*IdPProfile `json:"idp_profiles"`
 
 	// Bandwidth / QoS policies synced from CP to DP.
 	BandwidthPolicies []BandwidthPolicy `json:"bandwidth_policies,omitempty"`
@@ -1227,7 +1230,7 @@ func applyExternalAuthSnapshotSettings(snap ConfigSnapshot) {
 
 func syncSnapshotIdPProfiles(snap ConfigSnapshot) error {
 	if snap.IdPProfiles == nil {
-		return nil
+		return nil // absent (older CP): not an instruction; an explicit [] IS (R5)
 	}
 	if err := idpRegistry.ReplaceAll(snap.IdPProfiles); err != nil {
 		return fmt.Errorf("idp profile sync: %w", err)

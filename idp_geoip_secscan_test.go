@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -37,8 +38,21 @@ func TestIdPRegistry_Load_BadJSON(t *testing.T) {
 		profiles: nil,
 		live:     make(map[string]IdentityProvider),
 	}
-	if err := r.Load(f.Name()); err == nil {
-		t.Error("Load bad JSON should return error")
+	// FE-6A.0 R8: a corrupt registry file never fails the boot — it is
+	// quarantined and the registry starts EMPTY in the degraded posture.
+	if err := r.Load(f.Name()); err != nil {
+		t.Errorf("Load bad JSON must degrade, not error: %v", err)
+	}
+	if r.Degraded() == nil {
+		t.Error("Load bad JSON must leave the registry degraded")
+	}
+	if n := len(r.All()); n != 0 {
+		t.Errorf("degraded registry has %d profiles, want 0", n)
+	}
+	if q, _ := filepath.Glob(f.Name() + ".corrupt.*"); len(q) != 1 {
+		t.Errorf("corrupt file must be quarantined beside the store, found %v", q)
+	} else {
+		os.Remove(q[0]) //nolint:errcheck // test cleanup
 	}
 }
 

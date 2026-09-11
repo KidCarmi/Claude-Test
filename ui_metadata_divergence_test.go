@@ -22,10 +22,12 @@ import (
 //     response decision — handler-level RBAC remains the real backstop.
 //
 //   • The full middleware chain (uiMetadataEnforcement → mux) injects
-//     c2EvaluatedRoleKey from the per-method MinRole, so a request to
-//     /api/idp/{id} PUT (metadata MethodAny=viewer; handler asks
+//     c2EvaluatedRoleKey from the per-method MinRole, so a request to a
+//     dynamic dispatcher's PUT (metadata MethodAny=viewer; handler asks
 //     requireRole(admin)) increments the counter when the actor is
-//     viewer and does NOT increment when the actor is admin.
+//     viewer and does NOT increment when the actor is admin. (Since
+//     FE-6A.0 /api/idp/ is per-method, so the chain proof rides a
+//     synthetic dispatcher fixture.)
 //
 // Counter mutations are restored via t.Cleanup so other tests see the
 // pre-test baseline regardless of shuffle ordering.
@@ -184,19 +186,109 @@ func TestC4_RequireRole_FailureWithoutEvaluated(t *testing.T) {
 	}
 }
 
-// ── Full-middleware integration over the real mux ─────────────────────────
+// ── Full-middleware integration over the real middleware ─────────────────
 
-// TestC4_Middleware_ViewerOnIdPPut_RecordsDivergence is the end-to-end
-// canonical case: viewer hits PUT /api/idp/{id}. The route's metadata
-// declares MethodAny=viewer (apiIdPRouter is a dynamic dispatcher),
-// so C2 admits the request; the handler-level requireRole(admin) in
-// apiIdPItem then 403's. C4 records the divergence.
+// withC4SyntheticDispatcher installs a TEMPORARY dynamic-dispatcher route —
+// metadata MethodAny=viewer, handler asking requireRole(admin) on PUT and
+// requireRole(viewer) on GET — the exact shape /api/idp/ had before FE-6A.0
+// made its metadata per-method (the production divergence no longer exists,
+// so the whole-chain proof rides a synthetic route registered on a fresh
+// mux and appended to uiRoutes for the test's lifetime only).
+func withC4SyntheticDispatcher(t *testing.T) http.Handler {
+	t.Helper()
+	prev := uiRoutes
+	uiRoutes = append(append([]uiRouteMetadata(nil), prev...), uiRouteMetadata{
+		Path: "/api/c4-synthetic/", Handler: "c4SyntheticDispatcher", Domain: "test", Public: false,
+		Methods: []uiRouteMethod{{Method: MethodAny, MinRole: RoleViewer, Mutating: true, AuditExpected: false,
+			Note: "C4 test fixture: dynamic dispatcher (GET=viewer / PUT=admin)"}},
+	})
+	resetC2Index()
+	t.Cleanup(func() {
+		uiRoutes = prev
+		resetC2Index()
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/c4-synthetic/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			if !requireRole(w, r, RoleAdmin) {
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if !requireRole(w, r, RoleViewer) {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	return uiMetadataEnforcement(mux)
+}
+
+// TestC4_Middleware_ViewerOnDispatcherPut_RecordsDivergence is the
+// end-to-end canonical case: viewer hits PUT on a dynamic dispatcher whose
+// metadata declares MethodAny=viewer, so C2 admits the request; the
+// handler-level requireRole(admin) then 403's. C4 records the divergence.
 //
-// This proves the WHOLE chain wires correctly:
-// uiMetadataEnforcement injects c2EvaluatedRoleKey, the request flows
-// to apiIdPItem, requireRole runs and fails, and recordRoleDivergence
-// reads the context value the middleware put there.
-func TestC4_Middleware_ViewerOnIdPPut_RecordsDivergence(t *testing.T) {
+// This proves the WHOLE chain wires correctly: uiMetadataEnforcement
+// injects c2EvaluatedRoleKey, the request flows to the handler, requireRole
+// runs and fails, and recordRoleDivergence reads the context value the
+// middleware put there.
+func TestC4_Middleware_ViewerOnDispatcherPut_RecordsDivergence(t *testing.T) {
+	withC2Mode(t, c2ModeEnforce)
+	before := snapshotDivergence(t)
+	mw := withC4SyntheticDispatcher(t)
+
+	r := c2Req(http.MethodPut, "/api/c4-synthetic/c4-integration-test", RoleViewer)
+	w := httptest.NewRecorder()
+	mw.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", w.Code, w.Body.String())
+	}
+	if got := c2RoleDivergenceTotal.Load() - before; got != 1 {
+		t.Errorf("counter delta = %d, want 1", got)
+	}
+}
+
+// TestC4_Middleware_AdminOnDispatcherPut_NoDivergence — same route with an
+// admin session. The handler's requireRole(admin) succeeds, so no
+// divergence is recorded.
+func TestC4_Middleware_AdminOnDispatcherPut_NoDivergence(t *testing.T) {
+	withC2Mode(t, c2ModeEnforce)
+	before := snapshotDivergence(t)
+	mw := withC4SyntheticDispatcher(t)
+
+	r := c2Req(http.MethodPut, "/api/c4-synthetic/c4-integration-admin", RoleAdmin)
+	w := httptest.NewRecorder()
+	mw.ServeHTTP(w, r)
+
+	if got := c2RoleDivergenceTotal.Load() - before; got != 0 {
+		t.Errorf("counter delta = %d, want 0 (admin meets handler bar)", got)
+	}
+}
+
+// TestC4_Middleware_ViewerOnDispatcherGet_NoDivergence — same route, GET
+// instead of PUT. The handler's GET branch calls requireRole(viewer), which
+// is the same role C2 evaluated. Parity case → no divergence.
+func TestC4_Middleware_ViewerOnDispatcherGet_NoDivergence(t *testing.T) {
+	withC2Mode(t, c2ModeEnforce)
+	before := snapshotDivergence(t)
+	mw := withC4SyntheticDispatcher(t)
+
+	r := c2Req(http.MethodGet, "/api/c4-synthetic/c4-integration-get", RoleViewer)
+	w := httptest.NewRecorder()
+	mw.ServeHTTP(w, r)
+
+	if got := c2RoleDivergenceTotal.Load() - before; got != 0 {
+		t.Errorf("counter delta = %d, want 0 (parity: metadata=viewer, handler=viewer)", got)
+	}
+}
+
+// TestC4_Middleware_IdPPutIsNowPerMethod pins the FE-6A.0 correction: the
+// /api/idp/ metadata is per-method (PUT=admin), so C2 itself denies a
+// viewer PUT at the middleware — the handler is never reached and NO
+// divergence is recorded (metadata and handler agree).
+func TestC4_Middleware_IdPPutIsNowPerMethod(t *testing.T) {
 	withC2Mode(t, c2ModeEnforce)
 	resetC2Index()
 	before := snapshotDivergence(t)
@@ -212,51 +304,8 @@ func TestC4_Middleware_ViewerOnIdPPut_RecordsDivergence(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body=%s", w.Code, w.Body.String())
 	}
-	if got := c2RoleDivergenceTotal.Load() - before; got != 1 {
-		t.Errorf("counter delta = %d, want 1", got)
-	}
-}
-
-// TestC4_Middleware_AdminOnIdPPut_NoDivergence — same route with an
-// admin session. The handler's requireRole(admin) succeeds, so no
-// divergence is recorded. The handler may still 4xx (the test profile
-// id won't exist, JSON body is empty, etc.) but that's fine — what we
-// pin is the absence of a C4 event.
-func TestC4_Middleware_AdminOnIdPPut_NoDivergence(t *testing.T) {
-	withC2Mode(t, c2ModeEnforce)
-	resetC2Index()
-	before := snapshotDivergence(t)
-
-	mux := d0WireMux(t)
-	mw := uiMetadataEnforcement(mux)
-
-	r := c2Req(http.MethodPut, "/api/idp/c4-integration-admin", RoleAdmin)
-	r.Body = http.NoBody
-	w := httptest.NewRecorder()
-	mw.ServeHTTP(w, r)
-
 	if got := c2RoleDivergenceTotal.Load() - before; got != 0 {
-		t.Errorf("counter delta = %d, want 0 (admin meets handler bar)", got)
-	}
-}
-
-// TestC4_Middleware_ViewerOnIdPGet_NoDivergence — same route, GET
-// instead of PUT. The handler's GET branch calls requireRole(viewer),
-// which is the same role C2 evaluated. Parity case → no divergence.
-func TestC4_Middleware_ViewerOnIdPGet_NoDivergence(t *testing.T) {
-	withC2Mode(t, c2ModeEnforce)
-	resetC2Index()
-	before := snapshotDivergence(t)
-
-	mux := d0WireMux(t)
-	mw := uiMetadataEnforcement(mux)
-
-	r := c2Req(http.MethodGet, "/api/idp/c4-integration-get", RoleViewer)
-	w := httptest.NewRecorder()
-	mw.ServeHTTP(w, r)
-
-	if got := c2RoleDivergenceTotal.Load() - before; got != 0 {
-		t.Errorf("counter delta = %d, want 0 (parity: metadata=viewer, handler=viewer)", got)
+		t.Errorf("counter delta = %d, want 0 (C2 and the handler agree: PUT=admin)", got)
 	}
 }
 

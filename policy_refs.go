@@ -32,16 +32,18 @@ type objectRef struct {
 // objectRefType enumerates the shared-object kinds the walk understands.
 // Unknown kinds are a caller error (400 at the endpoint).
 //
-// idp is deliberately NOT here: auth rules reference IdPs by ID
-// (Auth.ProviderRefs hold IdP IDs, not names), so a name-keyed walk cannot
-// answer it, and IdP deletion is fail-CLOSED already (a dangling providerRef
-// fails SSO 403, not open). It joins this walk with the object-ID work that
-// makes ID-vs-name references first-class (see roadmap/POLICY-REFS-PLAN.md).
+// idp (FE-6A.0 R4): auth rules reference IdPs by ID (Auth.ProviderRefs hold
+// IdP IDs), so the walk is keyed on the id — exact, never case-folded — and
+// IdP delete blocks on it (409 referenced) exactly like the other kinds. A
+// dangling providerRef already fails SSO CLOSED (403, not open); the block
+// exists so an admin is never silently left with a rule that can never
+// match its intended provider.
 var objectRefTypes = map[string]bool{
 	"category":           true,
 	"category-group":     true,
 	"file-profile":       true,
 	"decryption-profile": true,
+	"idp":                true,
 }
 
 // consumerTypeForRule maps a rule's stage to its whereUsed consumerType/view.
@@ -148,6 +150,15 @@ func resolveObjectID(objType, name string) string {
 
 func ruleReferencesObject(r *PolicyRule, objType, name, objID string) string {
 	switch objType {
+	case "idp":
+		if r.Auth == nil {
+			return ""
+		}
+		for _, ref := range r.Auth.ProviderRefs {
+			if strings.TrimSpace(ref) == name {
+				return "auth.providerRefs"
+			}
+		}
 	case "category":
 		// CategoryAny ("Any") is the wildcard "any destination", NOT a
 		// reference to a concrete category object — the engine only

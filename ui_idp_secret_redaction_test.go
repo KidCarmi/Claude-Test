@@ -192,7 +192,7 @@ func TestAPIIdPAudit_RedactsWriteOnlyFields(t *testing.T) {
 		t.Fatal("created OIDC profile missing")
 	}
 	updateW := httptest.NewRecorder()
-	updateR := jsonReq(http.MethodPut, "/api/idp/"+oidc.ID, map[string]any{
+	updateR := jsonReq(http.MethodPut, fencedIdPPath(oidc.ID), map[string]any{
 		"name":    "OIDC Audit Update",
 		"type":    "oidc",
 		"enabled": false,
@@ -220,10 +220,10 @@ func TestAPIIdPAudit_RedactsWriteOnlyFields(t *testing.T) {
 	}
 	idpRegistry.profiles = append(idpRegistry.profiles, saml)
 	deleteW := httptest.NewRecorder()
-	deleteR := adminCtx(httptest.NewRequest(http.MethodDelete, "/api/idp/"+saml.ID, http.NoBody))
+	deleteR := fencedDeleteReq(fencedIdPPath(saml.ID))
 	apiIdPItem(deleteW, deleteR, saml.ID)
-	if deleteW.Code != http.StatusNoContent {
-		t.Fatalf("DELETE status = %d, want 204; body=%s", deleteW.Code, deleteW.Body.String())
+	if deleteW.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200; body=%s", deleteW.Code, deleteW.Body.String())
 	}
 	assertAuditNoWriteOnlyIdPFields(t, latestAuditEntry(t, "idp.delete"))
 }
@@ -249,7 +249,7 @@ func TestAPIIdPItemPut_PreservesOIDCClientSecretWhenRedactedFromForm(t *testing.
 	t.Cleanup(func() { idpRegistry = orig })
 
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/oidc-preserve-id", map[string]any{
+	r := jsonReq(http.MethodPut, fencedIdPPath("oidc-preserve-id"), map[string]any{
 		"name":         "Renamed OIDC Preserve",
 		"type":         "oidc",
 		"enabled":      false,
@@ -294,7 +294,7 @@ func TestAPIIdPItemPut_PreservesOIDCDiscoveryEndpointsWhenIssuerUnchanged(t *tes
 	t.Cleanup(func() { idpRegistry = orig })
 
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/"+p.ID, map[string]any{
+	r := jsonReq(http.MethodPut, fencedIdPPath(p.ID), map[string]any{
 		"name":    p.Name,
 		"type":    "oidc",
 		"enabled": false,
@@ -359,7 +359,7 @@ func TestAPIIdPItemPut_MutatesOIDCClientSecretWhenProvided(t *testing.T) {
 			t.Cleanup(func() { idpRegistry = orig })
 
 			w := httptest.NewRecorder()
-			r := jsonReq(http.MethodPut, "/api/idp/"+tt.id, map[string]any{
+			r := jsonReq(http.MethodPut, fencedIdPPath(tt.id), map[string]any{
 				"name":    p.Name,
 				"type":    "oidc",
 				"enabled": false,

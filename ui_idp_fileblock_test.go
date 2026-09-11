@@ -293,11 +293,9 @@ func TestAPIIdPItem_Delete_Exists(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/idp/%s", p.ID), http.NoBody)
-	r.RemoteAddr = "127.0.0.1:9999"
-	r = adminCtx(r)
+	r := fencedDeleteReq(fencedIdPPath(p.ID))
 	apiIdPItem(w, r, p.ID)
-	assertStatus(t, w, http.StatusNoContent)
+	assertStatus(t, w, http.StatusOK)
 }
 
 func TestAPIIdPItem_WrongMethod(t *testing.T) {

@@ -544,12 +544,10 @@ func TestAPIAuthUsers_Delete_QueryParam(t *testing.T) {
 	defer cfg.DeleteUIUser("deletetest2") //nolint:errcheck // test teardown; reset errors are non-actionable
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodDelete, "/api/auth/users?username=deletetest2", http.NoBody)
-	r.RemoteAddr = "127.0.0.1:9999"
-	r = adminCtx(r)
+	r := fencedDeleteReq(fencedUsersPath("username=deletetest2"))
 	apiAuthUsers(w, r)
-	// Should succeed (204) since there's another admin remaining
-	if w.Code != http.StatusNoContent && w.Code != http.StatusConflict {
+	// Should succeed (200 {deleted:true}) since there's another admin remaining
+	if w.Code != http.StatusOK && w.Code != http.StatusConflict {
 		t.Errorf("apiAuthUsers DELETE: unexpected status %d", w.Code)
 	}
 }
@@ -754,7 +752,7 @@ func TestAPIIdPItem_Put_Valid(t *testing.T) {
 	defer idpRegistry.Delete("put-test-id") //nolint:errcheck // test teardown; cleanup errors are non-actionable
 
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPut, "/api/idp/put-test-id", map[string]any{
+	r := jsonReq(http.MethodPut, fencedIdPPath("put-test-id"), map[string]any{
 		"name":    "put-test-updated",
 		"type":    IdPTypeSAML,
 		"enabled": false,

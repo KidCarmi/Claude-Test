@@ -10,6 +10,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -248,82 +251,209 @@ func apiAuthLogout(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]any{"ok": true})
 }
 
-// GET/POST/DELETE /api/auth/users — RBAC user management (admin only).
+// GET/POST/PUT/DELETE /api/auth/users — RBAC user management (admin only).
 //
-//	GET    → list all UI admin users (without passwords)
-//	POST   → create or update a user: {"username":"…","password":"…","role":"admin|operator|viewer"}
-//	DELETE → remove a user: ?username=…
+//	GET    → {users:[{username, role, totpEnabled}], revision}
+//	POST   → CREATE a user: {"username","password","role"}; 409 user_exists
+//	PUT    → UPDATE an existing user's role and/or password:
+//	         {"username","role"?,"password"?,"revision"} (fenced; 428/409)
+//	DELETE → remove a user: ?username=…&revision=… (fenced; 404/409 last_admin)
+//
+// FE-6A.0 contract: every mutation commits PERSIST-BEFORE-PUBLISH (a failed
+// save is 500 persist_failed with nothing changed), the roster revision is
+// the fence, create is never an upsert, TOTP enrollment survives a
+// password set, the last admin cannot be demoted or deleted, sessions of a
+// changed/deleted user are revoked ONLY after the durable commit and the
+// response says so (sessionsRevoked / selfAffected), and every refusal is
+// the typed JSON dialect (ui_refusal.go).
 func apiAuthUsers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		if !requireRole(w, r, RoleAdmin) {
+		if !requireRoleJSON(w, r, RoleAdmin) {
 			return
 		}
-		jsonOK(w, map[string]any{"users": cfg.ListUIUsers()})
-
+		jsonOK(w, map[string]any{
+			"users":    cfg.ListUIUsers(),
+			"revision": cfg.RosterRevision(),
+			"scope":    "node-local",
+		})
 	case http.MethodPost:
-		if !requireRole(w, r, RoleAdmin) {
-			return
-		}
-		var body struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-			Role     string `json:"role"`
-		}
-		if err := decodeJSON(r, &body); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		body.Username = strings.TrimSpace(body.Username)
-		if len(body.Username) < 1 || len(body.Username) > 64 {
-			http.Error(w, "username must be 1-64 characters", http.StatusBadRequest)
-			return
-		}
-		if body.Password != "" {
-			if err := validatePasswordComplexity(body.Password); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		role := UIRole(body.Role)
-		if !role.HasRole(RoleViewer) {
-			http.Error(w, "role must be admin, operator, or viewer", http.StatusBadRequest)
-			return
-		}
-		if err := cfg.SetUIUser(body.Username, body.Password, role); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err := cfg.SaveUIUsersFile(); err != nil {
-			logger.Printf("UIUsers: failed to persist: %v", err)
-		}
-		auditEvent(r, "auth.users.set", body.Username, fmt.Sprintf("role=%s", role))
-		jsonOK(w, map[string]any{"ok": true})
-
+		apiAuthUsersCreate(w, r)
+	case http.MethodPut:
+		apiAuthUsersUpdate(w, r)
 	case http.MethodDelete:
-		if !requireRole(w, r, RoleAdmin) {
-			return
-		}
-		username := strings.TrimSpace(r.URL.Query().Get("username"))
-		if username == "" {
-			http.Error(w, "missing username param", http.StatusBadRequest)
-			return
-		}
-		if err := cfg.DeleteUIUser(username); err != nil {
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
-		}
-		if err := cfg.SaveUIUsersFile(); err != nil {
-			logger.Printf("UIUsers: failed to persist: %v", err)
-		}
-		// Revoke all active sessions for the deleted user (Finding 5.2).
-		sessionRevoked.RevokeUser(username)
-		auditEvent(r, "auth.users.delete", username, "")
-		w.WriteHeader(http.StatusNoContent)
-
+		apiAuthUsersDelete(w, r)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 	}
+}
+
+// authUsersBody is the strict write shape shared by POST and PUT.
+type authUsersBody struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Role     string `json:"role"`
+	Revision int64  `json:"revision"`
+}
+
+// decodeAuthUsersBody decodes + trims and writes the 400 on failure.
+func decodeAuthUsersBody(w http.ResponseWriter, r *http.Request) (authUsersBody, bool) {
+	var body authUsersBody
+	if err := decodeJSON(r, &body); err != nil {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
+		return body, false
+	}
+	body.Username = strings.TrimSpace(body.Username)
+	if len(body.Username) < 1 || len(body.Username) > 64 {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "username must be 1-64 characters", nil)
+		return body, false
+	}
+	if body.Password != "" {
+		if err := validatePasswordComplexity(body.Password); err != nil {
+			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, err.Error(), nil)
+			return body, false
+		}
+	}
+	if body.Role != "" && !UIRole(body.Role).HasRole(RoleViewer) {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "role must be admin, operator, or viewer", nil)
+		return body, false
+	}
+	return body, true
+}
+
+// writeRosterRefusal maps a roster transaction error to its typed refusal.
+func writeRosterRefusal(w http.ResponseWriter, err error) {
+	var stale *rosterStaleError
+	switch {
+	case errors.As(err, &stale):
+		writeRefusal(w, http.StatusConflict, refusalStale,
+			"stale revision: the roster changed since you loaded it — reload and retry",
+			map[string]any{"revision": stale.Current})
+	case errors.Is(err, errRosterNotFound):
+		writeRefusal(w, http.StatusNotFound, refusalNotFound, "user not found", nil)
+	case errors.Is(err, errRosterUserExists):
+		writeRefusal(w, http.StatusConflict, refusalUserExists, "user already exists — update it instead", nil)
+	case errors.Is(err, errRosterLastAdmin):
+		writeRefusal(w, http.StatusConflict, refusalLastAdmin, "cannot demote or delete the last admin user", nil)
+	case errors.Is(err, errRosterPersistFailed):
+		writeRefusal(w, http.StatusInternalServerError, refusalPersistFailed,
+			"the admin roster could not be persisted; nothing was changed", nil)
+	default:
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, err.Error(), nil)
+	}
+}
+
+func apiAuthUsersCreate(w http.ResponseWriter, r *http.Request) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
+		return
+	}
+	body, ok := decodeAuthUsersBody(w, r)
+	if !ok {
+		return
+	}
+	if body.Password == "" || body.Role == "" {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "password and role are required to create a user", nil)
+		return
+	}
+	rev, err := cfg.CreateUIUser(body.Username, body.Password, UIRole(body.Role))
+	if err != nil {
+		writeRosterRefusal(w, err)
+		return
+	}
+	auditEvent(r, "auth.users.create", body.Username, fmt.Sprintf("role=%s", body.Role))
+	jsonOK(w, map[string]any{
+		"ok":        true,
+		"user":      UIUserInfo{Username: body.Username, Role: UIRole(body.Role)},
+		"revision":  rev,
+		"persisted": cfg.uiUsersFilePath() != "",
+	})
+}
+
+func apiAuthUsersUpdate(w http.ResponseWriter, r *http.Request) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
+		return
+	}
+	body, ok := decodeAuthUsersBody(w, r)
+	if !ok {
+		return
+	}
+	if body.Password == "" && body.Role == "" {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "nothing to update: supply role and/or password", nil)
+		return
+	}
+	if !cfg.UIUserExists(body.Username) {
+		writeRefusal(w, http.StatusNotFound, refusalNotFound, "user not found", nil)
+		return
+	}
+	token := revisionFence(r, body.Revision)
+	if !checkRevisionFence(w, token, cfg.RosterRevision()) {
+		return
+	}
+	res, err := cfg.UpdateUIUser(body.Username, body.Password, UIRole(body.Role), token)
+	if err != nil {
+		writeRosterRefusal(w, err)
+		return
+	}
+	// Session impact ONLY after the durable commit: a changed role or
+	// credential invalidates every live session of that user, so a demoted
+	// admin loses authority now — not at cookie TTL (R11).
+	revoked := res.RoleChanged || res.PasswordChanged
+	if revoked {
+		sessionRevoked.RevokeUserIssuedBefore(body.Username, time.Now())
+	}
+	self := sessionAdmin(r) == body.Username
+	role := res.PreviousRole
+	if body.Role != "" {
+		role = UIRole(body.Role)
+	}
+	auditEvent(r, "auth.users.update", body.Username,
+		fmt.Sprintf("role=%s roleChanged=%t passwordChanged=%t sessionsRevoked=%t", role, res.RoleChanged, res.PasswordChanged, revoked))
+	jsonOK(w, map[string]any{
+		"ok":              true,
+		"user":            UIUserInfo{Username: body.Username, Role: role, TOTPEnabled: cfg.UserHasTOTP(body.Username)},
+		"revision":        res.Revision,
+		"persisted":       cfg.uiUsersFilePath() != "",
+		"sessionsRevoked": revoked,
+		"selfAffected":    self,
+	})
+}
+
+func apiAuthUsersDelete(w http.ResponseWriter, r *http.Request) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
+		return
+	}
+	username := strings.TrimSpace(r.URL.Query().Get("username"))
+	if username == "" {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "missing username param", nil)
+		return
+	}
+	if !cfg.UIUserExists(username) {
+		writeRefusal(w, http.StatusNotFound, refusalNotFound, "user not found", nil)
+		return
+	}
+	token := revisionFence(r, 0)
+	if !checkRevisionFence(w, token, cfg.RosterRevision()) {
+		return
+	}
+	rev, err := cfg.DeleteUIUserFenced(username, token)
+	if err != nil {
+		writeRosterRefusal(w, err)
+		return
+	}
+	// Revoke all active sessions for the deleted user (Finding 5.2) — after
+	// the durable commit, never before it.
+	sessionRevoked.RevokeUser(username)
+	self := sessionAdmin(r) == username
+	auditEvent(r, "auth.users.delete", username, "sessionsRevoked=true")
+	jsonOK(w, map[string]any{
+		"ok":              true,
+		"deleted":         true,
+		"username":        username,
+		"revision":        rev,
+		"persisted":       cfg.uiUsersFilePath() != "",
+		"sessionsRevoked": true,
+		"selfAffected":    self,
+	})
 }
 
 // GET /api/auth/lockouts — list every currently-active login lockout (both
@@ -332,56 +462,59 @@ func apiAuthUsers(w http.ResponseWriter, r *http.Request) {
 // waiting out lockoutDuration, restarting the process, or reading logs.
 // Admin-only (like GET /api/auth/users): the listing includes usernames and
 // pair-lock source IPs, which is authentication telemetry a viewer should
-// not be able to enumerate.
+// not be able to enumerate. Lockout state is NODE-LOCAL (never cluster
+// synced) and the read model says so (scope).
 // POST /api/auth/lockouts — clear every lock for {"username":"..."} (both
 // tiers, every IP), the GUI equivalent of the existing ResetUser primitive.
 func apiAuthLockouts(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		if !requireRole(w, r, RoleAdmin) {
+		if !requireRoleJSON(w, r, RoleAdmin) {
 			return
 		}
-		jsonOK(w, map[string]any{"lockouts": loginLimiter.Snapshot()})
+		jsonOK(w, map[string]any{"lockouts": loginLimiter.Snapshot(), "scope": "node-local"})
 
 	case http.MethodPost:
-		if !requireRole(w, r, RoleAdmin) {
+		if !requireRoleJSON(w, r, RoleAdmin) {
 			return
 		}
 		var body struct {
 			Username string `json:"username"`
 		}
 		if err := decodeJSON(r, &body); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
 			return
 		}
 		body.Username = strings.TrimSpace(body.Username)
 		if body.Username == "" {
-			http.Error(w, "missing username", http.StatusBadRequest)
+			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "missing username", nil)
 			return
 		}
 		loginLimiter.ResetUser(body.Username)
 		auditEvent(r, "auth.lockout.clear", body.Username, "")
-		jsonOK(w, map[string]any{"ok": true})
+		jsonOK(w, map[string]any{"ok": true, "username": body.Username, "scope": "node-local"})
 
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 	}
 }
 
 // POST /api/auth/change-password — self-service password change for any authenticated user.
 // Body: {"current_password": "...", "new_password": "..."}
-// Verifies the current password before accepting the change.
+// Verifies the current password before accepting the change. Commits
+// persist-before-publish (500 persist_failed keeps the old credential) and
+// preserves TOTP enrollment (FE-6A.0 R9/R10).
 func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	if !requireRole(w, r, RoleViewer) {
+	if !requireRoleJSON(w, r, RoleViewer) {
 		return
 	}
 	username := sessionAdmin(r)
 	if username == "" || username == "unknown" {
-		http.Error(w, "Unauthorized: no valid session", http.StatusUnauthorized)
+		writeRefusal(w, http.StatusUnauthorized, "unauthorized", "no valid session", nil)
 		return
 	}
 	var body struct {
@@ -389,40 +522,34 @@ func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 		NewPass     string `json:"new_password"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
 		return
 	}
 	if body.CurrentPass == "" || body.NewPass == "" {
-		http.Error(w, "current_password and new_password are required", http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "current_password and new_password are required", nil)
 		return
 	}
 	// Verify current password.
 	if _, ok := cfg.VerifyUIUser(username, body.CurrentPass); !ok {
-		http.Error(w, "current password is incorrect", http.StatusForbidden)
+		writeRefusal(w, http.StatusForbidden, refusalWrongCurrent, "current password is incorrect", nil)
 		return
 	}
 	if err := validatePasswordComplexity(body.NewPass); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, err.Error(), nil)
 		return
 	}
-	// Preserve existing role when changing password.
-	users := cfg.ListUIUsers()
-	var role UIRole
-	for _, u := range users {
-		if u.Username == username {
-			role = u.Role
-			break
+	if !cfg.UIUserExists(username) {
+		// Legacy single-user deployment (pre-RBAC): the roster carries no
+		// entry, so the credential lives in the legacy mirror only.
+		if err := cfg.SetAuth(username, body.NewPass); err != nil {
+			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, err.Error(), nil)
+			return
 		}
 	}
-	if role == "" {
-		role = RoleAdmin // legacy single-user fallback
-	}
-	if err := cfg.SetUIUser(username, body.NewPass, role); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	rev, err := cfg.ChangeUIUserPassword(username, body.NewPass)
+	if err != nil {
+		writeRosterRefusal(w, err)
 		return
-	}
-	if err := cfg.SaveUIUsersFile(); err != nil {
-		logger.Printf("UIUsers: failed to persist after password change: %v", err)
 	}
 	auditEvent(r, "auth.password_change", username, "self-service password change")
 	// Intentionally NOT calling saveConfigVersion: password hashes are
@@ -434,7 +561,7 @@ func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 	// audit trail above is the appropriate observability tier; rollback
 	// is deliberately not. Category D-sec finding from
 	// roadmap/CONFIG-VERSIONING-TRIAGE.md.
-	jsonOK(w, map[string]any{"ok": true})
+	jsonOK(w, map[string]any{"ok": true, "revision": rev, "persisted": cfg.uiUsersFilePath() != ""})
 }
 
 // GET /api/setup/status — reports whether first-time setup is still needed.
@@ -569,54 +696,156 @@ func apiSetupComplete(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Generic IdP Framework API ────────────────────────────────────────────────
+//
+// FE-6A.0 contract (FRONTEND-MIGRATION-PLAN.md FE-6-0 §C1–C3, R1–R8): the
+// read model carries the server-minted entry `revision` and the registry
+// `revision` (content-derived) plus the `degraded` posture; PUT/DELETE are
+// fenced on the entry revision (428 precondition_required / 409 stale /
+// 404 vanished, decided inside the registry transaction); a DELETE of a
+// provider an SSORequired rule references is 409 referenced with the
+// referencing rules; every mutation commits persist-before-publish and an
+// enabling LDAP write records the legacy-YAML cutover DURABLY before the
+// registry publishes (500 persist_failed keeps the legacy authenticator
+// wired); secrets never appear on a read model — only the derived
+// *Configured indicators; every refusal is typed JSON.
+
+// idpListReadModel assembles GET /api/idp.
+func idpListReadModel() map[string]any {
+	out := map[string]any{
+		"persisted": idpRegistry.Persisted(),
+		"degraded":  false,
+		"revision":  idpRegistry.DocumentRevision(),
+		"profiles":  publicIdPProfiles(idpRegistry.All()),
+		"scope":     "cluster-synced",
+	}
+	if d := idpRegistry.Degraded(); d != nil {
+		out["degraded"] = true
+		out["degradedReason"] = d.Reason
+		out["degradedDetail"] = d.Detail
+		if d.QuarantinePath != "" {
+			out["quarantineEvidence"] = filepath.Base(d.QuarantinePath)
+		}
+	}
+	return out
+}
+
+// writeIdPRefusal maps a registry mutation error to its typed refusal.
+func writeIdPRefusal(w http.ResponseWriter, err error) {
+	var stale *idpStaleError
+	switch {
+	case errors.As(err, &stale):
+		writeRefusal(w, http.StatusConflict, refusalStale,
+			"stale revision: the profile changed since you loaded it — reload and retry",
+			map[string]any{"revision": stale.Current})
+	case errors.Is(err, errIdPVanished):
+		writeRefusal(w, http.StatusNotFound, refusalVanished, "profile vanished: it was deleted since you loaded it", nil)
+	case errors.Is(err, errIdPRegistryDegraded):
+		writeRefusal(w, http.StatusServiceUnavailable, refusalRegistryDegraded,
+			"the identity-provider registry is degraded (corrupt file quarantined); acknowledge the repair first", nil)
+	case errors.Is(err, errIdPOutcomeUnknown):
+		writeRefusal(w, http.StatusInternalServerError, refusalOutcomeUnknown,
+			"outcome unknown: the registry file was written but the cutover sentinel is not durable and the rollback failed; nothing is published — the next restart reconciles from disk",
+			map[string]any{"detail": "registry_persisted_sentinel_not_durable"})
+	case errors.Is(err, errIdPPersistFailed), errors.Is(err, errAdminSettingsPersist):
+		writeRefusal(w, http.StatusInternalServerError, refusalPersistFailed,
+			"the identity-provider registry could not be persisted; nothing was changed", nil)
+	default:
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, err.Error(), nil)
+	}
+}
+
+// errAdminSettingsPersist wraps a failed durable cutover-sentinel write so the
+// enabling registry mutation reports 500 persist_failed.
+var errAdminSettingsPersist = errors.New("legacy-ldap cutover sentinel could not be persisted")
+
+// idpLegacyCutoverHook returns the pre-publish step for a write that would
+// ENABLE an LDAP profile on a node that still carries an un-retired legacy
+// YAML ldap block: the cutover sentinel + operation record are persisted
+// (persist-before-publish) and the runtime flag flips only inside the
+// save's applyOnSuccess. nil when no cutover is due.
+func idpLegacyCutoverHook(r *http.Request, p *IdPProfile) func(next []*IdPProfile) error {
+	if p == nil || !p.Enabled || p.Type != IdPTypeLDAP || legacyLDAPYAMLConfig() == nil || legacyLDAPRetired() {
+		return nil
+	}
+	actor := auditActor(r)
+	return func(next []*IdPProfile) error {
+		rec := newLegacyLDAPCutover(p, idpDocumentRevisionOf(next), actor, "admin_api")
+		err := saveAdminSettingsWithOverrides(adminSaveOverrides{
+			legacyCutover: &rec,
+			applyOnSuccess: func() {
+				markLegacyLDAPRetiredWith(rec, "enabled LDAP identity provider "+p.ID+" committed through the admin API")
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("%w: %v", errAdminSettingsPersist, err)
+		}
+		return nil
+	}
+}
+
+// idpDocumentRevisionOf computes the registry document revision of a
+// candidate set (the same derivation as IdPRegistry.DocumentRevision).
+func idpDocumentRevisionOf(profiles []*IdPProfile) string {
+	parts := make([]string, 0, len(profiles))
+	for _, p := range profiles {
+		if p != nil {
+			parts = append(parts, p.ID+"@"+strconv.FormatInt(idpEntryRevision(p), 10))
+		}
+	}
+	sort.Strings(parts)
+	return contentSecRevision(append([]string{"idp-registry"}, parts...)...)
+}
 
 // GET /api/idp          — list all profiles
 // POST /api/idp         — create a new profile
 func apiIdPList(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		if !requireRole(w, r, RoleViewer) {
+		if !requireRoleJSON(w, r, RoleViewer) {
 			return
 		}
 		// Envelope (not a bare array) so the UI can warn when the registry
 		// is in-memory only and profiles would be lost on restart.
-		jsonOK(w, map[string]any{
-			"persisted": idpRegistry.Persisted(),
-			"profiles":  publicIdPProfiles(idpRegistry.All()),
-		})
+		jsonOK(w, idpListReadModel())
 	case http.MethodPost:
-		if !requireRole(w, r, RoleAdmin) {
+		if !requireRoleJSON(w, r, RoleAdmin) {
 			return
 		}
 		var p IdPProfile
 		if err := decodeJSON(r, &p); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
 			return
 		}
 		p.ID = "" // force generation of new ID
+		if idpRegistry.Degraded() != nil {
+			writeIdPRefusal(w, errIdPRegistryDegraded)
+			return
+		}
 		// Optional safe-activation preflight (?preflight=connection): a live
 		// connection test must pass BEFORE anything persists (LDAP only).
 		if rep := ldapActivationPreflight(r, &p); rep != nil && !rep.OK {
 			writeLDAPPreflightFailure(w, rep)
 			return
 		}
-		if err := idpRegistry.Upsert(&p); err != nil {
-			http.Error(w, err.Error(), idpMutationErrorStatus(err))
+		if err := idpRegistry.Create(&p, idpLegacyCutoverHook(r, &p)); err != nil {
+			writeIdPRefusal(w, err)
 			return
 		}
 		enforceLegacyLDAPShadowing()
-		_ = publishCurrentConfigSnapshot()
+		if err := publishCurrentConfigSnapshot(); err != nil {
+			logger.Printf("UI: IdP create published locally but the cluster snapshot was refused: %v", err)
+		}
 		auditEventDiff(r, "idp.create", p.ID, p.Name, nil, auditIdPProfile(&p))
 		logger.Printf("UI: IdP profile created id=%q name=%q type=%q", sanitizeLog(p.ID), sanitizeLog(p.Name), sanitizeLog(string(p.Type)))
 		jsonOK(w, publicIdPProfile(&p))
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 	}
 }
 
 // GET /api/idp/{id}     — get profile
-// PUT /api/idp/{id}     — update profile
-// DELETE /api/idp/{id}  — delete profile
+// PUT /api/idp/{id}     — update profile (fenced on the entry revision)
+// DELETE /api/idp/{id}  — delete profile (fenced; 409 referenced)
 // apiIdPRouter dispatches /api/idp/{id} and /api/idp/{id}/groups.
 func apiIdPRouter(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/idp/")
@@ -630,81 +859,170 @@ func apiIdPRouter(w http.ResponseWriter, r *http.Request) {
 
 func apiIdPItem(w http.ResponseWriter, r *http.Request, id string) {
 	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "missing id", nil)
 		return
 	}
 	switch r.Method {
 	case http.MethodGet:
-		if !requireRole(w, r, RoleViewer) {
+		if !requireRoleJSON(w, r, RoleViewer) {
 			return
 		}
 		p := idpRegistry.Get(id)
 		if p == nil {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeRefusal(w, http.StatusNotFound, refusalNotFound, "not found", nil)
 			return
 		}
 		jsonOK(w, publicIdPProfile(p))
 	case http.MethodPut:
-		if !requireRole(w, r, RoleAdmin) {
-			return
-		}
-		before := idpRegistry.Get(id)
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		var p IdPProfile
-		dec := json.NewDecoder(bytes.NewReader(body))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&p); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		p.ID = id
-		preserveWriteOnlyIdPFields(before, &p, writeOnlyIdPFieldPresence{
-			oidcClientSecret: oidcClientSecretPresent(body),
-			samlMetadataXML:  samlMetadataXMLPresent(body),
-			ldapBindPassword: ldapBindPasswordPresent(body),
-		})
-		// Optional safe-activation preflight (?preflight=connection): a broken
-		// candidate must never replace a working enabled provider — on failure
-		// nothing is mutated and the live provider stays untouched (LDAP only).
-		if rep := ldapActivationPreflight(r, &p); rep != nil && !rep.OK {
-			writeLDAPPreflightFailure(w, rep)
-			return
-		}
-		if err := idpRegistry.Upsert(&p); err != nil {
-			http.Error(w, err.Error(), idpMutationErrorStatus(err))
-			return
-		}
-		enforceLegacyLDAPShadowing()
-		_ = publishCurrentConfigSnapshot()
-		auditEventDiff(r, "idp.update", id, p.Name, auditIdPProfile(before), auditIdPProfile(&p))
-		logger.Printf("UI: IdP profile updated id=%q name=%q", sanitizeLog(id), sanitizeLog(p.Name))
-		jsonOK(w, publicIdPProfile(&p))
+		apiIdPUpdate(w, r, id)
 	case http.MethodDelete:
-		if !requireRole(w, r, RoleAdmin) {
-			return
-		}
-		p := idpRegistry.Get(id)
-		if err := idpRegistry.Delete(id); err != nil {
-			// A persist failure is NOT "not found": the profile still exists
-			// and its live provider is still authoritative (P1-3).
-			status := http.StatusNotFound
-			if errors.Is(err, errIdPPersistFailed) {
-				status = http.StatusInternalServerError
-			}
-			http.Error(w, err.Error(), status)
-			return
-		}
-		_ = publishCurrentConfigSnapshot()
-		auditEventDiff(r, "idp.delete", id, "", auditIdPProfile(p), nil)
-		logger.Printf("UI: IdP profile deleted id=%q", sanitizeLog(id))
-		w.WriteHeader(http.StatusNoContent)
+		apiIdPDelete(w, r, id)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 	}
+}
+
+func apiIdPUpdate(w http.ResponseWriter, r *http.Request, id string) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
+		return
+	}
+	var p IdPProfile
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
+		return
+	}
+	before := idpRegistry.Get(id)
+	if before == nil {
+		writeRefusal(w, http.StatusNotFound, refusalVanished, "profile not found", nil)
+		return
+	}
+	// Fast pre-check against the value read now; the authoritative fence is
+	// decided again INSIDE the registry transaction (Update).
+	token := revisionFence(r, p.Revision)
+	if !checkRevisionFence(w, token, idpEntryRevision(before)) {
+		return
+	}
+	if idpRegistry.Degraded() != nil {
+		writeIdPRefusal(w, errIdPRegistryDegraded)
+		return
+	}
+	p.ID = id
+	preserveWriteOnlyIdPFields(before, &p, writeOnlyIdPFieldPresence{
+		oidcClientSecret: oidcClientSecretPresent(body),
+		samlMetadataXML:  samlMetadataXMLPresent(body),
+		ldapBindPassword: ldapBindPasswordPresent(body),
+	})
+	// Optional safe-activation preflight (?preflight=connection): a broken
+	// candidate must never replace a working enabled provider — on failure
+	// nothing is mutated and the live provider stays untouched (LDAP only).
+	if rep := ldapActivationPreflight(r, &p); rep != nil && !rep.OK {
+		writeLDAPPreflightFailure(w, rep)
+		return
+	}
+	if err := idpRegistry.Update(&p, token, idpLegacyCutoverHook(r, &p)); err != nil {
+		writeIdPRefusal(w, err)
+		return
+	}
+	enforceLegacyLDAPShadowing()
+	if err := publishCurrentConfigSnapshot(); err != nil {
+		logger.Printf("UI: IdP update published locally but the cluster snapshot was refused: %v", err)
+	}
+	auditEventDiff(r, "idp.update", id, p.Name, auditIdPProfile(before), auditIdPProfile(&p))
+	logger.Printf("UI: IdP profile updated id=%q name=%q", sanitizeLog(id), sanitizeLog(p.Name))
+	jsonOK(w, publicIdPProfile(&p))
+}
+
+func apiIdPDelete(w http.ResponseWriter, r *http.Request, id string) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
+		return
+	}
+	p := idpRegistry.Get(id)
+	if p == nil {
+		writeRefusal(w, http.StatusNotFound, refusalVanished, "profile not found", nil)
+		return
+	}
+	token := revisionFence(r, 0)
+	if !checkRevisionFence(w, token, idpEntryRevision(p)) {
+		return
+	}
+	if idpRegistry.Degraded() != nil {
+		writeIdPRefusal(w, errIdPRegistryDegraded)
+		return
+	}
+	// Reference integrity (R4): an SSORequired rule naming this provider
+	// blocks the delete with the referencing rules as typed facts.
+	if _, refs := objectReferences("idp", id); len(refs) > 0 {
+		writeRefusal(w, http.StatusConflict, refusalReferenced,
+			"the provider is referenced by authentication rules; remove or retarget them first",
+			map[string]any{"revision": idpEntryRevision(p), "references": refs})
+		return
+	}
+	if err := idpRegistry.DeleteFenced(id, token); err != nil {
+		writeIdPRefusal(w, err)
+		return
+	}
+	if err := publishCurrentConfigSnapshot(); err != nil {
+		logger.Printf("UI: IdP delete published locally but the cluster snapshot was refused: %v", err)
+	}
+	auditEventDiff(r, "idp.delete", id, "", auditIdPProfile(p), nil)
+	logger.Printf("UI: IdP profile deleted id=%q", sanitizeLog(id))
+	jsonOK(w, map[string]any{
+		"ok":        true,
+		"deleted":   true,
+		"id":        id,
+		"revision":  idpRegistry.DocumentRevision(),
+		"persisted": idpRegistry.Persisted(),
+	})
+}
+
+// POST /api/idp/repair — fenced acknowledgement of a quarantined registry
+// (R8): {"confirm": "<quarantined file base name>"} clears the degraded
+// posture; the registry stays empty. Admin-only, audited.
+func apiIdPRepair(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	if !requireRoleJSON(w, r, RoleAdmin) {
+		return
+	}
+	var body struct {
+		Confirm string `json:"confirm"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
+		return
+	}
+	d := idpRegistry.Degraded()
+	if err := idpRegistry.Repair(strings.TrimSpace(body.Confirm)); err != nil {
+		switch {
+		case errors.Is(err, errIdPNotDegraded):
+			writeRefusal(w, http.StatusConflict, refusalNotDegraded, "the registry is not degraded", nil)
+		case errors.Is(err, errIdPRepairUnavailable):
+			writeRefusal(w, http.StatusConflict, refusalRepairUnavailable, err.Error(), nil)
+		default:
+			cur := map[string]any{}
+			if d != nil && d.QuarantinePath != "" {
+				cur["confirmValue"] = filepath.Base(d.QuarantinePath)
+			}
+			writeRefusal(w, http.StatusConflict, refusalConfirmMismatch, "confirm must name the quarantined file exactly", cur)
+		}
+		return
+	}
+	evidence := ""
+	if d != nil {
+		evidence = filepath.Base(d.QuarantinePath)
+	}
+	auditEvent(r, "idp.repair", "idp-registry", "quarantine acknowledged: "+evidence)
+	logger.Printf("UI: IdP registry repair acknowledged evidence=%q", sanitizeLog(evidence))
+	jsonOK(w, map[string]any{"ok": true, "repaired": true, "evidence": evidence, "revision": idpRegistry.DocumentRevision()})
 }
 
 // writeOnlyIdPFieldPresence records which write-only secret fields the update
@@ -722,8 +1040,11 @@ type writeOnlyIdPFieldPresence struct {
 // and NOTHING changed (transactional registry, P1-3) — while every other
 // error is a validation/compile rejection of the caller's input (400).
 func idpMutationErrorStatus(err error) int {
-	if errors.Is(err, errIdPPersistFailed) {
+	if errors.Is(err, errIdPPersistFailed) || errors.Is(err, errIdPOutcomeUnknown) {
 		return http.StatusInternalServerError
+	}
+	if errors.Is(err, errIdPRegistryDegraded) {
+		return http.StatusServiceUnavailable
 	}
 	return http.StatusBadRequest
 }
@@ -830,15 +1151,15 @@ func nestedJSONFieldPresent(body []byte, section, field string) bool {
 // GET /api/idp/{id}/groups — returns the known-groups list for the profile.
 func apiIdPGroups(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	if !requireRole(w, r, RoleViewer) {
+	if !requireRoleJSON(w, r, RoleViewer) {
 		return
 	}
 	p := idpRegistry.Get(id)
 	if p == nil {
-		http.Error(w, "not found", http.StatusNotFound)
+		writeRefusal(w, http.StatusNotFound, refusalNotFound, "not found", nil)
 		return
 	}
 	groups := p.KnownGroups
@@ -851,30 +1172,38 @@ func apiIdPGroups(w http.ResponseWriter, r *http.Request, id string) {
 // POST /api/idp/discover — run OIDC discovery for a given issuer URL and
 // return the discovered endpoints without saving anything.
 // Requires Admin: this endpoint makes outbound HTTP requests based on user input.
+// Audited (idp.discover) with the issuer HOST only — the admin actuated an
+// outbound fetch; the discovery document itself is never audited.
 func apiIdPDiscover(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	if !requireRole(w, r, RoleAdmin) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
 		return
 	}
 	var body struct {
 		Issuer string `json:"issuer"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
 		return
 	}
 	if err := validateExternalURL(body.Issuer); err != nil {
-		http.Error(w, "issuer: "+err.Error(), http.StatusBadRequest)
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "issuer: "+err.Error(), nil)
 		return
+	}
+	host := body.Issuer
+	if u, err := url.Parse(body.Issuer); err == nil && u.Host != "" {
+		host = u.Host
 	}
 	doc, err := fetchOIDCDiscovery(body.Issuer)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		auditEvent(r, "idp.discover", host, "failed")
+		writeRefusal(w, http.StatusBadGateway, refusalUpstreamError, "OIDC discovery failed for the issuer (see the server log for the cause)", nil)
 		return
 	}
+	auditEvent(r, "idp.discover", host, "ok")
 	jsonOK(w, doc)
 }
 
@@ -1116,6 +1445,7 @@ func registerAuthRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/idp/test", apiIdPTest)                           // POST: candidate-based LDAP directory test (ADR-0027)
 	mux.HandleFunc("/api/idp/legacy-ldap", apiIdPLegacyLDAP)              // GET: legacy YAML ldap summary
 	mux.HandleFunc("/api/idp/legacy-ldap/import", apiIdPLegacyLDAPImport) // POST: explicit legacy import
+	mux.HandleFunc("/api/idp/repair", apiIdPRepair)                       // POST: fenced quarantine acknowledgement (FE-6A.0 R8)
 	mux.HandleFunc("/api/idp/", apiIdPRouter)                             // GET|PUT|DELETE /api/idp/{id} + /api/idp/{id}/groups
 
 	// ── Auth callbacks (not behind UI auth middleware) ────────────────────

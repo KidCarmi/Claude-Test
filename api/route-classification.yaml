@@ -185,7 +185,17 @@ routes:
     min_role: "admin"
     mutating: true
     audit_expected: true
-    danger_level: medium
+    danger_level: high
+    documented: true
+  - route: "/api/auth/users"
+    method: "PUT"
+    handler: "apiAuthUsers"
+    domain: "auth"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: high
     documented: true
   - route: "/api/auth/users"
     method: "DELETE"
@@ -1628,20 +1638,39 @@ routes:
     danger_level: medium
     documented: true
   - route: "/api/idp/"
-    method: "*"
+    method: "GET"
     handler: "apiIdPRouter"
+    openapi_path: "/api/idp/{id}"
+    openapi_extra_paths: ["/api/idp/{id}/groups"]
     domain: "auth"
-    visibility: intentionally-undocumented
+    visibility: admin-supported
     min_role: "viewer"
+    mutating: false
+    audit_expected: false
+    danger_level: none
+    documented: true
+  - route: "/api/idp/"
+    method: "PUT"
+    handler: "apiIdPRouter"
+    openapi_path: "/api/idp/{id}"
+    domain: "auth"
+    visibility: admin-supported
+    min_role: "admin"
     mutating: true
     audit_expected: true
-    danger_level: medium
-    documented: false
-    exemption:
-      owner: platform-team
-      reason: dynamic IdP sub-router; per-sub-action RBAC varies (C4/MED-HIGH-4) - enumerate before documenting
-      security_class: non-rest-surface
-      expires: *baseline
+    danger_level: high
+    documented: true
+  - route: "/api/idp/"
+    method: "DELETE"
+    handler: "apiIdPRouter"
+    openapi_path: "/api/idp/{id}"
+    domain: "auth"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: high
+    documented: true
   - route: "/api/idp/discover"
     method: "POST"
     handler: "apiIdPDiscover"
@@ -1649,8 +1678,18 @@ routes:
     visibility: admin-supported
     min_role: "admin"
     mutating: true
-    audit_expected: false
+    audit_expected: true
     danger_level: medium
+    documented: true
+  - route: "/api/idp/repair"
+    method: "POST"
+    handler: "apiIdPRepair"
+    domain: "auth"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: true
+    audit_expected: true
+    danger_level: high
     documented: true
   - route: "/api/idp/test"
     method: "POST"

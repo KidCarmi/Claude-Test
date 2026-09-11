@@ -332,28 +332,93 @@ var legacyLDAPShadowWarnOnce sync.Once
 // deactivating the proxy backend can never fail the admin-UI setup gate open.
 func legacyLDAPRetired() bool { return legacyLDAPRetiredFlag.Load() }
 
-// markLegacyLDAPRetired records the cutover: in-memory immediately, durable
-// via the admin-settings snapshot (best-effort, like every admin mutation;
-// re-recorded by any later save and re-observed from the registry at next
-// boot, so a lost write cannot resurrect the legacy authenticator while the
-// registry profile exists). Idempotent; audited once.
+// LegacyLDAPCutover is the DURABLE, operation-identified record of the
+// legacy-YAML → registry LDAP authority cutover (FE-6A.0 R7). It binds the
+// once-ever transition to the candidate that carried it (profile id + the
+// registry's document revision), the actor, the trigger and the instant;
+// it is persisted beside the sentinel in admin_settings.json and surfaced
+// read-only on GET /api/idp/legacy-ldap. Node-local, off every config
+// surface (same row as the sentinel).
+type LegacyLDAPCutover struct {
+	OperationID      string `json:"operationId"`
+	ProfileID        string `json:"profileId,omitempty"`
+	ProfileName      string `json:"profileName,omitempty"`
+	RegistryRevision string `json:"registryRevision,omitempty"`
+	Actor            string `json:"actor"`
+	Trigger          string `json:"trigger"` // admin_api | observed
+	At               string `json:"at"`
+}
+
+// legacyLDAPCutoverRec is the in-memory view of the durable cutover record.
+var legacyLDAPCutoverRec atomic.Pointer[LegacyLDAPCutover]
+
+// legacyLDAPCutover returns a copy of the recorded cutover, or nil.
+func legacyLDAPCutover() *LegacyLDAPCutover {
+	rec := legacyLDAPCutoverRec.Load()
+	if rec == nil {
+		return nil
+	}
+	cp := *rec
+	return &cp
+}
+
+// newLegacyLDAPCutover mints the record for a cutover triggered now.
+func newLegacyLDAPCutover(profile *IdPProfile, registryRevision, actor, trigger string) LegacyLDAPCutover {
+	rec := LegacyLDAPCutover{
+		OperationID:      mustRandHex(16),
+		RegistryRevision: registryRevision,
+		Actor:            actor,
+		Trigger:          trigger,
+		At:               time.Now().UTC().Format(time.RFC3339),
+	}
+	if profile != nil {
+		rec.ProfileID, rec.ProfileName = profile.ID, profile.Name
+	}
+	return rec
+}
+
+// markLegacyLDAPRetired records an OBSERVED cutover (boot reconciliation,
+// CP→DP sync): in-memory immediately, durable via the admin-settings
+// snapshot (best-effort, like every admin mutation; re-recorded by any later
+// save and re-observed from the registry at next boot, so a lost write
+// cannot resurrect the legacy authenticator while the registry profile
+// exists). Idempotent; audited once. The ADMIN API path does NOT use this:
+// it persists the sentinel BEFORE the registry publish and attributes the
+// record to the admin (markLegacyLDAPRetiredWith).
 func markLegacyLDAPRetired(reason string) {
-	if legacyLDAPRetiredFlag.Swap(true) {
+	rec := newLegacyLDAPCutover(nil, "", "system", "observed")
+	if !markLegacyLDAPRetiredWith(rec, reason) {
 		return
 	}
-	audit.Add(audit.Entry{
-		TS:     time.Now().UnixMilli(),
-		Time:   time.Now().Format("2006-01-02 15:04:05"),
-		Actor:  "system",
-		Action: "idp.legacy_ldap.retired",
-		Object: "legacy-ldap",
-		Detail: "legacy YAML ldap block permanently retired as an operational authenticator (" + reason + "); registry is the sole LDAP authority",
-	})
 	// Synchronous persist: cutover is a once-ever authority transition, so the
 	// one bounded disk write on this path is worth durable-before-return
 	// semantics (error is logged inside SaveAdminSettings; a lost write is
 	// re-recorded by any later save and re-observed from the registry at boot).
 	_ = SaveAdminSettings()
+}
+
+// markLegacyLDAPRetiredWith flips the in-memory sentinel ONCE and records
+// rec + the audit entry (actor = rec.Actor). Reports whether this call
+// performed the transition (false ⇒ already retired: at-most-once, nothing
+// re-emitted). Durability is the CALLER's contract: the admin API persists
+// the sentinel before calling this (inside the save's applyOnSuccess), the
+// observed path saves afterwards.
+func markLegacyLDAPRetiredWith(rec LegacyLDAPCutover, reason string) bool {
+	if legacyLDAPRetiredFlag.Swap(true) {
+		return false
+	}
+	legacyLDAPCutoverRec.Store(&rec)
+	audit.Add(audit.Entry{
+		TS:       time.Now().UnixMilli(),
+		Time:     time.Now().Format("2006-01-02 15:04:05"),
+		Actor:    rec.Actor,
+		Action:   "idp.legacy_ldap.retired",
+		Object:   "legacy-ldap",
+		ObjectID: rec.ProfileID,
+		Detail: "legacy YAML ldap block permanently retired as an operational authenticator (" + reason +
+			"); registry is the sole LDAP authority; operationId=" + rec.OperationID,
+	})
+	return true
 }
 
 // enforceLegacyLDAPShadowing enforces the single-authority rule at every

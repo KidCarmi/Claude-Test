@@ -24,6 +24,7 @@ func setUISessionCookie(w http.ResponseWriter, r *http.Request, username string,
 		Role:     string(role),
 		Exp:      time.Now().Add(getSessionTTL()).Unix(),
 		Jti:      newSessionJti(),
+		Iat:      time.Now().UnixNano(),
 	}
 	value, err := encodeSession(s)
 	if err != nil {

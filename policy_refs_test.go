@@ -240,13 +240,14 @@ func TestDeleteBlockedByReferences_FailsClosedOnUnknownType(t *testing.T) {
 	}
 }
 
-// idp is no longer a walk type in slice 1 (auth rules reference IdPs by ID,
-// not name); the endpoint rejects it rather than silently returning empty.
-func TestApiObjectReferences_IdpRejected(t *testing.T) {
+// idp joined the walk in FE-6A.0 (R4): auth rules reference IdPs by ID, so
+// the walk is keyed on the id and the Where-Used endpoint answers it — an
+// unreferenced id is the known-type, empty-list answer (200), never a 400.
+func TestApiObjectReferences_IdpIsAWalkType(t *testing.T) {
 	rec := httptest.NewRecorder()
 	apiObjectReferences(rec, viewerReq(t, "/api/objects/references?type=idp&name=okta"))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("type=idp: got %d; want 400", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("type=idp: got %d; want 200 (known type, no consumers)", rec.Code)
 	}
 }
 
