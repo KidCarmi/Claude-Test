@@ -498,19 +498,19 @@ run_mutation M38 \
   'the admission transaction charges the probe verdict verbatim (timing decides the cause)' \
   'TestReviewedBinding_C22_FirstCauseDoesNotDependOnTheTransitionWindow' \
   . "$ADM" \
-  's/return rt\.latchDriftLocked\(cr, capb, reviewedFirstCause\(cr\.reviewed, obs\), gen, now\)/return rt.latchDriftLocked(cr, capb, obs.DriftCode, gen, now)/'
+  's/\tcase canary\.IsDriftVerdict\(v\):\n\t\treturn string\(v\)/\tcase canary.IsDriftVerdict(v):\n\t\treturn obs.DriftCode/'
 
 run_mutation M39 \
   'the pre-executor path charges the probe verdict verbatim (two paths, two causes, one state)' \
   'TestReviewedBinding_C22B_TheObservationPathAgreesOnTheFirstCause' \
   . "$ADM" \
-  's/\t\tcode = reviewedFirstCause\(cr\.reviewed, trust\(\)\)/\t\tcode = trust().DriftCode/'
+  's/\t\tcode = canaryDriftCause\(cr\.reviewed, trust\(\)\)/\t\tcode = trust().DriftCode/'
 
 run_mutation M40 \
   'the reviewed verdict REPLACES the probe code, so a reviewed match silences a real breach' \
   'TestReviewedBinding_C22Control2_AReviewedMatchNeverSilencesTheProbe' \
   . "$ADM" \
-  's/\tif v := reviewed\.Compare\(obs\.Current\); canary\.IsDriftVerdict\(v\) \{\n\t\treturn string\(v\)\n\t\}\n\treturn obs\.DriftCode/\tv := reviewed.Compare(obs.Current)\n\tif v == canary.ReviewedOutOfScope \{\n\t\treturn obs.DriftCode\n\t\}\n\treturn string(v)/'
+  's/\tdefault:\n\t\t\/\/ ReviewedMatches — the reviewed target is intact, so only the probe can still object\.\n\t\treturn obs\.DriftCode/\tdefault:\n\t\treturn ""/'
 
 run_mutation M41 \
   'the stale-fingerprint branch drops the authoritative target, so nothing can sharpen the cause' \
@@ -528,7 +528,7 @@ run_mutation M42 \
   'the tenant gate returns before the anchor facts are consulted (cause decided by path)' \
   'TestReviewedBinding_C24_AnchorLossOutranksTenantDriftOnBothPaths' \
   . mcp_live_gate.go \
-  's/\tif !ti\.target\.ServerUsable \{\n\t\treturn liveTrustPrecheck\{DriftCode: "server_identity_drift"\}\n\t\}\n/\tif ti.target.Tenant == "" || ti.target.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative\}\n\t\}\n\tif !ti.target.ServerUsable \{\n\t\treturn liveTrustPrecheck\{DriftCode: "server_identity_drift"\}\n\t\}\n/'
+  's/\tif !ti\.target\.ServerUsable \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative, AnchorLost: true\}\n\t\}\n/\tif ti.target.Tenant == "" || ti.target.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative\}\n\t\}\n\tif !ti.target.ServerUsable \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative, AnchorLost: true\}\n\t\}\n/'
 
 run_mutation M43 \
   'every wrong-tenant request reads as anchor loss, erasing the tenant-drift verdict' \
