@@ -73,21 +73,22 @@ func TestDetectProtocolName(t *testing.T) {
 
 // ─── clusterCountStore ──────────────────────────────────────────────────────
 
-func TestClusterCountStore_GetApply(t *testing.T) {
+func TestClusterCountStore_FreshCountApply(t *testing.T) {
 	cs := &clusterCountStore{counts: map[string]int{}}
+	const maxAge = time.Minute
 
 	// Empty store returns 0.
-	if got := cs.Get("1.2.3.4"); got != 0 {
-		t.Fatalf("empty store Get = %d, want 0", got)
+	if got := cs.FreshCount("1.2.3.4", time.Now(), maxAge); got != 0 {
+		t.Fatalf("empty store FreshCount = %d, want 0", got)
 	}
 
 	// Apply remote counts.
 	cs.Apply(map[string]int{"1.2.3.4": 50, "5.6.7.8": 30})
-	if got := cs.Get("1.2.3.4"); got != 50 {
-		t.Fatalf("Get(1.2.3.4) = %d, want 50", got)
+	if got := cs.FreshCount("1.2.3.4", time.Now(), maxAge); got != 50 {
+		t.Fatalf("FreshCount(1.2.3.4) = %d, want 50", got)
 	}
-	if got := cs.Get("5.6.7.8"); got != 30 {
-		t.Fatalf("Get(5.6.7.8) = %d, want 30", got)
+	if got := cs.FreshCount("5.6.7.8", time.Now(), maxAge); got != 30 {
+		t.Fatalf("FreshCount(5.6.7.8) = %d, want 30", got)
 	}
 	if got := cs.Count(); got != 2 {
 		t.Fatalf("Count() = %d, want 2", got)
@@ -95,11 +96,21 @@ func TestClusterCountStore_GetApply(t *testing.T) {
 
 	// Apply replaces entirely.
 	cs.Apply(map[string]int{"9.9.9.9": 10})
-	if got := cs.Get("1.2.3.4"); got != 0 {
+	if got := cs.FreshCount("1.2.3.4", time.Now(), maxAge); got != 0 {
 		t.Fatal("old key should be gone after Apply")
 	}
 	if got := cs.Count(); got != 1 {
 		t.Fatalf("Count() = %d, want 1", got)
+	}
+
+	// CHAOS-60: past maxAge the same broadcast contributes nothing, while
+	// Count() still reports what was last received — the two answer different
+	// questions and the freshness surface is what separates them.
+	if got := cs.FreshCount("9.9.9.9", time.Now().Add(2*maxAge), maxAge); got != 0 {
+		t.Fatalf("FreshCount past maxAge = %d, want 0", got)
+	}
+	if got := cs.Count(); got != 1 {
+		t.Fatalf("Count() after expiry = %d, want 1 (the map is not cleared, only ignored)", got)
 	}
 }
 
@@ -151,9 +162,13 @@ func TestAllowClusterAware_CombinesRemote(t *testing.T) {
 	r := newRateLimiter()
 	r.Configure(10, time.Minute)
 
-	// Simulate 7 remote requests from other nodes.
+	// Simulate 7 remote requests from other nodes. The broadcast has to be
+	// APPLIED (not just poked into the struct) so it carries a freshness stamp —
+	// CHAOS-60 made an unstamped store mean "nothing has ever arrived", which is
+	// exactly what a node that never reached its Control Plane should report.
 	oldCounts := clusterCounts
-	clusterCounts = &clusterCountStore{counts: map[string]int{"test-ip": 7}}
+	clusterCounts = &clusterCountStore{counts: map[string]int{}}
+	clusterCounts.Apply(map[string]int{"test-ip": 7})
 	defer func() { clusterCounts = oldCounts }()
 
 	// Local: should allow 3 more (7 remote + 3 local = 10 = limit).

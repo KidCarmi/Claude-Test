@@ -411,16 +411,71 @@ const maxPending = 1000
 var (
 	pendingMu sync.Mutex
 	pending   []Entry
+
+	// CHAOS-60 — overflow of the DP→CP push queue is COUNTED, never silent.
+	//
+	// The bound itself is correct: a Data Plane that cannot reach its Control
+	// Plane must not grow this queue without limit. What was missing is that
+	// the loss had no counter, no metric and no log line, while this same
+	// package documents the opposite contract three hundred lines up for the
+	// durable JSONL path ("count EVERY failure, log only the FIRST"). The
+	// centralized audit trail on the CP therefore acquired holes with no
+	// marker anywhere that an operator or an auditor could read.
+	//
+	// Which entries are lost makes it worse rather than better. The trim keeps
+	// the NEWEST, and Requeue prepends the events that just failed to send —
+	// so the first thing discarded is the OLDEST unsent history, i.e. the
+	// beginning of whatever happened during the outage. That is the half an
+	// investigation needs most, and losing it silently is CWE-778 in the same
+	// shape the durable-write counter exists to prevent.
+	//
+	// Persistence stays best-effort and the cap stays a cap: this counter
+	// changes nothing about which entries survive, only about whether their
+	// loss can be seen. Note the local JSONL record on the DP is unaffected —
+	// what is lost here is the CENTRAL aggregate, which is the surface an
+	// operator actually watches in a cluster.
+	pendingDrops      int64
+	pendingDropLogged atomic.Bool
 )
+
+// PendingDrops returns the cumulative count of audit entries that never reached
+// the Control Plane because the DP push queue was at its cap (process lifetime;
+// never reset). Non-zero means the CENTRALIZED audit trail has a gap — the local
+// JSONL record on this node is unaffected. Surfaced on /metrics and /healthz.
+func PendingDrops() int64 { return atomic.LoadInt64(&pendingDrops) }
+
+// countPendingDrops charges n lost entries and logs the first overflow only —
+// a Control Plane that is down is down for every push, and the counter carries
+// the magnitude. Mirrors countWriteError's contract exactly.
+func countPendingDrops(n int) {
+	if n <= 0 {
+		return
+	}
+	atomic.AddInt64(&pendingDrops, int64(n))
+	if pendingDropLogged.CompareAndSwap(false, true) {
+		obs.Printf("ERROR audit log: Control Plane push queue full at %d entries — "+
+			"the oldest unsent audit events are being discarded and will never reach the "+
+			"centralized log (further drops counted silently; the local audit file is unaffected)", maxPending)
+	}
+}
+
+// trimPendingLocked enforces the cap, keeping the newest entries and charging
+// everything it discards. The single chokepoint for the bound: both writers go
+// through it so neither can drop without counting.
+func trimPendingLocked() {
+	if len(pending) <= maxPending {
+		return
+	}
+	countPendingDrops(len(pending) - maxPending)
+	pending = pending[len(pending)-maxPending:]
+}
 
 // queueForCluster adds an audit event to the pending queue for CP push.
 // Called by Add when DP mode is on.
 func queueForCluster(e Entry) {
 	pendingMu.Lock()
 	pending = append(pending, e)
-	if len(pending) > maxPending {
-		pending = pending[len(pending)-maxPending:]
-	}
+	trimPendingLocked()
 	pendingMu.Unlock()
 }
 
@@ -442,9 +497,7 @@ func Drain() []Entry {
 func Requeue(events []Entry) {
 	pendingMu.Lock()
 	pending = append(events, pending...)
-	if len(pending) > maxPending {
-		pending = pending[len(pending)-maxPending:]
-	}
+	trimPendingLocked()
 	pendingMu.Unlock()
 }
 
@@ -527,6 +580,34 @@ func setPersistPathForTest(path string) (restore func()) {
 		mu.Unlock()
 	}
 }
+
+// ResetPendingForTest snapshots and clears the DP→CP push queue, its drop
+// counter and the one-shot log gate, returning a restore func. Test-only: the
+// production counter is process-lifetime and never reset.
+func ResetPendingForTest() (restore func()) {
+	pendingMu.Lock()
+	oldPending := pending
+	pending = nil
+	pendingMu.Unlock()
+	oldDrops := atomic.SwapInt64(&pendingDrops, 0)
+	oldLogged := pendingDropLogged.Swap(false)
+	return func() {
+		pendingMu.Lock()
+		pending = oldPending
+		pendingMu.Unlock()
+		atomic.StoreInt64(&pendingDrops, oldDrops)
+		pendingDropLogged.Store(oldLogged)
+	}
+}
+
+// MaxPendingForTest exposes the push-queue cap so a gate can overflow it by an
+// exact amount without duplicating the constant.
+func MaxPendingForTest() int { return maxPending }
+
+// QueueForClusterForTest enqueues one entry on the DP→CP push queue directly,
+// without going through Add (which would also write the ring and the JSONL
+// file). Test-only seam for the overflow gates.
+func QueueForClusterForTest(e Entry) { queueForCluster(e) }
 
 // ClearPersistForTest drops the persistence wiring without closing it (used
 // after a shutdown-hook test has already closed the file, so a later restore

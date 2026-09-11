@@ -547,6 +547,19 @@ func (c *DataPlaneClient) rateLimitGossipLoop(ctx context.Context, interval time
 			clusterRateLimitEnabled.Store(false)
 			return
 		case <-ticker.C:
+			// CHAOS-60: evaluate broadcast freshness on EVERY tick, including the
+			// ones whose RPC fails — reporting only from the success branch
+			// would mean the state is never reported during the outage that
+			// causes it.
+			//
+			// This deliberately does NOT report on a node whose rate limiter is
+			// off: clusterRateLimitFreshness is un-armed there and returns a
+			// not-stale status, because AllowClusterAware short-circuits before
+			// consulting a remote count, so there is no enforcement for an
+			// expired broadcast to degrade. The first version of this call
+			// claimed the opposite in its own comment and pinned every freshness
+			// surface at "degraded" on the default posture (limit 0).
+			noteClusterRateLimitFreshness(clusterRateLimitFreshness())
 			if !rl.Enabled() {
 				continue
 			}

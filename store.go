@@ -428,6 +428,7 @@ var (
 	requeueAuditEvents      = audit.Requeue
 	auditPersistActive      = audit.PersistActive
 	auditWriteErrors        = audit.WriteErrors
+	auditPendingDrops       = audit.PendingDrops
 )
 
 // InitAuditLog opens path for append-only JSONL audit persistence.
