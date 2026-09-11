@@ -103,6 +103,24 @@ endpoints for credentialed parents.
 
 ### Performance
 
+- The rate-limit exempt check is lock-free and flat in the exempt-CIDR count.
+  `RateLimiter.IsExempt` is the first decision inside `Allow`, so once a rate
+  limit is configured it runs on every proxied request; it took a
+  process-wide `RWMutex` read lock and then ran a linear `net.IPNet.Contains`
+  scan, which made the length of an operator's exempt list the price of the
+  gate for every *other* client. On a 4-core box it measured 59.2 ns with no
+  exemptions and 3.62 µs at 256 exempt CIDRs (~13.9 ns per configured CIDR);
+  reading an immutable view and probing a prefix-length-bucketed set it
+  measures 3.08 ns and 63.1 ns — flat from 1 to 256 prefixes. End to end the
+  whole `Allow` gate goes 1176 → 279 ns at 256 exempt CIDRs at four cores,
+  and the per-op cost now falls with core count (4.0x from 1→4) where it used
+  to rise (0.69x). The prefix-bucketing machinery is now one implementation
+  (`prefixSet`) shared with the IP filter rather than a second copy. Verdicts
+  are preserved exactly, including an IPv4-mapped probe continuing *not* to
+  match a plain-v4 single-IP exemption — canonicalising that would widen an
+  exemption. `RateLimiter.AddExemptions` is added as the bulk-load primitive
+  and used by the boot settings restore and config import, so restoring a
+  large exempt list stays linear. No API, metric, or dashboard change.
 - The top-hosts counter's tracked-host path is lock-free. `topHosts.Record`
   runs on every allowed request and took a process-wide `RWMutex` read lock
   to read a map that in steady state never changes; `RLock`/`RUnlock` are two
