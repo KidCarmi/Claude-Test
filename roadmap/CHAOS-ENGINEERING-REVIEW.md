@@ -6224,10 +6224,38 @@ audited as `ocsp.toggle`, deliberately off the config-version rollback surface.
 - **`maxResponders` = 4 is a constant**, like every other bound in this file
   whose only use would be widening an attack window.
 
+### Two defects the fix itself introduced
+
+Both found in an adversarial re-read of the diff, before merge, and both worth
+recording because each is a general trap rather than a slip.
+
+**The guard became the unbounded call.** `ssrf.PrivateHost` resolves under
+`context.Background()`. Reaching for it from a TLS handshake on the request
+goroutine makes the SSRF pre-check the thing that blocks for the system
+resolver's full budget — on a hostname written by the peer. That is §34's fault
+re-imported through the fix for OCSP-5, and strictly worse than what it
+replaced. `internal/ssrf` gains `PrivateHostContext`; `PrivateHost` delegates
+with a background context, so every existing caller is byte-identical. **The
+general trap: a guard added to a hot path is code on the hot path, and inherits
+every bound the path already required.**
+
+**The single-flight collapsed the REFUSALS along with the queries.** Followers
+inherited the leader's fail-closed verdict without charging
+`fail_closed_total`, so a fail-closed storm under-reported itself by however
+many handshakes happened to arrive concurrently — worst exactly when the storm
+is worst, and that counter is what the runbook tells an operator to alert on.
+The pre-existing cached-fail-closed path already charges every hit for this
+reason, which is what made the inconsistency findable. `revokedTotal` is
+deliberately *not* charged there: it counts responder CONFIRMATIONS, and the
+cached confirmed-revocation path does not charge it either. **The general trap:
+deduplicating work is not deduplicating events — ask, per counter, whether it
+measures the work or the outcome.**
+
 ### Gates
 
 `internal/ocsp/ocsp_chaos_test.go` — 8 defect gates, **each verified failing
-against the pre-fix tree**, plus 3 controls (a checker that refused everything
+against the pre-fix tree**, plus 2 gates for the self-review defects above
+(each mutation-checked against the shape it replaces) and 3 controls (a checker that refused everything
 would pass all eight while being a fleet-wide HTTPS outage: a healthy `good` is
 still accepted and still cached, a genuine revocation still blocks and still
 counts as a revocation rather than a fail-close, and a disabled checker still
