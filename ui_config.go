@@ -184,6 +184,14 @@ func apiStats(w http.ResponseWriter, r *http.Request) {
 		// Cluster config-publish freeze (empty = healthy).
 		"configPublishRejected":   publishRejected,
 		"configPublishRejectedAt": publishRejectedAt,
+		// CHAOS-63: login attempts refused because the submitted username
+		// exceeded the byte bound (rejected before lockout/credential
+		// evaluation). Previously visible only via the
+		// culvert_login_oversize_rejected_total Prometheus metric or the
+		// rate-limited process log — invisible to an operator without a
+		// metrics scraper wired up. A climbing count means an unauthenticated
+		// source is probing /api/auth/login.
+		"loginOversizeRejected": loginOversizeRejected.Load(),
 	})
 }
 
