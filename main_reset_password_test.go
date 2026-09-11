@@ -41,7 +41,30 @@ func listenUnix(t *testing.T, path string) net.Listener {
 // merely-unreadable file with a single fresh admin account — destroying
 // every other admin/operator/viewer account and TOTP enrollment with no
 // error, no quarantine copy, and no way back.
+// restoreGlobalUIUsersFile saves and restores cfg.uiUsersFile around a test.
+//
+// runResetPasswordCommand calls cfg.SetUIUsersFile on the PROCESS-GLOBAL cfg
+// (main.go), so a test that drives it repoints that global at its own
+// t.TempDir(). The directory is removed when the test ends but the global still
+// addresses it, so the next test in the shuffled order that persists the roster
+// — cfg.SaveUIUsersFile, reached from apiDefaultAuthOutcome among others —
+// cannot write and its handler correctly returns 500. That is order-dependent,
+// so it surfaces only under `-shuffle` in the determinism gate, in whichever
+// unrelated test happens to follow.
+func restoreGlobalUIUsersFile(t *testing.T) {
+	t.Helper()
+	cfg.mu.Lock()
+	prev := cfg.uiUsersFile
+	cfg.mu.Unlock()
+	t.Cleanup(func() {
+		cfg.mu.Lock()
+		cfg.uiUsersFile = prev
+		cfg.mu.Unlock()
+	})
+}
+
 func TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten(t *testing.T) {
+	restoreGlobalUIUsersFile(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ui_users.json")
 
@@ -121,6 +144,7 @@ func TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten(t *testing.T) 
 // roster once storage recovered. Only an affirmative os.IsNotExist result
 // may be trusted as "safe to create fresh".
 func TestRunResetPasswordCommand_LstatItselfFailingIsNotProofOfAbsence(t *testing.T) {
+	restoreGlobalUIUsersFile(t)
 	dir := t.TempDir()
 	// A regular file standing where a directory component is expected turns
 	// any Lstat/ReadFile under it into ENOTDIR — never ENOENT — regardless
