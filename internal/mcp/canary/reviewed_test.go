@@ -1,6 +1,10 @@
 package canary
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strings"
 	"testing"
 
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
@@ -231,4 +235,85 @@ func TestReviewedTargetSet_Equal(t *testing.T) {
 				"check is exactly this comparison", name)
 		}
 	}
+}
+
+// EVERY declared ReviewedVerdict is classified — by AST, so adding one cannot escape.
+//
+// DriftVerdicts()/NonBreachVerdicts() are what every consumer enumerates (the abort taxonomy, the
+// bounded evidence allowlist, the root's latch branches). A hand-written list at each of those
+// surfaces is how a new fact ends up wired into some of them and not the rest — the failure this
+// PR produced in four consecutive rounds.
+//
+// The obvious test — iterate DriftVerdicts() and check each is handled — is VACUOUS against exactly
+// the change that matters: adding a constant without adding it to the slice. So this reads the
+// declarations out of the source instead, and requires each to appear in one of the two sets.
+func TestReviewedVerdicts_EveryDeclaredConstantIsClassified(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "reviewed.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse reviewed.go: %v", err)
+	}
+	declared := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		vs, ok := n.(*ast.ValueSpec)
+		if !ok || vs.Type == nil {
+			return true
+		}
+		if id, ok := vs.Type.(*ast.Ident); !ok || id.Name != "ReviewedVerdict" {
+			return true
+		}
+		for _, name := range vs.Names {
+			declared[name.Name] = true
+		}
+		return true
+	})
+	if len(declared) < 5 {
+		t.Fatalf("found only %d ReviewedVerdict declarations (%v) — too few for the type this test "+
+			"claims to be checking, so its walk is broken rather than its subject clean",
+			len(declared), declared)
+	}
+
+	classified := map[string]bool{}
+	for _, v := range DriftVerdicts() {
+		classified[verdictConstName(t, f, v)] = true
+	}
+	for _, v := range NonBreachVerdicts() {
+		classified[verdictConstName(t, f, v)] = true
+	}
+	for name := range declared {
+		if !classified[name] {
+			t.Fatalf("ReviewedVerdict %s is declared but appears in neither DriftVerdicts() nor "+
+				"NonBreachVerdicts(). Every consumer enumerates those two sets, so an unclassified "+
+				"verdict reaches the abort taxonomy and the bounded evidence allowlist as an "+
+				"unrecognised string — the experiment stops without the evidence saying why", name)
+		}
+	}
+}
+
+// verdictConstName maps a verdict VALUE back to the identifier that declares it, so the test can
+// compare the two sets against the AST by name rather than by value.
+func verdictConstName(t *testing.T, f *ast.File, v ReviewedVerdict) string {
+	t.Helper()
+	var found string
+	ast.Inspect(f, func(n ast.Node) bool {
+		vs, ok := n.(*ast.ValueSpec)
+		if !ok || vs.Type == nil || len(vs.Names) != 1 || len(vs.Values) != 1 {
+			return true
+		}
+		if id, ok := vs.Type.(*ast.Ident); !ok || id.Name != "ReviewedVerdict" {
+			return true
+		}
+		lit, ok := vs.Values[0].(*ast.BasicLit)
+		if !ok {
+			return true
+		}
+		if strings.Trim(lit.Value, `"`) == string(v) {
+			found = vs.Names[0].Name
+		}
+		return true
+	})
+	if found == "" {
+		t.Fatalf("verdict %q has no declaring constant in reviewed.go", v)
+	}
+	return found
 }

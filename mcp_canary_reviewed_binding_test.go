@@ -1306,12 +1306,10 @@ func TestReviewedBinding_C19_ObservationPathLatchesTheRepinWindow(t *testing.T) 
 // it is the same shape as the round-5 P1 — a new fact wired into some of its consumers. A wall is
 // the only version of "remember to update both" that survives.
 func TestReviewedBinding_C20_EveryDriftVerdictIsANamedEvidenceKey(t *testing.T) {
-	// The engine's verdicts that mean DRIFT — everything except the two non-breach outcomes.
-	for _, v := range []canary.ReviewedVerdict{
-		canary.ReviewedFingerprintDrift,
-		canary.ReviewedServerIdentityDrift,
-		canary.ReviewedTenantDrift,
-	} {
+	// Enumerated from the ENGINE, not by hand. A hand-written list here would silently fail to
+	// cover a verdict added later — the exact shape this wall exists to prevent — and the engine
+	// has its own AST test requiring every declared verdict to be in one of the two sets.
+	for _, v := range canary.DriftVerdicts() {
 		if _, ok := canaryPreAdmissionDriftCodes[string(v)]; !ok {
 			t.Fatalf("reviewed verdict %q is not a named key in canaryPreAdmissionDriftCodes, so an "+
 				"abort charged to it is recorded as \"other\" — the experiment stops without the "+
@@ -1321,7 +1319,7 @@ func TestReviewedBinding_C20_EveryDriftVerdictIsANamedEvidenceKey(t *testing.T) 
 	// CONTROL: the non-breach verdicts must NOT be evidence keys. Without this the test would pass
 	// just as well if the allowlist were widened to everything, which would let a genuinely
 	// unrecognised code through as a named cause.
-	for _, v := range []canary.ReviewedVerdict{canary.ReviewedMatches, canary.ReviewedOutOfScope} {
+	for _, v := range canary.NonBreachVerdicts() {
 		if _, ok := canaryPreAdmissionDriftCodes[string(v)]; ok {
 			t.Fatalf("non-breach verdict %q must not be an evidence key", v)
 		}

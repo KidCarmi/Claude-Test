@@ -218,6 +218,27 @@ const (
 	ReviewedTenantDrift ReviewedVerdict = "reviewed_target_tenant_drift"
 )
 
+// DriftVerdicts returns every verdict that means the reviewed target MOVED — the breach verdicts,
+// as opposed to ReviewedMatches (healthy) and ReviewedOutOfScope (request-scoped by design).
+//
+// It exists so consumers enumerate this set from ONE place instead of hand-listing it. A drift
+// verdict has to reach several surfaces to be useful — the abort taxonomy, the bounded evidence
+// allowlist, the latch branches — and the failure mode this PR produced repeatedly is a new fact
+// wired into some of them and not the rest. A hand-written list at each surface makes that failure
+// silent; a shared accessor plus the exhaustiveness test beside it makes it loud.
+func DriftVerdicts() []ReviewedVerdict {
+	return []ReviewedVerdict{
+		ReviewedFingerprintDrift,
+		ReviewedServerIdentityDrift,
+		ReviewedTenantDrift,
+	}
+}
+
+// NonBreachVerdicts returns the verdicts that deliberately do NOT stop the experiment.
+func NonBreachVerdicts() []ReviewedVerdict {
+	return []ReviewedVerdict{ReviewedMatches, ReviewedOutOfScope}
+}
+
 // Compare decides the current target against the activation's reviewed record.
 //
 // It is PURE, total, and deliberately makes only ONE distinction that latches: the target
