@@ -8,7 +8,7 @@ package catdb
 // claim is proven live (not asserted from documentation) by
 // TestOpenResilient_SurvivesUncatchableOpenPanicOnNextBoot.
 
-// CHAOS-60 note: the machinery these gates exercise moved to
+// CHAOS-61 note: the machinery these gates exercise moved to
 // `internal/storeguard` so the request-history store could reuse it. The gates
 // themselves are unchanged and still run against the REAL community store — the
 // aliases below only re-point the identifiers at their new home, so what is

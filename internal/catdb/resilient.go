@@ -3,7 +3,7 @@ package catdb
 // resilient.go — CHAOS-50: surviving a corrupt Layer-2 community store.
 //
 // The recovery machinery this file used to carry in full now lives in
-// `internal/storeguard`, because CHAOS-60 found the identical uncatchable-panic
+// `internal/storeguard`, because CHAOS-61 found the identical uncatchable-panic
 // exposure on the request-history store (`internal/logstore`) and a second copy
 // of the empirically-derived badger message table is precisely the artefact
 // that must never drift — it is pinned by a test so a badger upgrade that

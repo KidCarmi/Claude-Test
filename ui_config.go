@@ -585,7 +585,7 @@ func applyRetentionUpdate(w http.ResponseWriter, r *http.Request, enabled *bool,
 			// A DIFFERENT remedy from the mismatch above, which is why it is a
 			// distinct sentinel: the saved history is still intact and still
 			// decryptable, but only by the salt sidecar that went missing. The
-			// key is never re-minted over an existing store (CHAOS-60), so
+			// key is never re-minted over an existing store (CHAOS-61), so
 			// restoring that one file recovers the history — purging is the
 			// fallback for an operator who cannot, and it is irreversible.
 			if errors.Is(err, errLogStoreSaltUnusable) {
