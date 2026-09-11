@@ -429,6 +429,11 @@ type mcpAuthoritativeTarget struct {
 	// Usable reports that the server behind it is still usable — present, enabled, and identity-
 	// verified. Meaningful only when Found.
 	Usable bool
+	// RegistryPinDiverged reports that the registry's CURRENT pin is not the identity the catalog
+	// record was built against — the repin/re-ingest window. The target below describes the
+	// catalog's coherent view, so a request routed by the registry's pin would not reach the
+	// workload this target names. Meaningful only when Found.
+	RegistryPinDiverged bool
 	// Target is the reviewed-shaped record, valid only when Found.
 	Target canary.ReviewedTarget
 }
@@ -464,8 +469,9 @@ func mcpCurrentAuthoritativeTarget(serverID, toolName string) mcpAuthoritativeTa
 		return mcpAuthoritativeTarget{}
 	}
 	return mcpAuthoritativeTarget{
-		Found:  true,
-		Usable: ti.target.ServerUsable,
+		Found:               true,
+		Usable:              ti.target.ServerUsable,
+		RegistryPinDiverged: ti.registryPinDiverged,
 		Target: canary.ReviewedTarget{
 			Tenant:            ti.target.Tenant,
 			ServerID:          serverID,

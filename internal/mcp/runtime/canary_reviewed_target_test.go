@@ -11,6 +11,7 @@ import (
 
 	"github.com/KidCarmi/Culvert/internal/mcp/mcperr"
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
+	"github.com/KidCarmi/Culvert/internal/mcp/registry"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 )
 
@@ -433,5 +434,92 @@ func TestCanaryReviewedTarget_EmissionIsAboveEveryReturnInDispatchPolicy(t *test
 		t.Fatalf("policy.go reaches noteCanaryTargetObserved %d times, want exactly 1 (inside "+
 			"observeCanaryReviewedTarget). More than one emission point makes the placement gate "+
 			"above prove less than it claims", seam)
+	}
+}
+
+// THE GATE THE ROUND-3 FIX LACKED. A request for a server that is no longer USABLE still reports
+// its target — and it is driven through the REAL pipeline, not through the sink.
+//
+// This is the failure that made the previous round's anchor-loss latch dead code. identity.Resolve
+// performs the registry existence + Usable() check and fails with ReasonRegistryServerUnavailable
+// (identity/context.go, resolveCapabilityRefs), so for the entire time a reviewed server is
+// disabled, EVERY request for it ends inside authenticate and dispatchPolicy never runs. The
+// observation at the top of that function, and the !obs.Usable latch behind it, were both
+// unreachable on production traffic — while the tests for them passed, because they called the sink
+// directly. A gate that exercises the sink proves the sink; only a gate that exercises the PIPELINE
+// proves the sink is reached (Codex P1, PR #1360, round 4).
+//
+// So this test disables the server in the shared registry and drives p.Process, asserting both that
+// the request really does fail at authentication (the premise — if it ever stops doing so, this
+// gate has stopped exercising the path it exists for) and that the target was reported anyway.
+func TestCanaryReviewedTarget_ReportedWhenTheServerIsNoLongerUsable(t *testing.T) {
+	rec := &targetRecorder{}
+	p, ex, k := reviewedTargetFixture(t, rec, 13)
+	tok, sid := driveToDecisionPoint(t, p, k)
+
+	// Disable the reviewed server. Nothing else changes.
+	disableRegistryServer(t, p, testServerID)
+
+	out := p.Process(context.Background(), withSession(gwRequest(tok, toolsCallBody(2)), sid), fixedClock())
+	if out.Reason != mcperr.ReasonRegistryServerUnavailable {
+		t.Fatalf("premise: a disabled server must be refused by identity.Resolve with "+
+			"registry_server_unavailable, got %v. If this changed, the emission point this gate "+
+			"guards may no longer be the one real traffic takes", out.Reason.Code())
+	}
+	if len(ex.resolvedInputs()) != 0 {
+		t.Fatalf("premise: the request must fail ABOVE dispatchPolicy (got %d resolutions) — that "+
+			"is precisely why the observation cannot live only inside it", len(ex.resolvedInputs()))
+	}
+
+	obs := rec.observations()
+	if len(obs) != 1 {
+		t.Fatalf("SECURITY: a request for an unusable reviewed server reported %d observations, "+
+			"want 1. While the server is disabled EVERY request ends here, so reporting nothing "+
+			"means the anchor loss is never recorded and re-enabling resumes the activation", len(obs))
+	}
+	if obs[0].ServerID != testServerID || obs[0].ToolName != "x" || obs[0].Generation != 13 {
+		t.Fatalf("the observation must name the tool and generation, got %+v", obs[0])
+	}
+}
+
+// CONTROL: an ordinary authentication failure — an attacker-mintable one — reports NOTHING.
+//
+// The emission above is gated on ReasonRegistryServerUnavailable precisely because that reason can
+// only be produced after the credential is validated (the pre-auth step does not consult the
+// registry, OVN-08). Emitting on every auth failure would hand an UNAUTHENTICATED caller a way to
+// drive observations against the activation — enumeration, and a lever on the experiment.
+func TestCanaryReviewedTarget_UnauthenticatedFailureReportsNothing(t *testing.T) {
+	rec := &targetRecorder{}
+	p, _, k := reviewedTargetFixture(t, rec, 13)
+	_, sid := driveToDecisionPoint(t, p, k)
+
+	// A syntactically plausible but invalid credential: rejected before any identity exists.
+	out := p.Process(context.Background(), withSession(gwRequest("not-a-valid-token", toolsCallBody(2)), sid), fixedClock())
+	if out.Status != 401 {
+		t.Fatalf("premise: an invalid credential must be rejected 401, got %d", out.Status)
+	}
+	if got := rec.observations(); len(got) != 0 {
+		t.Fatalf("SECURITY: an unauthenticated request reported %d reviewed-target observations, "+
+			"want 0 — an emission reachable without credentials is a lever on the experiment "+
+			"for anyone who can reach the port", len(got))
+	}
+}
+
+// disableRegistryServer disables a server in the pipeline's shared registry, leaving everything
+// else — the catalog record, the tool, its fingerprint — untouched.
+func disableRegistryServer(t *testing.T, p *pipeline, serverID string) {
+	t.Helper()
+	reg := p.deps.Registry
+	if reg == nil {
+		t.Fatal("fixture: the pipeline must carry a registry to disable a server in")
+	}
+	if _, ok := reg.Current().Get(registry.ServerID(serverID)); !ok {
+		t.Fatalf("fixture: server %q is not registered", serverID)
+	}
+	if _, err := reg.SetEnabled(registry.ServerID(serverID), false); err != nil {
+		t.Fatalf("disable server: %v", err)
+	}
+	if srv, ok := reg.Current().Get(registry.ServerID(serverID)); !ok || srv.Usable() {
+		t.Fatal("fixture: the server must be unusable after the disable")
 	}
 }

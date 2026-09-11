@@ -325,19 +325,35 @@ type toolTrustTargetInput struct {
 	fingerprint catalog.Fingerprint // the live record fingerprint (for the catalog CAS)
 	key         catalog.ToolKey
 	found       bool
-	// pinnedIdentity is the server's PINNED, verified identity as read from THE SAME registry
-	// snapshot this struct's other server facts came from.
+	// pinnedIdentity is the identity the CATALOG RECORD was built against
+	// (rec.Fingerprint.Identity), NOT a separate read of the registry's current pin.
 	//
-	// It lives here rather than being fetched by a second lookup because the two reads are not
-	// interchangeable. The catalog's composite fingerprint folds the pinned identity in, but a
-	// Registry.Repin and the catalog re-ingest that follows it are SEPARATE publications, so
-	// between them the registry says I2 while the catalog still says F1. A caller that read the
-	// fingerprint here and the identity from a fresh snapshot could therefore compose (F1, I2) —
-	// a pair that was never simultaneously authoritative — and persist it as a reviewed target,
-	// after which an identity rotation compares as reviewed (Codex P1, PR #1360, round 3).
+	// That choice is the correction to an earlier, wrong one. Moving the identity lookup into this
+	// function was not enough, because this function ALSO reads two snapshots: rec comes from
+	// cat.Current() and srv from reg.Current(), two independent atomic loads, and
+	// sharedInventory releases its lock before either (Codex P1, PR #1360, round 4).
 	//
-	// Empty when the server does not exist in that snapshot, which `found` already reports.
+	// More importantly, capturing a "consistent pair" is not achievable here, because the
+	// inconsistency is in the PUBLISHED STATE rather than in the reading of it: Registry.Repin
+	// and the catalog re-ingest that follows it are separate publications, so between them the
+	// registry genuinely pins I2 while the catalog's record genuinely describes I1. No reader can
+	// read around a window that exists in the data.
+	//
+	// So the pair is DETECTED instead of assumed. The catalog record is self-describing — its
+	// composite fingerprint folds in the identity it was ingested against — so taking the identity
+	// from the record makes (fingerprint, identity) atomic by construction, and
+	// registryPinDiverged reports whether the registry currently pins something else.
+	//
+	// Empty when the tool or the server is absent from that snapshot, which `found` already reports.
 	pinnedIdentity string
+	// registryPinDiverged is true when the registry's CURRENT pin is not the identity the catalog
+	// record was built against — i.e. this read landed inside the repin/re-ingest window.
+	//
+	// It is a fact, not a verdict: a request would be routed to the identity the REGISTRY pins,
+	// while the reviewed record describes the one the CATALOG named, so the two cannot both be
+	// what was approved. Callers on the Canary path treat it as drift; callers that only need the
+	// tool's shape do not have to care.
+	registryPinDiverged bool
 }
 
 // loadTarget resolves the authoritative current facts for a (server, tool) from the
@@ -355,12 +371,17 @@ func (c *mcpToolTrustCoordinator) loadTarget(serverID, toolName string) toolTrus
 		ServerUsable: sok && srv.Usable(),
 		ToolExists:   ok,
 	}
-	pinned := ""
 	if sok {
 		t.Tenant = string(srv.OwnerScope)
 		t.ServerRevision = srv.Revision
-		// Same snapshot, same record — see the field comment on pinnedIdentity.
-		pinned = string(srv.PinnedIdentity)
+	}
+	// The identity comes from the CATALOG RECORD, so it is atomic with the fingerprint taken from
+	// that same record; the registry's current pin is compared against it rather than substituted
+	// for it. See the pinnedIdentity/registryPinDiverged field comments.
+	pinned, diverged := "", false
+	if ok {
+		pinned = string(rec.Fingerprint.Identity)
+		diverged = sok && rec.Fingerprint.Identity != srv.PinnedIdentity
 	}
 	if ok {
 		t.Approvable = rec.Eligibility != catalog.ServerDisabled
@@ -375,7 +396,8 @@ func (c *mcpToolTrustCoordinator) loadTarget(serverID, toolName string) toolTrus
 		t.CatalogRevision = rec.Revision
 	}
 	return toolTrustTargetInput{
-		target: t, fingerprint: rec.Fingerprint, key: key, found: ok && sok, pinnedIdentity: pinned,
+		target: t, fingerprint: rec.Fingerprint, key: key, found: ok && sok,
+		pinnedIdentity: pinned, registryPinDiverged: diverged,
 	}
 }
 

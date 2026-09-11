@@ -205,6 +205,17 @@ const (
 	// never reviewed for is the Canary working. Latching the whole experiment for it would
 	// let any unrelated request stop it.
 	ReviewedOutOfScope ReviewedVerdict = "reviewed_target_out_of_scope"
+	// ReviewedTenantDrift — the reviewed (server, tool) still exists, but it now belongs to a
+	// DIFFERENT tenant than the one the review bound.
+	//
+	// This is a breach, and separating it from ReviewedOutOfScope is the whole point. The lookup
+	// key is (tenant, server, tool), so a reassignment A→B makes the current target miss the
+	// reviewed key and fall through to "not in the reviewed set" — which is deliberately silent.
+	// A reviewed target crossing a tenant boundary would therefore be invisible, and reassigning
+	// it back to A later would let the original activation resume with nothing recorded (Codex P1,
+	// PR #1360, round 4). Tenancy is the isolation boundary the approval was granted within; a
+	// target that changed hands is not the target that was reviewed.
+	ReviewedTenantDrift ReviewedVerdict = "reviewed_target_tenant_drift"
 )
 
 // Compare decides the current target against the activation's reviewed record.
@@ -215,9 +226,16 @@ const (
 // An EMPTY set returns ReviewedOutOfScope for every input rather than matching anything —
 // the fail-closed direction for a record that should never have been armed.
 func (s ReviewedTargetSet) Compare(cur ReviewedTarget) ReviewedVerdict {
+	tenantMoved := false
 	for i := range s.targets { // index-based: ReviewedTarget carries a 32-byte digest
 		r := s.targets[i]
 		if r.key() != cur.key() {
+			// The (server, tool) IS reviewed, under a different tenant. Remember it, but keep
+			// scanning: an exact key later in the set is the better answer, and the set is small
+			// (MaxReviewedTargets), so the full walk costs nothing.
+			if r.ServerID == cur.ServerID && r.ToolName == cur.ToolName {
+				tenantMoved = true
+			}
 			continue
 		}
 		// The reviewed tool. Compare what the review actually bound.
@@ -228,6 +246,12 @@ func (s ReviewedTargetSet) Compare(cur ReviewedTarget) ReviewedVerdict {
 			return ReviewedFingerprintDrift
 		}
 		return ReviewedMatches
+	}
+	if tenantMoved {
+		// A reviewed (server, tool) that now answers to another tenant. NOT out-of-scope: this is
+		// the reviewed target, and it has crossed the isolation boundary the approval was granted
+		// within.
+		return ReviewedTenantDrift
 	}
 	return ReviewedOutOfScope
 }

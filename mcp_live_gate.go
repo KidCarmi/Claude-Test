@@ -399,6 +399,14 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 	if !ti.target.ServerUsable {
 		return liveTrustPrecheck{DriftCode: "server_identity_drift"}
 	}
+	// The registry currently pins an identity the catalog record was NOT built against — the
+	// repin/re-ingest window. A request would be routed to the registry's pin while every approval
+	// and reviewed record describes the catalog's, so the workload about to be called is not the
+	// one that was reviewed. Same code, same reason as an unusable anchor: the approved anchor is
+	// not the one in force (Codex P1, PR #1360, round 4).
+	if ti.registryPinDiverged {
+		return liveTrustPrecheck{DriftCode: "server_identity_drift"}
+	}
 	// Bind trust to the DECISION's fingerprint, not merely whichever fingerprint is current (P1a): the
 	// current target must STILL equal the fingerprint this request was decided against, so an
 	// F1→F2→F1 flap cannot let an F2 approval authorize an F1 request.

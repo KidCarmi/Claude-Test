@@ -146,7 +146,13 @@ func TestReviewedTargetSet_CompareVerdicts(t *testing.T) {
 		{"exact", target("t1", "s1", "tool", 0xF1, "spiffe://x/s1"), ReviewedMatches},
 		{"fingerprint moved", target("t1", "s1", "tool", 0xF2, "spiffe://x/s1"), ReviewedFingerprintDrift},
 		{"identity moved", target("t1", "s1", "tool", 0xF1, "spiffe://x/other"), ReviewedServerIdentityDrift},
-		{"another tenant", target("t2", "s1", "tool", 0xF1, "spiffe://x/s1"), ReviewedOutOfScope},
+		// INVERTED (Codex P1, PR #1360, round 4). This case asserted ReviewedOutOfScope, and in
+		// doing so pinned the defect: the lookup key is (tenant, server, tool), so a reviewed pair
+		// reassigned A→B misses the key and falls through to "not in the reviewed set", which is
+		// deliberately silent. The reviewed target would have crossed a tenancy boundary with
+		// nothing recorded, and reassigning it back later would let the original activation resume.
+		// A genuinely unrelated target is still out of scope — the two cases below.
+		{"same server and tool, another tenant", target("t2", "s1", "tool", 0xF1, "spiffe://x/s1"), ReviewedTenantDrift},
 		{"another server", target("t1", "s2", "tool", 0xF1, "spiffe://x/s1"), ReviewedOutOfScope},
 		{"another tool", target("t1", "s1", "other", 0xF1, "spiffe://x/s1"), ReviewedOutOfScope},
 		// A CURRENT target reporting NO identity is drift, not a match.

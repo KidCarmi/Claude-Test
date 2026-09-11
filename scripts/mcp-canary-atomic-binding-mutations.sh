@@ -426,6 +426,37 @@ run_mutation M30 \
   . mcp_canary_preflight.go \
   's/\t\t\tServerIdentity: ti\.pinnedIdentity,/\t\t\tServerIdentity: string(registry.ServerID("")) + func() string { reg, _ := mcpInventory.sharedInventory(); if reg == nil { return "" }; s, ok := reg.Current().Get(registry.ServerID(serverID)); if !ok { return "" }; return string(s.PinnedIdentity) }(),/'
 
+# ── (13) ROUND 26: THE THREE REMAINING TRANSITION-DEPENDENCIES ─────────────
+# The through-line for four rounds: detection kept depending on a request arriving to notice a
+# change, and the thing that moves is what stops the change being observable. M33 is the one
+# that matters most — the anchor-loss latch was UNREACHABLE on real traffic because
+# identity.Resolve rejects a disabled server above dispatchPolicy, and the round-3 gates passed
+# because they drove the sink rather than the pipeline.
+
+run_mutation M31 \
+  'a reviewed target reassigned to another tenant reads as an unrelated target' \
+  'TestReviewedBinding_C17_TenantReassignmentOfAReviewedTargetLatches' \
+  . internal/mcp/canary/reviewed.go \
+  's/\tif tenantMoved \{/\tif false \&\& tenantMoved \{/'
+
+run_mutation M32 \
+  'the identity is taken from the registry pin again, recomposing the hybrid (F1,I2)' \
+  'TestReviewedBinding_C18_RepinWindowIsDetectedAsDrift' \
+  . mcp_tooltrust.go \
+  's/\t\tpinned = string\(rec\.Fingerprint\.Identity\)\n\t\tdiverged = sok \&\& rec\.Fingerprint\.Identity != srv\.PinnedIdentity/\t\tif sok \{ pinned = string(srv.PinnedIdentity) \}/'
+
+run_mutation M33 \
+  'the observation is dropped on the server-unavailable rejection (the unreachable-latch defect)' \
+  'TestCanaryReviewedTarget_ReportedWhenTheServerIsNoLongerUsable' \
+  ./internal/mcp/runtime/ internal/mcp/runtime/pipeline.go \
+  's/\t\tif reason == mcperr\.ReasonRegistryServerUnavailable \{\n\t\t\tp\.observeCanaryReviewedTarget\(req, msg\)\n\t\t\}\n//'
+
+run_mutation M34 \
+  'the observation fires on EVERY auth failure, reachable without credentials (the control)' \
+  'TestCanaryReviewedTarget_UnauthenticatedFailureReportsNothing' \
+  ./internal/mcp/runtime/ internal/mcp/runtime/pipeline.go \
+  's/\t\tif reason == mcperr\.ReasonRegistryServerUnavailable \{/\t\tif true \{/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

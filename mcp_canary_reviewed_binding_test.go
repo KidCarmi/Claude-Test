@@ -58,6 +58,8 @@ import (
 //	14  the reviewed SERVER becomes unusable            → server_identity_drift + latch
 //	15  that anchor loss is a verdict, not silence      → reported as drift, latched
 //	16  identity + fingerprint from ONE snapshot        → structural, no second lookup
+//	17  the reviewed pair reassigned to another tenant → reviewed_target_tenant_drift + latch
+//	18  the repin window (registry I2, catalog I1)     → detected, charged as identity drift
 
 // reviewedRig is one armed activation over the REAL inventory, the REAL approval store and the
 // REAL admission gate. Everything the matrix asserts flows through production code.
@@ -1121,5 +1123,127 @@ func TestReviewedBinding_C16Control_TheSnapshotCarriesTheIdentity(t *testing.T) 
 	if live.ServerIdentity != cur.Target.ServerIdentity {
 		t.Fatalf("the two paths must report the SAME identity, got %q and %q",
 			live.ServerIdentity, cur.Target.ServerIdentity)
+	}
+}
+
+// ── 17 ───────────────────────────────────────────────────────────────────────────────────────
+// A reviewed (server, tool) reassigned to ANOTHER TENANT latches, rather than reading as an
+// unrelated target.
+//
+// The reviewed lookup key is (tenant, server, tool), so a reassignment A→B makes the current target
+// miss the key and fall through to ReviewedOutOfScope — which the round-15 rule deliberately makes
+// silent, so that a catalog change to a tool the experiment never reviewed cannot stop it. The
+// reviewed target crossing a tenancy boundary would therefore be invisible, and reassigning it back
+// to A later would let the original activation resume with nothing recorded (Codex P1, round 4).
+//
+// Tenancy is the isolation boundary the approval was granted within: a target that changed hands is
+// not the target that was reviewed.
+func TestReviewedBinding_C17_TenantReassignmentOfAReviewedTargetLatches(t *testing.T) {
+	r := newReviewedRig(t)
+
+	before := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+	if !before.Found {
+		t.Fatal("premise: the reviewed tool must resolve")
+	}
+	republishUnderTenant(t, r.sid, r.tool, "other-tenant")
+	after := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+	if !after.Found {
+		t.Fatal("premise: the tool must still resolve after the reassignment — otherwise this gate " +
+			"exercises the not-found branch, which is deliberately not drift")
+	}
+	if after.Target.Tenant == before.Target.Tenant {
+		t.Fatalf("premise: the tenant must actually change, got %q both times", after.Target.Tenant)
+	}
+
+	canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+		Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
+	})
+	r.assertLatched(t, "reviewed_target_tenant_drift")
+}
+
+// CONTROL for C17: a genuinely unrelated tool on the reviewed server still latches NOTHING.
+// Without this, folding every key miss into tenant drift would pass C17 while letting any unrelated
+// request stop a healthy experiment — the round-15 rule inverted.
+func TestReviewedBinding_C17Control_AnUnrelatedToolIsStillSilent(t *testing.T) {
+	r := newReviewedRig(t)
+	const otherTool = "sibling"
+	publishTwoToolInventory(t, r.sid, r.tool, otherTool)
+	if !mcpCurrentAuthoritativeTarget(r.sid, otherTool).Found {
+		t.Fatal("premise: the sibling tool must resolve")
+	}
+	canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+		Generation: r.gen, ServerID: r.sid, ToolName: otherTool,
+	})
+	if r.rt.abortedNow(r.capb) {
+		t.Fatalf("SECURITY: an unrelated tool stopped the experiment (%q). Tenant drift must be "+
+			"distinguished from out-of-scope, not merged with it", r.rt.abortCodeNow(r.capb))
+	}
+}
+
+// republishUnderTenant re-publishes the same server and tool under a DIFFERENT tenant, leaving the
+// tool's schema (and therefore its own contribution to the fingerprint) alone.
+func republishUnderTenant(t *testing.T, sid, tool, tenant string) {
+	t.Helper()
+	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + tenant + `","servers":[
+	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"id","enabled":true,
+	   "tools":[{"name":"` + tool + `","input_schema":{"type":"object"}}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("decode inventory: %v", err)
+	}
+	reg, cat, err := seedInventory(doc, limits.DefaultCatalog())
+	if err != nil {
+		t.Fatalf("seed inventory: %v", err)
+	}
+	publishMCPInventory(mcpInvLoaded, "", reg, cat)
+}
+
+// ── 18 ───────────────────────────────────────────────────────────────────────────────────────
+// The REPIN WINDOW is detected, not read around.
+//
+// Registry.Repin and the catalog re-ingest that follows it are separate publications, so between
+// them the registry genuinely pins I2 while the catalog's record genuinely describes I1. That
+// inconsistency is in the PUBLISHED STATE, not in the reading of it — no consistent-snapshot read
+// can avoid it, which is why the earlier "take both from one snapshot" framing was not enough
+// (Codex P1, round 4).
+//
+// The catalog record is self-describing: its composite fingerprint folds in the identity it was
+// ingested against. So the identity is taken from the record — atomic with the fingerprint by
+// construction — and the registry's current pin is COMPARED against it. A disagreement means a
+// request would be routed to a workload the reviewed record does not describe.
+func TestReviewedBinding_C18_RepinWindowIsDetectedAsDrift(t *testing.T) {
+	r := newReviewedRig(t)
+	if cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool); !cur.Found || cur.RegistryPinDiverged {
+		t.Fatalf("premise: the reviewed target must start coherent, got %+v", cur)
+	}
+
+	// Repin the REGISTRY only — no catalog re-ingest. This is the window.
+	reg, _ := mcpInventory.sharedInventory()
+	if reg == nil {
+		t.Fatal("premise: a shared registry must be published")
+	}
+	if _, err := reg.Repin(registry.ServerID(r.sid), registry.Identity("rotated"), canaryRuntimeTestNow); err != nil {
+		t.Fatalf("repin: %v", err)
+	}
+
+	cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+	if !cur.Found {
+		t.Fatal("premise: the tool must still resolve inside the window")
+	}
+	if !cur.RegistryPinDiverged {
+		t.Fatal("SECURITY: the repin window was not detected. The registry now pins an identity the " +
+			"catalog record was not built against, so a request would reach a workload the reviewed " +
+			"record does not describe")
+	}
+	// The target still describes the CATALOG's coherent view — identity and fingerprint together.
+	if cur.Target.ServerIdentity == "rotated" {
+		t.Fatal("the target must carry the identity the CATALOG record was built against, not the " +
+			"registry's new pin — mixing the two is the hybrid pair this whole fix exists to prevent")
+	}
+
+	// And the live precheck charges it, so the request path refuses rather than executing.
+	if live := mcpLiveTrustPrecheck(ttTenant, r.sid, r.tool, r.fp1); live.DriftCode != "server_identity_drift" {
+		t.Fatalf("the live precheck must charge the repin window as server_identity_drift, got %q (eligible=%v)",
+			live.DriftCode, live.Eligible)
 	}
 }
