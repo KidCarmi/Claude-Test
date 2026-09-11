@@ -10,6 +10,7 @@ package main
 // distinct hostnames and resets the cache around itself.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -24,36 +25,71 @@ import (
 func stubResolver(addrs []string, err error) (calls *atomic.Int64, restore func()) {
 	var counter atomic.Int64
 	orig := lookupHostFn
-	lookupHostFn = func(host string) ([]string, error) {
+	lookupHostFn = func(_ context.Context, host string) ([]string, error) {
 		counter.Add(1)
 		return addrs, err
 	}
 	origCache := resolvedHostCache.entries
 	resolvedHostCache.mu.Lock()
 	resolvedHostCache.entries = map[string]hostIPEntry{}
-	// CHAOS-60: the single-flight map is part of the cache's state — a slot
-	// left behind by a previous test would make the next one a follower
-	// waiting on a resolution that already finished.
-	resolvedHostCache.inflight = map[string]*hostResolveCall{}
+	resolvedHostCache.inflight = map[string]*hostIPFlight{}
 	resolvedHostCache.mu.Unlock()
+	resetDNSResolveHealthForTest()
 	return &counter, func() {
-		// CHAOS-60: the warm pool's goroutines read lookupHostFn, and a warm
-		// outlives the test body that armed it — `defer restore()` runs BEFORE
-		// any t.Cleanup, so restoring here without waiting writes the seam
-		// while a live warm is still reading it. That is a test-harness race
-		// (production never reassigns these vars), but under -race it is a
-		// hard failure, so the seam waits for its users to finish. Bounded, so
-		// a wedged warm fails the test rather than hanging it.
-		deadline := time.Now().Add(5 * time.Second)
-		for geoWarm.inflight.Load() > 0 && time.Now().Before(deadline) {
-			time.Sleep(time.Millisecond)
-		}
+		// CHAOS-60 made the stale path refresh ASYNCHRONOUSLY, so a background
+		// goroutine can still be reading lookupHostFn when the test returns.
+		// Restoring the seam over a live reader is a data race the -race gate
+		// catches, and it is the same test-isolation class swapAutoExclude
+		// exists for: drain before restoring, never after.
+		drainInflightResolutions()
 		lookupHostFn = orig
 		resolvedHostCache.mu.Lock()
 		resolvedHostCache.entries = origCache
-		resolvedHostCache.inflight = map[string]*hostResolveCall{}
+		resolvedHostCache.inflight = map[string]*hostIPFlight{}
 		resolvedHostCache.mu.Unlock()
+		resetDNSResolveHealthForTest()
 	}
+}
+
+// drainInflightResolutions blocks until no resolution is in flight. Background
+// refreshes release their flight LAST (finishFlight is deferred ahead of the
+// panic guard), so an empty inflight map means no goroutine will touch the
+// resolver seam or the pool again.
+func drainInflightResolutions() {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		resolvedHostCache.mu.RLock()
+		n := len(resolvedHostCache.inflight)
+		resolvedHostCache.mu.RUnlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// expireEntry ages a cache entry by d past its expiry without sleeping.
+func expireEntry(host string, past time.Duration) {
+	resolvedHostCache.mu.Lock()
+	e := resolvedHostCache.entries[host]
+	e.expiry = time.Now().Add(-past)
+	resolvedHostCache.entries[host] = e
+	resolvedHostCache.mu.Unlock()
+}
+
+// waitForResolverCalls polls until the counter reaches n or the deadline
+// passes. The stale path refreshes ASYNCHRONOUSLY, so its resolver call lands
+// after resolveHost has already returned.
+func waitForResolverCalls(t *testing.T, calls *atomic.Int64, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if calls.Load() >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("resolver invoked %d times, want %d within the deadline", calls.Load(), n)
 }
 
 func TestResolveHost_CachesResolution(t *testing.T) {
@@ -88,23 +124,43 @@ func TestResolveHost_NegativeCache(t *testing.T) {
 	}
 }
 
+// TestResolveHost_TTLExpiry pins the CHAOS-60 stale-while-revalidate contract:
+// past its TTL but inside hostIPCacheStaleMax, the cached address is still
+// SERVED (the caller never blocks) and a refresh runs behind it.
+//
+// The pre-CHAOS-60 contract was a synchronous re-resolve on expiry, which is
+// what made the first expiry during a resolver outage a synchronized stampede
+// — see the hostIPCacheStaleMax comment in geoip.go.
 func TestResolveHost_TTLExpiry(t *testing.T) {
 	calls, restore := stubResolver([]string{"203.0.113.20"}, nil)
 	defer restore()
 
 	_ = resolveHost("ttl-expiry.test.invalid")
-	// Force the entry stale instead of sleeping.
-	resolvedHostCache.mu.Lock()
-	e := resolvedHostCache.entries["ttl-expiry.test.invalid"]
-	e.expiry = time.Now().Add(-time.Second)
-	resolvedHostCache.entries["ttl-expiry.test.invalid"] = e
-	resolvedHostCache.mu.Unlock()
+	expireEntry("ttl-expiry.test.invalid", time.Second)
 
 	if ip := resolveHost("ttl-expiry.test.invalid"); ip == nil {
-		t.Fatal("post-expiry resolveHost returned nil, want re-resolved IP")
+		t.Fatal("post-expiry resolveHost returned nil, want the stale address served")
+	}
+	// The refresh is asynchronous; it must still happen.
+	waitForResolverCalls(t, calls, 2)
+}
+
+// TestResolveHost_StaleCeilingForcesResolution pins the other end of the
+// window: past hostIPCacheStaleMax the entry is no longer servable and the
+// caller resolves synchronously again. Without this bound a decommissioned host
+// would keep a stale country indefinitely.
+func TestResolveHost_StaleCeilingForcesResolution(t *testing.T) {
+	calls, restore := stubResolver([]string{"203.0.113.21"}, nil)
+	defer restore()
+
+	_ = resolveHost("stale-ceiling.test.invalid")
+	expireEntry("stale-ceiling.test.invalid", hostIPCacheStaleMax+time.Minute)
+
+	if ip := resolveHost("stale-ceiling.test.invalid"); ip == nil {
+		t.Fatal("beyond the staleness ceiling resolveHost returned nil, want a fresh resolution")
 	}
 	if n := calls.Load(); n != 2 {
-		t.Fatalf("resolver invoked %d times, want 2 (initial + post-expiry re-resolve)", n)
+		t.Fatalf("resolver invoked %d times, want 2 (initial + synchronous re-resolve past the ceiling)", n)
 	}
 }
 

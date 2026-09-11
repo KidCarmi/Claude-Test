@@ -109,33 +109,35 @@ func warmGeoHost(host string) {
 		return
 	}
 
-	call, leader, hit, cached := resolvedHostCache.begin(key)
-	switch {
-	case hit:
-		// The address is known; it is the country that is missing. A nil entry
-		// is a negative cache (NXDOMAIN, resolver down, private-only) — there
-		// is no country to learn and its TTL governs the retry.
+	// A servable entry (fresh OR stale-within-ceiling) means the address is
+	// known; only the country half can be missing. resolveHost owns the stale
+	// refresh — a warm must not start a second one.
+	if cached, state, _ := resolvedHostCache.lookup(key, time.Now()); state != hostIPMiss {
 		if cached != nil {
 			spawnGeoWarm(func() { geoLookupIPFn(cached) })
 		}
-	case !leader:
-		// Another warm already owns this host's resolution. Returning costs
-		// nothing; waiting would cost a slot to do nothing.
-	default:
-		warmGeoResolve(key, call)
+		return
 	}
+
+	fl, leader := resolvedHostCache.joinFlight(key)
+	if !leader {
+		// Another resolution already owns this host. Returning costs nothing;
+		// waiting would cost a warm slot to do nothing.
+		return
+	}
+	warmGeoResolve(key, fl)
 }
 
 // warmGeoResolve performs the resolution this caller was elected to lead, on
 // the bounded pool, and hands the claim back if it never gets to run.
-func warmGeoResolve(key string, call *hostResolveCall) {
+func warmGeoResolve(key string, fl *hostIPFlight) {
 	spawned := spawnGeoWarm(func() {
-		// finish is idempotent, so this can never double-publish over
-		// resolveAsLeader's own deferred publish. It is here so that a panic
-		// BEFORE resolveAsLeader is entered cannot strand the claim — a
-		// stranded claim blocks every later caller for this host forever.
-		defer resolvedHostCache.finish(key, call, nil)
-		ip := resolveAsLeader(key, call)
+		// finishFlight is idempotent, so this can never double-publish over
+		// resolveAsFlightLeader's own deferred publish. It is here so that a
+		// panic BEFORE resolveAsFlightLeader is entered cannot strand the claim
+		// — a stranded claim blocks every later caller for this host forever.
+		defer resolvedHostCache.finishFlight(key, fl, nil)
+		ip := resolveAsFlightLeader(key, fl)
 		if ip == nil {
 			geoWarm.failed.Add(1)
 			return
@@ -150,7 +152,7 @@ func warmGeoResolve(key string, call *hostResolveCall) {
 		// and release anyone who attached to it. Deliberately WITHOUT a cache
 		// write — nothing was learned, and a negative entry would suppress the
 		// retry for a full TTL over a transient pool shortage.
-		resolvedHostCache.finish(key, call, nil)
+		resolvedHostCache.finishFlight(key, fl, nil)
 	}
 }
 
