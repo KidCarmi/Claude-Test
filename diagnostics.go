@@ -169,6 +169,7 @@ func buildOperatorContract() OperatorContract {
 		checkBandwidthQoSEnforcement(),
 		checkSOCKS5Listener(),
 		checkAdminUIListener(),
+		checkDNSResolution(),
 		checkRequestLogPersistence(),
 		checkIdentityBackend(),
 		checkCredentialVerification(),

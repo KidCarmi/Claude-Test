@@ -24,6 +24,7 @@ package main
 // process-wide caches and counters, so each resets what it touches.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -143,9 +144,9 @@ func TestChaos60_LookupCachedNeverBlocksOnDNS(t *testing.T) {
 	_, restore := stubResolver([]string{"203.0.113.7"}, nil)
 	defer restore()
 	orig := lookupHostFn
-	lookupHostFn = func(host string) ([]string, error) {
+	lookupHostFn = func(ctx context.Context, host string) ([]string, error) {
 		time.Sleep(resolverDelay)
-		return orig(host)
+		return orig(ctx, host)
 	}
 
 	start := time.Now()
@@ -174,9 +175,9 @@ func TestChaos60_PreFixShapeBlocksOnDNS(t *testing.T) {
 	_, restore := stubResolver([]string{"203.0.113.8"}, nil)
 	defer restore()
 	orig := lookupHostFn
-	lookupHostFn = func(host string) ([]string, error) {
+	lookupHostFn = func(ctx context.Context, host string) ([]string, error) {
 		time.Sleep(resolverDelay)
-		return orig(host)
+		return orig(ctx, host)
 	}
 
 	// The pre-fix body, verbatim in shape: Enabled → resolveHost (blocking) →
@@ -209,10 +210,10 @@ func TestChaos60_ConcurrentMissesResolveOnce(t *testing.T) {
 	calls, restore := stubResolver([]string{"203.0.113.9"}, nil)
 	defer restore()
 	orig := lookupHostFn
-	lookupHostFn = func(host string) ([]string, error) {
+	lookupHostFn = func(ctx context.Context, host string) ([]string, error) {
 		// Wide enough that every caller is inside the miss window.
 		time.Sleep(100 * time.Millisecond)
-		return orig(host)
+		return orig(ctx, host)
 	}
 
 	const callers = 50
@@ -380,11 +381,11 @@ func TestChaos60_WarmSkipsAHostAlreadyBeingResolved(t *testing.T) {
 	defer restore()
 
 	// Claim the single-flight slot the way a leader would, and hold it.
-	call, leader, hit, _ := resolvedHostCache.begin("inflight.test.invalid")
-	if !leader || hit {
-		t.Fatalf("test setup: begin returned leader=%v hit=%v, want leader", leader, hit)
+	call, leader := resolvedHostCache.joinFlight("inflight.test.invalid")
+	if !leader {
+		t.Fatalf("test setup: joinFlight returned leader=%v, want leader", leader)
 	}
-	defer resolvedHostCache.finish("inflight.test.invalid", call, nil)
+	defer resolvedHostCache.finishFlight("inflight.test.invalid", call, nil)
 
 	spawned := make(chan struct{}, 8)
 	geoWarmHook = func() { spawned <- struct{}{} }
@@ -563,7 +564,7 @@ func TestChaos60_APanickingLeaderStillPublishes(t *testing.T) {
 	const host = "panicking-leader.test.invalid"
 	release := make(chan struct{})
 	var first atomic.Bool
-	lookupHostFn = func(string) ([]string, error) {
+	lookupHostFn = func(context.Context, string) ([]string, error) {
 		if first.CompareAndSwap(false, true) {
 			<-release // hold the slot until the follower is committed
 			panic("resolver seam blew up")
@@ -647,7 +648,7 @@ func TestChaos60_OneHotHostCannotMonopolizeTheWarmPool(t *testing.T) {
 
 		release := make(chan struct{})
 		var releaseOnce sync.Once
-		lookupHostFn = func(string) ([]string, error) {
+		lookupHostFn = func(context.Context, string) ([]string, error) {
 			<-release // hold the slot the way a slow resolver would
 			return []string{"203.0.113.40"}, nil
 		}
