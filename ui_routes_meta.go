@@ -265,6 +265,11 @@ var uiRoutes = []uiRouteMetadata{
 		}},
 	{Path: "/api/authpolicy/reorder", Handler: "apiAuthPolicyReorder", Domain: "policy", Public: false,
 		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true}}},
+	{Path: "/api/authpolicy/killswitch", Handler: "apiAuthPolicyKillSwitch", Domain: "policy", Public: false,
+		Methods: []uiRouteMethod{
+			{Method: "GET", MinRole: RoleViewer, Note: "break-glass status: env + runtime Auth Exempt kill switch layers"},
+			{Method: "PUT", MinRole: RoleAdmin, Mutating: true, AuditExpected: true, Note: "engage/release the runtime layer only; env layer is read-once"},
+		}},
 	{Path: "/api/default-action", Handler: "apiDefaultAction", Domain: "policy", Public: false,
 		Methods: []uiRouteMethod{
 			{Method: "GET", MinRole: RoleViewer, Note: "GET branch protected by uiAuthMiddleware; no explicit requireRole call observed"},
@@ -805,6 +810,12 @@ var uiRoutes = []uiRouteMetadata{
 	{Path: "/api/backups", Handler: "apiBackups", Domain: "support", Public: false,
 		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleViewer,
 			Note: "read-only backup archive listing via the CP-local maintenance agent"}}},
+
+	// Maintenance-agent health visibility (read-only pass-through of the
+	// CP-local maintenance agent's GET /v1/status; no new agent capability).
+	{Path: "/api/maintenance-agent", Handler: "apiMaintAgentStatus", Domain: "support", Public: false,
+		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleViewer,
+			Note: "read-only agent version/privilege-posture/compose-stack health via the CP-local maintenance agent"}}},
 
 	// Supportability framework (M1) — redacted csb/1 diagnostic bundles.
 	{Path: "/api/support/status", Handler: "apiSupportStatus", Domain: "support", Public: false,

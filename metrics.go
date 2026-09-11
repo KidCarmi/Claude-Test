@@ -31,6 +31,150 @@ type ruleMetrics struct {
 	loadedByName  map[string]persistedRuleCounter // immutable legacy persistence baseline
 	appliedByName map[string]int64                // greatest persisted hit baseline merged into telemetry
 	order         []string                        // insertion order for cap enforcement
+
+	// view is the lock-free READ path for RecordHit — see the block comment on
+	// ruleCounter. It is DERIVED state: the mu-guarded maps above stay
+	// authoritative, and every mutator republishes before releasing mu.
+	view atomic.Pointer[map[string]ruleCounter]
+}
+
+// ruleCounter pairs one rule's two counter cells so the hot path resolves both
+// with a SINGLE map lookup.
+//
+// ── Why RecordHit does not take rm.mu ────────────────────────────────────────
+//
+// RecordHit runs on EVERY proxied request that matched a policy rule
+// (applyPolicyDecision, proxy.go) — i.e. on all ordinary allowed traffic. It
+// used to take rm.mu.RLock to reach two maps that, in steady state, never
+// change: rules are registered at most maxRuleMetrics (200) times per process,
+// and every request after that is a pure read.
+//
+// sync.RWMutex.RLock is an atomic read-modify-write on ONE shared word, so this
+// was not a constant cost but a THROUGHPUT CEILING — the same shape already
+// recorded for internal/threatfeed, internal/connlimit and the IP filter. It
+// also hashed the rule name TWICE, once for each of the two parallel maps.
+//
+// Measured on this machine (Go 1.26, 4-core, 50 registered rules, medians of
+// n=11). The pre-view shape is kept in-tree as BenchmarkRecordHit_*_Legacy and
+// both variants run in the SAME process, because the absolute numbers on a
+// shared box are load-sensitive — quote the SHAPE, not the constant:
+//
+//	                 │ 1 core │ 2 cores │ 4 cores │ 1→4 throughput
+//	─────────────────┼────────┼─────────┼─────────┼───────────────
+//	50 rules, before │ 107 ns │  140 ns │  209 ns │  0.51x
+//	50 rules, after  │  91 ns │   65 ns │   57 ns │  1.60x
+//	hot rule, before │  98 ns │  163 ns │  229 ns │  0.43x
+//	hot rule, after  │  77 ns │   79 ns │  119 ns │  0.65x
+//
+// The 50-rule row is the diagnostic one: those requests hit 50 DISTINCT
+// counters, so no two share a counter cache line — yet throughput still FELL as
+// cores were added (0.51x: four cores delivered half of one core). That isolates
+// the lock, not the counters, as the ceiling. At 4 cores it is now 3.7x faster
+// and scales up instead of down.
+//
+// The hot-rule row keeps a genuine residual: when all traffic matches ONE rule,
+// every core still contends on that rule's single counter cache line, so it
+// gains 1.9x but does not scale. That is inherent to a per-rule counter and is
+// NOT worth sharding — 200 rules x N shards costs memory and a summing read for
+// a value scraped once per interval. Recorded, not fixed.
+//
+// The read path is now one atomic pointer load plus one map lookup. Two
+// invariants make that safe, and they are the whole contract:
+//
+//  1. A map reachable from a PUBLISHED view is never mutated in place. Writers
+//     build a replacement and swap it (publishViewLocked). Registration is
+//     bounded at 200 per process, so copy-on-write is free in practice.
+//
+//  2. Every mutator of hits/last republishes before releasing mu. Adding one
+//     that does not is a silent CORRECTNESS failure — a restored counter that
+//     never increments, or a rule whose hits vanish from /metrics — not merely a
+//     performance one. Pinned per mutator by
+//     TestRuleMetricsView_EveryMutatorRepublishes.
+//
+//     That applies to REPLACING the maps as much as to inserting into them, and
+//     replacement is the easier one to get wrong: the view then names cells the
+//     maps no longer hold, so the fast path increments a counter nothing reads
+//     and returns satisfied. Replace whole state via setCountersLocked, which
+//     cannot forget; after an in-place delete, call publishViewLocked. Pinned by
+//     TestRuleMetricsView_ResetLeavesNoStaleView and
+//     TestRuleMetricsView_InPlaceDeleteRepublishes.
+//
+// The counters themselves are still shared int64s mutated atomically THROUGH
+// the view; only the map structure is immutable. That is deliberate and matches
+// the pre-existing contract: restoreRecordLocked increments a pointer it obtained
+// under the write lock while RecordHit may hold the same pointer, and both are
+// atomic operations on the same cell.
+//
+// last may be nil: the ruleMetrics literals used by tests construct `hits`
+// without `last`, and the pre-view code guarded that case explicitly. The guard
+// is preserved rather than tidied away.
+type ruleCounter struct {
+	hits *int64
+	last *int64
+}
+
+// publishViewLocked rebuilds the lock-free read view from the authoritative
+// maps. Callers MUST hold rm.mu for writing.
+func (rm *ruleMetrics) publishViewLocked() {
+	next := make(map[string]ruleCounter, len(rm.hits))
+	for name, ptr := range rm.hits {
+		next[name] = ruleCounter{hits: ptr, last: rm.last[name]}
+	}
+	rm.view.Store(&next)
+}
+
+// ruleCounterState is the whole authoritative counter state of a ruleMetrics.
+//
+// It exists so that REPLACING that state — as distinct from inserting into it —
+// is a single operation that cannot forget to republish the derived view. A
+// stale view entry is not a missing increment but a SILENT one: RecordHit's fast
+// path would find the old name, increment the cell it points at, and return
+// satisfied, while the freshly installed maps never see the hit and every
+// reader (/metrics, OTLP, persistence) reports zero.
+//
+// Reported by Codex on PR #1321 against a reset helper that assigned the six
+// fields directly; reproduced by `go test -count=2 -run
+// '^TestHitCounters_LastHitPersistRoundTrip$' .`, where the second run in the
+// same process persisted no counters at all. Pinned by
+// TestRuleMetricsView_ResetLeavesNoStaleView.
+type ruleCounterState struct {
+	hits          map[string]*int64
+	last          map[string]*int64
+	byID          map[string]persistedRuleCounter
+	loadedByName  map[string]persistedRuleCounter
+	appliedByName map[string]int64
+	order         []string
+}
+
+// emptyRuleCounterState is a fully initialised, zero-counter state.
+func emptyRuleCounterState() ruleCounterState {
+	return ruleCounterState{
+		hits:          make(map[string]*int64),
+		last:          make(map[string]*int64),
+		byID:          make(map[string]persistedRuleCounter),
+		loadedByName:  make(map[string]persistedRuleCounter),
+		appliedByName: make(map[string]int64),
+	}
+}
+
+// countersLocked captures the current authoritative state so a caller can put it
+// back later. Callers MUST hold rm.mu.
+func (rm *ruleMetrics) countersLocked() ruleCounterState {
+	return ruleCounterState{
+		hits: rm.hits, last: rm.last, byID: rm.byID,
+		loadedByName: rm.loadedByName, appliedByName: rm.appliedByName, order: rm.order,
+	}
+}
+
+// setCountersLocked installs a whole counter state and republishes the view in
+// the same critical section, so the two can never disagree. Callers MUST hold
+// rm.mu for writing. This is the ONLY sanctioned way to replace the counter
+// maps; assigning the fields directly leaves a stale view (see
+// ruleCounterState).
+func (rm *ruleMetrics) setCountersLocked(s ruleCounterState) {
+	rm.hits, rm.last, rm.byID = s.hits, s.last, s.byID
+	rm.loadedByName, rm.appliedByName, rm.order = s.loadedByName, s.appliedByName, s.order
+	rm.publishViewLocked()
 }
 
 var ruleMet = &ruleMetrics{hits: make(map[string]*int64), last: make(map[string]*int64), byID: make(map[string]persistedRuleCounter), loadedByName: make(map[string]persistedRuleCounter), appliedByName: make(map[string]int64)}
@@ -42,25 +186,27 @@ func (rm *ruleMetrics) RecordHit(ruleName string) {
 	if ruleName == "" {
 		return
 	}
-	now := time.Now().Unix()
-	rm.mu.RLock()
-	ctr, ok := rm.hits[ruleName]
-	lastPtr := rm.last[ruleName]
-	rm.mu.RUnlock()
-	if ok {
-		atomic.AddInt64(ctr, 1)
-		if lastPtr != nil {
-			atomicStoreMax(lastPtr, now)
+	// ── Lock-free steady-state path ──────────────────────────────────────────
+	// One atomic load + one map lookup. A nil view means nothing has been
+	// registered yet (or this is a bare test literal), which falls through to the
+	// locked registration path below exactly as an unknown rule name does.
+	if v := rm.view.Load(); v != nil {
+		if c, ok := (*v)[ruleName]; ok {
+			atomic.AddInt64(c.hits, 1)
+			if c.last != nil {
+				atomicStoreMax(c.last, time.Now().Unix())
+			}
+			return
 		}
-		return
 	}
+	now := time.Now().Unix()
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	if rm.last == nil { // defensive: literals built with only `hits` set
 		rm.last = make(map[string]*int64)
 	}
 	// Double-check after acquiring write lock.
-	if ctr, ok = rm.hits[ruleName]; ok {
+	if ctr, ok := rm.hits[ruleName]; ok {
 		atomic.AddInt64(ctr, 1)
 		if lp := rm.last[ruleName]; lp != nil {
 			atomicStoreMax(lp, now)
@@ -75,6 +221,7 @@ func (rm *ruleMetrics) RecordHit(ruleName string) {
 	lv := now
 	rm.last[ruleName] = &lv
 	rm.order = append(rm.order, ruleName)
+	rm.publishViewLocked()
 }
 
 // persistedRuleCounter is the on-disk shape of one rule's persisted counters
@@ -165,6 +312,10 @@ func loadHitCounters(path string) {
 func (rm *ruleMetrics) restoreRecords(recs map[string]persistedRuleCounter) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
+	// Republish once, after the whole batch: restoreRecordLocked both inserts new
+	// names and back-fills a missing `last` cell for an existing one, and the view
+	// must reflect either. Deferred so it runs before mu is released.
+	defer rm.publishViewLocked()
 	if rm.last == nil {
 		rm.last = make(map[string]*int64)
 	}
@@ -728,6 +879,10 @@ culvert_yara_blocked_total %d
 # TYPE culvert_clam_scan_errors_total counter
 culvert_clam_scan_errors_total %d
 
+# HELP culvert_clamav_scan_errors_total Total ClamAV scan errors mid-request (content forwarded unscanned, fail-open). Canonical name for the culvert_clamav_* family; identical value to culvert_clam_scan_errors_total, kept for wire compatibility.
+# TYPE culvert_clamav_scan_errors_total counter
+culvert_clamav_scan_errors_total %d
+
 # HELP culvert_scan_timeout_total Total body scans that exceeded the scan budget and were refused (fail-closed)
 # TYPE culvert_scan_timeout_total counter
 culvert_scan_timeout_total %d
@@ -810,6 +965,7 @@ culvert_auth_sso_required_total %d
 		clamBlocked,
 		yaraBlocked,
 		scanCounters.ClamScanError,
+		scanCounters.ClamScanError, // culvert_clamav_scan_errors_total dual-emit (T-31)
 		scanCounters.ScanTimeout,
 		scanCounters.ClamSaturated,
 		scanCounters.ScanLateDiscarded,
@@ -865,6 +1021,35 @@ culvert_h2_inspect_drain_forced_total %d
 		atomic.LoadInt64(&statH2InspectForced),
 	)
 
+	// CHAOS-57 — per-class hijacked-tunnel visibility. Until this landed, four of the
+	// seven tunnel classes (both non-TLS inspect fallbacks, WebSocket, SOCKS5) touched
+	// NO counter at all: they were absent from activeConns, from the dashboard's
+	// activeConns field and from /metrics entirely, so an operator sizing FD or
+	// connection budgets was reading a number that excluded SOCKS5 and WebSocket. The
+	// class label matters on shutdown: when the drain times out, WHICH kind of session
+	// is holding the node decides the remedy. forced_total counts tunnels ended by the
+	// drain-deadline backstop — a persistently non-zero rate across a fleet upgrade
+	// says the 15 s window is too short for this deployment's session mix, not that
+	// anything failed.
+	for i := tunnelClass(0); i < tunnelClassCount; i++ {
+		if i == 0 {
+			_, _ = fmt.Fprint(w, `# HELP culvert_tunnels_active Currently active hijacked tunnels by class
+# TYPE culvert_tunnels_active gauge
+`)
+		}
+		_, _ = fmt.Fprintf(w, "culvert_tunnels_active{class=%q} %d\n", tunnelClassNames[i], atomic.LoadInt64(&tunnelClassActive[i]))
+	}
+	_, _ = fmt.Fprintf(w, `
+# HELP culvert_tunnel_drain_forced_total Hijacked tunnels force-closed by the shutdown drain-deadline backstop
+# TYPE culvert_tunnel_drain_forced_total counter
+culvert_tunnel_drain_forced_total %d
+
+# HELP culvert_tunnel_fence_refused_total Sessions refused because the node was already draining
+# TYPE culvert_tunnel_fence_refused_total counter
+culvert_tunnel_fence_refused_total %d
+
+`, atomic.LoadInt64(&statTunnelForced), atomic.LoadInt64(&statTunnelFenceRefused))
+
 	// CHAOS-11: parent-proxy chain fail-open visibility. fallback_active=1
 	// means the pool is CURRENTLY bypassed (all parents unhealthy or
 	// circuit-open) and egress is direct; the counter tracks how many
@@ -918,6 +1103,87 @@ culvert_catfeeddb_quarantined_copies %d
 		cfdb.ResidualCopies,
 	)
 
+	// CHAOS-60: GeoIP resolution health. Emitted ONLY when a GeoIP database is
+	// loaded — on the default appliance (no .mmdb configured) these series are
+	// absent entirely, because a flat 0 on a node that has no GeoIP is
+	// indistinguishable from a node whose geo rules have stopped enforcing, and
+	// the paging rules below are all `> 0` (the socks5/cluster_ca precedent).
+	//
+	// policy_unresolved_total is the security-relevant one: it counts
+	// country-scoped rule evaluations that fell through because the
+	// destination's country was not cached. It is expected to be non-zero at a
+	// low rate (one per host per cache lifetime, the warm being off-path); a
+	// rate that tracks request rate means enforcement is not converging, and is
+	// almost always accompanied by warm_dropped_total climbing.
+	if geoEnabledFn() {
+		gr := geoResolveState()
+		saturated := 0
+		if gr.Saturated {
+			saturated = 1
+		}
+		_, _ = fmt.Fprintf(w, `# HELP culvert_geo_warm_total GeoIP resolutions started off the request path to warm the country caches
+# TYPE culvert_geo_warm_total counter
+culvert_geo_warm_total %d
+
+# HELP culvert_geo_warm_dropped_total GeoIP warm requests refused because the bounded resolution pool was saturated
+# TYPE culvert_geo_warm_dropped_total counter
+culvert_geo_warm_dropped_total %d
+
+# HELP culvert_geo_warm_failed_total GeoIP warm resolutions that yielded no usable public address
+# TYPE culvert_geo_warm_failed_total counter
+culvert_geo_warm_failed_total %d
+
+# HELP culvert_geo_warm_saturated 1 while the GeoIP resolution pool is full and warm requests are being dropped
+# TYPE culvert_geo_warm_saturated gauge
+culvert_geo_warm_saturated %d
+
+# HELP culvert_geo_warm_inflight GeoIP resolutions currently in flight off the request path
+# TYPE culvert_geo_warm_inflight gauge
+culvert_geo_warm_inflight %d
+
+# HELP culvert_geo_policy_unresolved_total Country-scoped policy rule evaluations that did not match because the destination country was unknown
+# TYPE culvert_geo_policy_unresolved_total counter
+culvert_geo_policy_unresolved_total %d
+`,
+			gr.Started,
+			gr.Dropped,
+			gr.Failed,
+			saturated,
+			gr.InFlight,
+			gr.Unresolved,
+		)
+	}
+	// CHAOS-62: request-history store health, the same triple for the same
+	// reasons. `available` is 0 both when history saving is off and when the
+	// store failed to open — the `request_history` diagnostics row distinguishes
+	// them, while an alerting rule that only cares "is history being saved?"
+	// needs a single series. `quarantined_copies` keeps an incident visible
+	// across restarts even after the store self-healed.
+	lsh := logStoreHealthState()
+	lsAvailable, lsRecovered := 0, 0
+	if lsh.Available {
+		lsAvailable = 1
+	}
+	if lsh.Recovered {
+		lsRecovered = 1
+	}
+	_, _ = fmt.Fprintf(w, `# HELP culvert_logstore_available 1 when the request-history store is open and saving history
+# TYPE culvert_logstore_available gauge
+culvert_logstore_available %d
+
+# HELP culvert_logstore_recovered 1 when a damaged request-history store was quarantined and re-created during this process's lifetime
+# TYPE culvert_logstore_recovered gauge
+culvert_logstore_recovered %d
+
+# HELP culvert_logstore_quarantined_copies Quarantined (.corrupt.*) copies of the request-history store still on the data volume
+# TYPE culvert_logstore_quarantined_copies gauge
+culvert_logstore_quarantined_copies %d
+`,
+		lsAvailable,
+		lsRecovered,
+		lsh.ResidualCopies,
+	)
+
 	// CHAOS-54: SOCKS5 accept-loop health. Emitted ONLY when a SOCKS5 listener
 	// is configured — on the ordinary appliance (-socks5-port 0) these series
 	// are absent entirely, because `listener_up 0` on a node that never had
@@ -956,6 +1222,142 @@ culvert_socks5_accept_backoff_seconds %g
 			sk.Total,
 			degraded,
 			sk.Backoff.Seconds(),
+		)
+	}
+
+	// CHAOS-61: cluster rate-limit broadcast freshness. Emitted ONLY on a node
+	// where cluster-wide rate limiting is armed — `remote_stale 0` on a
+	// standalone proxy that never had a Control Plane is indistinguishable from
+	// a healthy clustered node, and the paging rule is `== 1` (the
+	// socks5_listener / cluster_ca gauge precedent).
+	//
+	// `remote_stale 1` means this node has stopped adding other nodes' request
+	// counts to its own: local rate limits are still enforced, the cluster-wide
+	// aggregate is not. It is a correctness gate, not an error — it is what
+	// stops a frozen broadcast from denying a client forever — but it is a
+	// degradation of the distributed limit and should be visible for as long as
+	// it lasts.
+	if crl := clusterRateLimitFreshness(); crl.Armed {
+		stale := 0
+		if crl.Stale {
+			stale = 1
+		}
+		_, _ = fmt.Fprintf(w, `# HELP culvert_cluster_ratelimit_remote_stale 1 while the Control Plane rate-limit broadcast is older than the rate-limit window, so other nodes' counts are no longer applied on this node
+# TYPE culvert_cluster_ratelimit_remote_stale gauge
+culvert_cluster_ratelimit_remote_stale %d
+
+# HELP culvert_cluster_ratelimit_broadcast_age_seconds Age of the last applied Control Plane rate-limit broadcast; -1 when none has ever been applied
+# TYPE culvert_cluster_ratelimit_broadcast_age_seconds gauge
+culvert_cluster_ratelimit_broadcast_age_seconds %g
+
+# HELP culvert_cluster_ratelimit_stale_episodes_total Times the cluster rate-limit broadcast went stale since startup (one long outage counts once)
+# TYPE culvert_cluster_ratelimit_stale_episodes_total counter
+culvert_cluster_ratelimit_stale_episodes_total %d
+`,
+			stale,
+			clusterRateLimitBroadcastAgeMetric(crl),
+			crl.Episodes,
+		)
+	}
+
+	// CHAOS-57: admin UI listener health. Emitted only when an admin UI was
+	// configured, for the reason the socks5 block states: `up 0` on a node that
+	// never had the listener is indistinguishable from a dead one and the
+	// documented paging rule is `== 0`.
+	//
+	// `up` is 0 whenever the listener is not currently accepting — including
+	// while it is retrying — because unlike SOCKS5 there is no terminal "down"
+	// state here: the loop rebinds for as long as the process lives. The
+	// alertable pair is `culvert_admin_ui_unavailable 1`, which is latched only
+	// after the fault has persisted past the threshold and so does not fire on
+	// the few seconds of rebinding that follow an ordinary redeploy.
+	//
+	// This series is emitted by the PROXY port's /metrics, which is what makes
+	// it reachable at all while the admin plane is down.
+	if au := adminUIListenerState(); au.Configured {
+		up, unavailable := 0, 0
+		if au.Serving {
+			up = 1
+		}
+		if au.Unavailable {
+			unavailable = 1
+		}
+		_, _ = fmt.Fprintf(w, `# HELP culvert_admin_ui_up 1 while the admin UI listener is accepting connections; 0 while it is not
+# TYPE culvert_admin_ui_up gauge
+culvert_admin_ui_up %d
+
+# HELP culvert_admin_ui_unavailable 1 while the admin UI has been unable to bind for longer than the unavailability threshold
+# TYPE culvert_admin_ui_unavailable gauge
+culvert_admin_ui_unavailable %d
+
+# HELP culvert_admin_ui_listen_failures_total Admin UI bind/serve failures since startup
+# TYPE culvert_admin_ui_listen_failures_total counter
+culvert_admin_ui_listen_failures_total %d
+
+# HELP culvert_admin_ui_binds_total Successful admin UI listener binds since startup
+# TYPE culvert_admin_ui_binds_total counter
+culvert_admin_ui_binds_total %d
+
+# HELP culvert_admin_ui_listen_backoff_seconds Current admin UI rebind backoff; 0 while the listener is serving
+# TYPE culvert_admin_ui_listen_backoff_seconds gauge
+culvert_admin_ui_listen_backoff_seconds %g
+`,
+			up,
+			unavailable,
+			au.Total,
+			au.Binds,
+			au.Backoff.Seconds(),
+		)
+	}
+
+	// CHAOS-64: destination-host DNS resolution health. Emitted ONLY once this
+	// node has actually resolved something — resolution runs on the policy path
+	// only for a DestCountry rule on a node with a GeoIP database, and a block
+	// of zeros on an appliance that has no geo rules is indistinguishable from a
+	// resolver that has answered nothing (the socks5/cluster_ca rule, applied
+	// here). Every value is a plain total or a 0/1 gauge: /metrics is
+	// unauthenticated on the proxy port, so no hostname, resolver address or
+	// error text may appear, and nothing here is a label.
+	//
+	// The paging signal is `culvert_dns_resolve_degraded == 1`, not a failure
+	// RATE: a gateway sees a steady background of NXDOMAIN from typos and
+	// beaconing malware, and those are excluded from the degradation run
+	// precisely so they cannot fabricate a page.
+	if dns := dnsResolveState(); dns.Total > 0 {
+		dnsDegraded := 0
+		if dns.Degraded {
+			dnsDegraded = 1
+		}
+		_, _ = fmt.Fprintf(w, `# HELP culvert_dns_resolve_total Destination-host DNS resolutions attempted on the policy path since startup
+# TYPE culvert_dns_resolve_total counter
+culvert_dns_resolve_total %d
+
+# HELP culvert_dns_resolve_failures_total Destination-host DNS resolutions that returned no answer from the resolver
+# TYPE culvert_dns_resolve_failures_total counter
+culvert_dns_resolve_failures_total %d
+
+# HELP culvert_dns_resolve_timeouts_total Destination-host DNS resolutions abandoned at the resolution deadline
+# TYPE culvert_dns_resolve_timeouts_total counter
+culvert_dns_resolve_timeouts_total %d
+
+# HELP culvert_dns_resolve_shed_total Destination-host DNS resolutions refused because the bounded resolver pool was saturated
+# TYPE culvert_dns_resolve_shed_total counter
+culvert_dns_resolve_shed_total %d
+
+# HELP culvert_dns_resolve_stale_served_total Expired-but-servable cached addresses returned while a refresh ran behind them
+# TYPE culvert_dns_resolve_stale_served_total counter
+culvert_dns_resolve_stale_served_total %d
+
+# HELP culvert_dns_resolve_degraded 1 while destination-host DNS resolution has been failing for longer than the degradation threshold; geo-scoped policy rules are not matching
+# TYPE culvert_dns_resolve_degraded gauge
+culvert_dns_resolve_degraded %d
+`,
+			dns.Total,
+			dns.Failures,
+			dns.Timeouts,
+			dns.Shed,
+			dns.StaleServed,
+			dnsDegraded,
 		)
 	}
 
@@ -1117,6 +1519,69 @@ culvert_auth_backend_gated_denials_total %d
 		abSnap.GatedDenials,
 	)
 
+	// CHAOS-57: the credential-verification cost governor. bcrypt is ~80 ms of
+	// exclusive CPU per comparison and it runs on the per-request proxy-auth
+	// path, so these series are how an operator sees a credential flood — and,
+	// more importantly, how they tell "users are being denied because the
+	// governor is saturated" from "users are typing the wrong password", which
+	// look identical on culvert_auth_* alone.
+	//
+	// _refused_total is labelled by a CLOSED three-value reason set, never by
+	// anything caller-derived. _saturated is a gauge and _inflight tracks the
+	// ceiling it saturates against, so a dashboard can show utilisation rather
+	// than just the overflow. _waited_total is the LEADING indicator: it climbs
+	// while the queue is still absorbing, i.e. before anybody is refused.
+	acSnap := authCostHealthStatus()
+	acSaturated := 0
+	if acSnap.Saturated {
+		acSaturated = 1
+	}
+	_, _ = fmt.Fprintf(w, `# HELP culvert_auth_verify_total Local-account credential verifications that ran a bcrypt comparison
+# TYPE culvert_auth_verify_total counter
+culvert_auth_verify_total %d
+
+# HELP culvert_auth_verify_refused_total Credential verifications refused by the cost governor — denied fail-closed WITHOUT checking the credential
+# TYPE culvert_auth_verify_refused_total counter
+culvert_auth_verify_refused_total{reason="per_client"} %d
+culvert_auth_verify_refused_total{reason="queue_full"} %d
+culvert_auth_verify_refused_total{reason="timeout"} %d
+
+# HELP culvert_auth_verify_waited_total Credential verifications that had to queue for a slot (leading indicator: the ceiling is being approached but still absorbing)
+# TYPE culvert_auth_verify_waited_total counter
+culvert_auth_verify_waited_total %d
+
+# HELP culvert_auth_verify_inflight Credential verifications running right now
+# TYPE culvert_auth_verify_inflight gauge
+culvert_auth_verify_inflight %d
+
+# HELP culvert_auth_verify_max_concurrent Ceiling on concurrent credential verifications (half of GOMAXPROCS)
+# TYPE culvert_auth_verify_max_concurrent gauge
+culvert_auth_verify_max_concurrent %d
+
+# HELP culvert_auth_verify_queued Callers currently waiting for a verification slot
+# TYPE culvert_auth_verify_queued gauge
+culvert_auth_verify_queued %d
+
+# HELP culvert_auth_verify_saturated 1 while every credential-verification slot is occupied
+# TYPE culvert_auth_verify_saturated gauge
+culvert_auth_verify_saturated %d
+
+# HELP culvert_auth_cache_evictions_total Cached verification results displaced to stay under the cache cap — each one costs somebody a full bcrypt on their next request
+# TYPE culvert_auth_cache_evictions_total counter
+culvert_auth_cache_evictions_total %d
+`,
+		acSnap.Admitted,
+		acSnap.RefusedPerClient,
+		acSnap.RefusedQueueFull,
+		acSnap.RefusedTimeout,
+		acSnap.Waited,
+		acSnap.InFlight,
+		acSnap.MaxConcurrent,
+		acSnap.Queued,
+		acSaturated,
+		cfg.AuthCacheEvictions(),
+	)
+
 	// Decryption-profile success delta: which protocol inspected tunnels negotiated
 	// on the upstream leg (h2 = Inspect-as-HTTP/2 working; http/1.1 = strip/downgrade).
 	_, _ = fmt.Fprintf(w, `# HELP culvert_inspect_upstream_alpn_total Inspected-tunnel upstream (origin) leg negotiated protocol
@@ -1162,6 +1627,7 @@ culvert_decrypt_autoexclude_surge_total %d
 	crashByComponent.writePrometheus(&ruleMetBuf)       // culvert_crash_records_* (panic recovery)
 	latencyHist.WritePrometheus(&ruleMetBuf)
 	urlcatWritePrometheus(&ruleMetBuf)
+	threatFeedWritePrometheus(&ruleMetBuf) // culvert_threat_feed_* freshness (WK-5 staleness plane)
 	caWritePrometheus(&ruleMetBuf)
 	certSignHist.WritePrometheus(&ruleMetBuf)
 	clusterWritePrometheus(&ruleMetBuf)

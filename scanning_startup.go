@@ -19,7 +19,9 @@ func loadScanning(cfg scanningStartupConfig, ctx context.Context) *ScanService {
 	case cfg.RemoteScanURL != "":
 		globalRemoteScanner.Init(cfg.RemoteScanURL)
 		globalRemoteScanner.SetExclusions(globalScanExclusions)
-		logger.Printf("ScanSvc: remote mode, delegating to %s", cfg.RemoteScanURL)
+		// Userinfo-redacted: an operator URL may carry an embedded credential
+		// and the process log is shipped in support bundles.
+		logger.Printf("ScanSvc: remote mode, delegating to %s", redactURLUserinfo(cfg.RemoteScanURL))
 		loadScanExclusions(cfg.ScanExclusionsPath)
 		startThreatFeedIfEnabled(cfg, ctx)
 	case cfg.LocalEnabled:
@@ -57,6 +59,11 @@ func startThreatFeedIfEnabled(cfg scanningStartupConfig, ctx context.Context) {
 		return
 	}
 	globalThreatFeed.Init(cfg.FeedDB, cfg.SyncInterval)
+	// Arm the staleness plane BEFORE Start: Start may run an immediate sync
+	// (empty on-disk DB), and that round's outcome — the cold-start case where
+	// a failure leaves the node enforcing with no threat intelligence at all —
+	// is exactly the one the observer must not miss.
+	noteThreatFeedConfigured()
 	globalThreatFeed.Start(ctx)
 	logger.Printf("ThreatFeed: sync every %s, db=%q", cfg.SyncInterval, cfg.FeedDB)
 }

@@ -22,7 +22,9 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"runtime"
+	"sync"
 	"testing"
+	"time"
 )
 
 // TestOwnershipLinearization_TransitionWaitsForInFlightBuiltInMutation is the
@@ -107,11 +109,27 @@ func TestOwnershipLinearization_BuiltInMutationWaitsDuringTransition(t *testing.
 // TestOwnershipLinearization_AdminRowNeverSerializedAgainstTransition pins
 // §13: an admin-created (BuiltIn=false) mutation is never feed-owned and
 // deliberately does NOT serialize against signed activation.
+//
+// This is the one test in the file asserting the POSITIVE direction (the
+// mutation MUST complete while the gate is held), so it must not use the
+// Gosched-spin technique its siblings use: a spin count is a wall-clock
+// budget (~70 ms under -race on an idle box), and the PUT fsyncs the
+// category store twice (file + directory). On a saturated CI runner the
+// goroutine parks in fsync, every Gosched returns instantly, and the budget
+// expires before the disk does — the test then blamed the gate for a slow
+// volume (observed in the Fast PR Gate -race + coverage run). The negative-direction siblings
+// are safe under load (slowness only makes "did not escape" easier to
+// pass); this one waits on the completion channel with a deadline that a
+// gate-blocked PUT can never meet — it stays blocked until the deferred
+// Unlock — while a merely slow disk always does.
 func TestOwnershipLinearization_AdminRowNeverSerializedAgainstTransition(t *testing.T) {
 	rev := ownershipSetup(t)
 	installView(t, nil)
 
 	taxonomyAuthorityGate.Lock()
+	unlock := sync.OnceFunc(taxonomyAuthorityGate.Unlock)
+	defer unlock()
+
 	w := httptest.NewRecorder()
 	putDone := make(chan struct{})
 	go func() {
@@ -119,24 +137,28 @@ func TestOwnershipLinearization_AdminRowNeverSerializedAgainstTransition(t *test
 		apiURLCat(w, jsonReq("PUT", "/api/urlcat?name=Custom&ifRevision="+rev,
 			map[string]any{"hosts": []string{"custom-during.example.com"}}))
 	}()
-	for i := 0; i < 200000; i++ {
-		runtime.Gosched()
-	}
-	completed := false
 	select {
 	case <-putDone:
-		completed = true
-	default:
+	case <-time.After(adminRowCompletionDeadline):
+		// Release the gate BEFORE failing so a genuinely gate-blocked PUT
+		// goroutine can exit and the process does not leak it into later
+		// tests (the recorder is only read after putDone).
+		unlock()
+		<-putDone
+		t.Fatalf("an admin-created mutation must not wait on the authority transition gate (§13): PUT still running after %v with the gate held", adminRowCompletionDeadline)
 	}
-	taxonomyAuthorityGate.Unlock()
-	<-putDone
-	if !completed {
-		t.Fatal("an admin-created mutation must not wait on the authority transition gate (§13)")
-	}
+	unlock()
 	if w.Code != 200 {
 		t.Fatalf("admin-created mutation: got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// adminRowCompletionDeadline bounds the §13 positive-direction wait. It is
+// deliberately generous: a false failure needs the admin PUT (two fsyncs +
+// audit + config-version capture) to take longer than this on a loaded
+// runner, while a true failure — the PUT parked on the gate — never
+// completes at all, so the deadline's size costs nothing in sensitivity.
+const adminRowCompletionDeadline = 30 * time.Second
 
 // TestOwnership_SerialOutcomesAreTruthful pins the §14 serial contract in
 // both orders: local-first mutation succeeds durably; after the cutover the

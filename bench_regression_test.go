@@ -19,6 +19,7 @@ package main
 //   go test -tags benchgate -run 'TestBenchGate_' -v .
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -240,7 +241,7 @@ func TestBenchGate_AuthScheduleTZAllocs(t *testing.T) {
 func TestBenchGate_ResolveHostCached(t *testing.T) {
 	origFn := lookupHostFn
 	var resolverCalls int64
-	lookupHostFn = func(host string) ([]string, error) {
+	lookupHostFn = func(_ context.Context, host string) ([]string, error) {
 		resolverCalls++
 		return []string{"203.0.113.99"}, nil
 	}
@@ -538,6 +539,115 @@ func TestBenchGate_TracingIDAllocs(t *testing.T) {
 			t.Errorf("REGRESSION: %s allocates %d/op, exceeds bound %d — "+
 				"per-request tracing-ID generation has regained fmt/hex-string overhead "+
 				"(this runs on every proxied request via setupRequestTracing)", name, allocs, maxAllocs)
+		}
+	}
+	// The combined generator covers both IDs from one draw, so it must stay at
+	// the SAME single allocation the lone request-ID generator costs — not the
+	// two the separate pair paid.
+	res := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if id, tp := generateTraceIDs(); id == "" || tp == "" {
+				b.Fatal("empty tracing ID")
+			}
+		}
+	})
+	if allocs := res.AllocsPerOp(); allocs > 1 {
+		t.Errorf("REGRESSION: generateTraceIDs allocates %d/op, exceeds bound 1 — "+
+			"the two IDs are no longer cut from ONE string allocation "+
+			"(see connlimit.go; this runs on nearly every proxied request)", allocs)
+	}
+}
+
+// TestBenchGate_RequestTracingAllocs is the hard, hardware-independent gate on
+// setupRequestTracing (proxy.go) — the second statement in handleRequest, run
+// on 100% of proxied traffic on every protocol.
+//
+// The bounds are the measured steady state EXACTLY — no headroom, because
+// allocation counts on this path are deterministic and every one of them is
+// accounted for:
+//
+//	fresh request (client sent neither header)  4 allocs
+//	  = 1 combined ID draw + 3 header-value slices
+//	already-traced request (client sent both)   1 alloc
+//	  = the single response-header value slice
+//
+// The pre-fix shape cost 8 and 3 respectively. The extra allocations were
+// textproto.CanonicalMIMEHeaderKey rewriting the non-canonical "X-Request-ID"
+// literal (once per Get/Set, three per request) plus the second CSPRNG draw's
+// string. Either regression — reverting a key constant to a non-canonical
+// spelling, or splitting the combined draw back apart — lands here.
+func TestBenchGate_RequestTracingAllocs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		run    func(*testing.B)
+		bound  int64
+		detail string
+	}{
+		{
+			name:   "fresh",
+			run:    func(b *testing.B) { benchTracingFresh(b, setupRequestTracing) },
+			bound:  4,
+			detail: "one combined ID allocation plus three header-value slices",
+		},
+		{
+			name:   "already-traced",
+			run:    func(b *testing.B) { benchTracingClientIDs(b, setupRequestTracing) },
+			bound:  1,
+			detail: "the single response-header value slice; nothing is generated",
+		},
+	} {
+		res := testing.Benchmark(tc.run)
+		allocs := res.AllocsPerOp()
+		t.Logf("setupRequestTracing/%s: %d allocs/op (bound %d), %d ns/op", tc.name, allocs, tc.bound, res.NsPerOp())
+		if allocs > tc.bound {
+			t.Errorf("REGRESSION: setupRequestTracing (%s) allocates %d/op, exceeds bound %d — "+
+				"steady state is %s. A non-canonical header-key literal "+
+				"(e.g. \"X-Request-ID\" instead of headerRequestID) costs one allocation per "+
+				"Get/Set; this runs on every proxied request.",
+				tc.name, allocs, tc.bound, tc.detail)
+		}
+	}
+}
+
+// TestBenchGate_RequestTracingBeatsLegacy is the before/after relationship,
+// measured in ONE run so it is machine-independent: the current shape must
+// cost strictly fewer allocations than the frozen pre-change body
+// (legacySetupRequestTracing, proxy_tracing_test.go) on both arrival shapes.
+//
+// Allocation counts are deterministic, so this is a hard gate rather than a
+// timing heuristic — the same reasoning as the file header. It exists because
+// TestBenchGate_RequestTracingAllocs alone could be satisfied by a rewrite
+// that happens to hit the bound while quietly losing the comparison the change
+// was justified by.
+func TestBenchGate_RequestTracingBeatsLegacy(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		now, was   func(*testing.B)
+		wantSaving int64
+	}{
+		{
+			name:       "fresh",
+			now:        func(b *testing.B) { benchTracingFresh(b, setupRequestTracing) },
+			was:        func(b *testing.B) { benchTracingFresh(b, legacySetupRequestTracing) },
+			wantSaving: 4,
+		},
+		{
+			name:       "already-traced",
+			now:        func(b *testing.B) { benchTracingClientIDs(b, setupRequestTracing) },
+			was:        func(b *testing.B) { benchTracingClientIDs(b, legacySetupRequestTracing) },
+			wantSaving: 2,
+		},
+	} {
+		now := testing.Benchmark(tc.now).AllocsPerOp()
+		was := testing.Benchmark(tc.was).AllocsPerOp()
+		t.Logf("setupRequestTracing/%s: %d allocs/op now vs %d legacy (saving %d, want %d)",
+			tc.name, now, was, was-now, tc.wantSaving)
+		if was-now < tc.wantSaving {
+			t.Errorf("REGRESSION: setupRequestTracing (%s) saves only %d allocs/op over the frozen "+
+				"pre-change body (%d now vs %d legacy), want at least %d — the canonical-key / "+
+				"single-draw optimization has been partly undone",
+				tc.name, was-now, now, was, tc.wantSaving)
 		}
 	}
 }

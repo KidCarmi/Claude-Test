@@ -329,6 +329,26 @@
         ],
         "type": "object"
       },
+      "AuthExemptKillSwitchStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "engaged": {
+            "type": "boolean"
+          },
+          "envDisabled": {
+            "type": "boolean"
+          },
+          "runtimeDisabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "envDisabled",
+          "runtimeDisabled",
+          "engaged"
+        ],
+        "type": "object"
+      },
       "AuthPolicyList": {
         "additionalProperties": false,
         "properties": {
@@ -341,6 +361,9 @@
               "deny"
             ],
             "type": "string"
+          },
+          "killSwitch": {
+            "$ref": "#/components/schemas/AuthExemptKillSwitchStatus"
           },
           "note": {
             "type": "string"
@@ -368,7 +391,8 @@
           "defaultAction",
           "note",
           "version",
-          "updatedAt"
+          "updatedAt",
+          "killSwitch"
         ],
         "type": "object"
       },
@@ -1175,6 +1199,26 @@
         "properties": {
           "enabled": {
             "type": "boolean"
+          },
+          "remote_counts_age_secs": {
+            "description": "Age of the last applied broadcast, in seconds. Absent when none has ever been applied.",
+            "type": "number"
+          },
+          "remote_counts_applied": {
+            "description": "Whether any Control Plane broadcast has ever been received by this node.",
+            "type": "boolean"
+          },
+          "remote_counts_max_age_secs": {
+            "description": "How long an applied broadcast can still describe the current window — the rate limiter's own window. Past it the broadcast counts timestamps that have all aged out, so it contributes nothing.",
+            "type": "number"
+          },
+          "remote_counts_stale": {
+            "description": "True while the last Control Plane broadcast is older than the rate-limit window, so other nodes' request counts are no longer added to this node's local counts. Local rate limits are still enforced; the cluster-wide aggregate is not.",
+            "type": "boolean"
+          },
+          "remote_counts_stale_episodes": {
+            "description": "Times the broadcast went stale since startup (one continuous outage counts once).",
+            "type": "integer"
           }
         },
         "required": [
@@ -2387,6 +2431,8 @@
             "type": "string"
           },
           "user": {
+            "description": "Admin username. Bounded at 256 bytes (CHAOS-61): this endpoint is\npublic, and an unbounded value here reaches the account-lockout\nmaps and the durable audit log. A longer value is rejected with\n400 before any credential evaluation. A name that already belongs\nto a configured account is never rejected, however long, so the\nlimit cannot lock out a real admin.\n",
+            "maxLength": 256,
             "type": "string"
           }
         },
@@ -2438,6 +2484,11 @@
         ],
         "type": "object"
       },
+      "MaintAgentStatus": {
+        "additionalProperties": true,
+        "description": "Health of the CP-local maintenance agent, read from its GET /v1/status. `available:false` means the agent could not be reached or is not configured, with `reason` carrying the cause; otherwise carries agent_version, privilege_mode(+privilege_warning), and compose_stack_up(+compose_error).",
+        "type": "object"
+      },
       "MetricsConfig": {
         "additionalProperties": false,
         "properties": {
@@ -2487,6 +2538,10 @@
           },
           "ui_custom_cert_active": {
             "description": "True when the running UI server was started using the uploaded custom certificate (i.e. it is already live, not just saved pending a restart).",
+            "type": "boolean"
+          },
+          "ui_custom_cert_corrupt": {
+            "description": "True when the persisted custom UI certificate/key pair does not parse as a matching TLS pair (interrupted or corrupted upload). It is NOT active, and a restart will NOT fix this — the pair must be re-uploaded.",
             "type": "boolean"
           },
           "ui_custom_cert_uploaded": {
@@ -2585,6 +2640,31 @@
             "type": "integer"
           },
           "lastFailClosedAt": {
+            "type": "string"
+          },
+          "mtlsClientCertConfigured": {
+            "description": "True when an upstream mTLS client certificate (client_cert_file/client_key_file) is configured. Omitted when unset.",
+            "type": "boolean"
+          },
+          "mtlsClientCertDaysRemaining": {
+            "description": "Days until the loaded client certificate expires (negative if already expired). Present only when mtlsClientCertLoaded is true.",
+            "type": "integer"
+          },
+          "mtlsClientCertFile": {
+            "description": "Configured client-certificate file path. Present only when mtlsClientCertConfigured is true.",
+            "type": "string"
+          },
+          "mtlsClientCertLastError": {
+            "description": "Most recent client-certificate load failure. Present only when the configured certificate failed to load.",
+            "type": "string"
+          },
+          "mtlsClientCertLoaded": {
+            "description": "True when the configured client certificate loaded successfully and is active on the upstream transport. Present only when mtlsClientCertConfigured is true.",
+            "type": "boolean"
+          },
+          "mtlsClientCertNotAfter": {
+            "description": "Expiry (RFC 3339) of the loaded client certificate. Present only when mtlsClientCertLoaded is true.",
+            "format": "date-time",
             "type": "string"
           },
           "revokedTotal": {
@@ -3166,6 +3246,11 @@
           "defaultProfile": {
             "additionalProperties": true,
             "nullable": true,
+            "type": "object"
+          },
+          "degraded": {
+            "additionalProperties": true,
+            "description": "Keyed by profile ID (\"default\" for the legacy profile); present only for a profile whose most recent PAC serve compiled with warnings (dropped rule, unresolvable pool reference, secure-mode conflict). Empty when every profile last served clean.",
             "type": "object"
           },
           "poolEtags": {
@@ -7366,6 +7451,106 @@
           "policy"
         ],
         "x-culvert-audit-event": "authpolicy.update",
+        "x-culvert-danger-level": "high",
+        "x-culvert-idempotency": "idempotent",
+        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-permission": "admin",
+        "x-culvert-stability": "stable",
+        "x-culvert-tenant-scope": "appliance",
+        "x-culvert-visibility": "admin-supported"
+      }
+    },
+    "/api/authpolicy/killswitch": {
+      "get": {
+        "description": "Reports the Auth Exempt break-glass kill switch: the read-once CULVERT_AUTHBYPASS_DISABLE env layer, the admin-settable runtime toggle, and the combined verdict the Stage-1 gate consults.",
+        "operationId": "getAuthPolicyKillSwitch",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthExemptKillSwitchStatus"
+                }
+              }
+            },
+            "description": "Get Auth Exempt kill-switch status."
+          },
+          "403": {
+            "$ref": "#/components/responses/PlainForbidden"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "basicAuth": []
+          }
+        ],
+        "summary": "Get Auth Exempt kill-switch status",
+        "tags": [
+          "policy"
+        ],
+        "x-culvert-idempotency": "safe",
+        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-permission": "viewer",
+        "x-culvert-stability": "stable",
+        "x-culvert-tenant-scope": "appliance",
+        "x-culvert-visibility": "admin-supported"
+      },
+      "put": {
+        "description": "Engages or releases ONLY the runtime toggle (no restart required); the env layer is read-once and cannot be changed at runtime. Engaging the switch fails every Auth Exempt rule (scoped and the global Open default) closed to \"authentication required\" — it never affects Stage-2 access decisions.",
+        "operationId": "setAuthPolicyKillSwitch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "disabled": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "disabled"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthExemptKillSwitchStatus"
+                }
+              }
+            },
+            "description": "Engage or release the Auth Exempt kill switch."
+          },
+          "400": {
+            "$ref": "#/components/responses/PlainBadRequest"
+          },
+          "403": {
+            "$ref": "#/components/responses/PlainForbidden"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "basicAuth": []
+          }
+        ],
+        "summary": "Engage or release the Auth Exempt kill switch",
+        "tags": [
+          "policy"
+        ],
+        "x-culvert-audit-event": "authpolicy.killswitch",
         "x-culvert-danger-level": "high",
         "x-culvert-idempotency": "idempotent",
         "x-culvert-introduced-version": "1.0.0",
@@ -14735,6 +14920,45 @@
         "x-culvert-visibility": "admin-supported"
       }
     },
+    "/api/maintenance-agent": {
+      "get": {
+        "description": "Read-only health of the CP-local maintenance agent, sourced from its GET /v1/status (agent version, privilege posture, compose-stack state). Lets an admin confirm the host-root agent is reachable and healthy without SSH access to the host.",
+        "operationId": "getMaintenanceAgentStatus",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintAgentStatus"
+                }
+              }
+            },
+            "description": "Maintenance agent health."
+          },
+          "403": {
+            "$ref": "#/components/responses/PlainForbidden"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "basicAuth": []
+          }
+        ],
+        "summary": "Maintenance agent health",
+        "tags": [
+          "support"
+        ],
+        "x-culvert-idempotency": "safe",
+        "x-culvert-introduced-version": "1.0.0",
+        "x-culvert-permission": "viewer",
+        "x-culvert-stability": "stable",
+        "x-culvert-tenant-scope": "appliance",
+        "x-culvert-visibility": "admin-supported"
+      }
+    },
     "/api/mcp/approval-decision": {
       "post": {
         "description": "Four-eyes decision on an operational approval. Commits the PR-8 event before state change; never executes, calls upstream, or materializes a credential.",
@@ -14970,9 +15194,13 @@
               "schema": {
                 "properties": {
                   "evidence_digest": {
+                    "description": "Canonical lowercase-hex SHA-256 (exactly 64 characters matching ^[0-9a-f]{64}$) of the reviewed Shadow Exit evidence bundle — the \"which evidence\" binding. A non-empty but non-digest value is rejected with 400 so a review can never be attested against an unidentifiable evidence reference.",
+                    "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
                     "type": "string"
                   },
                   "review_id": {
+                    "description": "The exact Shadow Exit Review artifact / case id. Must be non-empty and at most 256 bytes — it is the only free-text field that reaches the durable attestation record, so it is bounded at the trust boundary rather than inheriting the admin middleware's 1 MiB body cap. Over-bound input is rejected with 400, never truncated (a truncated identity would name a different review than the operator attested).",
+                    "example": "SXR-2026-08-30-gateway-shadow-exit-review",
                     "type": "string"
                   }
                 },
@@ -17269,7 +17497,7 @@
     },
     "/api/ocsp": {
       "get": {
-        "description": "Returns OCSP revocation-check status and counters.",
+        "description": "Returns OCSP revocation-check status and counters, plus the upstream mTLS client-certificate's load/expiry status (both are loaded together at startup).",
         "operationId": "getOCSP",
         "responses": {
           "200": {
@@ -22082,7 +22310,7 @@
     },
     "/api/settings": {
       "get": {
-        "description": "Returns core appliance settings — auth state, admin user, ports, and default auth outcome (password never returned).",
+        "description": "Returns core node settings — auth state, admin user, ports, and default auth outcome (password never returned).",
         "operationId": "getSettings",
         "responses": {
           "200": {
@@ -22093,7 +22321,7 @@
                 }
               }
             },
-            "description": "Appliance settings summary."
+            "description": "Node settings summary."
           },
           "403": {
             "$ref": "#/components/responses/PlainForbidden"
@@ -22107,7 +22335,7 @@
             "basicAuth": []
           }
         ],
-        "summary": "Appliance settings summary",
+        "summary": "Node settings summary",
         "tags": [
           "settings"
         ],
@@ -25967,7 +26195,7 @@
       "name": "pac"
     },
     {
-      "description": "Appliance settings — logging, session, connection limits.",
+      "description": "Node settings — logging, session, connection limits.",
       "name": "settings"
     },
     {

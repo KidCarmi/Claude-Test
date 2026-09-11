@@ -38,6 +38,10 @@ type mcpLiveSideEffectGate struct {
 	// admit is the lifecycle admission (globalMCPLiveTier.admitExecution): returns a release and
 	// ok==true only while armed and not quiescing.
 	admit func() (release func(), ok bool)
+	// admitOpen is the read-only form of the same question (globalMCPLiveTier.admissionOpen),
+	// used as the auxiliary admission's final-boundary revalidation so a disarm or quiesce that
+	// lands after admission still refuses. It takes no in-flight slot.
+	admitOpen func() bool
 	// readFirst decides whether the operation class may cross the boundary.
 	readFirst func(policy.OperationClass) bool
 	// trustPrecheck is the LOCK-FREE half of live-execution trust revalidation, bound to the
@@ -83,6 +87,7 @@ func newMCPLiveSideEffectGate(capb rollout.Capability) *mcpLiveSideEffectGate {
 	return &mcpLiveSideEffectGate{
 		capb:          capb,
 		admit:         lt.admitExecution,
+		admitOpen:     lt.admissionOpen,
 		readFirst:     canary.IsReadFirstOperation,
 		trustPrecheck: mcpLiveTrustPrecheck,
 		approvalOK:    mcpLiveApprovalSatisfied,
@@ -184,6 +189,24 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	case canaryAdmitAborted, canaryAdmitBudget:
 		releaseAdmit()
 		return deny(mcperr.ReasonRolloutBudgetExhausted)
+	case canaryAdmitGranted:
+		// The one class that authorizes a physical attempt. Named explicitly so
+		// the default below can be what it should be.
+	default:
+		// FAIL CLOSED on a class this gate does not know. Reaching the admit
+		// path by falling out of a switch is how a denial added to
+		// canaryAdmissionDenial later would silently authorize an irreversible
+		// upstream call: every existing class is handled above, so this branch
+		// changes nothing today and is the whole point — the boundary must deny
+		// what it cannot classify, not admit it.
+		releaseAdmit()
+		return deny(mcperr.ReasonRolloutModeInvalid)
+	}
+	if !adm.Granted() {
+		// Belt-and-braces against the two halves disagreeing: Granted() is the
+		// single authority on whether a physical attempt is authorized.
+		releaseAdmit()
+		return deny(mcperr.ReasonRolloutModeInvalid)
 	}
 	gen := adm.Generation
 
@@ -224,6 +247,65 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		},
 	}
 }
+
+// AdmitAuxiliary implements execution.LiveExecutionGate for NON-side-effect-bearing traffic —
+// MCP lifecycle (initialize / notifications/initialized / ping / notifications/cancelled) and
+// discovery (tools/list). SEC-MCP-AUX-1.
+//
+// It runs gate (1) ONLY — the lifecycle admission. The other three are deliberately absent, and
+// each absence is a decision rather than an omission:
+//
+//   - READ-FIRST (2) is not asked, because the operation class carried by session lifecycle
+//     traffic is not the tool-call class the read-first rule was written for; asking it here is
+//     the gate answering a question about a tool that does not exist.
+//   - LIVE-TRUST REVALIDATION (3) is not asked for the same reason and more sharply: it binds
+//     (tenant, server, TOOL, fingerprint), and auxiliary traffic has no tool binding, so the
+//     production predicate refuses every time. That refusal is what made an armed Canary node
+//     unable to complete a session handshake or list tools.
+//   - BUDGET RESERVATION (4) is not taken, because the budget counts AUTHORIZED TOOL
+//     EXECUTIONS. Spending a slot on a call that can cause no side effect makes
+//     MaxTotalExecutions stop measuring physical invocations, which is exactly the accounting
+//     property the physical-effect ledger exists to establish.
+//
+// What remains is the half that DOES apply: a tier the operator has disarmed, or has begun
+// quiescing, must not open a session to a third-party upstream, read its catalog, or carry a
+// materialized credential to it. That is the same fail-closed posture a restart deliberately
+// leaves behind (a re-composed tier is never automatically re-armed), and it must not depend on
+// which method the client happened to send.
+//
+// The returned Revalidate re-asks the SAME question read-only at the final boundary, so a
+// disarm or quiesce landing between admission and the irreversible call still refuses; Release
+// returns the lifecycle in-flight count exactly once, so a quiesce drain always completes.
+// No ReservationID and no ActivationGeneration are returned: an auxiliary invocation has no
+// attempt, so naming a slot it never consumed could only misattribute a physical effect.
+func (g *mcpLiveSideEffectGate) AdmitAuxiliary(_ execution.LiveGateInput) execution.LiveGateDecision {
+	releaseAdmit, ok := g.admit()
+	if !ok {
+		if g.note != nil {
+			g.note(mcperr.ReasonRolloutModeInvalid)
+		}
+		return execution.LiveGateDecision{Admit: false, Reason: mcperr.ReasonRolloutModeInvalid}
+	}
+	return execution.LiveGateDecision{
+		Admit: true,
+		Revalidate: func() bool {
+			if g.admitOpen == nil {
+				return true // no revalidation seam wired ⇒ preserve the admission decision
+			}
+			return g.admitOpen()
+		},
+		Release: releaseAdmit,
+	}
+}
+
+// mcpLiveTrustRevalidate is the runtime live-execution trust revalidation (§10). It resolves the
+// CURRENT authoritative target for (serverID, toolName) from the tool-trust coordinator (never a
+// request-supplied claim) and requires an active, unexpired live_execution approval that binds
+// that EXACT (tenant, server, tool, fingerprint, format) under the full first-Canary governance
+// (canary.SatisfiesLiveExecution). It is fail-closed: an uncomposed coordinator, a missing tool,
+// a tenant mismatch, an unusable server, a fingerprint that no longer matches the decision, or no
+// satisfying approval all deny. It NEVER consults a shadow approval (SatisfiesLiveExecution rejects
+// a non-live purpose) and NEVER materializes a credential.
 
 // liveTrustPrecheck is the LOCK-FREE half of live-execution trust revalidation: everything that can
 // produce an authoritative whole-Canary DRIFT verdict, and nothing that can block.

@@ -1599,6 +1599,10 @@ table.mcpx-cat-tbl td{padding:6px 10px;border-bottom:1px solid var(--border)}
               <div style="font-size:.7rem;color:var(--muted);margin-bottom:2px" title="Remote scan round trips in flight. The saturation gauge for a sidecar deployment, where 'Scans in flight' is always zero.">Remote scans in flight</div>
               <div id="sec-remote-inflight" style="font-weight:600;font-size:.85rem">0</div>
             </div>
+            <div style="background:var(--surface2);border-radius:8px;padding:10px">
+              <div style="font-size:.7rem;color:var(--muted);margin-bottom:2px" title="A YARA regex match panicked (an internal crash, not a slow match) and was contained instead of taking down the scan. The verdict was decided by the configured on-timeout posture (block/allow), not by the rule itself. Non-zero points at a bug in a specific rule's regex, not a timeout — raising the timeout will not help.">YARA match panics</div>
+              <div id="sec-yara-match-panics" style="font-weight:600;font-size:.85rem">0</div>
+            </div>
           </div>
           <div id="sec-yara-warnings" style="display:none;background:rgba(234,179,8,.1);border-left:3px solid var(--yellow);padding:8px 12px;border-radius:6px;margin-bottom:14px;font-size:.78rem;color:var(--yellow)"></div>
 
@@ -2305,7 +2309,7 @@ table.mcpx-cat-tbl td{padding:6px 10px;border-bottom:1px solid var(--border)}
         <div class="panel">
           <div class="panel-header">
             <span class="panel-title">Steering Profiles</span>
-            <button class="btn primary sm" data-click="newPACProfile" data-min-role="admin">+ New Profile</button>
+            <button class="btn primary sm" data-click="newPACProfile" data-min-role="admin">+ New Steering Profile</button>
           </div>
           <div class="panel-body">
             <p style="font-size:.8rem;color:var(--muted);margin-bottom:10px;line-height:1.6">
@@ -2316,7 +2320,7 @@ table.mcpx-cat-tbl td{padding:6px 10px;border-bottom:1px solid var(--border)}
             <div id="pac-profiles-list" style="font-size:.82rem">Loading…</div>
             <div id="pac-profile-editor" style="display:none;margin-top:14px;border-top:1px solid var(--surface2);padding-top:12px">
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-                <div><label class="form-label">Profile ID (URL-safe)</label><input id="pacp-id" class="input" placeholder="hq-israel"></div>
+                <div><label class="form-label">Steering Profile ID (URL-safe)</label><input id="pacp-id" class="input" placeholder="hq-israel"></div>
                 <div><label class="form-label">Name</label><input id="pacp-name" class="input" placeholder="HQ Israel"></div>
                 <div><label class="form-label">Proxy Pool</label><select id="pacp-pool" class="input"></select></div>
                 <div><label class="form-label">Availability Mode</label>
@@ -2340,7 +2344,7 @@ table.mcpx-cat-tbl td{padding:6px 10px;border-bottom:1px solid var(--border)}
               <button class="btn ghost sm" data-click="addPACRuleRow" style="margin-top:6px">+ Add Rule</button>
               <div id="pac-profile-errors" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--red,#e5484d);border-radius:8px;font-size:.8rem;line-height:1.5"></div>
               <div style="display:flex;gap:8px;margin-top:12px">
-                <button class="btn primary" data-click="savePACProfile">Save Profile</button>
+                <button class="btn primary" data-click="savePACProfile">Save Steering Profile</button>
                 <button class="btn ghost" data-click="cancelPACProfileEdit">Cancel</button>
               </div>
             </div>
@@ -2382,12 +2386,12 @@ table.mcpx-cat-tbl td{padding:6px 10px;border-bottom:1px solid var(--border)}
         <div class="panel-header"><span class="panel-title">Steering Simulator</span></div>
         <div class="panel-body">
           <p style="font-size:.8rem;color:var(--muted);margin-bottom:10px;line-height:1.6">
-            Explain what a profile would return for a destination - the same rule
+            Explain what a steering profile would return for a destination - the same rule
             evaluation the compiler emits. No live DNS: supply a resolved IP to
             evaluate CIDR/private-network rules definitively.
           </p>
           <div class="pac-sim-grid" style="display:grid;grid-template-columns:1fr 2fr 1fr 90px 120px auto;gap:8px;align-items:end">
-            <div><label class="form-label">Profile</label><select id="pacsim-profile" class="input"></select></div>
+            <div><label class="form-label">Steering Profile</label><select id="pacsim-profile" class="input"></select></div>
             <div><label class="form-label">URL or Host</label><input id="pacsim-host" class="input" placeholder="https://intranet.corp.example/"></div>
             <div><label class="form-label">Resolved IP (optional)</label><input id="pacsim-ip" class="input" placeholder="10.1.2.3"></div>
             <div><label class="form-label">Port</label><input id="pacsim-port" class="input" placeholder="443"></div>
@@ -3260,7 +3264,7 @@ Firefox (all platforms):
       <!-- Rule Table -->
       <div class="panel">
         <div class="panel-header">
-          <span class="panel-title">Active Policy Rules</span>
+          <span class="panel-title">Access Rules</span>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <span class="topbar-meta" id="pol-count">0 rules</span>
             <span id="pol-version-badge" style="display:none;background:rgba(20,184,166,.15);color:#2dd4bf;border:1px solid rgba(20,184,166,.3);border-radius:4px;padding:2px 8px;font-size:.68rem;font-weight:700;font-family:monospace" title="Policy revision. Increments on every add/edit/delete/reorder."></span>
@@ -3362,9 +3366,21 @@ Firefox (all platforms):
         </div>
       </div>
 
+      <div class="panel" id="ap-killswitch-panel" style="margin-bottom:14px;border:1px solid var(--border)">
+        <div class="panel-body" id="ap-killswitch-body" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div style="font-size:.85rem">
+            <span id="ap-killswitch-badge"></span>
+            <div id="ap-killswitch-note" style="color:var(--muted);margin-top:4px;font-size:.78rem">
+              Break-glass: forces every Auth Exempt rule (scoped and the global Open default) to require authentication, with no restart. CredentialRequired, SSORequired and Stage-2 access decisions are unaffected.
+            </div>
+          </div>
+          <button class="btn sm" id="ap-killswitch-btn" data-click="apToggleKillSwitch"></button>
+        </div>
+      </div>
+
       <div class="panel" style="margin-bottom:14px">
         <div class="panel-header">
-          <span class="panel-title">Auth Policy Rules</span>
+          <span class="panel-title">Authentication Rules</span>
           <button class="btn sm" data-click="apShowAdd">+ Add Auth Rule</button>
         </div>
         <div class="tbl-wrap">
@@ -4381,6 +4397,8 @@ Firefox (all platforms):
           <div style="display:flex;gap:8px;align-items:center">
             <input type="text" class="input" style="width:200px" id="audit-filter" placeholder="Filter (name, rule id, actor…)" data-input="renderAuditLog">
             <button class="btn ghost sm" data-click="loadAuditLog"><svg class="ico" aria-hidden="true"><use href="#i-refresh"/></svg> Refresh</button>
+            <button class="btn ghost sm" data-click="exportAuditLog" data-arg="csv" title="Download the persisted audit history as CSV"><svg class="ico" aria-hidden="true"><use href="#i-download"/></svg> CSV</button>
+            <button class="btn ghost sm" data-click="exportAuditLog" data-arg="json" title="Download the persisted audit history as JSON"><svg class="ico" aria-hidden="true"><use href="#i-download"/></svg> JSON</button>
           </div>
         </div>
         <div class="tbl-wrap">
@@ -4463,6 +4481,20 @@ Firefox (all platforms):
         </div>
         <div id="ocsp-failclosed-banner" style="display:none;margin:0 16px 16px;background:rgba(234,179,8,.1);border-left:3px solid var(--yellow);padding:8px 12px;border-radius:6px;font-size:.78rem;color:var(--yellow)">
           OCSP responders were unreachable and Culvert treated affected certificates as revoked (fail-closed), blocking those connections. Last occurrence: <strong id="ocsp-failclosed-last">-</strong>.
+        </div>
+      </div>
+      <!-- Upstream mTLS Client Certificate -->
+      <div class="panel" style="margin-top:16px" id="mtls-client-cert-panel">
+        <div class="panel-header"><span class="panel-title">Upstream mTLS Client Certificate</span></div>
+        <div style="padding:16px;display:flex;align-items:center;gap:16px;font-size:.85rem;flex-wrap:wrap">
+          <span>Status: <strong id="mtls-client-cert-status">Not configured</strong></span>
+          <span id="mtls-client-cert-expiry-wrap" style="display:none">Expires: <strong id="mtls-client-cert-expiry">-</strong></span>
+        </div>
+        <div id="mtls-client-cert-error-banner" style="display:none;margin:0 16px 16px;background:rgba(220,53,69,.1);border-left:3px solid var(--red,#dc3545);padding:8px 12px;border-radius:6px;font-size:.78rem;color:var(--red,#dc3545)">
+          The configured upstream mTLS client certificate failed to load — connections to upstreams requiring client-cert authentication proceed WITHOUT it. <span id="mtls-client-cert-error-detail"></span>
+        </div>
+        <div id="mtls-client-cert-expired-banner" style="display:none;margin:0 16px 16px;background:rgba(220,53,69,.1);border-left:3px solid var(--red,#dc3545);padding:8px 12px;border-radius:6px;font-size:.78rem;color:var(--red,#dc3545)">
+          The configured upstream mTLS client certificate has EXPIRED. Culvert still presents it as-is — an upstream that validates certificate lifetime will reject those connections. Re-issue and upload a new certificate.
         </div>
       </div>
       <!-- Dual-CA Overlap -->
@@ -4641,6 +4673,10 @@ Firefox (all platforms):
             <p id="ha-lease-note" style="display:none;color:var(--muted);font-size:.7rem;margin:0 0 16px 0">
               Fencing is configured at startup (<code>--ha-etcd-endpoints</code> / <code>cluster.etcd_endpoints</code>) and read once - this panel shows status only. With a lease armed, leadership and automatic failover are arbitrated by etcd; write authority requires a live lease. The <strong>Term</strong> tile above equals the epoch of the currently-held fencing lease (ADR-0005: term = a held lease's epoch). In a failure state where no lease is held - e.g. a leader that restarted and cannot reacquire the etcd lease, running read-only - the lease card shows <code>epoch 0</code> while <strong>Term</strong> retains the last synced value, so the two can differ precisely when you are diagnosing a fencing problem.
             </p>
+            <!-- CHAOS-55: an unfenced leader (role=leader, lease not held) is either
+                 actively self-healing or permanently stuck until an operator acts -
+                 those two states look identical unless called out explicitly. -->
+            <p id="ha-lease-recovery-banner" style="display:none;font-size:.8rem;margin:0 0 16px 0;padding:8px 12px;border-radius:6px"></p>
             <p id="ha-sync-note" style="display:none;color:var(--muted);font-size:.7rem;margin:0 0 16px 0">
               This standby polls the leader every ~5s. The <strong>Sync to Leader</strong> tile shows the current consecutive-failure streak - it resets to 0 on every successful sync. At the configured threshold this standby stops waiting and either self-promotes (automatic failover / fencing lease) or, if automatic failover is off, stays read-only until an operator promotes it manually. Watching this tile climb is your early warning before that happens.
             </p>
@@ -4802,6 +4838,12 @@ Firefox (all platforms):
             <div class="stat-card"><div class="stat-val" id="crl-hot">-</div><div class="stat-label">Hot IPs</div></div>
             <div class="stat-card"><div class="stat-val" id="crl-rpm">-</div><div class="stat-label">Limit (RPM)</div></div>
           </div>
+          <div id="crl-stale-banner" style="display:none;margin-top:12px;padding:10px 12px;border-radius:6px;background:rgba(255,176,32,.12);border:1px solid var(--yellow,#ffb020);color:var(--yellow,#ffb020)">
+            <strong>Cluster counts not applied.</strong>
+            <span id="crl-stale-detail"></span>
+            This node is enforcing its LOCAL rate limit only — other nodes' request counts are ignored until a
+            Control Plane broadcast arrives. Rate limits are still enforced; the cluster-wide aggregate is not.
+          </div>
         </div>
       </div>
 
@@ -4859,6 +4901,10 @@ Firefox (all platforms):
           <p class="hint">
             Set per-group bandwidth limits using token bucket rate limiting. Higher priority policies take precedence.
           </p>
+          <div class="banner warn" style="margin-bottom:12px">
+            <span>&#9888;</span>
+            <span>Not yet enforced on the data path — policies below are stored and synced across the cluster, but traffic is not currently rate-limited by them. See the Diagnostics tab (<code>bandwidth_qos_enforcement</code>) for the live status.</span>
+          </div>
           <div id="bandwidth-policies-list">
             <em style="color:var(--muted);font-size:.82rem">Loading policies...</em>
           </div>
@@ -5145,6 +5191,17 @@ Firefox (all platforms):
             </div>
             <p class="hint">Archive directory scanned by the maintenance agent - the same listing <code>--list-backups</code> produces, without SSH.</p>
             <div id="support-backups" role="status" aria-live="polite"><p class="hint">Loading…</p></div>
+          </div>
+
+          <div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+              <span style="font-weight:600">Maintenance Agent</span>
+              <button class="btn ghost sm" data-click="loadMaintAgentStatus" title="Re-check the maintenance agent's own health">
+                <svg class="ico" aria-hidden="true"><use href="#i-refresh"/></svg> Refresh
+              </button>
+            </div>
+            <p class="hint">Version and health of the host-root agent that applies updates and runs backups - the same detail <code>systemctl status culvert-maint</code> shows, without SSH.</p>
+            <div id="support-maint-agent" role="status" aria-live="polite"><p class="hint">Loading…</p></div>
           </div>
 
           <div>
@@ -5684,6 +5741,7 @@ document.addEventListener('click', e => {
 
     // ── Audit / CA management ──
     case 'loadAuditLog':      loadAuditLog(); break;
+    case 'exportAuditLog':    exportAuditLog(arg); break;
     case 'toggleAuditDiff':   toggleAuditDiff(+arg); break;
     case 'loadCAMgmt':        loadCAMgmt(); break;
     case 'downloadCA':        downloadCA(); break;
@@ -5753,6 +5811,7 @@ document.addEventListener('click', e => {
     case 'loadReleases':           loadReleases(); break;
     case 'loadSupport':            loadSupport(); break;
     case 'loadBackups':            loadBackups(); break;
+    case 'loadMaintAgentStatus':    loadMaintAgentStatus(); break;
     case 'supportCreateBundle':    supportCreateBundle(); break;
     case 'supportSetDebugLevel':   supportSetDebugLevel(); break;
     case 'supportClearDebugLevel': supportClearDebugLevel(); break;
@@ -7998,12 +8057,22 @@ async function importConfig(input) {
     });
     const data = await r.json().catch(() => ({}));
     if (r.ok) {
-      if (data.cluster_publish_rejected) {
-        // Local import succeeded, but the config is too big to sync — the fleet
-        // did NOT receive it. Amber, not green: this is the silent-stale-fleet
-        // trap the commit-time validation exists to make visible.
+      const hasWarnings = data.warnings && data.warnings.length;
+      if (data.cluster_publish_rejected || hasWarnings) {
+        // Amber, not red: the local import applied. But two independent
+        // failure modes can both fire on one import (e.g. an oversized
+        // backup that ALSO contains a rejected item) — show both instead of
+        // letting one hide the other, which would recreate the silent
+        // partial-restore problem this banner exists to prevent.
         statusEl.style.cssText = 'display:block;color:var(--warn)';
-        statusEl.textContent = `⚠ Imported locally, but the cluster did NOT receive it (over cap): ${data.cluster_publish_rejected}. Data-plane nodes stay on the last valid config — trim the oversized collection and re-import.`;
+        let html = data.cluster_publish_rejected
+          ? `⚠ Imported locally, but the cluster did NOT receive it (over cap): ${escHtml(data.cluster_publish_rejected)}. Data-plane nodes stay on the last valid config — trim the oversized collection and re-import.`
+          : `⚠ Configuration imported (${escHtml(data.mode || 'merge')} mode)`;
+        if (hasWarnings) {
+          html += `${data.cluster_publish_rejected ? ' Additionally, ' : ' with '}${data.warnings.length} item(s) skipped:<ul style="margin:4px 0 0 18px;padding:0">` +
+            data.warnings.map(w => `<li>${escHtml(w)}</li>`).join('') + '</ul>';
+        }
+        statusEl.innerHTML = html;
       } else {
         statusEl.style.cssText = 'display:block;color:var(--green)';
         statusEl.textContent = `✓ Configuration imported (${data.mode || 'merge'} mode, exported ${data.exportedAt || 'unknown date'})`;
@@ -9466,6 +9535,7 @@ async function loadSecScanStatus() {
     setMetric('sec-clam-error', s.stat_clam_scan_error, 1, 10);
     setMetric('sec-clam-saturated', s.stat_clam_saturated, 1, 10);
     setMetric('sec-scan-inflight', s.scan_inflight, 4, 16);
+    setMetric('sec-yara-match-panics', s.yara_match_panics, 1, 10);
     setMetric('sec-scan-late-discard', s.stat_scan_late_discard, 1, 10);
   } catch(e) { console.error(e); }
 }
@@ -10443,6 +10513,19 @@ function exportLogs(format) {
   a.click();
   document.body.removeChild(a);
   toast('Downloading logs as ' + format.toUpperCase(), 'success');
+}
+
+// exportAuditLog downloads the persisted audit history (not just the 500-entry
+// in-memory ring the panel renders from) as CSV/JSON, same server-streamed
+// attachment pattern as exportLogs — no client-side reassembly needed.
+function exportAuditLog(format) {
+  const a = document.createElement('a');
+  a.href = '/api/audit?format=' + format + '&source=file';
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  toast('Downloading audit log as ' + format.toUpperCase(), 'success');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -13351,11 +13434,25 @@ async function loadUICertStatus() {
   if (!el) return;
   try {
     const n = await api('/api/settings/network');
-    if (!n.ui_custom_cert_uploaded) { el.textContent = ''; return; }
+    if (!n.ui_custom_cert_uploaded) { el.textContent = ''; el.style.color = ''; return; }
+    if (n.ui_custom_cert_corrupt) {
+      // The saved pair failed to parse as a matching cert/key (interrupted or
+      // corrupted upload). Restarting will NOT fix this — every restart keeps
+      // rejecting the same corrupt pair — so this must never be conflated
+      // with the ordinary "awaiting restart" state below. Deliberately does
+      // NOT claim the running server fell back to a self-signed cert: if
+      // self-sign generation also failed, or -ui-no-tls was set, the actual
+      // fallback is plain HTTP, and asserting "self-signed" would misstate
+      // the transport-security posture in those cases.
+      el.textContent = 'Saved certificate is corrupt or mismatched — it is NOT active, and a restart will not fix this. Re-upload a valid certificate.';
+      el.style.color = 'var(--warn)';
+      return;
+    }
+    el.style.color = '';
     el.textContent = n.ui_custom_cert_active
       ? 'Custom certificate uploaded and active.'
       : 'Custom certificate saved — restart the proxy to activate it.';
-  } catch(e) { el.textContent = ''; }
+  } catch(e) { el.textContent = ''; el.style.color = ''; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -14562,17 +14659,29 @@ function pacProfileURL(id) {
   return 'http://' + window.location.hostname + ':' + proxyPort + '/pac/' + id + '.pac';
 }
 
+// pacDegradedBadge renders a "degraded" badge with the compile warning
+// messages in its tooltip when this profile's most recent serve produced
+// warnings (dropped rule, unresolvable pool reference, secure-mode
+// conflict) - the only GUI signal that a live PAC file is not being served
+// exactly as configured, without checking server logs or a webhook alert.
+function pacDegradedBadge(id) {
+  const dg = (pacProfilesData.degraded || {})[id];
+  if (!dg) return '';
+  const msgs = (dg.warnings || []).map(w => w.message).join('; ') || 'compiled with warnings';
+  return ' <span class="badge warn" title="' + escHtml(msgs) + '">degraded</span>';
+}
+
 function renderPACProfilesList() {
   const box = document.getElementById('pac-profiles-list');
   const d = pacProfilesData.defaultProfile;
   let rows = '';
   if (d) {
-    rows += '<tr><td><code>' + escHtml(d.id) + '</code> <span class="badge">default</span></td>' +
+    rows += '<tr><td><code>' + escHtml(d.id) + '</code> <span class="badge">default</span>' + pacDegradedBadge(d.id) + '</td>' +
       '<td>' + escHtml(d.name) + '</td><td>' + escHtml(d.availabilityMode) + '</td>' +
       '<td><button class="btn ghost sm" data-click="copyPACProfileURL" data-arg="default">Copy URL</button></td></tr>';
   }
   for (const p of (pacProfilesData.profiles || [])) {
-    rows += '<tr><td><code>' + escHtml(p.id) + '</code>' + (p.enabled ? '' : ' <span class="badge">disabled</span>') + '</td>' +
+    rows += '<tr><td><code>' + escHtml(p.id) + '</code>' + (p.enabled ? '' : ' <span class="badge">disabled</span>') + pacDegradedBadge(p.id) + '</td>' +
       '<td>' + escHtml(p.name) + ' <span style="color:var(--muted)">r' + (p.revision || 0) + '</span></td>' +
       '<td>' + escHtml(p.availabilityMode) + '</td>' +
       '<td><div class="row-actions"><button class="btn ghost sm" data-click="copyPACProfileURL" data-arg="' + escHtml(p.id) + '">Copy URL</button>' +
@@ -15220,7 +15329,7 @@ async function runPolicyTest() {
       ${credReq ? '<div class="pt-sub" style="color:#60a5fa;margin-top:4px">CredentialRequired returns a deterministic 407 credential challenge - the client must authenticate first. This is NOT Allow. At runtime Stage-2 is NOT evaluated until the client authenticates; the Stage-2 result shown below is computed with the UNAUTHENTICATED context for reference only, and the real post-authentication decision (with the authenticated identity) may differ.</div>' : ''}
       ${sso ? '<div class="pt-sub" style="color:#34d399;margin-top:4px">SSORequired requires an interactive browser SSO login first. A browser client is redirected (302) to the IdP; a non-browser or CONNECT client is failed closed (403). This is NOT Allow. Stage-2 is NOT evaluated until SSO completes and a session exists; the Stage-2 result shown below is computed with the UNAUTHENTICATED context for reference only, and the real post-SSO decision (with the authenticated identity) may differ.</div>' : ''}
       ${a.credentialsPresented ? '<div class="pt-sub" style="color:var(--muted);margin-top:4px">Credentials presented - at runtime, credentials always win and the Stage-1 outcome is not evaluated.</div>' : ''}
-      ${a.killSwitch ? '<div class="pt-sub" style="color:#ef4444;margin-top:4px">Kill switch engaged - exemptions (scoped Exempt and the Open default) are forced to Require authentication. CredentialRequired and SSORequired are unaffected.</div>' : ''}
+      ${a.killSwitch ? '<div class="pt-sub" style="color:#ef4444;margin-top:4px">Authentication kill switch engaged - exemptions (scoped Exempt and the Open default) are forced to Require authentication. CredentialRequired and SSORequired are unaffected.</div>' : ''}
       <div class="pt-sub" style="margin-top:6px;color:${a.stage2Reached ? '#34d399' : 'var(--muted)'}">Stage-2: <strong>${a.stage2Reached ? 'reached at runtime' : 'NOT reached at runtime'}</strong>.${a.stage2Note ? ' ' + escHtml(a.stage2Note) : ''}</div>
     </div>`;
   }
@@ -15276,7 +15385,50 @@ async function loadAuthPolicy() {
     document.getElementById('ap-default-allow-warn').style.display =
       (d.defaultAction === 'allow' && apRules.length) ? 'block' : 'none';
     renderAuthPolicy();
+    renderAuthKillSwitch(d.killSwitch);
   } catch(e) { console.error(e); }
+}
+
+// Auth Exempt break-glass kill switch (authKillSwitchStatus, /api/authpolicy/killswitch).
+// envDisabled is the read-once CULVERT_AUTHBYPASS_DISABLE var - it cannot be
+// changed at runtime, so the toggle only ever controls runtimeDisabled.
+let apKillSwitchState = null;
+
+function renderAuthKillSwitch(status) {
+  apKillSwitchState = status || { envDisabled: false, runtimeDisabled: false, engaged: false };
+  const badge = document.getElementById('ap-killswitch-badge');
+  const btn = document.getElementById('ap-killswitch-btn');
+  const isAdmin = (typeof window.currentRole !== 'undefined' && window.currentRole === 'admin');
+  if (apKillSwitchState.engaged) {
+    let why = apKillSwitchState.envDisabled
+      ? (apKillSwitchState.runtimeDisabled ? 'env + runtime' : 'env (CULVERT_AUTHBYPASS_DISABLE)')
+      : 'runtime toggle';
+    badge.innerHTML = `<span style="background:rgba(239,68,68,.15);color:#ef4444;padding:2px 8px;border-radius:12px;font-size:.78rem;font-weight:600"><svg class="ico" aria-hidden="true"><use href="#i-alert-triangle"/></svg> Kill switch engaged (${escHtml(why)})</span>`;
+  } else {
+    badge.innerHTML = '<span style="background:rgba(52,211,153,.15);color:#34d399;padding:2px 8px;border-radius:12px;font-size:.78rem;font-weight:600">Kill switch clear - exemptions active</span>';
+  }
+  if (apKillSwitchState.envDisabled && !apKillSwitchState.runtimeDisabled) {
+    // Runtime toggle has nothing to add: the env layer already forces Default,
+    // and only a restart with the env var cleared can release it.
+    btn.style.display = 'none';
+  } else {
+    btn.style.display = '';
+    btn.disabled = !isAdmin;
+    btn.title = isAdmin ? '' : 'Requires the admin role';
+    btn.textContent = apKillSwitchState.runtimeDisabled ? 'Release runtime kill switch' : 'Engage kill switch (require auth for all exemptions)';
+    btn.className = apKillSwitchState.runtimeDisabled ? 'btn sm' : 'btn sm danger-quiet';
+  }
+}
+
+async function apToggleKillSwitch() {
+  if (!apKillSwitchState) return;
+  const engaging = !apKillSwitchState.runtimeDisabled;
+  if (engaging && !window.confirm('Engage the Auth Exempt kill switch? Every Exempt rule and the Open default will require authentication until released. This does not affect CredentialRequired, SSORequired, or Stage-2 access decisions.')) return;
+  try {
+    const status = await api('/api/authpolicy/killswitch', { method: 'PUT', body: { disabled: engaging } });
+    renderAuthKillSwitch(status);
+    toast(engaging ? 'Kill switch engaged - exemptions now require authentication' : 'Kill switch released');
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
 }
 
 function apOutcomeBadge(r) {
@@ -15570,6 +15722,7 @@ async function loadSupport() {
   loadTelemetryConfig();
   loadSupportTelemetryPreview();
   loadBackups();
+  loadMaintAgentStatus();
 }
 
 // Backup archive visibility: read-only pass-through of the CP-local
@@ -15621,6 +15774,50 @@ function renderBackups(data) {
       '<td>' + (b.modified_at ? escHtml(timeAgo(new Date(b.modified_at))) : '-') + '</td>' +
       '<td>' + (b.encrypted ? 'yes' : 'no') + '</td>' +
     '</tr>').join('') + '</tbody></table></div>';
+}
+
+// Maintenance-agent health visibility: read-only pass-through of the
+// CP-local maintenance agent's GET /v1/status (see maint_agent_status_api.go).
+// Answers "is my host-root agent healthy, what version, is the compose stack
+// really up" from the GUI - no SSH/systemctl.
+async function loadMaintAgentStatus() {
+  const el = document.getElementById('support-maint-agent');
+  if (!el) return;
+  el.innerHTML = '<p class="hint">Loading…</p>';
+  el.setAttribute('aria-busy', 'true');
+  try {
+    const data = await api('/api/maintenance-agent');
+    renderMaintAgentStatus(data);
+  } catch (e) {
+    el.innerHTML = '<p class="hint">Failed to load agent status: ' + escHtml(e.message) + '</p>';
+  } finally {
+    el.removeAttribute('aria-busy');
+  }
+}
+
+function renderMaintAgentStatus(data) {
+  const el = document.getElementById('support-maint-agent');
+  if (!el) return;
+  data = data || {};
+  if (!data.available) {
+    el.innerHTML = '<p class="hint">Not available' + (data.reason ? ': ' + escHtml(String(data.reason)) : '') + '.</p>';
+    return;
+  }
+  const rows = [];
+  if (data.agent_version) rows.push(['Version', escHtml(String(data.agent_version))]);
+  if (data.privilege_mode) rows.push(['Privilege mode', escHtml(String(data.privilege_mode))]);
+  rows.push(['Compose stack', data.compose_stack_up
+    ? '<span style="color:var(--green)">up</span>'
+    : '<span style="color:var(--red);font-weight:600">down' + (data.compose_error ? ' - ' + escHtml(String(data.compose_error)) : '') + '</span>']);
+  if (data.last_operation_kind) {
+    rows.push(['Last operation', escHtml(String(data.last_operation_kind)) + (data.last_operation_state ? ' (' + escHtml(String(data.last_operation_state)) + ')' : '')]);
+  }
+  let warning = '';
+  if (data.privilege_warning) {
+    warning = '<p class="hint" style="color:var(--red);font-weight:600">' + escHtml(String(data.privilege_warning)) + '</p>';
+  }
+  el.innerHTML = warning + '<table class="tbl" style="width:100%">' +
+    rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('') + '</table>';
 }
 
 // M7 Slice 1: read-only preview only — GET /api/support/telemetry/preview
@@ -17292,6 +17489,34 @@ async function loadCAMgmt() {
     } else {
       fcBanner.style.display = 'none';
     }
+    const mtlsStatus = document.getElementById('mtls-client-cert-status');
+    const mtlsExpiryWrap = document.getElementById('mtls-client-cert-expiry-wrap');
+    const mtlsErrBanner = document.getElementById('mtls-client-cert-error-banner');
+    const mtlsExpiredBanner = document.getElementById('mtls-client-cert-expired-banner');
+    if (!ocsp.mtlsClientCertConfigured) {
+      mtlsStatus.textContent = 'Not configured';
+      mtlsStatus.style.color = 'var(--muted)';
+      mtlsExpiryWrap.style.display = 'none';
+      mtlsErrBanner.style.display = 'none';
+      mtlsExpiredBanner.style.display = 'none';
+    } else if (ocsp.mtlsClientCertLoaded) {
+      const days = ocsp.mtlsClientCertDaysRemaining;
+      const expired = typeof days === 'number' && days < 0;
+      mtlsStatus.textContent = (expired ? 'Expired' : 'Loaded') + ' (' + (ocsp.mtlsClientCertFile || '') + ')';
+      mtlsStatus.style.color = expired ? 'var(--red,#dc3545)' : (typeof days === 'number' && days < 14) ? 'var(--yellow)' : 'var(--green)';
+      mtlsExpiryWrap.style.display = '';
+      document.getElementById('mtls-client-cert-expiry').textContent =
+        (ocsp.mtlsClientCertNotAfter || '-') + (typeof days === 'number' ? ' (' + days + 'd)' : '');
+      mtlsErrBanner.style.display = 'none';
+      mtlsExpiredBanner.style.display = expired ? '' : 'none';
+    } else {
+      mtlsStatus.textContent = 'Load failed';
+      mtlsStatus.style.color = 'var(--red,#dc3545)';
+      mtlsExpiryWrap.style.display = 'none';
+      mtlsErrBanner.style.display = '';
+      mtlsExpiredBanner.style.display = 'none';
+      document.getElementById('mtls-client-cert-error-detail').textContent = ocsp.mtlsClientCertLastError || '';
+    }
   }
   // Dual-CA overlap status.
   const dcaStatus = document.getElementById('dca-status');
@@ -18114,6 +18339,19 @@ async function loadClusterRateLimits(show) {
     document.getElementById('crl-nodes').textContent = r.syncing_nodes || 0;
     document.getElementById('crl-hot').textContent = r.hot_ips || 0;
     document.getElementById('crl-rpm').textContent = r.rate_limit_rpm || 'Off';
+    // CHAOS-61: a stale broadcast is not an error — it is the gate that stops a
+    // frozen Control Plane snapshot from denying a client forever — but it IS a
+    // degradation of the distributed limit, and a 429 on this node no longer
+    // reflects cluster-wide traffic while it holds.
+    const staleBanner = document.getElementById('crl-stale-banner');
+    if (r.enabled && r.remote_counts_stale) {
+      staleBanner.style.display = '';
+      document.getElementById('crl-stale-detail').textContent = r.remote_counts_applied
+        ? `Last Control Plane broadcast was ${Math.round(r.remote_counts_age_secs)}s ago (limit ${Math.round(r.remote_counts_max_age_secs)}s).`
+        : 'No Control Plane broadcast has been received yet.';
+    } else {
+      staleBanner.style.display = 'none';
+    }
   } catch(e) { panel.style.display = 'none'; }
 }
 
@@ -18256,7 +18494,7 @@ async function createBandwidthPolicy() {
 }
 
 async function deleteBandwidthPolicy(name) {
-  if (!await confirmAction('Delete Bandwidth Policy', `Delete bandwidth policy "${name}"? Rate limits will no longer apply.`)) return;
+  if (!await confirmAction('Delete Bandwidth Policy', `Delete bandwidth policy "${name}"? It is not currently enforced, but will no longer sync to the cluster or appear in configuration exports.`)) return;
   try {
     await api('/api/cluster/bandwidth?name=' + encodeURIComponent(name), { method: 'DELETE' });
     loadBandwidthPolicies(true);
@@ -18466,14 +18704,38 @@ async function loadHA(isCP) {
       // Fencing-lease posture (ADR-0005): startup-scoped config, status-only here.
       const leaseVal = document.getElementById('ha-lease-val');
       const leaseNote = document.getElementById('ha-lease-note');
+      const leaseRecoveryBanner = document.getElementById('ha-lease-recovery-banner');
       if (r.lease_mode === 'lease') {
         leaseVal.innerHTML = r.lease_valid
           ? `<span style="color:#22c55e">● held</span><br><span style="font-size:.65rem;color:var(--muted)">epoch ${escHtml(String(r.epoch))}</span>`
           : '<span style="color:#ef4444">○ not held</span><br><span style="font-size:.65rem;color:var(--muted)">writes fenced</span>';
         leaseNote.style.display = '';
+        // CHAOS-55: this node holds the LEADER role but not the fence - a state
+        // that must page. "recovering" (the background re-acquire loop is
+        // armed) and "stuck" (it gave up; a foreign holder took the lease, or
+        // there is no recorded ex-standby to resync from) look identical on
+        // every other surface, so call it out explicitly here rather than
+        // leaving the operator to infer it from /metrics or /healthz.
+        if (r.role === 'leader' && !r.lease_valid) {
+          if (r.lease_recovering) {
+            leaseRecoveryBanner.style.background = 'rgba(245,158,11,.12)';
+            leaseRecoveryBanner.style.color = '#f59e0b';
+            leaseRecoveryBanner.innerHTML = '<strong>Recovering write authority…</strong> the fencing lease was lost and this node is automatically retrying in the background (no operator action needed yet). ' +
+              escHtml(String(r.lease_reacquire_attempts || 0)) + ' attempt(s) so far this run' +
+              (r.lease_reacquired_total ? ', ' + escHtml(String(r.lease_reacquired_total)) + ' recovered previously' : '') + '.';
+          } else {
+            leaseRecoveryBanner.style.background = 'rgba(239,68,68,.12)';
+            leaseRecoveryBanner.style.color = '#ef4444';
+            leaseRecoveryBanner.innerHTML = '<strong>Write authority lost and recovery is not active.</strong> This node still holds the leader role but is running read-only, and it is not currently retrying - most likely another node already holds the fencing lease. Check <code>diagnose etcd</code> / peer status and promote or restart as needed; see docs/operator/ha-lease-recovery.md.';
+          }
+          leaseRecoveryBanner.style.display = '';
+        } else {
+          leaseRecoveryBanner.style.display = 'none';
+        }
       } else {
         leaseVal.innerHTML = '<span style="color:var(--muted)">none</span>';
         leaseNote.style.display = 'none';
+        leaseRecoveryBanner.style.display = 'none';
       }
       // Manual-failover button: only a standby can be promoted.
       document.getElementById('ha-promote-row').style.display = (r.role === 'standby') ? '' : 'none';
@@ -18976,6 +19238,19 @@ function resetBlockPage() {
              on its own) or has stopped entirely (the listening socket is gone —
              restart required). Fires once per episode, never per retry. -->
         <label style="display:flex;align-items:center;gap:5px;font-size:.84rem"><input type="checkbox" class="wh-event" value="socks5_listener_down"> SOCKS5 listener not accepting connections</label>
+        <!-- CHAOS-57: threat intelligence has not synced successfully for over 2x the
+             sync interval, or has never synced on this node. Last-known-good entries
+             keep being enforced throughout — this is degraded freshness, not a dark
+             control. Fires once per episode, cleared by an observed clean sync. -->
+        <label style="display:flex;align-items:center;gap:5px;font-size:.84rem"><input type="checkbox" class="wh-event" value="threat_feed_stale"> Threat feed stale (intelligence not refreshing)</label>
+        <!-- CHAOS-57: the credential-verification cost governor has been refusing
+             authentication attempts for a sustained period. bcrypt costs ~80 ms of a
+             core and runs on the per-request proxy-auth path, so verification is
+             bounded deliberately; hitting that bound means either a credential flood
+             or a node undersized for its login volume. Proxy auth fails CLOSED while
+             it persists, so valid credentials may be denied. Fires once per episode,
+             never per denied request. -->
+        <label style="display:flex;align-items:center;gap:5px;font-size:.84rem"><input type="checkbox" class="wh-event" value="auth_verify_saturated"> Credential verification saturated (auth failing closed)</label>
         <!-- RISK-027 / OVN-16: MCP Agent Security Gateway enablement was requested but
              the capability is not serving (port in use, startup failure, or the
              listener stopped on its own). Fires once per episode, evaluated on a
@@ -21378,6 +21653,14 @@ function mcpxHealthCard(name, cap){
   mcpxRfKv(dl,'Accepted conns', rt.accepted_conns);
   mcpxRfKv(dl,'Rejected conns', rt.rejected_conns);
   mcpxRfKv(dl,'In flight', rt.in_flight);
+  mcpxRfKv(dl,'Requests total', rt.requests_total);
+  mcpxRfKv(dl,'Requests rejected', rt.requests_rejected);
+  mcpxRfKv(dl,'Queued', rt.queued);
+  mcpxRfKv(dl,'Timeouts', rt.timeouts);
+  mcpxRfKv(dl,'Auth failures', rt.auth_failures);
+  mcpxRfKv(dl,'Ambiguous headers rejected', rt.ambiguous_headers);
+  mcpxRfKv(dl,'Host/Origin mismatches rejected', rt.host_origin_failures);
+  mcpxRfKv(dl,'Observation events dropped', rt.observe_drops);
   mcpxRfKv(dl,'Servers', cap.servers);
   mcpxRfKv(dl,'Quarantined tools', cap.quarantined_tools);
   mcpxRfKv(dl,'Review required tools', cap.review_required_tools);

@@ -35,6 +35,529 @@ everything else is triaged below with a suggested PR and required tests for foll
 > placeholder row, is what would actually prevent it. Renumbering now means
 > rewriting identifiers three merged PRs already reference, so it is an OWNER
 > decision, not a unilateral edit — recorded here rather than silently "fixed".
+>
+> **The request-history sweep (§31) collided FOUR TIMES and renumbered itself
+> every time, while still unmerged.** It first took `CHAOS-57` alongside the
+> hijacked-tunnel sweep (§25); §25 merged first, so it kept the id and this one
+> moved to `CHAOS-59` (`CHAOS-58` having gone to §26). Within the same day the
+> intelligence-feed sweep (§27) landed on `CHAOS-59` too, so it moved to
+> `CHAOS-60` — the next day the GeoIP sweep (§28) merged holding `CHAOS-60`, so
+> it moved to `CHAOS-61` — the day after that the cluster rate-limit sweep
+> (§30) merged holding `CHAOS-61`, so it moved to `CHAOS-62` — and within the
+> hour the request-history sweep (§31) merged holding `CHAOS-62`, so it moved
+> once more, to **`CHAOS-63`**. That last one is the sharpest instance: this
+> sweep's move ONTO `CHAOS-62` and §31's were made independently, minutes
+> apart, from the same merged tree — which is exactly why "take the next free
+> id" cannot be the tie-break (see the §32 revision-log entry).
+> Counting the other sweeps' own collisions (the intelligence-feed sweep's two,
+> and §30's, whose revision-log entry records that it was itself numbered "at
+> the THIRD attempt" after running as `CHAOS-57` and then `CHAOS-60`), that is
+> **at least ten occurrences across six sweeps in about seventy-six hours**.
+> The pattern is not bad luck, it is the default, and it is getting more
+> frequent as more sweeps run concurrently.
+>
+> **An id that has to be rewritten four times is itself the evidence.** Each
+> renumber was individually cheap and correct, and the sequence is still pure
+> waste: every one of them touched ~15 files, invalidated the PR description's
+> gate names, and bought nothing a committed placeholder row would not have
+> bought for free on day one. Do not read the convention below as a solution —
+> it is the bandage. The fix is allocation.
+>
+> **Two sweeps have now independently converged on the same fix while colliding
+> with each other**, which is the strongest argument available that the
+> convention is not enough: §30's own entry reaches the identical conclusion
+> from the other side of the same collision. The next sweep to open should
+> claim its id in a committed placeholder row in this file as its FIRST commit,
+> before any code is written — that is the whole remedy, and it costs one line.
+>
+> Both sweeps independently arrived at the same rule, which is the one to
+> follow until the durable fix exists: **an id is rewritable for free right up
+> until its first merge, and needs owner sign-off the moment after — so the
+> sweep that is still an open PR renumbers ITSELF, and does not leave the
+> collision for a later owner decision.** That is the whole difference between
+> these cases and the `CHAOS-50` one above, where all three had already merged.
+>
+> Three further cautions this episode produced, all learned the expensive way.
+> **A merge-conflict resolver is not a substitute for allocating the id**: the
+> automatic main-merges renumbered the SECTION heading each time and left the
+> `CHAOS-` id colliding, so the document silently ended up with two §-numbers
+> claiming one id. **"Keep both sides" is wrong for a line that is a LIST, not
+> an entry**: one of these merges resolved `CLAUDE.md`'s `internal/` package
+> inventory — a single line naming every package — by keeping both versions,
+> leaving the file with two contradictory inventories (`66 packages` and `67
+> packages`) that no test reads and no build rejects. It survived two further
+> merges, and the later reader (this sweep) then "fixed" the stale half by
+> editing the OTHER line, which looked right and left the contradiction intact.
+> A conflict in an enumerating line needs the two sides UNIONED, never stacked.
+> And **the only reason any of this was caught is that all four sweeps happened
+> to edit THIS file** — sweeps touching disjoint code merge cleanly and collide
+> in silence. The durable fix is still the one recorded above (allocate the id
+> in a committed placeholder row at the START of a sweep), and at six
+> occurrences it is well past overdue.
+
+**2026-09-02 — CHAOS-58 sweep (the directory that accepts and then stops answering).**
+CHAOS-47 solved the *unreachable* directory: fail closed, arm a provider-wide cooldown, deny
+without dialing, recover on evidence. This sweep asked which faults can actually ARM that
+machinery, and the answer is the finding: **the cooldown is armed by an error that RETURNS**, so
+every mitigation it built sits downstream of a value a hung call never produces. `LDAPAuth.verify`
+dialed with a 10 s dialer timeout and then ran up to four blocking operations with no deadline of
+any kind — go-ldap defaults to `requestTimeout: 0`, which arms no timer at all, so `Bind` and
+`Search` wait on a bare channel receive. A directory that completes the TCP handshake and then goes
+silent (overloaded server, firewall dropping established flows, half-open socket after a peer
+reboot, hung VM) blocked the **request goroutine forever** — no error, no counter, no log, no health
+movement — pinning a goroutine, a socket, an FD and a per-IP connection slot per authenticating
+request, permanently. FD exhaustion is the recorded terminal state of PX-6/WK-11 and the entry point
+to CHAOS-54's SOCKS5 findings, so the fault feeds an amplifier this register already documents. The
+asymmetry that hid it: the ADMIN directory-test endpoint already called `conn.SetTimeout`; the
+per-request production path did not — the bounded path is the one clicked occasionally, the
+unbounded one is the one every request takes. Shipped: ONE 10 s end-to-end envelope, deliberately
+the same budget this process already gives one OIDC introspection (the CHAOS-53 "both back ends
+share one budget" rule, applied to the credential back ends), enforced in two NON-redundant layers —
+a per-message timeout, plus a connection watchdog for the post-StartTLS `tls.Handshake()` that
+go-ldap runs on the raw socket outside its own timer, verified against the library and kept as a
+permanent defect proof. No new metric, no new alert, no new operator vocabulary: a stall now
+produces exactly what a down directory produces. 9 gates; all six defect gates verified failing
+against the pre-fix tree. See rows AU-5 (re-scored M→H) and AU-14, §25, and
+`docs/operator/ldap-directory-stalls.md`.
+**2026-09-03 — CHAOS-59 sweep (the intelligence-feed plane under origin outage).**
+*(Numbered CHAOS-59/§27 on merge, at the SECOND attempt. This sweep ran concurrently with two
+others and collided with both: it first took `CHAOS-57`/`§25` alongside the hijacked-tunnel sweep
+(§25), renumbered to `CHAOS-58`/`§26`, and within hours collided AGAIN with the directory-stall
+sweep (§26) that took the same id. That is the THIRD and FOURTH occurrences of the collision this
+section's header warns about, both on one PR, in one afternoon. The pattern is now unambiguous:
+concurrent sweeps in this repository collide by default, and the only reason either was caught is
+that all three happened to edit THIS file — sweeps touching disjoint code merge cleanly and collide
+silently. The second collision also shows the failure surviving its own remedy: the automatic
+main-merge renumbered the SECTION (§26→§27) and left the `CHAOS-` id colliding, so a
+merge-conflict resolver is not a substitute for allocating the id. Each time, the already-merged
+sweep kept the id and this one moved — renumbering an id that merged PRs reference stays the owner
+decision the header records. The header's own recommendation — allocate the id at the START of a
+sweep in a committed placeholder row — would have prevented all four, and is now overdue rather
+than advisable.)*
+Culvert ships THREE periodic feed schedulers and only the newest one — the signed SaaS
+feed's `saasFeedScheduler` — backs off, jitters, or reports. The two older loops
+(`internal/threatfeed`, `internal/feedsync`) were bare `time.NewTicker`s with the round's
+outcome discarded, and the consequences compound in three directions. **Cadence:** a ticker
+has no notion of failure, so a failed round waited a FULL interval — six hours for threat
+intel, twenty-four for categories — and the triggering fault is a DNS blip or a 503, not an
+exotic one. **Cold start:** `Start` syncs immediately when the on-disk DB is empty, so a
+fresh or re-imaged node whose FIRST round failed enforced with an EMPTY threat database — not
+stale intelligence, none — for up to six hours, with every probe reporting a healthy node.
+**Fleet:** a ticker fires at a fixed offset from process start, so nodes that boot together
+sync together forever, against public third-party origins shared by every deployment (one of
+them a 50+ MB tarball on `raw.githubusercontent.com`); the ordinary answer is rate-limiting
+of the customer's egress IP, which PRODUCES the failure the absent backoff then holds the
+fleet at. And none of it was visible: **the carry-forward that closed WK-5's stale-erase half
+also consumed the only detector**, because it holds `culvert_threat_feed_entries` at its
+last-good value by design — so a feed dead for three weeks exported metrics byte-identical to
+one that synced ten minutes ago, and the sole surviving difference reached one role-gated
+admin JSON field nothing scrapes. Shipped: `internal/feedsched` (one shared cadence engine —
+bounded backoff whose ceiling is CLAMPED below the interval, stable per-node ±10% jitter,
+interruptible waits, a panicking round charged as a failed one), both legacy loops migrated
+onto it, and a staleness plane (five `culvert_threat_feed_*` series emitted only when
+configured, a `threat_feed` contract row, a fire-once `threat_feed_stale` alert on a BOUNDED
+reason class, recovery on observed evidence only). Deliberately NOT added: a `/readyz` row or
+a fail-closed toggle — a stale deny-list is a fully serving gateway, and blocking traffic
+because a third-party feed is unreachable converts a provider's outage into the customer's.
+35 gates, the cadence ones failing against the bare-ticker shape by construction, with four
+CONTROLS (an immediate retry, a ceiling above the interval, and an always-firing alert each
+pass a defect gate while being worse than the defect). See rows WK-5/WK-5b/WK-5c/WK-6/WK-13b,
+§27, and `docs/operator/threat-feed-freshness.md`.
+> **⚠️ `CHAOS-57`, THEN `CHAOS-58`, THEN `CHAOS-59` were each CLAIMED TWICE by
+> the same open PR — the renumber lost the race three times running, because
+> "take the next free id" is a rule every concurrent sweep computes identically.**
+> Two sweeps ran concurrently in September 2026 and each took 57:
+> §25 (the hijacked-tunnel plane on the way out, merged via #1288) and the GeoIP
+> resolution chain (PR #1339). The collision surfaced as a merge conflict in
+> this file — both appended a `## 25. CHAOS-57` at the same position — which is
+> the FOURTH occurrence of the governance failure recorded above, and the first
+> one caught before both halves were merged.
+>
+> **That is exactly why it could be fixed rather than recorded.** The rule the
+> `CHAOS-50` note states — renumbering is an owner decision once merged PRs
+> reference the id — turns on whether the identifier has escaped. Here one had
+> and one had not: §25 was merged and keeps `CHAOS-57`; the GeoIP sweep was
+> still an open PR, so it took the next free id (`CHAOS-58`) and renumbered to
+> §26, along with every source comment, `CLAUDE.md` note, operator runbook and
+> register row that cited it. Nothing merged was rewritten.
+>
+> The asymmetry is the lesson, not the fix: the cheap moment to resolve a
+> collision is while one side is still unmerged, and the only reason this one
+> was noticed then is that both sweeps happened to append to the same file at
+> the same offset. Two sweeps touching disjoint files would have collided
+> silently and merged clean. The START-of-sweep placeholder row recommended
+> above remains unimplemented and remains the actual prevention.
+
+> **It then happened AGAIN, to the renumber itself, within hours.** The GeoIP
+> sweep was moved to `CHAOS-58` on 2026-09-10; by the next merge of `main` that
+> id was taken too — §26, the directory that accepts and then stops answering,
+> merged via #1286 while this PR was still open. So the sweep moved a second
+> time, to **`CHAOS-59` / §27**, by the identical rule: `main` holds the id, the
+> open PR yields. That rule is stable and cheap to apply. **It is also not a
+> fix, and the second collision is the proof.**
+>
+> The mechanism is a RACE, not a mistake, and renumbering runs the race again.
+> An id is chosen when a sweep is written and validated only when it merges, so
+> every sweep open across another sweep's merge is exposed, and an open PR that
+> renumbers is exposed AGAIN for as long as it stays open — a PR that lives
+> across N merges of sweep work can be renumbered N times, each time touching
+> every source comment, gate name, register row and doc that cites it. The cost
+> is not the edit; it is that the identifier in a merged commit message, a
+> review thread, or someone's notes now names a different sweep.
+>
+> **And then a THIRD time — which finally shows WHY the rule cannot converge.**
+> The GeoIP sweep took `CHAOS-59` / §27 on 2026-09-10; by the next merge of
+> `main`, that id was taken too — §27, the intelligence-feed plane under origin
+> outage. So the sweep moved a third time, to **`CHAOS-60` / §28**, same rule,
+> same afternoon, third application.
+>
+> Read the intelligence-feed sweep's own revision-log entry above and the
+> mechanism stops looking like bad luck: **it walked the identical path.** It
+> took `CHAOS-57`, collided with the hijacked-tunnel sweep and moved to
+> `CHAOS-58`, collided with the directory-stall sweep and moved to `CHAOS-59` —
+> and landed on the number the GeoIP sweep had just moved to for exactly the
+> same two reasons. Two sweeps, renumbering independently, in the same window,
+> produced the same sequence and collided at every step of it.
+>
+> That is the part worth keeping. **"Take the next free id" is not a
+> tie-breaker; it is a shared deterministic function of the same input.** Every
+> concurrent sweep computes "next free" against the same `main`, so they all
+> compute the SAME answer, and a collision does not disperse them — it moves
+> them together. The remedy behaves like the fault, which is why applying it
+> three times produced three collisions rather than converging. Nothing here
+> was done wrong; the rule cannot succeed against a concurrent peer running it.
+>
+> All three collisions were caught only because every side appended a heading to
+> THIS file at the same offset, so git surfaced them as a conflict. Nothing
+> checks the id itself. Two sweeps whose write-ups land in different sections —
+> or whose source comments collide but whose documents do not — merge clean and
+> silently share an id, which is exactly how `CHAOS-50` came to name three
+> sweeps.
+>
+> The placeholder row is still the prevention, and it now has a third piece of
+> evidence behind it — the strongest, because it is the one that shows the
+> current rule is not merely expensive but non-convergent: **allocate the id in
+> a committed row on `main` BEFORE the sweep is written**, so the claim is
+> visible to every concurrent sweep at the moment it picks a number, the
+> allocation is serialised by `main` rather than recomputed independently by
+> each PR, and a duplicate is a merge conflict on one line instead of a rename
+> across a dozen files. A cheap approximation while that is unimplemented:
+> prefer citing a sweep by SECTION and title, and treat the `CHAOS-nn` id as a
+> label that may move until the sweep merges.
+
+**2026-09-01 — CHAOS-57 sweep (the hijacked-tunnel plane on the way out).** CHAOS-56 bounded
+the shutdown sequence end to end and made the drain honour its phase deadline. It did not ask the
+prior question: **does the drain see what it is draining?** It does not. `drainActiveTunnels` waits
+on ONE number, `activeConns`, and **four of Culvert's seven hijacked-tunnel classes never touched
+it** — both non-TLS inspect fallbacks (strip and native), WebSocket, and SOCKS5. A hijacked conn is
+invisible to `http.Server.Shutdown` by construction, and `socks5Server.Stop` waits only for the
+ACCEPT LOOP while every session runs in a detached `go handleSOCKS5(conn)` — a deferral that file's
+own header records ("In-flight SOCKS5 tunnels are NOT drained… tracked for Phase 2"). So for those
+four classes nothing waited and nothing closed them: they ran until process exit and the kernel
+reset them. **PX-8**, registered since the first sweep. Three consequences, all silent. (1) **One
+fault, two postures** — a CONNECT tunnel gets 15 s of grace on SIGTERM; a WebSocket or an
+SSH-over-SOCKS5 session on the same node at the same instant gets none, decided by which
+`recordActiveConn` call site the code path happened to pass. (2) **The accounting for every severed
+tunnel is lost** — `recordTunnelClose*` runs only after both relay goroutines drain, so every
+graceful shutdown dropped the bytes and duration of every in-flight raw tunnel from the request log,
+the JSONL export, the SIEM feed and the dashboard totals; across a rolling fleet upgrade that is
+systematic, not incidental. (3) **The drain's own log line undercounts** — "Draining 0 active
+tunnel(s)" on a node severing hundreds of sessions, and `activeConns` is the dashboard field an
+operator sizes FD budgets from. **The finding inside the finding is why counting alone would have
+been the WRONG fix**: long-lived is what WebSocket and SOCKS5 are FOR, so a drain that waits on them
+with no way to END the wait hits its deadline on every shutdown, turning an instant restart into a
+guaranteed 15 s one across a fleet — and severs them anyway. The wait only earns its cost if it ends
+in a deterministic teardown, which is the argument PR3d already made for inspected H2. Shipped: a
+per-class registry holding both legs of every hijacked tunnel, a drain-deadline force-close backstop
+covering all five classes (so each relay's `io.Copy` returns and its accounting is written), a
+bounded settle clamped to the phase budget that keeps that accounting ahead of the FLUSH hooks
+instead of leaving the ordering to luck, and `culvert_tunnels_active{class}` +
+`culvert_tunnel_drain_forced_total`. A **PX-4 residual** was found alongside and closed:
+`relayPlaintextInspectFallback` was the ONE relay goroutine in the tree with no panic guard, so a
+panic there killed an in-line security appliance and dropped every other in-flight tunnel with it.
+15 gates; every defect gate verified failing against its reintroduced pre-fix shape, plus controls
+for the two cheapest wrong fixes (force-close at drain START — which passes every defect gate while
+being strictly worse than the defect — and a non-idempotent release, whose negative gauge restores
+the original blindness by accident). See rows PX-4/PX-8, §25 and
+`docs/operator/tunnel-drain-on-shutdown.md`.
+**2026-09-07 — CHAOS-60 sweep (the GeoIP resolution chain under a failing resolver).**
+This sweep started from a row in this document that said a path was SAFE. Row
+WK-3 recorded that `geo.LookupCached` — the accessor the per-request policy path
+uses for country-scoped rules — "never blocks on DB/DNS", marked ✓, citing
+`geoip.go:84-93`. Those lines are now the body of a function that did not exist
+when the row was written. **GEO-1**: the accessor called `resolveHost`, which on
+a cache miss called `net.LookupHost` — no context, no deadline, no way to
+abandon — inside the request goroutine, holding the client connection and its
+per-IP slot for the system resolver's full budget (10–40 s on a blackholed
+resolver). The same file already said so 380 lines earlier, in the comment
+explaining why `Evaluate` releases its lock before the scan; two comments, one
+saying the geo check cannot block and one explaining the locking discipline
+required because it can. There was no single-flight either, and the negative
+entry that suppresses the next lookup is only written when a lookup RETURNS — so
+in exactly the window where lookups do not return, nothing suppresses the next
+one, and the proxy amplifies client request rate 1:1 into queries at an
+already-failing resolver (measured pre-fix: 50 concurrent misses for one host →
+50 resolver invocations). **GEO-2**, found in the sweep and worse: after the
+resolution, the country half is read from a cache that on the request path had
+exactly ONE populator — `trackDestinationCountry`, a best-effort dashboard
+sampler that runs on the ALLOW branch only and drops its work when its 256-slot
+pool is full. Country-scoped policy ENFORCEMENT therefore depended on a
+telemetry goroutine having won a semaphore slot on an earlier request; saturate
+the sampler and every country rule silently stops matching, with the rule's hit
+counter reading exactly like "no traffic matched this rule". Shipped: a
+genuinely cache-only accessor that fails closed and arms a bounded (64,
+drop-on-full), single-flighted, off-path warm; the warm fills BOTH caches, so
+enforcement owns its own populator; and six `culvert_geo_*` series, of which
+`culvert_geo_policy_unresolved_total` is the first signal an operator has ever
+had that a geo rule is evaluating against an unknown country. The first-request
+window is unchanged and recorded as an owner decision (WK-3c). See §28.
+**2026-09-06 — CHAOS-57 sweep (credential verification as an unbounded, unauthenticated CPU sink).**
+The register carried **AU-3** as an open Medium — *"correct-username + N wrong-passwords is a cache
+miss every time"* — which described an attack requiring a valid username and categorised the
+consequence as latency. Both halves understated it. **The cheap branch is the WRONG-username branch
+and the consequence is a gateway-wide outage.** `verifyAuthWithSnapshot` ran an unconditional bcrypt
+against a fixed dummy hash whenever the username did not match — RISK-008's timing equaliser, which
+exists for a good reason — but it sat BEFORE the result cache and never populated it, so a flood of
+distinct usernames was a guaranteed miss every time. No credential, no valid username, no knowledge
+of the deployment. And nothing stood in front of it: the per-IP connection limiter, the request rate
+limiter (`-rate-limit`, default 0) and the IP filter all ship DISABLED, and nothing capped
+concurrency. Measured on the 4-core reference box: **79.6 ms of exclusive CPU per ~200-byte request
+(51,631x a cached auth); 66 req/s — about 13 KB/s on the wire — consumed 100% of all four cores; other
+CPU work degraded 15.6x under 64 attacker connections.** Two amplifiers sat beside it: the result
+cache evicted **one arbitrary LIVE entry** at capacity, so a flood displaced honest users' cached
+positives (measured: gone by a 2x-capacity flood, after which the victim paid a full bcrypt on every
+request — the attacker's amplification landing on legitimate traffic, the `internal/authstate`
+finding standing unchanged one subsystem over), and its expired-entry scan is O(cache) under the
+process-wide mutex at 64 µs per insertion. **The finding inside the fix:** gating only the branch
+that reaches the real hash — the obvious fix, and the one written first — makes "over budget" fast
+for a wrong username and slow for a wrong password, handing back exactly the username-enumeration
+oracle RISK-008 removed. The admission decision is therefore taken BEFORE the username is compared
+and cannot depend on it; the gate that pins this was verified failing against that asymmetric shape.
+Shipped: `internal/authcost` (global ceiling of GOMAXPROCS/2, per-client ceiling of 1, bounded wait
+with a BOUNDED queue — an unbounded one would trade CPU exhaustion for goroutine exhaustion), the
+`internal/authstate` fair-eviction policy ported to the result cache, and a full observability plane
+(eight series, a `credential_verification` contract row, a rate-limited log pair, and a
+fire-once-per-episode `auth_verify_saturated` alert with evidence-based recovery). Bounds are
+CONSTANTS by design — a knob here could only widen a DoS window — with an order of magnitude of
+headroom over real demand. 34 gates; eleven defect gates verified failing against the shape each replaces. A SECOND finding inside the fix, caught in self-review and fixed on the branch: moving the cache lookup ahead of the username comparison made a latent NON-INJECTIVE cache key (`user + ":" + pass`) reachable with a caller-chosen username — an AUTHENTICATION BYPASS whenever the configured password contains a colon. `cacheKey` is now length-framed. **AU-3e**, a
+PRE-EXISTING username-enumeration oracle reached by repetition (wrong-username negatives are not
+cached, correct-username ones are), is recorded and deliberately NOT fixed here: closing it changes a
+security control's behaviour and deserves its own review. See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, §25,
+and `docs/operator/credential-verification-cost.md`.
+**2026-09-08 — CHAOS-61 sweep (the Data Plane's outbound cluster state under a Control
+Plane outage).**
+*(Numbered CHAOS-61/§30 on merge, at the THIRD attempt. This sweep ran as `CHAOS-57`/§25 and
+collided with the hijacked-tunnel sweep, which merged first and kept the id; an intervening
+main-merge moved the SECTION to §27 and left the `CHAOS-` id colliding, so the tree carried TWO
+different sweeps stamped `CHAOS-57` — two `## ` sections here and two Architecture Notes in
+`CLAUDE.md`. Renumbered to `CHAOS-60`/§28 — and within a day collided AGAIN, with the GeoIP
+resolution sweep that took `CHAOS-60` concurrently and merged first; that merge once more moved
+the SECTION (§28→§29) and left the id colliding, so two sweeps shared `CHAOS-60` and, in the same
+package, a `TestChaos60_` test-name prefix. Those are the FIFTH and SIXTH occurrences of the
+collision this section's header warns about, the second and third time a section-only renumber let
+the id survive its own remedy, and the second time it happened to THIS sweep specifically — a
+renumber is not a fix, because the next free id is exactly what every other concurrent sweep is
+also taking. Resolved both times by this section's established precedent: the already-merged sweep
+keeps the id and this one moved. The header's standing recommendation — allocate the id at the
+START of a sweep, in a committed placeholder row — would have prevented all six, and this sweep
+having to move twice is the clearest evidence yet that renumbering-on-merge cannot converge. A
+FOURTH main-merge then moved this section again, §29→§30, ahead of the credential-verification
+sweep that landed at §29 — this time with no id collision at all, because the id was already
+unique. That is the distinction the six collisions kept obscuring: a SECTION number is positional
+and every concurrent merge can change it, so it is not a handle anything may cite, while the
+`CHAOS-` id is stable the moment it is allocated. Cross-references should name the id; the three
+`§29` references this sweep had to fix on that merge are what a positional handle costs.)*
+Register row **HA-1** records the deliberate posture for a DP that loses its
+Control Plane — it keeps serving its last-known-good CONFIG — and that posture was reasoned about
+carefully. This sweep asked the adjacent question the row does not cover: what happens to the DP's
+other outbound cluster state, the per-tick loops that are not config sync at all. The same posture
+had been applied to data where it is not correct. **CL-20:** `clusterCounts.Apply` is reached from
+exactly one place, the gossip loop's SUCCESS branch, so a failed `SyncRateLimits` left the Control
+Plane's last per-IP broadcast FROZEN in memory and `AllowClusterAware` kept adding it to every
+local count for the rest of the process lifetime. An IP whose cluster-wide total happened to be at
+the limit when the CP went away — an ordinary NAT or corporate egress address, exactly the kind
+that gets hot — was thereafter denied on that node with a local count of ZERO: a total blackhole
+for that client, on a healthy proxy, cleared only by the CP returning or a restart, and
+indistinguishable in the log from a client genuinely sending too fast. The fix is arithmetic
+rather than posture — `RemoteCounts` means "the total in the CURRENT window", so past one window
+every timestamp it counted has aged out and its correct contribution is zero — and **the Control
+Plane had been applying that exact reasoning in the other direction all along**
+(`ClusterTotalsExcluding` prunes a node that has not reported for two minutes, so a dead DP's
+counts stop suppressing fleet traffic). The rule existed on one side of the link and not the
+other, and the side that lacked it is the one that decides allow/deny on live traffic.
+**CL-21:** the DP→CP audit push queue is correctly bounded at 1000 and correctly keeps the newest —
+but dropped with no counter, no metric and no log line, three hundred lines below this same
+package's documented contract for the durable path ("count EVERY failure, log only the FIRST"),
+and because `Requeue` prepends the events that just failed to send, the first thing discarded is
+the OLDEST unsent history: the beginning of whatever happened during the outage. Shipped: broadcast
+expiry derived from the live limiter window (with a negative age — clock rollback — failing toward
+the local decision, a disagreement between the enforcement and reporting paths that the sweep's own
+gate caught inside the first version of the fix), a freshness health plane armed only on a
+clustered node, counted audit-push drops, and 17 gates with every defect gate verified failing
+against the pre-fix tree. No new alert event: a stale broadcast is always the CP link, which
+already alerts. See rows CL-20/CL-21, §30 (CHAOS-61), and
+`docs/operator/cluster-rate-limit-freshness.md`.
+**2026-08-29 — CHAOS-62 sweep (the request-history store under a damaged data volume).**
+§19.6 opened row **R-E** and marked it *"next sweep candidate"*: `internal/logstore` calls
+`badger.Open` with the same uncatchable-panic exposure CHAOS-50 had just fixed for the category
+store — a corrupt `.sst` panics from a goroutine badger spawns, so no `recover()` at any call site
+contains it. Re-measured against THIS store's options (encryption on, 128 MiB value log) it
+reproduces exactly. **Both clauses of the deferral inverted on re-derivation.** *"Quarantining it
+silently is an evidence decision"* argues FOR the fix: the CHAOS-05/07 contract MOVES ASIDE, never
+deletes, so the evidence survives either way — what the deferral preserved was a crash-looping
+appliance whose history is equally unreadable and whose entire service is down as well. And
+*"bounded by being opt-in"* is backwards: opt-in means DURABLE in `admin_settings.json`, so one
+unclean kill becomes an **unattended crash loop** with no admin UI left to turn the setting back
+off, and it means reachable from the **LIVE ADMIN API**, so the toggle kills a gateway carrying
+production traffic rather than merely failing a boot. The clause meant to bound the severity was
+the mechanism that raised it. **Two further defects.** **LS-3:** on a KEYED store badger reports a
+changed passphrase, a lost salt and real KEYREGISTRY damage with the SAME error, and CHAOS-50's
+classifier lists that message as corruption on the explicit rationale *"this store is never opened
+with a key"* — so reusing it unmodified would have moved a HEALTHY store aside over an ordinary
+config change. That is why the classifier is now a per-store `Policy` that can only ever SUBTRACT.
+**LS-4:** `EncKey` minted and WROTE a fresh salt over an existing encrypted store whenever the
+sidecar was unreadable — destroying, on the READ path, the only value that could decrypt it, and
+leaving an error indistinguishable from a passphrase change so the operator's remedy became
+"purge". The codebase had already adopted that exact rule elsewhere (SEC-WHSIGN-1, *"a failed
+decrypt never mints a key"*); nothing was checking whether anywhere else did the same thing.
+Shipped: `internal/storeguard` (the CHAOS-50 engine extracted verbatim — a second copy would have
+duplicated the empirical badger message table that is pinned by a test precisely so an upgrade
+which rewords a message fails the build), `catdb` reduced to a thin adapter with its 21 recovery gates
+unchanged and green, `logstore.OpenResilientTTL`, the `EncKey` refusal, and a full health plane
+(`request_history` row, three `culvert_logstore_*` series, the existing `state_file_corrupt`
+alert). 37 new gates; every defect gate verified failing against the reintroduced pre-fix shape, plus
+a permanent defect proof that the bare open still panics uncatchably. R-E CLOSED. See §25 and
+`docs/engineering/CHAOS-ENGINEERING-REVIEW-2026-08-29.md`.
+**2026-09-05 — CHAOS-63 sweep (the public admin-login endpoint's untrusted username).**
+*(Numbered CHAOS-63/§32 on merge, at the SIXTH attempt. This sweep took `CHAOS-58`/`§25`, collided
+with the directory-stall sweep and moved to `CHAOS-59`/`§27`; collided with the intelligence-feed
+sweep and moved to `CHAOS-60`/`§28`; collided with the GeoIP sweep — which was itself renumbering
+for the third time in the same window — and moved to `CHAOS-61`/`§30`; collided AGAIN, with the
+DP-outbound-cluster-state sweep, which had reached `CHAOS-61` at its OWN third attempt (see its
+entry above), and moved to `CHAOS-62`/`§31`; collided a FIFTH time, with the request-history-store
+sweep, which had taken `CHAOS-62` independently and merged minutes later, and moved here. Five
+renumberings on ONE PR, spanning ~38 hours. Same rule each time, the one §27 records: the
+already-merged sweep keeps the id, the unmerged one moves.
+**What these rounds add to the §27 analysis is a boundary on the remedy, not more evidence of the
+fault.** Round two already showed a renumbering cannot prevent the next collision. Round three
+shows the stronger thing: BOTH sweeps in that collision were mid-renumbering, so the two remedies
+raced each other — the GeoIP sweep moved onto `CHAOS-60` while this one was moving onto the same
+id, and neither could have observed the other, because until a merge lands there is nothing to
+observe. Renumbering is a reconciliation, and two reconciliations against an unallocated namespace
+do not converge; they take turns. That is why the placeholder row §27 calls overdue is not an
+improvement to the current practice but a replacement for it: allocation has to happen BEFORE the
+work, in a committed artifact, or the only mechanism available is discovery-after-the-fact.
+**Round four sharpens that from a tendency into a mechanism.** Both sweeps in this collision had
+ALREADY renumbered three times each, and both independently arrived at `CHAOS-61` — because
+"the next free id" is a PURE FUNCTION of the merged tree, so every sweep renumbering in the same
+window necessarily computes the SAME answer. Renumbering to the next free id is therefore not a
+tie-break at all: between two concurrent sweeps it is a guarantee of collision, and the guarantee
+does not weaken as the namespace grows. Round three showed the two remedies racing; round four
+shows they were never racing toward different answers. A tie-break has to consume something the
+other party cannot also take — which is what a committed allocation is, and what a recomputation
+can never be.
+**Round five is that prediction confirmed inside the hour, and it is the reason this entry is
+worth keeping rather than trimming.** The round-four fix — moving to `CHAOS-62` — was itself
+computed from the merged tree and pushed; the request-history-store sweep had computed the SAME
+id from the SAME tree, independently, and merged minutes later. So the remedy for the fourth
+collision CAUSED the fifth, exactly as the paragraph above says it must. Note what this rules
+out: the failure is not haste, not inattention, and not a missing check — no amount of looking
+harder at the tree before renumbering can help, because the tree is precisely what both parties
+agree on. The bug is that the allocation step has no side effect until a merge lands, so two
+correct actors reading correct state produce the same answer; the only repair is to make
+allocation WRITE something, before the work, that the other actor must observe.
+Two secondary observations from these rounds. The automatic main-merge renumbers the SECTION
+heading and leaves the `CHAOS-` id colliding, so the resolver looks like it handled the conflict
+while the identifier people search by stays duplicated (§27 saw this too — it reproduces every
+time). And round one collided on the REGISTER as well (both sweeps took `AU-14`), which is the
+worse half: a duplicate section heading is visible on sight, a duplicate register row is not.
+The residual cost is unchanged and is not the edit — it is that `CHAOS-58`, `CHAOS-59`,
+`CHAOS-60` and `CHAOS-61` each name a different sweep in this PR's commit messages, review threads
+and notifications than they name in the merged tree.)*
+The
+first sweep in this register to ask what an *unauthenticated caller gets to write*, rather than
+what happens when infrastructure fails. `apiAuthLogin` is on the public allowlist and bounded
+nothing: the username reached two lockout maps (retained ≥ 10 min), the audit ring, and the
+durable audit JSONL — a 50 MB rotating file keeping ONE archive. Inside the endpoint's own
+60-POST/min limit, one client commits ~60 MiB/min of chosen bytes and rotates the entire retained
+compliance record away in under two minutes. The instrument built for exactly this outcome
+(`internal/audit`'s `writeErrors`, CWE-778) cannot see it, because **every one of these writes
+succeeds**. Closes AU-15/AU-16; the count axis is recorded open as AU-17. The sweep also found and MEASURED the
+same class on the **proxy data path** — `sanitizeLog(r.Host)` bounds nothing and the proxy server sets
+no `MaxHeaderBytes`, so one request with a 200 KB host writes 204,899 bytes to the process log and a
+204,812-byte `Host` field to the request log, on a port every client can reach. Recorded OPEN as
+**PX-21** rather than bundled: rejecting an over-long host is probably the right fix and is a
+data-plane behaviour change that needs its own review. See §31.
+**2026-09-09 — CHAOS-57 sweep (the admin UI listener, and which plane may kill which).**
+Every earlier sweep asked whether a subsystem survives its own failure. This one asked what
+a failing subsystem takes with it, and found the *least* critical listener in the process
+holding a lever over the *most* critical one. `startUI` spawned a detached listen goroutine
+whose ONLY error branch was `logFatalf` — `os.Exit(1)` — so **every way the ADMIN UI's
+listener could fail terminated the PROXY DATA PLANE with it**, asynchronously, against a
+process that had already announced itself as serving. Two triggers, both reproduced against
+the real binary and both routine operations: an occupied admin port (`validatePortCollisions`
+checks only Culvert's own three ports against each other, never the host) and an unreadable
+custom UI certificate (the pair is read at listen time, so any rotation that momentarily
+breaks it was a boot that ended in exit 1). Under `restart: unless-stopped` each becomes an
+unattended crash loop — no proxy, no admin UI, no health endpoint — which is exactly the
+outcome §19 closed for the category store, reached from the opposite direction. The defence
+that "exiting fails closed" does not survive contact: **process death picks no posture at
+all**, it delegates the choice to the topology — an explicit-proxy fleet loses all egress, a
+PAC fleet with a DIRECT fallback goes UNFILTERED. The codebase already knew the answer in two
+places, one of them inside the same function (a `selfSignedTLS()` failure degrades to HTTP
+rather than exiting; CHAOS-54 gave the SOCKS5 listener a gentler death than the admin UI had).
+Shipped: no listen path is fatal; an explicit bind so recovery can be declared on OBSERVED
+evidence; a rate-bounded, jittered, interruptible rebind loop; the certificate re-read on
+every attempt (so a rotation self-heals with no restart); the success log moved to AFTER the
+bind (it used to claim a listener that did not exist); and a full observability plane on the
+PROXY port — because the admin port's own `/healthz` cannot report that the admin port is
+unreachable. The `/ready` row is REPORT-ONLY by design and pinned as a control: failing it
+would eject a healthy gateway from the load balancer over its management plane. 15 gates; the
+defect gates were verified failing against the reintroduced pre-fix shape, where `logFatalf`
+kills the TEST BINARY mid-run and takes the package with it — so the defect cannot be
+reintroduced and kept green. **SOCKS5-BIND** (an occupied SOCKS5 port still takes down HTTP
+proxying) is recorded, not fixed: it is the same class one plane over, but a posture decision
+rather than a mechanical extension. See rows AP-1…AP-4/SOCKS5-BIND, §25, and
+`docs/operator/admin-ui-listener-recovery.md`.
+**2026-09-04 — CHAOS-64 sweep (destination-host DNS resolution on the policy path).** The
+sweep took the one failure domain the register had never entered: **DNS**, listed in the original
+scope and never swept, because it looks like somebody else's dependency. It is not — a
+`DestCountry` policy rule puts the customer's resolver on the critical path of every request that
+misses one process-wide cache, on the REQUEST goroutine, inside the policy scan. `policy.go`'s own
+comment names the hazard ("the scan can block → `geo.LookupCached` → DNS on an uncached
+DestCountry host") and the code drops the evaluation lock because of it, which is the right fix for
+the *lock* and no fix at all for the *request*. Behind that call sat `net.LookupHost` with **no
+deadline, no single-flight, no concurrency bound and no counter**. Three defects, each reproduced
+against the pre-fix tree: a wedged resolver held the request goroutine for the OS budget (5 s ×
+attempts × nameservers) while it owned a client connection and a per-IP connection-limiter slot;
+**200 concurrent requests for ONE host produced 200 resolver invocations**, so a brownout amplified
+by request rate straight back at the resolver that was already failing (the WK-13 herd, aimed at
+the customer's own DNS); and an expired entry was DISCARDED, so the first expiry during an outage
+took every popular host cold inside the same five-minute window. That third one is the security
+half and it is the register's §1 theme reached through a new door: a `DestCountry` rule that cannot
+determine a country does not match, a rule that does not match is SKIPPED, and evaluation continues
+to lower-priority rules — so **a "block sanctioned countries" rule silently stops enforcing while a
+broad allow rule beneath it takes over.** Geo blocking goes dark because DNS is slow, and nothing
+on this path counted, logged or alerted it. Shipped: a 2 s deadline via a context-aware seam;
+single-flight (concurrent callers inherit the leader's answer AND its deadline, never start a
+second lookup); a bounded resolver pool that SHEDS a distinct-host flood instead of queueing it,
+without caching the shed result; stale-while-revalidate with a one-hour ceiling, so **a host
+resolved in the last hour never blocks a request and never goes dark**, plus the guard that keeps a
+failed refresh from overwriting the servable answer it was supposed to renew; and the missing
+health plane — six `culvert_dns_resolve_*` series, a `dns_resolution` contract row, and a
+fire-once page on the EXISTING `dns_failure` event. NXDOMAIN is counted but excluded from
+degradation: the hostname is client-chosen, so counting it would let any client fabricate the page.
+The same sweep bounded `fireDNSFailureAlert`'s Detail, which was a raw `err.Error()` — a
+`*net.DNSError` embeds the queried hostname, so every failure minted a distinct dedup key the 30 s
+window could not suppress, and the fan-out evicted real threat alerts from the 500-entry retry
+queue (WK-12/RS-5, remotely triggerable). Deliberately NOT changed and recorded as residual: the
+fall-through posture itself (making an unknown country match a block rule would deny every
+destination this node cannot resolve — a bounded security gap traded for an unbounded availability
+one), and the cgo resolver's uncancellable `getaddrinfo` (the deadline releases the request
+goroutine; the OS thread is bounded by Go's own 500-thread cap). Gates:
+`dns_resolve_chaos_test.go` (23, incl. two CONTROLS — a resolver that simply stopped resolving
+would pass every defect gate while being far worse than the defect). See §28 and
+`docs/operator/dns-resolution-health.md`.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -412,16 +935,17 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | PX-1 | HTTPS CONNECT, WebSocket, and SOCKS5 dial the origin **directly** — the upstream parent-proxy pool is only wired into the plain-HTTP transport. Parent-proxy chaining silently applies to HTTP only. | GAP | H | `proxy.go:1374,1466`, `socks5.go:320`; pool only via `applyUpstreamProxy`→`getUpstreamTransport()` in `handleHTTP` `proxy.go:928` |
 | PX-2 | Circuit breaker / all-upstreams-down **fails open to direct** egress, bypassing the parent-proxy control. | GAP → **PARTLY CLOSED** (CHAOS-11: still fail-open by design, now counted + alerted + surfaced) | H | `internal/upstream/upstream.go:240,267` (`// all upstreams down — fall back to direct`) |
 | PX-3 | Raw relays (CONNECT bypass, WebSocket, non-TLS fallback) have **no idle/read deadline** — a half-open peer leaks a goroutine + FD + 128KB pooled buffer indefinitely. Only the SSL-inspect *request loop* arms a deadline. | GAP → **CLOSED** (CHAOS-03 `idleCopyCounted`, `proxy_tunnel.go`) | H | `bidiRelayCounted` `proxy.go:1431,1262`; contrast deadline at `proxy.go:1621` |
-| PX-4 | Spawned relay/async goroutines have **no `recover()`** — a panic in any propagates to the runtime and kills the process, dropping every in-flight tunnel. | GAP | M | `go relayCounted(...)` `proxy.go:1290`, inline relays `proxy.go:1565,1747`, `go trackDestinationCountry` `proxy.go:696` |
+| PX-4 | Spawned relay/async goroutines have **no `recover()`** — a panic in any propagates to the runtime and kills the process, dropping every in-flight tunnel. **CHAOS-57 found the last one:** `relayPlaintextInspectFallback` (the native-ALPN non-TLS fallback) was the ONE relay goroutine in the tree still unguarded — every other raw relay had carried a guard since CHAOS-24, so this branch was the odd one out rather than a known gap. Containing it is strictly fail-closed (a relay goroutine holds no authority the recovery could extend — the CHAOS-24 objection does not apply) and it closes BOTH legs, since the peer relay may be parked in a deadline-less Write that only a close can end. | GAP → **relays CLOSED** (CHAOS-24 + CHAOS-57); `go trackDestinationCountry` remains an unguarded async spawn | M | `relayCounted` + the strip-path/`rawRelay`/`socks5Relay` inline relays; last gap `proxy_tunnel_h2.go` `relayPlaintextInspectFallback`; residual `go trackDestinationCountry` `proxy.go:951` |
 | PX-5 | SOCKS5 connections **bypass the per-IP connection limiter** entirely. | GAP | M | `handleSOCKS5` `socks5.go:251` never calls `connLimiter.Acquire`; HTTP path does at `proxy.go:627` |
 | PX-16 | **The SOCKS5 accept loop retried a failed `Accept` with NO delay, forever.** `net/http.Server.Serve` (every other listener in the process) backs off 5 ms→1 s and stops on a non-temporary error; this loop logged and `continue`d on anything that was not `net.ErrClosed`. EMFILE/ENFILE come straight out of `FD.Accept` without blocking, so a descriptor incident produced **7.68 M attempts / 300 ms**, one log line each — a pinned core, ~40 MB/s into a 50 MB rotating log that erased its own diagnostic history in seconds, and (via `logsink`'s blocking backpressure) added latency to the HTTP data path on a node not using SOCKS5. Self-amplifying: FD exhaustion is the terminal state of WK-11 and PX-6. | NEW → **CLOSED** (CHAOS-54: backoff + errno classification + rate-limited logging; interruptible sleep keeps shutdown prompt) | **H** | was: `socks5.go` `serve`; see §22 |
 | PX-17 | **An unrecoverable listener error was retried identically to a transient one.** EBADF/ENOTSOCK on the listening descriptor return instantly and forever, so the "retry" was a pure spin that could never accept anything, on a port that stayed BOUND — clients hung against a black hole instead of getting connection-refused. | NEW → **CLOSED** (CHAOS-54: the loop stops, closes the listener so clients fail fast, and records the service DOWN; transient/unknown errors still retry, which is the fail-safe direction) | M/H | was: `socks5.go` `serve`; now `socks5AcceptFatal` — see §22 |
 | PX-18 | **The SOCKS5 listener had NO health surface** — absent from `/healthz`, `/readyz`, `/api/diagnostics` and `/metrics`. A listener spinning on EMFILE and a listener that had stopped accepting entirely were both reported by every probe as a fully healthy node. | NEW → **CLOSED** (CHAOS-54: `socks5_listener` contract row, report-only `/readyz socks5` row, `/healthz socks5` field, `culvert_socks5_{listener_up,accept_errors_total,accept_degraded,accept_backoff_seconds}`, `socks5_listener_down` alert) | M/H | `socks5_health.go` — see §22 |
 | PX-20 | **Every `net.ErrClosed` from `Accept` was read as an expected shutdown.** `ErrClosed` says the listener is gone; it does NOT say a shutdown was requested, and `Stop` is only one of the ways a listener can end up closed. Any closure outside the shutdown path therefore terminated the accept loop with EVERY probe still green (`socks5: ready`, `culvert_socks5_listener_up 1`, `ok` contract row) — PX-18 reintroduced in a narrower costume, inside the very change that closed PX-18. Raised by Codex review on the PR, not by the sweep. | NEW → **CLOSED** (CHAOS-54: the loop checks whether `stopping` was actually closed; `Stop` closes it BEFORE `ln.Close()`, so the check is race-free in the direction that matters and errs toward silence, never toward a false page) | M/H | was: `socks5.go` `serve`; see §22.3 |
+| PX-21 | **The same unbounded-untrusted-value class as AU-15, on the PROXY data path, and it is NOT fixed.** `handleRequest` writes `sanitizeLog(r.Host)` into the POLICY_* process-log line and `r.Host` verbatim into the request-log entry. `sanitizeLog` neutralises control characters but bounds NOTHING, and the proxy `http.Server` sets no `MaxHeaderBytes`, so net/http admits a request line plus headers up to ~1 MiB. **Measured on the default-deny path: one request with a 200 KB host wrote 204,899 bytes to the process log and a 204,812-byte `Host` field to the request log.** Both sinks are rotating files with one archive, and the proxy port is reachable by every client on the network — a far broader audience than the admin login endpoint, with the process log holding the diagnostics for every other incident (the §22 amplification lesson). | **NEW, OPEN** | **H** | `proxy.go:689,728` (`sanitizeLog(r.Host)`), `recordRequestAuthURI` `proxy.go:688`; reproduction in §32.6 |
 | PX-19 | **The SOCKS5 accept loop had no panic guard.** `handleSOCKS5` carries `recoverGoroutine`, but a panic in `serve` itself propagated to the runtime and killed the whole proxy process (the PX-4 class, one level up). | NEW → **CLOSED** (CHAOS-54: contained and reported as listener DOWN — the CHAOS-24 objection to recovering in a worker goroutine does not apply when the recovery path is the loudest state the subsystem can produce) | M | was: `socks5.go` `serve`; see §22 |
 | PX-6 | **No global connection cap**; per-IP map is unbounded in cardinality; limiter ships **disabled by default**. Distributed flood → FD/memory exhaustion. | GAP | H | `internal/connlimit/connlimit.go:12,67` (default disabled, `Acquire`→true when off) |
 | PX-7 | Bandwidth/QoS token buckets are **never enforced on the data path** — `AllowBytes` has no call site in the relays. Configured QoS silently does nothing. | GAP (feature dead) | M | `internal/bandwidth` `AllowBytes` `bandwidth.go:261` — no caller in `proxy.go`/`socks5.go` |
-| PX-8 | Shutdown drain only accounts for CONNECT tunnels — WebSocket, non-TLS-fallback, and SOCKS5 relays are invisible to `drainActiveTunnels`, so SIGTERM hard-kills them. | GAP | M | `recordActiveConn` only at `proxy.go:1410,1599`; `drainActiveTunnels` `main.go:1131` |
+| PX-8 | Shutdown drain only accounts for CONNECT tunnels — WebSocket, both non-TLS inspect fallbacks, and SOCKS5 relays are invisible to `drainActiveTunnels`, so SIGTERM hard-kills them. **Re-scoped by CHAOS-57 and larger than recorded:** the invisibility also silently DESTROYED each severed tunnel's `TUNNEL_CLOSED` byte/duration accounting (written only after both relays drain), and `activeConns` — the drain's log line and the dashboard's `activeConns` field — undercounted by four whole classes. Counting alone would have been the wrong fix: the classes are long-lived by design, so a drain that waits with no way to END the wait costs a guaranteed 15 s per node and severs them anyway. | GAP → **CLOSED** (CHAOS-57: per-class registry owning the `activeConns` accounting, drain-deadline force-close backstop across all five classes, budget-clamped settle so the accounting lands ahead of the FLUSH hooks, `culvert_tunnels_active{class}` + `culvert_tunnel_drain_forced_total`) | M | was: `recordActiveConn` at the CONNECT sites only; now `proxy_tunnel_drain.go`, `drainActiveTunnels` `main_shutdown.go` — see §25 |
 | PX-9 | Half-open circuit admits **all** concurrent requests, not a single probe → thundering herd on a recovering upstream. | GAP | L/M | `internal/upstream/upstream.go:83` (no single-flight gate) |
 | PX-10 | Plain-HTTP `WriteTimeout: 30s` can truncate large/slow legitimate downloads (absolute deadline over `io.Copy`). | GAP | M | `main.go:894`, stream at `proxy.go:1045` |
 | PX-11 | SSL-inspect slowloris protection: 60s read deadline + per-`Read` re-arming body-stall detector. | ✓ | — | `proxy.go:1621`, `stallDetectReadCloser` `proxy.go:884`; test `proxy_slowloris_body_test.go` |
@@ -505,9 +1029,14 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 |---|----------|---------|-----|----------|
 | AU-1 | Registry OIDC introspection has **no result cache** → one IdP round-trip per request, ×N providers, each 10s timeout. The legacy `OIDCAuth` *does* cache (2-min TTL); the newer registry path dropped it. | GAP | H | `auth_oidc_flow.go:344-363,608-627` (no cache field); loop `proxy.go:209-220`; contrast `auth_oidc.go:210-238` |
 | AU-2 | In-flight SSO sessions **survive IdP deletion** — no `RevokeProvider`; cookies are self-contained and keep full access up to TTL (default 8h). User-delete *does* revoke. | GAP | H | `auth_idp.go:319-330`, `ui_auth.go:517-529` vs `ui_auth.go:245` |
-| AU-3 | Proxy-path Basic-auth bcrypt is **not rate-limited** — correct-username + N wrong-passwords is a cache miss every time → full ~100ms bcrypt per request → CPU starvation. The `loginLimiter` guards only the admin UI. | GAP | M | `store.go:440-444`, limiter only at `ui_auth.go:48,116`, proxy call `proxy.go:223` |
+| AU-3 | Proxy-path Basic-auth bcrypt is **not rate-limited** — correct-username + N wrong-passwords is a cache miss every time → full ~100ms bcrypt per request → CPU starvation. The `loginLimiter` guards only the admin UI. **Understated: the WRONG-username branch is worse (AU-3a) and needs no valid username at all.** | GAP → **CLOSED** (CHAOS-57, §25: `internal/authcost` bounds concurrency globally + per client, fail-closed) | M → **C** | `store.go` `verifyAuthFrom`, `internal/authcost`, `auth_cost_health.go` |
+| AU-3a | The wrong-username branch runs an unconditional bcrypt against the dummy hash (RISK-008 timing equaliser), is reached BEFORE the result cache, and never populates it — so a flood of DISTINCT usernames is a guaranteed miss every time. Measured **79.6 ms of exclusive CPU per ~200-byte request (51,631x a cached auth)**; **66 req/s (~13 KB/s) consumed 100% of a 4-core box** and degraded other CPU work **15.6x**. Unauthenticated, remotely triggerable, and in the DEFAULT posture nothing stands in front of it — the connection limiter, rate limiter and IP filter all ship disabled. | GAP → **CLOSED** (CHAOS-57) | **C** | `store.go:521` (pre-fix), gates `TestChaos57_WrongUsernamePathIsGoverned`, `..._ConcurrentVerificationsAreBounded` |
+| AU-3c | The auth result cache evicted **one arbitrary LIVE entry** at capacity (a Go map range stopping at the first key), so a flood of distinct passwords under a known username displaced OTHER clients' cached positives. Measured: an honest client's cached credential survived a 1x-capacity flood and was reliably gone by 2x — after which that user paid a full ~80 ms bcrypt on EVERY request. The attacker's amplification lands on legitimate traffic. Same class as the `internal/authstate` finding. | GAP → **CLOSED** (CHAOS-57: `internal/authstate`'s fair-eviction policy ported — oldest entry of the largest holder, deterministic) | H | `store.go` `evictOneLocked`, gate `TestChaos57_FloodCannotDisplaceAnHonestClientsCachedResult` |
+| AU-3d | The at-capacity expired-entry scan is O(cache) whenever nothing has expired — precisely the state a flood keeps it in — and runs holding the process-wide auth mutex. Measured **64 µs per insertion** at the 5,000-entry cap. | GAP → **CLOSED** (CHAOS-57: bucket-indexed eviction, no full scan) | L/M | `store.go` `set` (pre-fix) |
+| AU-3e | **Username-enumeration timing oracle, PRE-EXISTING and deliberately NOT closed by CHAOS-57.** A negative result for the CORRECT username is cached; one for a wrong username is not (the branch returns before the cache). So repeating the SAME wrong (user, pass) pair twice is ~1.5 µs the second time for a valid username and ~80 ms for an invalid one — which is the oracle RISK-008's dummy-compare equalisation exists to prevent, reachable by repetition rather than by a single request. Closing it means caching wrong-username negatives, a behaviour change to a security control that deserves its own review. CHAOS-57 verifies only that it does not WIDEN it (`TestChaos57_AdmissionDecisionIsUsernameIndependent`). | GAP | M | `store.go` `verifyAuthFrom` — cache write is on the username-match branch only |
 | AU-4 | Lockout store is bounded + fail-closed, and TOTP failures now feed it. But it is **not persisted** (resets on restart) and **per-node** (attacker gets MaxAttempts per node in a cluster). | ✓ (+2 gaps) | M | `lockout.go:111-126,102-110`; per-node note `roadmap/edge-case-audit.md:138` |
-| AU-5 | LDAP proxy auth fails closed, but the 10s timeout covers only the **dial** — `Bind`/`Search` have no per-op deadline, so a server that accepts then stalls hangs the request goroutine. | GAP | M | `auth_ldap.go:128-180` |
+| AU-5 | LDAP proxy auth fails closed, but the 10s timeout covers only the **dial** — `Bind`/`Search` have no per-op deadline, so a server that accepts then stalls hangs the request goroutine. | GAP → **CLOSED** (CHAOS-58 §26: one 10s round-trip envelope, two non-redundant layers; re-scored **H** on discovery — the stall is unbounded, not slow, and it made the CHAOS-47 cooldown structurally unreachable) | ~~M~~ H | `auth_ldap.go` `verify`; gates `auth_ldap_stall_chaos_test.go` (9) |
+| AU-14 | The CHAOS-47 provider-wide cooldown is armed only by an error that RETURNS, so any identity-backend fault that HANGS is invisible to it by construction. Closed for LDAP by CHAOS-58; the OIDC leg is bounded by `http.Client{Timeout}` on every call, and SAML is browser-mediated. Recorded so the next backend added to the credential chain inherits the rule rather than rediscovering it. | GAP → **CLOSED for the shipped backends** (CHAOS-58 §26) | M | `auth_backend_health.go` `authProbeGate`; `noteVerifyError` `auth_ldap.go` |
 | AU-6 | SAML metadata & OIDC discovery fetched **once** at compile — no periodic refresh. IdP SAML signing-cert rotation breaks assertion validation until re-save/restart. (OIDC JWKs *do* auto-refresh every 15 min + serve-stale.) | GAP | M | `auth_saml.go:54-57,249-294`; JWKs OK `auth_oidc_flow.go:129-157` |
 | AU-7 | IdP 5xx / network error / expired token all collapse to fail-closed "auth fail" — correct posture, but an IdP outage is indistinguishable from a brute-force spike (no distinct `idp.unreachable` metric). | ✓ (obs gap) | L | `auth_oidc.go:152-162`, `auth_oidc_flow.go:623-636` |
 | AU-8 | Auth caches bounded at 5000 with eviction; HMAC-keyed keys (heap-dump safe); cached OK TTL capped at token `exp`. | ✓ | — | `store.go:236,241-258,268-285`, `auth_oidc.go:219-227` |
@@ -516,6 +1045,8 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | AU-11 | Multi-IdP registry: compile is isolated (all-or-nothing staging swap; bad profile dropped, not fatal). But the **request-time provider loop is sequential and unguarded** — one slow IdP adds latency to every request that reaches it. | ✓ compile / GAP request | M | `auth_idp.go:159-165,354-376` vs loop `proxy.go:209-220` |
 | AU-12 | All admin-configured IdP URLs dial through `ssrfSafeDialContext`; HTTPS+non-private pre-validated; response bodies `io.LimitReader`-capped. | ✓ | — | `auth_oidc_flow.go:64,300`, `auth_idp.go:556-565` |
 | AU-13 | Registry introspection also lacks **negative caching / circuit breaker** — a permanently-invalid token amplifies one IdP call per provider per request forever. | GAP | M | `auth_oidc_flow.go:623-636`; breaker exists unused `internal/upstream/upstream.go:89-96` |
+| AU-15 | **The public admin-login endpoint accepted an UNBOUNDED username and copied it verbatim into durable state.** `apiAuthLogin` is on `uiAuthMiddleware`'s public allowlist; nothing between the 1 MiB body cap and the handler limited `body.User`, and every failed attempt wrote it into the two lockout maps (retained ≥ `lockout.Window`), the 500-entry audit ring, and the **durable audit JSONL** — a 50 MB rotating file keeping exactly ONE archive. At the endpoint's own rate limit (60 mutating POSTs/min/IP) one unauthenticated client commits ~60 MiB/min of chosen bytes, rotating the entire 100 MB retained compliance record away in **under two minutes**, with no disk fault and every write SUCCEEDING (so `writeErrors`/`storage_write_failed` never fire). Measured by the gate: **4,195,672 bytes into the audit file from 8 requests.** | NEW → **CLOSED** (CHAOS-63: bounded at the handler; `lockout.MaxUsernameKeyLen` is the structural half; `culvert_login_oversize_rejected_total`) | **H** | was: `ui_auth.go` `apiAuthLogin`; `internal/audit/audit.go:213` (`NewRotatingFile(path, 50)`); see §32 |
+| AU-16 | **`internal/lockout` bounded its maps by ENTRY COUNT but not by KEY SIZE.** `Cleanup`'s own doc claims the maps are bounded "against an unbounded-memory DoS" — true on the count axis, and the janitor cannot sweep an entry before its `Window` elapses, so the SIZE axis was the whole exposure: one caller retained (rate × Window × username size) bytes in a leaf package whose stated contract is to be bounded. | NEW → **CLOSED** (CHAOS-63: `boundUsername` applied at every public entry point; consistency pinned so `Check` and `RecordFailure` cannot disagree on the key) | M/H | was: `internal/lockout/lockout.go`; see §32 |
 
 ### 2.6 Background Workers / Feeds / Scanning / Alerting
 
@@ -526,10 +1057,15 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | WK-2 | Remote scan sidecar down → fail-open, **but** alerted (`scan_svc_down`) + counted. Posture not admin-selectable; 30s per-request timeout stacks latency when hard-down. **Re-scoped by CHAOS-53 and much larger than recorded:** that 30 s timeout was not merely latency, it was a PRIVATE deadline three times the process's own fail-closed scan budget, and exceeding it surfaced as a transport error → classified as a fault → fail-OPEN. So a merely SLOW sidecar forwarded content unscanned while the local back end blocks for the identical condition (WK-19). The down-sidecar posture is split out as WK-2b. | GAP → **slowness/capacity CLOSED** (CHAOS-53, §21); the sidecar-DOWN posture is split out as WK-2b | H | `internal/secscan/remote.go` `ScanBody`/`scanOnce` |
 | WK-2b | **Posture**: a sidecar that is genuinely unreachable/erroring still fails OPEN (counted + alerted). Deliberately asymmetric with slowness and capacity, which now fail closed — exactly the WK-1/WK-1b split, for the same reasons. | GAP (**owner decision**; now counted, gated-alerted, rate-limit logged, and reachable only by an actual fault) | H | `internal/secscan/remote.go` `remoteScanFail` |
 | WK-19 | **The remote sidecar had none of the CHAOS-52 protections, and the runbook recommended switching to it.** Six further defects: any HTTP 200 whose body parsed as JSON (`{}`, `null`) was read as CLEAN with no counter/log/alert; NO `culvert_scan_*` series is produced on a sidecar node and `stat_remote_scan_fail` never reached `/metrics`; the fail-open alert fired per request ungated with a raw `err.Error()` (ephemeral port ⇒ un-dedupable key) and logged per request; scan exclusions were never LOADED in remote mode, so `scanexcl.Store` had no path and every admin Save was a silent no-op that returned 200 and was audited as success; the hash allowlist was never consulted and `Result.Hash` came from the SIDECAR; `Status()` decoded an unbounded body on an admin endpoint; and the sidecar's own status blob shadowed this node's `scan_svc_mode`, so a remote node reported "local". | GAP → **CLOSED (CHAOS-53)** | **H** | §21; `docs/engineering/CHAOS-ENGINEERING-REVIEW-2026-08-22.md` |
-| WK-3 | GeoIP cache-miss on the policy hot path fails **closed** (country allow-rule cannot match unknown country); `LookupCached` never blocks on DB/DNS. | ✓ | — | `policy.go:831-839`, `geoip.go:84-93`; tests `final_coverage_test.go:203` |
+| WK-3 | GeoIP cache-miss on the policy hot path fails **closed** (country allow-rule cannot match unknown country); `LookupCached` never blocks on DB/DNS. **The fail-closed half was and is true. The "never blocks" half STOPPED being true** and this row went on asserting it: the host→IP cache added in front of the engine made the common path fast without removing the blocking `net.LookupHost` from the MISS path, so the accessor the request goroutine calls performed an uncancellable resolution inside policy evaluation. Re-scoped by CHAOS-60 (§28) as GEO-1, with GEO-2 alongside it. | ✓ fail-closed / GAP no-block → **CLOSED (CHAOS-60)** | **H** | §28; `geoip.go` `LookupCached`/`resolveHostCached`, `geoip_resolve_health.go` |
+| WK-3b | **Country-scoped ENFORCEMENT was fed by a best-effort dashboard sampler.** On the request path the only populator of the IP→country cache that `matchDestNorm` reads was `trackDestinationCountry` — telemetry, ALLOW-branch only, drop-on-full at 256. A saturated sampler, or a first request that was blocked, left the country permanently unknown and every country-scoped rule silently non-matching. | GAP → **CLOSED (CHAOS-60)**; the enforcement path now owns its own bounded warmer | **H** | §28; `proxy.go` `trackDestinationCountry`, `geoip_resolve_health.go` `warmGeoHost` |
+| WK-3c | **Posture**: a country-scoped rule still does not match on the FIRST request to a host whose country is not yet cached — fail-closed for an allow-rule (user-visible block), fall-through for a deny-rule. Unchanged by CHAOS-60, which only makes the window converge in one request instead of depending on a sampler. Closing it means deciding what "unknown country" MEANS in policy, which is a product decision. | GAP (**owner decision**; now counted as `culvert_geo_policy_unresolved_total`) | M | §28.5; `policy.go` `matchDestNorm` |
 | WK-4 | GeoIP DB missing/corrupt: reader stays nil, feature degrades to "no country data" — safe, but **no staleness/health signal** (MMDBs expire silently). | GAP (obs) → **PARTIALLY CLOSED** (`BuildTime()` reads the `.mmdb`'s own `build_epoch`; `GET /api/geoip` returns `dbBuildDate`/`dbAgeDays`; GeoIP Database panel shows the age, warn-colored past 90 days; load failures surfaced via `lastError`. Residual: no PROACTIVE alert/metric — an operator must open the panel to notice) | M | `internal/geoip/geoip.go` `BuildTime`, `ui_security.go` `apiGeoIPConfig` |
-| WK-5 | **Threat-feed timeout → stale-erase.** On partial failure `Sync` unconditionally replaces the maps with only what succeeded, discarding prior good entries; stamps `lastSync=now` even on failure; no backoff, no staleness alert → coverage silently shrinks for up to 6h. | GAP → **CLOSED** (per-source `replacedSources` replacement, `threatfeed.go` `applySync`) | H | `internal/threatfeed/threatfeed.go:150-183` |
-| WK-6 | UT1 category feed failures counted but **never alerted**; fixed 24h retry, no backoff. Stale-serve is safe (last-good BadgerDB). | GAP (obs) | M | `internal/feedsync/feedsync.go:192-213,176` |
+| WK-5 | **Threat-feed timeout → stale-erase.** On partial failure `Sync` unconditionally replaces the maps with only what succeeded, discarding prior good entries; stamps `lastSync=now` even on failure; no backoff, no staleness alert → coverage silently shrinks for up to 6h. | GAP → **CLOSED** (stale-erase: per-source `replacedSources` replacement, `threatfeed.go` `applySync`. Backoff + staleness alert: CHAOS-59, §27) | H | `internal/threatfeed/threatfeed.go` `applySync`; `threatfeed_health.go` |
+| WK-5b | **The carry-forward fix removed the only signal.** `culvert_threat_feed_entries` is held at its last-good value by design, so after WK-5's fix a node whose feed has not synced in three weeks exported metrics byte-identical to one that synced ten minutes ago; the only surviving difference reached ONE role-gated admin JSON field no alerting rule scrapes. | GAP → **CLOSED (CHAOS-59)** — five `culvert_threat_feed_*` freshness series, `threat_feed` contract row, fire-once `threat_feed_stale` alert | **H** | §27; `threatfeed_health.go` |
+| WK-5c | **A feed round that fails at COLD START leaves the node with no coverage at all.** `Start` syncs immediately when the on-disk DB is empty (fresh install, re-image, replaced volume); pre-fix a failed first round was not retried for 6h, so the node enforced with an EMPTY threat database while every probe reported healthy. | GAP → **CLOSED (CHAOS-59)** — backoff ladder + a distinct never-synced alert/row at a 30-min grace rather than 2× the interval | **H** | §27; `threatfeed_health.go` `checkThreatFeed` |
+| WK-6 | UT1 category feed failures counted but **never alerted**; fixed 24h retry, no backoff. Stale-serve is safe (last-good BadgerDB). | GAP → **retry/backoff/jitter CLOSED (CHAOS-59)**; the alert half stays open by owner decision (last-good BadgerDB keeps serving; category staleness is not a security control) | M | `internal/feedsync/feedsync.go` `Start`/`syncRound`, §25 |
+| WK-13b | **No jitter on either legacy feed ticker** (the WK-13 herd finding, instantiated). `time.NewTicker` fires at a fixed offset from process start, so a fleet that boots together fetches from the same third-party origins forever — and the origins are public/shared (abuse.ch, openphish.com, a raw.githubusercontent.com mirror of a 50+ MB tarball). Rate-limiting of the customer's egress IP is the ordinary answer, which then produces the failure the absent backoff held the fleet at. | GAP → **CLOSED (CHAOS-59)** — stable per-node ±10% jitter on both, via `internal/feedsched` | M | §27; `internal/feedsched/feedsched.go` `StableJitter` |
 | WK-7 | Category DB (Badger) corruption: read errors → "not found" (fail-open for category-block, no crash); value-log truncate/replay on restart. **The RUNTIME half is correct and unchanged; the claim about restart was not** — see ST-12/§17: a value log is indeed tolerated, but a torn MANIFEST used to be fatal at boot and a corrupt table panics uncatchably. | ✓ runtime / GAP boot → **boot half CLOSED** (CHAOS-50) | — | `internal/catdb/catdb.go` `Lookup`/`getExact`; boot path `internal/catdb/resilient.go` |
 | WK-8 | **Background workers have NO panic recovery.** `threatfeed.Start`, `feedsync.Start`, blocklistfeed scheduler, `startCDRHealthPoller`, `startAlertRetryLoop` all run their loop body with no `recover()`. One panic (bad feed line, nil-map deref, a `.(time.Time)` assertion) **terminates the whole in-line proxy.** | GAP → **CLOSED (CHAOS-24)** | **C** | was: `threatfeed.go:131-145`, `feedsync.go:171-187`, `cdr_health.go:65-80`, `alerts.go:46`→`store.go:511`. Now guarded per ROUND — see §12 |
 | WK-9 | Syslog on the hot path: `writeMsg` holds `s.mu` and does a **blocking 5s dial** while locked; TCP writes have **no write deadline** → a slow SIEM can stall proxy goroutines. UDP is non-blocking (acceptable). | GAP → **CLOSED** (async drain goroutine owns the socket, `internal/syslog`) | M | `internal/syslog/syslog.go:117-146,68` |
@@ -701,7 +1237,7 @@ touch security-critical paths that warrant isolated review.
 | CA-1 | Seed an expired CA via `SetCAForTest`; assert `GetCert` errors + alert. |
 | CA-2 | Point `caPath` at a read-only dir; drive `RotateIfNeeded`; assert a failure alert (not a success alert). |
 | AU-2 | Mint a session with `Provider:"idpA"`; delete idpA; assert the cookie now fails to decode. |
-| AU-3 | Assert the Nth rapid wrong-password attempt for a valid user is rejected before bcrypt runs. |
+| AU-3 | **DONE** (CHAOS-57): 19 root gates in `auth_cost_chaos_test.go` + 15 engine gates in `internal/authcost`. Eleven defect gates verified failing against the shape each replaces, including the asymmetric-gate variant that reintroduces the RISK-008 oracle, the non-injective cache key (an authentication bypass), and the immediate per-client refusal that denied a workstation's own parallel connections. |
 | PX-3 | Open a tunnel, half-close the client without FIN; assert goroutine count returns to baseline within the idle window. |
 | PX-6 | Global cap K; open K+1 conns across distinct IPs; assert rejection + stable FD count. |
 | HA-7 | Resume denied → etcd becomes reachable → assert `WriteAllowed()` becomes true within a bounded time with no operator action. |
@@ -1122,7 +1658,7 @@ binary terminated).
   semantics and is deliberately **not** bundled into a panic-containment change (§12.2's own lesson).
 - **Still unguarded: the MCP runtime listener** (`internal/mcp/runtime`). Left open on purpose: it
   is disabled-by-default with a different blast radius (its own listener, not the SWG request path),
-  it spans 25 subpackages, and ADR-0024's rollout ladder means "contain and continue" has to be
+  it spans 27 subpackages, and ADR-0024's rollout ladder means "contain and continue" has to be
   reconciled with the Observe/Shadow/Canary semantics before a guard is correct. Tracked as
   **CHAOS-26**.
 - The `crashThrottleEvery` (1s per component) flood guard still means a tight panic loop reports a
@@ -1844,6 +2380,17 @@ pinned by `TestCheckCategoryFeedDB_RowCarriesNoRawCause`.
   on. Not fixed here because its content is request history with retention
   semantics: quarantining it silently is an evidence decision, not a cache
   decision. **Next sweep candidate.**
+
+  > **CLOSED by CHAOS-62 (2026-08-29) — and both bounding clauses above were
+  > WRONG.** "Quarantining it silently is an evidence decision" argues FOR the
+  > fix: the CHAOS-05/07 contract moves aside and never deletes, so the evidence
+  > survives either way; what this deferral preserved was a crash loop whose
+  > history is equally unreadable and whose whole service is down too. And
+  > "bounded by being opt-in" is backwards — opt-in means DURABLE in
+  > `admin_settings.json` (so the crash loop is self-latching, with no admin UI
+  > left to turn the setting off) and reachable from the LIVE admin API (so it
+  > is a runtime kill of a gateway carrying traffic, not a boot failure). See
+  > §25. The severity was Critical, not the bounded case recorded here.
 - **R-F — three fatal boot loads remain with no declared principle.**
   `catStore.Load`, `blocklist_startup.go:59`, `main.go:724`. `categories.json` is
   the closest analogue to the two files CHAOS-05/07 chose to quarantine, and it
@@ -2768,3 +3315,2622 @@ first draft of the fix as its rationale, and it was wrong — the idle case is
 bounded at 6s. Measuring it, rather than shipping the plausible story, is what
 surfaced the active-stream case, which is both unbounded and reachable by
 faults this codebase already has runbooks for.
+
+---
+
+## 25. CHAOS-57 — The hijacked-tunnel plane on the way out
+
+**Sweep date:** 2026-09-01 · **Register rows:** PX-8 (closed), PX-4 (relays closed)
+· **Runbook:** `docs/operator/tunnel-drain-on-shutdown.md`
+
+### 25.1 Why this domain
+
+§24 (CHAOS-56) bounded the shutdown sequence end to end and made the tunnel
+drain honour its phase deadline instead of adding a private 15 s window on top
+of it. It answered *how long may the drain take?* It never asked the prior
+question:
+
+> **Does the drain see what it is draining?**
+
+It does not. `drainActiveTunnels` waits on ONE number — `activeConns`
+(geoip.go) — and Culvert has seven hijacked-tunnel classes. Four of them never
+touched that number:
+
+| class | counted before? | force-closed before? |
+|---|---|---|
+| CONNECT bypass | yes | no |
+| CONNECT inspect (strip, H1) | yes | no |
+| CONNECT inspect (native ALPN) | yes | only if it negotiated h2 |
+| CONNECT inspect non-TLS fallback (strip) | **no** | no |
+| CONNECT inspect non-TLS fallback (native) | **no** | no |
+| WebSocket | **no** | no |
+| SOCKS5 | **no** | no |
+
+Two mechanisms produce the blind spots, and neither is a bug in isolation. A
+hijacked conn is invisible to `http.Server.Shutdown` **by construction** —
+net/http stops tracking a conn the moment it is hijacked, which is the whole
+point of hijacking. And `socks5Server.Stop` waits only for the ACCEPT LOOP,
+because every session runs in a detached `go handleSOCKS5(conn)`; that file's
+own header records the deferral verbatim:
+
+> *"In-flight SOCKS5 tunnels are NOT drained — that is explicitly out of scope
+> for P1.5 (tracked for Phase 2)."* — `socks5_shutdown_test.go`
+
+Phase 2 never came. So for four classes **nothing in the shutdown sequence
+waited, and nothing closed them**: they ran until the process exited and the
+kernel reset them.
+
+### 25.2 Three consequences, all silent
+
+**(1) One fault, two postures.** A CONNECT tunnel gets a 15 s grace on SIGTERM.
+A WebSocket or an SSH-over-SOCKS5 session on the same node, at the same instant,
+under the same signal, gets none. Nothing decides this deliberately — it is
+decided by which `recordActiveConn` call site the code path happened to pass
+through. That is the §16.3 theme (opposite postures for one fault class,
+decided by an incidental predicate) reappearing in the data plane.
+
+**(2) The accounting for every severed tunnel is destroyed.**
+`recordTunnelClose*` — the `TUNNEL_CLOSED` request-log entry carrying
+`BytesSent`/`BytesRecv`/`DurationMs`, and the `recordTunnelBytes` fold into the
+global byte counters — runs **after** both relay goroutines drain. A tunnel
+killed by process exit never reaches it. So every graceful shutdown dropped the
+bytes and duration of every in-flight WebSocket and SOCKS5 session from the
+request log, the JSONL export, the SIEM feed and the dashboard totals, with no
+counter saying so. On a rolling fleet upgrade this is systematic, not
+incidental: the loss is proportional to how many long-lived sessions the fleet
+carries, which is exactly the deployments that care about the numbers.
+
+**(3) The drain's own evidence undercounts.** `Draining %d active tunnel(s)` is
+what an operator reads to confirm a node left cleanly; with four classes
+uncounted it reports 0 — and returns immediately — on a node severing hundreds
+of live sessions. `activeConns` is also the dashboard's `activeConns` field, so
+an operator sizing FD or connection budgets from it was reading a number that
+excluded SOCKS5 and WebSocket entirely.
+
+### 25.3 The finding inside the finding: counting alone is the WRONG fix
+
+The obvious change is four `recordActiveConn` calls. It is wrong, and it is
+wrong in a way the defect gates would not have caught.
+
+Adding the calls makes the drain **wait** on those classes — but nothing would
+END that wait. Long-lived is what WebSocket and SOCKS5 are FOR: SSH sessions,
+IMAP IDLE, push channels, database tunnels. They do not go quiet inside 15 s. So
+the drain would hit its deadline on **every** shutdown of a node carrying any
+such session, converting an instant restart into a guaranteed 15 s one across a
+rolling fleet upgrade — and then sever them anyway, because nothing closed them.
+The operator would have paid `N × 15 s` of maintenance window and received
+nothing.
+
+The wait is only worth its cost if it ends in a **deterministic teardown**. That
+is the same argument PR3d already made for inspected H2, which is why the fix
+mirrors `forceCloseH2InspectTunnels` rather than inventing a second mechanism:
+the registry holds both legs of every hijacked tunnel, and the drain deadline
+hard-closes them. Each relay's `io.Copy` returns, its parent runs
+`recordTunnelClose*`, and the accounting lands in the request-log queue while
+the FLUSH hooks (order ≥ 110) are still ahead of us. **Force-closing is never
+worse than the SIGKILL it replaces** — that abandons the same conns AND the
+accounting.
+
+### 25.4 What shipped
+
+1. **`proxy_tunnel_drain.go` — a per-class registry.**
+   `registerDrainableTunnel(class, conns...) func()` OWNS the `activeConns`
+   accounting for its class (a caller must not also call `recordActiveConn`, or
+   the drain would wait on a count that never reaches zero). Release is
+   idempotent via `sync.Once`.
+
+2. **The map key is the ENTRY pointer, never a conn.** Two tunnels can
+   legitimately hold the same conn value — the strip-path fallback registers
+   `rawClient` while the inspect path registers the `tls.Conn` wrapping it — and
+   a conn-keyed registry lets one release evict the other's registration, so the
+   surviving tunnel would never be force-closed. Verified: the conn-keyed shape
+   evicts *both*.
+
+3. **All five classes wired**, including the two the drain could already see
+   (`connect_bypass`, `connect_inspect`) which were counted but held by no
+   registry, so the drain waited on them with no way to end the wait. A native
+   tunnel that negotiates h2 appears in both registries; that is deliberate and
+   not double-counting — this registry owns the single `activeConns` increment
+   while `culvert_h2_inspect_active` measures the GOAWAY-capable subset, both
+   backstops fire at the same deadline, and a second `Close` is a no-op.
+
+4. **The backstop closes conns, not contexts.** `idleCopyCounted` sits in
+   `io.CopyBuffer`, which returns only on a read/write error, and the peer
+   direction may be parked in a deadline-less Write that nothing but a close can
+   end — the same reason every relay's panic path closes BOTH legs. Entries are
+   left in the map: the relay's own release removes them, and deleting here
+   would race a concurrent release into double-decrementing the gauge.
+
+5. **A budget-clamped settle** (`tunnelForceCloseSettle`, 2 s ceiling). Without
+   it the ordering between "the relay writes its entry" and "the flush hooks
+   run" is only probabilistic — the relays need microseconds and the intervening
+   hooks take milliseconds, so it *works* — and this section exists because
+   probabilistic shutdown ordering is what CHAOS-56 removed everywhere else. It
+   is a CEILING clamped to whatever the phase has left, so it can never overrun
+   the deadline or borrow from the flush reserve. **On the `ctx.Done()` branch
+   the settle is SKIPPED**: the budget is already spent, and lingering would
+   take time from the hooks behind us. Losing the accounting there is exactly
+   the pre-change behaviour — never worse.
+
+6. **PX-4 residual closed.** `relayPlaintextInspectFallback` was the ONE relay
+   goroutine in the tree with no panic guard; every other raw relay
+   (`relayCounted`, the strip-path fallback, `rawRelay`, `socks5Relay`) has
+   carried one since CHAOS-24, so this branch was the odd one out rather than a
+   known gap. A panic there propagated to the runtime and killed an in-line
+   security appliance, dropping every OTHER in-flight tunnel with it.
+
+7. **Observability.** `culvert_tunnels_active{class}` (five classes) and
+   `culvert_tunnel_drain_forced_total`. The class label matters at exactly the
+   moment it is read: when the drain times out, WHICH kind of session is holding
+   the node decides the remedy. The class names are a monitoring contract and
+   are pinned by test.
+
+### 25.5 Gates
+
+`proxy_tunnel_drain_chaos_test.go` — 15. Every DEFECT gate was verified failing
+against its reintroduced pre-fix shape:
+
+| gate | pre-fix failure |
+|---|---|
+| `SOCKS5TunnelIsVisibleToTheDrain` | `activeConns = 0` with a live relay |
+| `WebSocketTunnelIsVisibleToTheDrain` | `activeConns = 0` on a real 101 through the real proxy |
+| `SeveredTunnelStillRecordsItsAccounting` | no `TUNNEL_CLOSED` entry; relay still parked in `io.Copy` |
+| `DrainWaitsForAHijackedTunnel` | drain returns instantly |
+| `DrainDeadlineForceClosesEveryClass` | `forced_total = 0`, want 5 |
+| `NativeInspectFallbackRelayContainsAPanic` | the test binary itself panics — the production failure mode |
+| `RegistryKeysOnTheEntryNotTheConn` | conn-keyed registry evicts both registrations |
+| `SettleIsClampedToTheBudget` | settle runs its full 2 s past a spent deadline |
+| `ReleaseIsIdempotent` | `activeConns = -2` |
+
+Plus CONTROLS, because the two cheapest wrong fixes pass every defect gate:
+`ControlGraceIsRealNotImmediateForceClose` (force-closing at drain START
+satisfies all of them while being **strictly worse than the defect** — a session
+that would have finished inside the window is killed; verified failing against
+that shape) and `ControlDrainStillReturnsImmediatelyWithNoTunnels` (seeing four
+more classes must not make a quiet node pay the window on every restart). A
+non-idempotent release is its own control: a negative gauge makes
+`active <= 0` true forever, restoring the original blindness by accident.
+
+### 25.6 What is deliberately left
+
+- ~~**New tunnels are not fenced during the drain.**~~ **This was recorded as a
+  residual and the reasoning given for it was WRONG.** The original note claimed
+  the raw classes need no fence "because their listeners are already closed by
+  the time the drain runs and the drain's per-tick loop picks up any late
+  registrant." Codex review of PR #1288 showed that is false for SOCKS5, and
+  §25.8 records it — the fence shipped in the same PR.
+- **`go trackDestinationCountry` remains an unguarded async spawn** (PX-4
+  residual). It is not a relay and holds no conn; recorded rather than swept in
+  with a tunnel change.
+- **Tunnels are still cut, not migrated.** Draining a node before a restart
+  remains the operator's job — CHAOS-57 makes the cut deterministic, accounted
+  and observable, not avoidable.
+- **The settle can legitimately time out.** `activeConns` is a SUPERSET of what
+  either backstop can force-close (a native-ALPN tunnel mid-handshake is counted
+  but held by neither registry), so it is best-effort by construction and
+  bounded by its own ceiling.
+
+### 25.7 The process lesson
+
+§24 was about documented residuals whose named mitigation had silently acquired
+a correctness requirement. This sweep adds one about **counters as interfaces**:
+
+> A drain, a health check and a dashboard that all read one counter have all
+> inherited that counter's blind spots — and a blind spot in a counter is
+> invisible in exactly the way a blind spot in a check is not. Nobody audits a
+> number for what it is *not* counting. `activeConns` was correct for every
+> call site that incremented it; the defect lived entirely in the sites that
+> did not, and it reached three consumers with three different consequences
+> (no grace, lost accounting, a false gauge) without any of them being wrong.
+
+### 25.8 Review follow-up — the defect surviving inside its own fix
+
+Raised by Codex review against PR #1288 and fixed in the same PR. It is the
+sharpest kind of finding this series produces: **the fix was correct for every
+tunnel the drain could see, and PX-8 survived in the window where the drain
+could not see one yet.**
+
+`handleSOCKS5` sets a 30 s negotiation deadline, dials with a 10 s timeout, and
+only then calls `socks5Relay` — which is where CHAOS-57 registers the tunnel. So
+a connection accepted moments before `Stop` can register **up to ~40 s after the
+listener closed.** And `socks5Server.Stop` waits only for the ACCEPT LOOP,
+because each session is a detached `go handleSOCKS5(conn)`, so nothing in the
+sequence is waiting for that handler.
+
+The consequence is not a race the drain narrowly loses — it is a drain that has
+already finished. `drainActiveTunnels` returns IMMEDIATELY when
+`activeConns <= 0`, and that is exactly the state of a node whose SOCKS5 sessions
+are all still negotiating. So the drain returns instantly, the force-close
+backstop runs against an empty registry, the flush hooks complete — and only
+*then* does the handler send `0x00 success` and establish a long-lived tunnel
+that nothing will close and nothing will account for. PX-8, inside the change
+that closed PX-8.
+
+**Why SOCKS5 and not the HTTP classes.** This is the distinction the original
+residual note missed:
+
+> `proxySrv.Shutdown` (order 90) waits for every in-flight request, so a CONNECT
+> or WebSocket either completes or hijacks-and-registers before the drain at
+> order 100 looks. **The HTTP paths have a synchronization barrier before the
+> drain. SOCKS5 has none at all.**
+
+**The fix is to refuse, not to register earlier.** Codex offered both. Registering
+at handler entry would make the drain wait on sessions that may never become
+tunnels, and would redefine `culvert_tunnels_active` from *live tunnels* to
+*attempts* — a monitoring contract change to fix a shutdown bug. Refusing is
+protocol-correct (SOCKS5 reply `0x01`, general server failure) and strictly
+kinder to the client: it learns the request failed and retries, on a fleet
+against another node, instead of being handed a success reply and a tunnel that
+dies seconds later with no record it existed. A node that is shutting down should
+not be minting new long-lived tunnels.
+
+`fenceTunnelEstablishment` is a shutdown hook at **order 94**, and the ordering is
+the correctness argument, not a detail: after the listeners stop (80/90) so a
+session that can still be drained is never refused needlessly, and before the
+drain (100) so nothing establishes behind its back. The check sits after the dial
+and immediately before the success reply, so the unavoidable check-to-register
+window is microseconds rather than spanning a 10 s dial. Pinned by
+`TestChaos57_FenceIsOrderedBetweenTheListenersAndTheDrain`, which fails if the
+fence is moved to either side of its bracket.
+
+The control matters as much as the gate here: a fence stuck raised refuses every
+SOCKS5 session on a healthy node — a total protocol outage, far worse than the
+window it closes — so `ControlFenceIsDownDuringNormalOperation` pins that it is
+down in normal operation and that the test reset clears it (the PR3d
+fence-pollution class), and `ControlFencedSOCKS5StillEstablishesWhenNotDraining`
+drives the real establishment path to prove an unfenced session still relays and
+still records its accounting.
+
+**The process lesson**, and it is the second time this sweep produced one about
+documentation rather than code: §25.6 recorded this as a deliberate residual
+*with a stated reason*, and the reason was false. A "deliberately left" entry
+carries more authority than an unexamined gap — it tells the next reader the
+question was asked and answered — so a wrong one is worse than silence. The
+entry has been struck rather than quietly deleted, so the record shows the claim
+was made and refuted.
+## 26. CHAOS-58 — The directory that accepts and then stops answering
+
+**Date:** 2026-09-02 · **Domain:** authentication / LDAP + Active Directory ·
+**Status:** shipped · **Gates:** `auth_ldap_stall_chaos_test.go` (9) ·
+**Closes:** AU-5 (re-scored M→H), AU-14 (new)
+
+### 26.1 Why this domain
+
+CHAOS-47 gave the identity backends a posture for an unreachable directory and
+built the machinery to make it cheap: fail closed, arm a provider-wide cooldown,
+deny without dialing, recover on observed evidence. CHAOS-49 extended the same
+primitives to the IdP registry rather than inventing a second dialect. Between
+them the *unreachable directory* is a solved problem in this codebase, with one
+health row, one metric family and one alert.
+
+This sweep asked a narrower question: **which faults can arm that machinery?**
+
+The answer is one sentence, and it is the finding. `authProbeGate` is armed from
+`noteVerifyError`, which runs on the error `verify()` returns. So the cooldown
+can only see a fault that **returns**. Every mitigation CHAOS-47 built is
+downstream of a value that a hung call never produces.
+
+### 26.2 The fault
+
+`LDAPAuth.verify` dialed with a 10 s dialer timeout and then ran up to four
+blocking operations — StartTLS, service bind, user search, user bind — with no
+deadline of any kind. go-ldap's `Conn` defaults to `requestTimeout: 0`, and its
+message loop arms a timer only `if requestTimeout > 0`, so **no timer existed at
+all**. `Bind` and `Search` wait on `<-msgCtx.responses`, a bare channel receive.
+
+A directory that completes the TCP handshake and then goes silent therefore
+blocked the **request goroutine forever**. Not slowly — permanently, with no
+error, no counter, no log line and no health-surface movement.
+
+That fault is ordinary, not exotic: an overloaded directory, a firewall that
+drops established flows without a reset, a half-open socket after a peer reboot,
+a hung VM, a storage stall on the directory host. In every one of them the dial
+**succeeds**, which is precisely why bounding the dial answered the wrong
+question.
+
+The blast radius is per request, not per outage. `verify()` is reached from the
+proxy's per-request credential loop (`proxy.go`, via
+`LDAPIdPProvider.ResolveIdentity` and `Config.VerifyAuth`), so every
+cache-missing authentication pinned a goroutine, a socket, an FD, the client's
+connection and a per-IP connection-limiter slot, permanently. FD exhaustion is
+the recorded terminal state of PX-6 and WK-11, and CHAOS-54 measured what an
+FD-exhausted node then does to the SOCKS5 accept loop — so this fault feeds an
+amplifier this register already documents rather than staying contained.
+
+**Reproduced before it was fixed** (a listener that accepts and never writes):
+`Verify` was still blocked when the gate gave up, and the six defect gates were
+each verified failing against the pre-fix tree.
+
+### 26.3 The asymmetry that made it easy to miss
+
+The correct pattern was already in the tree, one call away. The **admin
+directory-test** endpoint (`ui_auth_ldap.go`) calls `conn.SetTimeout(8s)`
+immediately after dialing. The **per-request production path** did not.
+
+So the bounded path is the one an admin clicks occasionally, and the unbounded
+path is the one every proxied request takes. That is the inversion worth
+recording: a safe pattern existing in the repository is not the same as it
+being applied where the load is.
+
+### 26.4 The second layer, and why it is not belt-and-braces
+
+Adding `SetTimeout` is the obvious fix and it is **not sufficient**.
+`Conn.StartTLS` waits for the extended response through the message loop — which
+the timer covers — and then runs `tls.Client(l.conn, config).Handshake()` on the
+**raw socket**, outside the message loop and outside the timer. A directory that
+ACKs StartTLS and then never negotiates TLS hangs with `SetTimeout` armed.
+
+This was verified directly against the library, not assumed, and the check is
+kept as a permanent **defect proof**
+(`TestChaos58_SetTimeoutDoesNotBoundStartTLSHandshake`): it asserts that go-ldap
+still behaves this way, so a future library release that fixes it fails the
+build rather than leaving a backstop silently guarding nothing — the role
+`BareGracefulStopIsUnboundedOnAWedgedStream` plays for CHAOS-56.
+
+The second layer is therefore a whole-envelope watchdog that **closes the
+connection**. Closing is what unblocks a deadline-less read — the same reason
+`idleCopyCounted` hard-closes both conns on idle (CHAOS-03) instead of trusting
+a deadline the blocked goroutine cannot observe. Two properties of go-ldap make
+it safe and were read rather than assumed: `Close` is idempotent via
+`setClosing`, and `messageMutex` is released before every network wait
+(`sendMessageWithFlags` unlocks before sending; the StartTLS handshake runs with
+it released), so a timer-goroutine close cannot deadlock the operation it is
+rescuing.
+
+The same gap exists on the admin test path — which set the per-message timeout
+and was therefore *more* obviously bounded while carrying the one stage that
+timeout cannot reach, on an endpoint that actuates an admin-supplied address on
+demand. It gets the same watchdog under its own, deliberately generous, envelope
+(a diagnostic should report a slow directory rather than clip it; its job is to
+guarantee the handler goroutine is released at all).
+
+### 26.5 The budget
+
+One directory round trip is bounded **end to end at 10 s** — an envelope, not a
+per-step allowance, so the historical 10 s dial timeout becomes the ceiling for
+the whole flow rather than for its first step. Summing four per-operation
+budgets would have produced a ~42 s worst case on a per-request path, which is
+not a bound anyone would act on.
+
+10 s is deliberately the **same** budget this process already gives one identity
+resolution against an OIDC IdP (`http.Client{Timeout: 10s}`, `auth_oidc.go` /
+`auth_oidc_flow.go`). Two identity backends answering the same question on the
+same request path must not disagree about how long that decision may take —
+CHAOS-53's rule for the two body-scan back ends, applied to the two credential
+back ends. It is a constant for the same reason the JWKS stale ceiling is: a
+per-deployment knob whose only use is widening it re-opens the fault.
+
+The bound is unreachable on a functioning deployment — roughly 50x a healthy WAN
+round trip, with authoritative answers cached for 5 minutes.
+
+### 26.6 What changes for the operator
+
+Nothing new to learn, which is the design goal. A stalled directory now produces
+exactly what a down one produces: an `ErrorNetwork` the existing classifier
+already reads as unreachable, so it arms the same cooldown, moves the same
+`identity_backend` diagnostics row, increments the same
+`culvert_auth_backend_*` series, and fires the same
+`identity_backend_unreachable` alert. One additional rate-limited log line names
+the backend and the budget, with a **bounded reason class only** — no directory
+address and no server-supplied diagnostic on a per-request path (the WK-12/RS-5
+rule).
+
+The outage therefore becomes self-limiting: one probe per 3 s cooldown instead
+of one permanently hung goroutine per request, recovering on observed evidence
+with no restart.
+
+Runbook: `docs/operator/ldap-directory-stalls.md`.
+
+### 26.7 Gates
+
+Nine, in three groups — the controls exist because a bound that fired on a
+healthy directory would pass every defect gate while being strictly worse than
+the defect it replaced.
+
+| Group | Gate | Pins |
+|---|---|---|
+| Defect | `StalledDirectoryReleasesTheRequestGoroutine` | the call returns inside its envelope, fail-closed |
+| Defect | `StalledDirectoryArmsTheUnreachableCooldown` | the fault is now visible to CHAOS-47 at all |
+| Defect | `ArmedCooldownDeniesAStalledDirectoryWithoutDialing` | the outage is self-limiting, not re-paid per request |
+| Defect | `StartTLSHandshakeStallIsBounded` | layer 2 is load-bearing (remove the watchdog and it hangs) |
+| Defect | `AdminDirectoryTestIsBoundedOnAStartTLSStall` | the admin handler goroutine is released too |
+| Defect | `ConcurrentStallsDoNotAccumulateGoroutines` | 12 concurrent stalls all return and unwind |
+| Proof | `SetTimeoutDoesNotBoundStartTLSHandshake` | the library assumption layer 2 exists for |
+| Control | `PromptDirectoryIsNeitherClippedNorGated` | a healthy directory is not clipped, and its deny does not arm the gate |
+| Control | `WatchdogStopsWhenTheRoundTripCompletes` | a cancelled watchdog never closes a live connection |
+
+All six defect gates were verified failing against the pre-fix shape; the proof
+and both controls pass in both trees, which is what makes them controls.
+
+### 26.8 Deliberately left
+
+- **AU-3** (proxy-path bcrypt is not rate-limited) and **AU-11** (the credential
+  provider loop is sequential, so N providers serialise their budgets on one
+  request) are untouched and remain open. AU-11's worst case is now bounded
+  rather than infinite, which lowers its severity without closing it.
+- **The fail-closed posture is unchanged.** A directory that cannot answer
+  denies; it never becomes an implicit allow.
+- **No new metric.** A stall is an unreachable backend, and it now lands on the
+  series that already means that. A second name for one operator action is the
+  thing CHAOS-47's `identity_backend` naming note warns against.
+
+### 26.9 The general rule this sweep produces
+
+> A cooldown, breaker, or health gate armed by a returned error is blind to
+> every fault that hangs. Bounding the call is what makes the mitigation
+> reachable — the mitigation is not the bound.
+
+Recorded as **AU-14** so the next backend added to the credential chain inherits
+it instead of rediscovering it. The shipped backends satisfy it today: OIDC by
+`http.Client{Timeout}` on every call, SAML because it is browser-mediated, and
+LDAP as of this sweep.
+
+---
+
+## 27. CHAOS-59 — The intelligence-feed plane under origin outage
+
+**Date:** 2026-09-03
+**Scope:** the two legacy periodic feed loops — `internal/threatfeed`
+(URLhaus + OpenPhish) and `internal/feedsync` (the UT1 community category
+tarball) — under an unreachable, slow, rate-limiting or erroring third-party
+origin, on a single node and across a fleet.
+**Registry rows:** WK-5 (reopened and closed), WK-5b, WK-5c, WK-6 (partially),
+WK-13b.
+
+### 27.1 The finding in one sentence
+
+**Culvert ships three periodic feed schedulers, and only the newest one backs
+off, jitters, or reports** — so a transient outage at a public feed origin
+froze threat intelligence for a full sync interval, a fleet-wide restart aimed
+a synchronised fetch storm at that same origin, and neither condition was
+visible on any surface an alerting rule can read.
+
+### 27.2 Why it was invisible, and why that is this sweep's fault
+
+The register has carried **WK-5** since the first sweep: a partially-failed
+sync unconditionally replaced the lookup tables with only what had succeeded,
+wiping the rest of the threat database in memory and — because `Sync` persists
+immediately after — on disk. That was closed by the per-source carry-forward in
+`applySync`, and the fix is correct.
+
+It also **removed the only signal an operator had.**
+
+Before carry-forward, a feed outage was catastrophic but LOUD in the one place
+a Prometheus rule can read: `culvert_threat_feed_entries` collapsed toward
+zero. After it, the entry count is held at its last-good value *by design*. A
+node whose feed has not fetched successfully in three weeks and a node that
+synced ten minutes ago export **byte-identical metrics**. The only surviving
+difference — `threat_feed_sync_ok` — reached exactly one role-gated admin JSON
+blob (`security_scan.go`), which nothing scrapes and no rule alerts on.
+
+This is the §1 silent-degradation theme in a form worth naming, because it is
+not a missing feature. It is a *fix that consumed its own detector*:
+
+> A fix that converts a loud failure into a safe one inherits the obligation to
+> replace the signal it silenced. Carry-forward made the failure survivable and
+> simultaneously made it unobservable, and the second half was never done.
+
+Freshness is the whole value of this control. A URLhaus entry is useful because
+it was added hours ago; yesterday's list does not contain today's campaign.
+"Serving last-known-good intelligence" is the right behaviour and an
+indefinitely acceptable *state* only if someone is told.
+
+### 27.3 The cadence defect (WK-5, WK-6)
+
+Both loops were `time.NewTicker(syncInterval)` with the round's outcome
+discarded:
+
+```go
+ticker := time.NewTicker(tf.syncInterval)   // 6h  (threatfeed)
+for { select { case <-ticker.C: obs.SafeCall("threatfeed", tf.Sync) } }
+```
+
+A `time.Ticker` has no notion of failure, so **a failed round waits a full
+interval** — six hours for threat intel, **twenty-four** for categories. The
+fault that triggers it is not exotic: a DNS blip, a 503 from the provider, a
+restarted upstream proxy, or a few seconds of packet loss on the customer's own
+egress path. One such second bought six hours of frozen intelligence.
+
+The evidence that this was understood and simply not applied here is in the
+tree: `saas_feed_scheduler.go`, the *newest* feed loop, already implements
+bounded exponential backoff, stable ±10% jitter, injectable clock/timer seams
+and fake-clock tests. Two older loops never got it.
+
+### 27.4 The severe shape: a cold start into an outage (WK-5c)
+
+`Start` runs an immediate sync when the on-disk DB is empty — a fresh install,
+a re-imaged node, a replaced data volume, or a node whose category store was
+quarantined by §19's boot-path recovery.
+
+If **that** round fails, the node is not serving stale intelligence. It is
+serving **none**: an empty threat database, for up to six hours, while
+`/health`, `/ready`, `/metrics` and the dashboard all report a completely
+healthy gateway. Policy, category, DPI, AV and CDR are untouched, so this is a
+coverage hole rather than an outage — but it is a security control that is
+fully dark and silently so, and it is reachable by the single most ordinary
+operational event there is: bringing up a new node.
+
+Combined with §26.5, a rolling upgrade performed during a provider incident
+brings the *whole fleet* up in this state simultaneously.
+
+### 27.5 The fleet shape: a self-inflicted herd (WK-13b)
+
+`time.NewTicker` fires at a fixed offset from process start. Nodes that boot
+together — a rolling upgrade, a compose restart, a hypervisor recovering a rack
+— therefore sync together, **forever**, with no mechanism that could ever
+spread them.
+
+The origins are the aggravating factor. They are public, third-party, shared by
+every Culvert deployment, and one of them serves a 50+ MB tarball from
+`raw.githubusercontent.com`. The ordinary answer to a synchronised fleet
+hammering such an endpoint is rate-limiting or blocking of the customer's
+egress IP — which **produces** a feed failure. And the missing backoff then
+held every node in the fleet at that failure for a full interval, at which
+point they retried in lockstep again.
+
+That is a closed loop in which the scheduler manufactures the outage it cannot
+recover from promptly. Neither half is dangerous alone; together they are the
+finding.
+
+### 27.6 What shipped
+
+**`internal/feedsched`** — one shared cadence engine, deliberately shaped like
+the `saasFeedScheduler` that already existed rather than invented:
+
+- delay after a clean round = the configured interval, offset by a per-node
+  jitter fraction **drawn once** (stable within a node, spread across a fleet;
+  re-rolling per tick would let nodes drift back into phase and would make the
+  cadence untestable);
+- delay after a failed round = bounded exponential backoff from `BackoffMin`,
+  doubling, clamped at `BackoffMax`, reset by the first success;
+- **Both the retry FLOOR and the CEILING are clamped to the live interval.** A
+  ceiling above the interval would mean a failing feed attempts *less* often
+  than a healthy one — the recovery mechanism becoming an extra delay. A caller
+  cannot express that shape. Clamping the ceiling ALONE is not sufficient, and
+  the first version shipped in this PR got it wrong (Codex review): with an
+  interval shorter than `BackoffMin` — an admin running `-feed-sync-interval
+  1m` against the 5 m floor — the ceiling clamped down to 1 m and was then
+  raised straight back to the floor, so a failed round waited **five times
+  longer** than a healthy one. That is the bare-ticker regression this whole
+  section exists to remove, reintroduced inside its own fix, and the original
+  gate missed it because it used an interval comfortably above the floor. The
+  invariant is one sentence and it has to hold at every interval: *a retry is
+  never later than the configured cadence.*
+- the wait is interruptible: ctx cancellation returns from inside a backoff, so
+  shutdown never waits one out;
+- a **panicking round is a failed round**, contained at the iteration per
+  `internal/obs`'s rule, so a hostile feed body backs off instead of either
+  killing an in-line gateway or hot-looping.
+
+Retries are unbounded in COUNT and bounded in RATE. That does not violate
+"avoid infinite retries" for the reason §23 recorded: the retry is never silent
+(every failure is counted, classified and — past the threshold — alerted), and
+a feed that *stopped* retrying would be strictly worse, freezing intelligence
+permanently on one transient error.
+
+**Threat feed:** 6 h interval, retries 5 min → 1 h. **Category feed:** 24 h
+interval, retries 15 min → 2 h.
+
+**`threatfeed_health.go`** — the staleness plane, in the shape
+`storage_health.go` / `ca_health.go` / `socks5_health.go` already use, with no
+new operator vocabulary:
+
+- five `culvert_threat_feed_*` series (`last_success_timestamp_seconds`,
+  `stale_seconds`, `sync_ok`, `sync_failures_total`,
+  `consecutive_sync_failures`), emitted **only when the feed is configured** —
+  the §22 rule, since `sync_ok 0` on a node that never ran the feed is
+  indistinguishable from a broken one and the paging rule is `== 0`;
+- the `threat_feed` operator-contract row;
+- a `threat_feed_stale` alert, **fire-once per episode**, cleared only by an
+  OBSERVED clean round, and **also evaluated once at startup** for the
+  warm-but-already-stale database (a node that was powered off, or one whose
+  feed has been failing across restarts). Without that startup pass the alert
+  waited on a failed round, and the first round is a full jittered interval
+  away — so nothing fired for the window in which the gateway was enforcing
+  against stale intelligence, and nothing fired at all if that round then
+  succeeded. It routes through `deferStartupAlert` because the webhook store is
+  loaded by a LATER startup slice: firing directly would fan out to an empty
+  subscriber list and vanish, which is precisely the failure that queue exists
+  to prevent. The never-synced branch is deliberately excluded from the startup
+  pass — at boot its age is ~0, and a node that has simply not finished its
+  first sync is not a fault.
+
+`culvert_threat_feed_sync_ok` derives from the **persisted** `lastSyncErr`, not
+from the in-memory consecutive-failure count. The count is deliberately not
+persisted (the true run length across restarts is unknowable), so a gauge keyed
+on it reported a green `1` after a restart from a database written by a failed
+sync — for hours, until the next scheduled round (Codex review). Deriving it
+from the persisted error also makes `/metrics` and the admin API's
+`threat_feed_sync_ok` agree by construction rather than by coincidence.
+
+Failures are classified into a **bounded reason class** (`urlhaus`,
+`openphish`, `urlhaus+openphish`, sorted so it is stable). The verbose summary
+stays on the role-gated admin API and in the rate-limited log, because
+`Dispatch` dedups on `event + ":" + Detail` and the summary embeds the feed URL
+and — for a transport failure — the ephemeral local port, so a raw detail would
+defeat the dedup window by construction and evict real threat alerts from the
+500-entry retry queue (the WK-12/RS-5 defect).
+
+### 27.7 Rejected alternatives, recorded
+
+- **No `/readyz` row and no `/healthz` failure.** A node with stale threat
+  intelligence is a fully serving gateway; failing readiness would pull healthy
+  gateways out of rotation over a degraded cache. Same judgement §19 records
+  for the community category store, for the same reason.
+- **No fail-closed toggle.** Blocking traffic because a third-party feed is
+  unreachable converts a provider's outage into the customer's. The threat feed
+  is an additive deny-list on top of default-deny policy, not the control that
+  decides whether a request is allowed. This is the deliberate asymmetry with
+  WK-1b/WK-2b: those govern a scanner's verdict on content in flight; this
+  governs how fresh a deny-list is.
+- **Staleness at 2× the interval, not 1×.** One missed window is exactly the
+  transient the new backoff exists to absorb — the ladder reaches its 1 h
+  ceiling long before 2 × 6 h elapses, so by the time this fires the feed has
+  failed a dozen bounded retries. But the **never-synced** case is measured
+  from process start against a 30-minute grace instead, because it is the
+  severe shape (§26.4) and its usual cause is a deploy-time misconfiguration an
+  operator should hear about in minutes.
+- **The category feed gets the cadence fix but not an alert.** Its last-good
+  BadgerDB keeps serving and category staleness is not a security control;
+  adding a second staleness dialect for it would be operator noise. Recorded as
+  the open half of WK-6.
+
+### 27.8 Gates
+
+`internal/feedsched/feedsched_test.go` (11), `internal/threatfeed/sync_cadence_test.go` (10),
+`internal/feedsync/sync_cadence_test.go` (5), `threatfeed_health_test.go` (13).
+
+The cadence defect gates fail against the bare-ticker shape **by
+construction**: a `time.NewTicker(interval)` returns the interval after a
+failed round, and the gates require a strictly smaller delay. That was
+**verified empirically, not asserted** — reintroducing the pre-fix shape
+(`NextDelay` returning the interval regardless of outcome) fails six gates
+across all three packages (`TestNextDelay_SuccessUsesInterval_FailureBacksOff`,
+`TestNextDelay_SuccessResetsBackoff`, `TestRun_ImmediateRoundThenBackoffOnFailure`,
+`TestRun_PanickingRoundIsContainedAndChargedAsFailure`, and
+`TestScheduler_FailedRoundRetriesLongBeforeTheInterval` in both feed packages),
+while every CONTROL correctly still passes — which is what makes the controls
+controls rather than more defect gates. The staleness-plane gates have no
+pre-fix counterpart to fail against: those surfaces did not exist. Four CONTROLS
+guard the direction of the fix, because each defect gate has a trivially worse
+way to pass:
+
+- `TestRetryRateIsBounded` / `TestRetryBoundsAreSaneRelativeToTheInterval` — a
+  scheduler that retried *immediately* satisfies "a failure is retried before
+  the next interval" while being a hot loop against a third-party origin.
+- `TestBackoffCeilingIsClampedToInterval` — a ceiling above the interval turns
+  recovery into an extra delay.
+- `TestThreatFeedStale_HealthyFeedNeverAlerts` — an alert that fired on every
+  round passes every staleness gate while being useless.
+- `TestScheduler_ColdStartArmsAnImmediateRound` also pins the *other* half: a
+  warm feed must NOT re-fetch at boot, or a fleet restart stampedes the origins
+  regardless of jitter.
+
+Four gates pin defects **introduced and caught inside this work**, which is
+worth recording as a pattern rather than as embarrassment — three of the four
+are the section's own findings reappearing one level down:
+
+- `TestApplySync_CarriedForwardEntriesAreCounted` — counting entries before the
+  carry-forward merge reported a partially-failed sync as a nearly-emptied
+  feed, precisely the false alarm carry-forward exists to prevent.
+- `TestBackoffNeverExceedsAnIntervalShorterThanTheFloor` — the floor-clamp
+  defect above: §26.3's "a failed round waits longer than a healthy one",
+  rebuilt inside the fix for it.
+- `TestThreatFeedSyncOK_SurvivesARestartFromAFailedSync` — a freshness gauge
+  that reads healthy while the feed is known to be failing: §26.2's "the
+  detector says fine", rebuilt inside the detector.
+- `TestThreatFeedStale_EvaluatedAtStartupForAWarmButStaleDatabase` — an alert
+  that cannot fire in the window it exists for, with a CONTROL (a fresh install
+  and a node that synced ten minutes ago must both stay silent) so an alert
+  firing on every boot cannot pass it.
+
+### 27.9 Residual risk
+
+- **The main-side `saasFeedScheduler` is a third instance of this engine** and
+  was not migrated onto `internal/feedsched`. It is already correct — it is the
+  shape the package copies — and it additionally owns a config-change wakeup
+  bound to its runtime. Migrating it is a refactor, not a chaos fix, and
+  bundling it here would have mixed the two. Recorded as a follow-up.
+- **A DP with no direct feed egress reports never-synced forever.** Such a node
+  receives coverage through the CP's config snapshot (`cluster-sync` entries,
+  which local syncs never replace), so the state is correct but the alert is
+  noise on those nodes. The runbook says to suppress it there; a per-node
+  "feed egress not expected" declaration is not modelled.
+- **Feed content trust is unchanged.** These are unsigned plaintext lists over
+  TLS; a compromised or hijacked origin can add entries (over-blocking) or
+  withhold them (under-blocking). Signing is out of scope here and is the
+  problem the signed SaaS feed solves for its own path.
+- **No age ceiling on carried-forward entries.** A permanently-failing feed
+  serves its last-known-good list indefinitely. That is the fail-safe direction
+  (over-blocking, and a stale entry is still a real past threat), and it is now
+  visible rather than silent — but nothing expires it.
+
+### 27.10 The process lesson
+
+§21 stated it for back ends, §22 for listeners, §23 for decisions, §24 for
+documented residuals. This sweep adds one about **fixes**:
+
+> Making a failure safe is not the same as making it observed, and a fix that
+> converts a loud failure into a quiet one has *taken on a debt*. Carry-forward
+> was the correct remedy for the stale-erase defect, and it silenced the entry
+> count — the one signal that had made the defect visible. Two sweeps later the
+> register still recorded WK-5 as closed. It was half closed: the failure could
+> no longer hurt you, and it could no longer be seen.
+
+The corollary is a review question worth asking of every degradation fix in
+this register: *what signal did the old, worse behaviour emit, and what emits
+it now?*
+## 28. CHAOS-60 — The GeoIP resolution chain under a slow or unavailable resolver
+
+**Date:** 2026-09-07
+**Scope:** `geo.LookupCached` (the per-request policy accessor), `resolveHost`,
+`internal/geoip`'s IP→country cache, and the destination-country tracker.
+**Shipped:** `geoip.go` (single-flight + a genuinely cache-only accessor),
+`geoip_resolve_health.go` (bounded warmer + health plane), `policy.go`
+(unresolved-country counter, two corrected comments), `metrics.go` (six series),
+`geoip_resolve_chaos_test.go` (15 gates).
+
+### 28.1 Why this domain
+
+Every earlier sweep in this register found its defect on a path that was
+already *suspected*: a CA that expires, a lease that cannot be re-acquired, a
+hook that does not return. This one started from the opposite end — a row in
+this document that said a path was **safe**.
+
+Row WK-3 read: *"GeoIP cache-miss on the policy hot path fails closed;
+`LookupCached` never blocks on DB/DNS."* Marked ✓. It cited `geoip.go:84-93`.
+Those lines are now the body of `hostIPCache.get`, a function that did not
+exist when the row was written. The citation had drifted, and so had the claim.
+
+### 28.2 GEO-1 — the accessor named "Cached" took an uncancellable DNS round trip
+
+`matchDestNorm` (policy.go) evaluates a country-scoped rule with:
+
+```go
+// Geo-IP country check — cache-only to avoid blocking the request goroutine.
+code, cached := geo.LookupCached(host)
+```
+
+`LookupCached` called `resolveHost(host)`, and `resolveHost` on a cache miss
+called `lookupPublicHostIP` → `net.LookupHost`. `net.LookupHost` takes **no
+context**. It runs to the system resolver's own budget — `resolv.conf`
+`timeout` × `attempts` × nameservers, commonly 10–40 s on a blackholed
+resolver — and there is no way to abandon it.
+
+That ran **inside the request goroutine**, during policy evaluation, which
+happens before the plain-HTTP path's `upstreamRequestTimeout` is armed and on
+the CONNECT path has no overall budget at all. For the duration the request
+holds its goroutine, the client's TCP connection, its per-IP connection slot
+(`internal/connlimit`), and a resolver descriptor.
+
+The same file said so, 380 lines earlier, in `Evaluate`:
+
+```go
+// the scan can block (matchDestNorm → geo.LookupCached → DNS on an uncached
+// DestCountry host; …), so the lock must NOT be held across it
+```
+
+Two comments in one file, one saying the geo check cannot block and one
+explaining the locking discipline required *because* it can. Both were written
+in good faith; the second is the one that was true.
+
+There was no single-flight either — the code said so explicitly
+(*"Concurrent misses for the same host may resolve in parallel; last write
+wins, which is benign"*). It is benign for correctness and not for load: the
+negative entry that stops the next lookup is only written when a lookup
+**returns**, so during exactly the window where lookups do not return, nothing
+suppresses the next one. A proxy is therefore a 1:1 amplifier of client
+request rate into DNS query rate (×2 for the A/AAAA pair Go issues), aimed at
+a resolver that is by hypothesis already failing. A reconnect storm against a
+single host — one of this document's own simulate-list entries — is the worst
+case, and it is the case a caching layer looks like it should have covered.
+
+Measured against the pre-fix tree by `TestChaos57_ConcurrentMissesResolveOnce`:
+**50 concurrent misses for one host → 50 resolver invocations.**
+
+### 28.3 GEO-2 — enforcement was fed by a telemetry sampler
+
+The blocking resolution is only half the chain. After it, `LookupCached` calls
+`geoip.LookupCachedByIP`, which — correctly, and as documented — *never*
+performs a database lookup. So the country half still had to be populated by
+someone.
+
+On the request path, exactly one thing populated it: `trackDestinationCountry`
+(proxy.go), whose own doc comment reads *"Dashboard stats are best-effort:
+when the tracker pool is saturated the sample is dropped rather than queued."*
+It runs on the **allow** branch only, after the policy decision, behind a
+256-slot drop-on-full semaphore.
+
+So the enforcement of a country-scoped policy rule depended on a
+dashboard-statistics goroutine having won a semaphore slot on an earlier
+request. Three consequences, none of them visible:
+
+1. Under enough concurrency to saturate that pool the samples are dropped, the
+   country stays unknown, and **every country-scoped rule silently stops
+   matching** — the rule's hit counter stays at zero while the traffic it
+   describes flows.
+2. If the first request to a host is BLOCKED, the tracker never runs at all,
+   so nothing on the enforcement path ever learns that host's country.
+3. The one signal an operator could have read — the rule's hit count — reads
+   identically to "no traffic matched this rule", which is the reading an
+   operator will reach for first.
+
+This is the §21/§22 theme in a new costume: a security control wired to a
+lossy path, where the loss is the designed behaviour of the path and a
+correctness requirement of the control.
+
+### 28.4 What shipped
+
+**The accessor is genuinely cache-only.** `resolveHostCached` answers from an
+IP literal or a live cache entry and never touches the resolver. A miss returns
+`("", false)` — the fail-closed answer the call site already documented — and
+arms a warm. The distinction between *"unknown, nothing cached"* and
+*"resolved to nothing usable"* is now explicit in the return, because only the
+first is worth warming; a negative-cached host is governed by its TTL, not by
+the request rate (`TestChaos57_NegativeCachedHostDoesNotWarm`).
+
+**The warm is BOUNDED, and deliberately not by a deadline.** `geoWarmSem`
+(64, drop-on-full) is the bound. A context deadline was considered and
+rejected: under the cgo resolver a cancelled lookup returns to the caller while
+the OS thread stays blocked in `getaddrinfo`, so a deadline would release the
+semaphore slot without releasing the thread — turning a bounded goroutine pool
+into an unbounded thread pool, which is worse than the fault it treats. Holding
+the slot for the **true** duration of the call is what makes the bound real.
+A queue was rejected for the reason drop-on-full is used everywhere else here:
+it converts a resolver outage into unbounded memory and unbounded staleness.
+
+**Misses are single-flighted, and the host is claimed BEFORE a pool slot is
+taken.** `hostIPCache.begin`/`finish` elect one leader per host; every
+concurrent caller waits on its result (the jwksCache shape from
+`auth_oidc_flow.go`). The warmer takes that claim **synchronously**, before it
+consumes a slot or spawns anything, so N concurrent callers for one host cost
+exactly one slot and the other N−1 return having touched nothing. The ordering
+is not incidental — see §28.8, where getting it wrong re-entered this
+document's own finding.
+
+**The warm fills BOTH caches.** It calls `geoip.LookupByIP`, not just the
+resolver, so the enforcement path now owns its own populator and no longer
+depends on `trackDestinationCountry` having run. That is the GEO-2 fix, and it
+is why the warm also fires on the *country-half* miss (host→IP cached, IP never
+geolocated) — the shape that was otherwise permanently undecidable on a node
+whose sampler is saturated.
+
+**The release is bound to the channel the slot came from.** `warmGeoHost`
+captures `sem` rather than re-reading the global, so a goroutine outliving a
+swap cannot return a slot to a channel it never took one from. This was found
+by the gates themselves: the first draft read the global on release, and two
+saturation gates passed or failed on goroutine timing.
+
+**It is observable.** Six series, emitted **only when a GeoIP database is
+loaded** — the socks5/cluster_ca rule, because a flat `0` on a node that has no
+GeoIP is indistinguishable from a node whose geo rules have stopped enforcing,
+and every paging rule here is `> 0`:
+
+| Series | Reads |
+|---|---|
+| `culvert_geo_warm_total` | warms started off the request path |
+| `culvert_geo_warm_dropped_total` | warms refused — the pool was saturated |
+| `culvert_geo_warm_failed_total` | warms that found no usable public address |
+| `culvert_geo_warm_saturated` | 1 while warms are being dropped |
+| `culvert_geo_warm_inflight` | warm goroutines running |
+| `culvert_geo_policy_unresolved_total` | **country-rule evaluations that did not match because the country was unknown** |
+
+The last one is the security-relevant one and the one that did not exist in any
+form before: it is the operator's only way to see a geo rule evaluating against
+an unknown country. A low rate is expected (one per host per cache lifetime,
+the warm being off-path); a rate that tracks request rate means enforcement is
+not converging, and it will be accompanied by `warm_dropped_total` climbing.
+Saturation onset is logged immediately, then rate-limited to one line per
+minute, then one recovery line naming the suppressed count — signal in the log,
+magnitude in the counter (socks5_health.go's discipline). Recovery clears on
+**observed evidence** (a warm that actually got a slot), never on elapsed time.
+
+No new alert event was added: the operator vocabulary is unchanged and the
+metrics carry the state. Recorded as a deliberate choice, not an oversight.
+
+### 28.5 What is deliberately left
+
+- **WK-3c — the first-request window is an OWNER DECISION.** A country-scoped
+  rule still does not match on the first request to a host whose country is not
+  yet cached. For an allow-rule that is fail-closed (a user-visible block that
+  clears on retry); for a deny-rule it is traffic falling through to a
+  lower-priority rule. CHAOS-60 does not change this in either direction — it
+  makes the window converge in **one request** instead of depending on whether
+  a dashboard sampler won a slot, and it makes the window **countable**.
+
+  The evidence for whoever decides: `geoip.LookupByIP` is an **mmap read of a
+  local file**, not I/O that can block, so performing it inline on the policy
+  path is affordable and would close the window entirely for any host whose
+  address is already cached. That is not shipped here because it changes when a
+  rule first matches — a policy-semantics change, not a resilience fix, and this
+  register's rule is that a security posture is never flipped unilaterally. The
+  fuller version of the same decision is what "unknown country" should MEAN in
+  policy (today: "does not match"; the alternative is an explicit deny-on-unknown
+  option per rule), which is a product decision.
+
+- **`LookupFull` still blocks**, by design. Its two callers are bounded some
+  other way — the destination-country tracker (256, drop-on-full) and node
+  enrollment (admin-rate) — and both may block. The contract is now written
+  down on `resolveHost` itself, so a future caller has to opt into it knowingly.
+
+- **A private-only or unresolvable host re-warms once per negative TTL**
+  (30 s). On an estate with many internal hostnames that is a steady low rate of
+  warms that can never succeed. It is bounded by the semaphore and counted by
+  `warm_failed_total`; a per-host suppression window was judged not worth the
+  state.
+
+- **The MaxMind database itself is still unmonitored proactively** — WK-4's
+  residual, untouched here.
+
+### 28.6 Gates
+
+`geoip_resolve_chaos_test.go` (15). **Five defect gates were verified failing
+against the reintroduced pre-fix shape**, with the numbers quoted above:
+
+| Gate | Pre-fix result |
+|---|---|
+| `LookupCachedNeverBlocksOnDNS` | blocked 2.0006 s against a 2 s resolver |
+| `ConcurrentMissesResolveOnce` | 50 concurrent misses → 50 resolver invocations |
+| `WarmConvergesWithoutTheDashboardSampler` | no warm armed |
+| `WarmFiresWhenOnlyTheCountryHalfIsMissing` | no warm armed |
+| `WarmIsBoundedAndDropsWhenSaturated` | no warm armed |
+
+`PreFixShapeBlocksOnDNS` is a permanent **defect proof**: it rebuilds the
+pre-fix body inline and requires it to still block, so the primary gate can
+never quietly start proving less than it claims (the
+`BareGracefulStopIsUnboundedOnAWedgedStream` pattern from §24).
+
+Two **controls**, because the gates above are all satisfiable by a warmer that
+does nothing: `ControlWarmerActuallyResolves` requires the warm to perform the
+resolution and the engine lookup and populate the cache;
+`ControlDisabledGeoIPDoesNothing` pins the shipped default — with no `.mmdb`
+loaded, no resolution, no goroutine, no counter movement. A sixth gate,
+`MetricsAppearOnlyWhenGeoIPIsLoaded`, pins both halves of the exposition rule.
+
+One gate is against a defect **introduced by the fix and caught inside it**.
+`APanickingLeaderStillPublishes`: the single-flight's leader owns the slot, and
+the first draft published after the call rather than in a `defer`. A leader
+that returns without publishing strands every current follower *and* leaves the
+slot occupied, so every LATER caller for that hostname becomes a permanently
+blocked follower — one panic in the resolver seam would take that host out for
+the life of the process, which is a strictly worse failure than the unbounded
+block being fixed. Verified failing against the non-deferred shape
+("the follower was stranded by a leader that returned without publishing").
+
+Every bounded wait in the file is bounded *for a reason*: the first draft used
+bare channel receives, and against the pre-fix tree three gates hung to the
+package timeout instead of failing with a message. A gate that hangs tells a
+future reader nothing.
+
+### 28.7 The process lesson
+
+§24 was about documented residuals. This one is about **documented safety**:
+
+> A register row that records a path as safe is a claim with a shelf life, and
+> nothing in the build checks it. The row here was accurate when written and was
+> invalidated by an ordinary, well-executed performance change that put a cache
+> in front of the blocking call without removing it — a change that made the
+> defect *less* likely to be observed, which is precisely why the claim survived.
+> The line-number citations drifted at the same time and in the same direction:
+> the row still pointed at real code, so it still looked checked.
+
+The practical consequence for this register: when a sweep confirms a ✓ row,
+it should confirm it against the code, not against the row. Two of the three
+sweeps' worth of confidence in this path came from re-reading the row.
+
+### 28.8 Review follow-up — the fix re-entered its own finding
+
+Codex raised a **P1** against the first version of this change, and it was
+right. The finding is worth recording in full because it is the same shape as
+GEO-2, one level down.
+
+`warmGeoHost` began with:
+
+```go
+if resolvedHostCache.resolving(key) { return }   // (A) pre-CHECK
+select { case sem <- struct{}{}: default: drop } // (B) take a slot
+go func() { … resolveHost(key) … }()             // (C) the claim is registered HERE
+```
+
+The claim is registered by `begin`, which runs inside `resolveHost` — in the
+**goroutine**, at (C). So (A) is a pre-check against a claim that does not
+exist yet, and the window between (A) and (C) is a goroutine scheduling round.
+Concurrent policy evaluations for one uncached hostname — precisely the
+reconnect-storm shape this change exists to survive — all pass (A), all consume
+a slot at (B), and all but one park as **followers holding those slots** for
+the resolver's full delay.
+
+One popular destination could therefore drain the whole 64-slot pool, and every
+*unrelated* host's warm would be dropped and its country rule left unresolved.
+That is the GEO-2 degradation — country rules silently not enforcing because a
+bounded pool ran out — re-entered through the fix for GEO-2.
+
+The fix is an ordering one: `begin` is now called **synchronously in the
+caller**, before any slot is taken. A non-leader returns immediately having
+touched nothing; a leader that then cannot get a slot **hands the claim back**
+(`finish` with a nil result, deliberately *without* a cache write — nothing was
+learned, and a negative entry would suppress the retry for a full TTL over a
+transient pool shortage). `finish` was made idempotent with a `sync.Once` so
+every hand-back path can call it unconditionally, which is what turns "a claim
+is never stranded" from a proof about ordering into a local property.
+
+**The gate that missed it is the more instructive part.**
+`WarmSkipsAHostAlreadyBeingResolved` claimed the single-flight, and passed — it
+pre-claimed the slot synchronously in the test and so only ever exercised the
+*post*-registration state, never the window. The first replacement gate missed
+it too, for a different reason: with all callers spawned as goroutines, the
+leader usually wins the race to register, so a single trial passes a broken
+build most of the time. It is now a **many-trial** gate (60 trials × 32
+concurrent callers, the `TestChaos54_StopIsPromptDuringAcceptBackoff`
+precedent) — the invariant asserted per trial is exact (one host, at most one
+held slot) and only the trial count is statistical. Against the pre-fix shape
+it fails at trial 6: *"32 concurrent warms for ONE host held 2/8 pool slots."*
+
+A second, smaller defect surfaced on the way: under `-race`, a warm goroutine
+outlives the test body that armed it, and `defer restore()` runs **before** any
+`t.Cleanup` — so the resolver seam was being restored while a live warm was
+still reading it. Production never reassigns those vars, so this is harness-only,
+but `stubResolver` now waits for in-flight warms before restoring: a seam must
+outlive its users.
+## 29. CHAOS-57 — Credential verification as an unbounded, unauthenticated CPU sink
+
+**Date:** 2026-09-06
+**Scope:** the per-request proxy-authentication path for local accounts —
+`Config.verifyAuthFrom` (store.go), its two data-plane callers
+(`resolveRequestAuth` in proxy.go, `socks5Negotiate` in socks5.go), and the
+verification result cache.
+
+### 29.1 Why this domain
+
+The register has carried **AU-3** as an open Medium since the first sweep,
+framed as *"correct-username + N wrong-passwords is a cache miss every time →
+full ~100 ms bcrypt per request"*. That framing was too narrow in the one
+direction that mattered: it described an attack that requires knowing a valid
+username, and it categorised the consequence as latency.
+
+**The cheap branch is the wrong-username branch, and the consequence is a
+gateway-wide outage.**
+
+`verifyAuthWithSnapshot` ran an unconditional `bcrypt.CompareHashAndPassword`
+against a fixed dummy hash whenever the presented username did not match. That
+comparison exists for a good reason — RISK-008 equalises the wrong-username and
+wrong-password paths so neither is distinguishable by timing — but it sat
+**before** the result cache and never populated it, so a flood of *distinct*
+usernames was a guaranteed cache miss every single time. No valid username, no
+credential, no knowledge of the deployment.
+
+And nothing stood in front of it. The three front-door limiters that could have
+capped the arrival rate — the per-IP connection limiter, the request rate
+limiter (`-rate-limit`, default **0 = off**) and the IP filter — **all ship
+disabled**. Nothing capped concurrency either, so N simultaneous requests put N
+goroutines into bcrypt at once and the scheduler shared every core between them.
+
+### 29.2 The measurements
+
+Taken on the reference 4-core box against the pre-fix tree. The probe that
+produced them is preserved as the defect gates.
+
+| | |
+|---|---|
+| one wrong-username attempt | **79.6 ms of exclusive CPU** |
+| one cached successful authentication | 1.5 µs |
+| **amplification** | **51,631×** |
+| sustained attempt rate at full saturation | **66/s** |
+| bytes on the wire to achieve that | **~13 KB/s** |
+| degradation to other CPU work, 64 attacker connections | **15.6×** |
+
+So roughly **thirteen kilobytes per second from one unauthenticated source
+consumes an entire four-core gateway**, and everything else the appliance must
+do per request — TLS handshakes, DPI scanning, policy evaluation, relay copying
+— competes for what is left. That is a remotely triggerable denial of service
+against the data plane, in the shipped default configuration.
+
+The arithmetic generalises without needing a benchmark: one request buys ~80 ms
+of a core, so **12.5 × GOMAXPROCS requests per second saturates the machine**.
+
+### 29.3 Two amplifiers found alongside it
+
+**AU-3c — the cache evicted a random victim.** At capacity the cache scanned
+for an expired entry and, finding none, dropped *an arbitrary one* — a Go map
+range that stops at the first key, i.e. a uniformly random **live** entry. A
+flood of distinct passwords under a known username therefore displaced other
+clients' cached positives. Measured: an honest user's cached credential
+survived a flood of 1× the cache capacity and was **reliably gone by 2×**,
+after which that user paid a full ~80 ms bcrypt on *every* request. The
+attacker's amplification lands on legitimate traffic. This is precisely the
+finding `internal/authstate` closed for the login-state stores, standing
+unchanged one subsystem over.
+
+**AU-3d — the scan is O(cache) under the process-wide mutex.** The
+expired-entry scan walks the whole 5,000-entry map whenever nothing has
+expired, which is exactly the state a flood keeps it in. Measured **64 µs per
+insertion**, serialised against every other authentication in the process.
+
+### 29.4 The finding inside the fix
+
+The obvious fix — gate the branch that runs the expensive comparison — **is a
+security regression**, and it is subtle enough that it was written first.
+
+RISK-008's dummy comparison exists so that a wrong username and a wrong
+password take the same time. A governor consulted only on the branch that
+reaches the real hash makes "over budget" **fast for a wrong username and slow
+for a wrong password**, handing back exactly the username-enumeration oracle
+the equalisation removed. The bound would have been bought with the
+vulnerability it was protecting.
+
+So the rule is: **the admission decision is taken before the username is
+compared, and does not depend on it.** The code reads as *answer for free if you
+can, then buy permission to spend 80 ms, then look at the credential*:
+
+1. **Cache first, unconditionally** — ahead of the username comparison. This
+   changes no verdict (entries are only ever stored for the configured
+   username, so a wrong username was always a miss and still is) and costs the
+   same one HMAC + one map probe either way, but it means a client riding a
+   warm cache never consumes a slot. Without it, a legitimate high-rate
+   deployment would be throttled by a bound on work it is not doing.
+2. **Admission second**, username-independent.
+3. **Refusal is a deny** — fail closed.
+4. **The slot is held across both branches**, released by `defer` so a panic
+   inside bcrypt cannot leak it.
+
+`TestChaos57_AdmissionDecisionIsUsernameIndependent` is written to fail against
+the asymmetric shape, and was verified doing so.
+
+### 29.4b The second finding inside the fix — an authentication BYPASS
+
+Raised against this change during self-review, before it left the branch, and
+it is the more serious of the two.
+
+Moving the cache lookup ahead of the username comparison (§25.4 step 1) is
+necessary — without it a client riding a warm cache would consume a
+verification slot, and the governor would throttle work it is not doing. But
+the pre-existing key derivation hashed `user + ":" + pass`, which is **not
+injective** once either field can contain the separator:
+
+```
+("admin",   "a:b")  ->  "admin:a:b"
+("admin:a", "b")    ->  "admin:a:b"     <- same key, different credential
+```
+
+That was **latent and unreachable** while the cache was consulted only *after*
+the presented username had been confirmed equal to the configured one: every
+reachable key then shared the same `user + ":"` prefix, so distinct passwords
+gave distinct keys. Moving the lookup earlier makes the ambiguity reachable
+with a **caller-chosen username**, and it is then an authentication bypass —
+with a colon anywhere in the configured password, an attacker presents a
+re-split of the same concatenation, hits the cached POSITIVE, and is
+authenticated with a caller-controlled subject:
+
+```
+configured:  user="admin"    pass="a:b"
+presented:   user="admin:a"  pass="b"     -> cache hit, ok=true, Sub="admin:a"
+```
+
+Reproduced end to end against the branch before it was fixed. Passwords
+containing a colon are entirely ordinary, so this needed no unusual
+configuration.
+
+`cacheKey` now **length-frames** each field, making the encoding injective, so
+no two distinct `(user, pass)` pairs can share a key regardless of separator
+placement. The derivation is process-local (the HMAC key is random per start)
+and the cache is memory-only, so changing the encoding invalidates nothing that
+outlives a restart. Pinned by `TestChaos57_CacheKeyIsInjective` (unit) and
+`TestChaos57_ReSplitCredentialCannotAuthenticate` (end to end); both were
+verified failing against the concatenation-based key.
+
+**The lesson is about the shape of the change, not the bug.** Reordering two
+steps changed the *reachable input domain* of a hash that was only ever safe
+because of the ordering — and nothing in the original code recorded that
+dependency, because at the time it was not a dependency but a coincidence. A
+reordering is not a refactor when a downstream invariant is holding the old
+order up.
+
+### 29.4c The third finding inside the fix — the governor denying service itself
+
+Found by CI, not by the local suite, and it is the most instructive of the
+three because the fix was behaving exactly as designed and the design was
+wrong.
+
+The per-client rule originally REFUSED a client already at its cap, immediately.
+That reads as obviously correct — "one source, one slot" — until you ask what a
+single ordinary client actually does. A browser opens six to eight parallel
+connections. When their cached verification results expire together, all of them
+present the same credential at the same moment, and all but one were **denied**:
+
+```
+6 concurrent VALID authentications from one workstation
+  -> 1 admitted, 5 refused (reason: per_client)
+```
+
+Measured on the real authentication path. No attacker, no flood, no load —
+just a workstation behaving normally. **A control built to stop an attacker
+denying service was denying it unprompted**, which is precisely the failure the
+CONTROL gates in this file exist to catch; they missed it because they only
+exercised the *cached* path, where the governor is never consulted.
+
+It surfaced as a `Deep · determinism` failure on CI and not locally, and that
+difference is the tell: whether a client's parallel requests overlap enough to
+collide depends on machine load, so the same code passed a quiet box twice
+(non-race and race) and failed a loaded runner.
+
+**The fix is that a client at its cap WAITS for its own earlier verification
+rather than being refused.** Fairness is untouched — the cap still bounds how
+many slots one source holds *at any instant*, which is the whole property — and
+only the excess changes: serialised behind its predecessor (~80 ms each)
+instead of rejected. Parked waiters are counted against the SAME bounded
+waiter budget as the global queue, so the goroutine bound this engine insists
+on is unchanged; and the wait is bounded, so a burst deeper than roughly
+`maxWait / verification cost` (about a dozen from one client) still ends in a
+refusal, which is stated in the runbook rather than implied away.
+
+The wakeup is a close-and-replace generation channel read under the same mutex
+that releases the reservation, so a release can never be missed by a caller
+about to park.
+
+Gates: `TestClientAtItsCapWaitsRatherThanBeingRefused` and
+`TestWaitingDoesNotWidenThePerClientCap` (engine, the pair — one proves waiting
+happens, the other proves the cap still binds while a caller waits), plus
+`TestChaos57_OneWorkstationsParallelRequestsAreNotDenied` end to end through the
+real authentication path. The end-to-end gate uses a long wait budget
+deliberately: the property is "none of them is refused", and tying it to how
+long bcrypt happens to take on a given build would make it fail under `-race`
+for a reason unrelated to the property.
+
+**The lesson:** "one source, one slot" is a correct fairness rule and an
+incorrect *admission* rule. Fairness is about what a client may HOLD; admission
+is about what happens to the rest. Conflating them turned a bound into a denial.
+
+### 29.4d The fourth finding inside the fix — the alert that could never fire
+
+Raised by Codex review against the observability plane, as a P1, and correct.
+
+The refusal episode was cleared by any FAST-PATH admission. The reasoning
+behind that was sound as far as it went — a queued admission proves nothing, a
+fast one proves a slot was free — but it stops one step short: **a slot being
+free at an instant is not evidence that refusals have stopped**, and during a
+sustained flood the two coexist by construction. Every in-flight bcrypt
+eventually releases its slot, so some arrival wins the fast path roughly once
+per comparison while its siblings continue to be refused.
+
+The consequence is that the whole observability plane failed at its one job:
+
+- the episode restarted every ~80 ms and so could **never** reach
+  `authCostDegradedAfter`,
+- the `credential_verification` contract row flapped between "refusing" and
+  "recovered",
+- an `AUTH_VERIFY_RECOVERED` line was emitted per comparison — a log flood
+  produced by the flood-detection code,
+- and `auth_verify_saturated` **would never have fired for the primary attack
+  this governor exists to expose.**
+
+Recovery now requires BOTH halves of the evidence: a fast-path admission AND no
+refusal for `authCostRecoveryQuiet` (5 s — comfortably longer than the 1 s wait
+budget, so a client timing out once a second keeps the episode alive, and far
+short of the 30 s degradation threshold, so a real recovery is still reported
+promptly).
+
+This is not a retreat to "recovery on elapsed time", the rule `ca_health.go` and
+`storage_health.go` exist to enforce. Elapsed time alone still clears nothing —
+an admission is still required, so a gateway nobody is authenticating against
+stays reported as refusing rather than being declared healthy by silence. The
+window supplies the half of the evidence that was missing, it does not replace
+the half that was there.
+
+Gates: `TestChaos57_RefusalEpisodeSurvivesInterleavedFastAdmissions` (drives the
+exact refuse/admit interleaving a flood produces, and then checks the episode
+can still age into Degraded — the state the alert keys on) and the extended
+`TestChaos57_RecoveryRequiresObservedCapacity`. Both verified failing against
+the pre-fix shape.
+
+**The lesson, and it is the same one as §25.4c in a different costume:** the
+evidence has to match the claim. "A slot was free" and "refusals have stopped"
+are different propositions, and the recovery signal was keyed on the one that
+was easy to observe rather than the one it was asserting.
+
+### 29.5 What shipped
+
+**`internal/authcost`** — the admission governor. Two bounds and one fairness
+rule, all fail-closed:
+
+- **A global ceiling** of `GOMAXPROCS/2` (floored at 1) concurrent
+  verifications. Half, not all: the gateway's real work has to keep running
+  while somebody authenticates, and a ceiling equal to GOMAXPROCS bounds the
+  fault without preventing the outage. This is the bound that holds against a
+  **distributed** flood, where no per-client rule can help.
+- **A per-client ceiling of 1.** Without it the global ceiling contains the CPU
+  but not the outage: one source occupies every slot and denies everyone else.
+  A legitimate workstation authenticates serially and never notices.
+- **A bounded wait (1 s) with a bounded queue (8 × the ceiling).** A legitimate
+  synchronised burst is absorbed rather than refused, because graceful
+  degradation is the house preference — but the queue is capped, because an
+  unbounded one converts a CPU-exhaustion vector into a goroutine-and-memory
+  one. **Trading one exhaustion for another is not a fix**, so both are bounded
+  explicitly.
+
+The bounds are **constants**, deliberately: the only use for a knob here would
+be to widen a denial-of-service window. Headroom is large and checkable —
+successful results are cached for 5 minutes, so the sustained uncached rate is
+`active users / 300 s` (~1.7/s for 500 users) against a ceiling of ~25/s on
+four cores. The governor bites under attack, not under load.
+
+**Fair cache eviction.** `internal/authstate`'s policy ported verbatim in
+spirit: entries are attributed to a client key and eviction always takes the
+**oldest entry of the client holding the most** (ties broken by oldest entry,
+then by client key, so the victim never depends on map order). A flooding
+source evicts *itself* until it is no longer the largest holder; a client
+holding one entry is untouchable until every other client is down to one too.
+The bucket index also removes the O(cache) scan. The compaction condition is on
+`len(keys)`, not on the un-consumed window — the same trap `internal/authstate`
+documents, where a window-based test never fires under a sustained flood and
+the backing array grows with total request count.
+
+**Observability**, in the existing vocabulary: eight
+`culvert_auth_verify_*` / `culvert_auth_cache_evictions_total` series, a
+`credential_verification` operator-contract row (counts and bounds only — the
+client key is admin-scoped), a rate-limited `AUTH_VERIFY_REFUSED` /
+`AUTH_VERIFY_RECOVERED` log pair, and a fire-once-per-episode
+`auth_verify_saturated` alert. Recovery clears on **observed evidence** — a
+fast-path admission, meaning capacity genuinely exists — never on elapsed time
+and never on a merely-queued admission: a flood that stops *sending* looks
+identical to capacity returning.
+
+This matters more than usual because a refusal denies a request whose
+credential was never checked. Silent, its symptom would be *"users
+intermittently get 407"* against a healthy directory and a healthy proxy, with
+nothing anywhere saying why.
+
+### 29.6 Gates
+
+34 in total: 15 in `internal/authcost/authcost_test.go`, 19 in
+`auth_cost_chaos_test.go`. **Eleven defect gates were verified failing against
+the shape each replaces** — including the asymmetric-gate variant of §25.4,
+both halves of the §25.4b bypass, and the immediate-refusal shape of §25.4c
+(the engine's own first form, which the parallel-connection gate was
+reproduced against before it was changed) and both halves of the §25.4d
+recovery defect.
+
+The controls are load-bearing, because several defect gates would also pass
+against a "fix" that simply broke authentication:
+
+- `TestChaos57_CachedVerificationsDoNotConsumeTheGovernor` — a warm cache must
+  not be throttled, or the fix is a self-inflicted outage.
+- `TestChaos57_UnderBudgetBothBranchesStillEqualise` — under budget both
+  branches must *still* run a comparison. A "fix" that skipped bcrypt on the
+  wrong-username branch to save CPU would pass the oracle gate while
+  reintroducing the oracle in the opposite direction.
+- `TestChaos57_CacheStaysBounded` — a policy that never evicted would pass the
+  displacement gate while turning the cache into an unbounded map.
+- `TestChaos57_ExternalProvidersBypassTheGovernor` — LDAP/OIDC run no bcrypt;
+  charging them a slot would bound the wrong resource and let a slow directory
+  starve local authentication.
+- `TestChaos57_VerdictsAreUnchanged` — the governor changes no verdict.
+
+### 29.7 What is deliberately left
+
+- **AU-3e — a pre-existing username-enumeration oracle, reported not fixed.** A
+  negative result for the *correct* username is cached; one for a wrong
+  username is not. Repeating the same wrong pair twice is therefore ~1.5 µs for
+  a valid username and ~80 ms for an invalid one — the RISK-008 oracle reached
+  by repetition rather than by a single request. Closing it means caching
+  wrong-username negatives, which is a behaviour change to a security control
+  and deserves its own review rather than riding along in an availability fix.
+  CHAOS-57 verifies only that it does not *widen* it.
+- **The admin UI login path is untouched.** `VerifyUIUser` also runs bcrypt (two
+  comparisons, in fact) but is bounded by the brute-force lockout
+  (`loginLimiter`), which the proxy path never had.
+- **Per-client parked waiters share one budget** (§25.4c). Callers waiting on
+  their own client budget are counted against the same bounded waiter pool as
+  the global queue, and are not additionally capped per client — so one source
+  with many concurrent requests can occupy that pool and leave others unable to
+  QUEUE for a slot. It costs them no capacity (the fast path still admits
+  whenever a slot is genuinely free, and the flooding source still holds at
+  most its cap), so the fairness claim holds: a flood can take the queue, not
+  the slots. It is also strictly better than the shape it replaced, where those
+  requests were refused outright. Capping parked waiters per client would close
+  it; not done, because it adds a second bound to ration a wait that is already
+  bounded twice.
+- **The front-door limiters still ship disabled** (PX-6 remains open). The
+  governor bounds the *cost* of the flood; it does not stop the flood arriving.
+  The runbook says so explicitly and points at the three limiters.
+- **No configuration surface**, and therefore no GUI-parity obligation — the
+  bounds are constants derived from `GOMAXPROCS`. This is the recorded
+  deferral class of `jwksStaleMaxAge` and the M1-3 release thresholds: a knob
+  whose only use is widening a trust or availability window is not a feature.
+
+### 29.7b The cost that is actually paid: restart and mass reconnect
+
+The verification cache is memory-only, so a restart empties it and every active
+client's next request is an uncached verification arriving at once — the "mass
+reconnect storm" scenario. This is the one case where the governor legitimately
+refuses valid credentials, and it is worth stating plainly rather than
+discovering.
+
+The queue absorbs the first arrivals; the rest get a `407` and retry.
+Authentication drains at the ceiling rate (~25/s on four cores), so a
+1,000-client fleet re-authenticates over roughly 40–80 seconds with some clients
+seeing a retried 407.
+
+**That is strictly better than the behaviour it replaces**, and the comparison
+is the justification for the whole posture: pre-fix, the same 1,000 clients put
+1,000 goroutines into bcrypt simultaneously — ~40 seconds during which every
+core was consumed and **the proxy served nobody**, including clients that were
+already authenticated and only wanted to browse. The governor trades *slower
+authentication for some* against *the data plane keeps working for everyone*.
+
+The residual is real and recorded: a non-browser client that does not retry a
+`407` will see a hard failure during that window. The runbook names the three
+remedies (stagger restarts, move authentication to an IdP — which this control
+does not govern at all — or add cores) and, more importantly, says that a
+DECAYING post-restart spike is not an incident while a sustained one is.
+
+### 29.8 The process lesson
+
+AU-3 sat open at **Medium** for the whole review series because its register
+row described the attack that needs a valid username. The variant that needs
+nothing at all was one branch away in the same function, and it is Critical.
+The row was not wrong about what it described; it was wrong about being the
+worst case.
+
+The general shape — *an expensive operation reachable before authentication
+completes* — is worth sweeping for directly rather than finding one instance at
+a time. bcrypt is the obvious one because its cost is deliberate and
+documented. The same question should be asked of every cryptographic
+verification on an unauthenticated path.
+
+See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, `internal/authcost` (package comment),
+`auth_cost_health.go`, and `docs/operator/credential-verification-cost.md`.
+
+## 30. CHAOS-61 — The Data Plane's outbound cluster state under a Control Plane outage
+
+**Date:** 2026-09-08 · **Domain:** DP→CP gossip (`controlplane_client.go`), the
+distributed rate limiter (`security.go`), the DP→CP audit push queue
+(`internal/audit`).
+
+### 30.1 Why this domain
+
+Register row **HA-1** records the deliberate posture for a DP that loses its
+Control Plane: it keeps serving its last-known-good *config*. That posture was
+reasoned about for configuration and reasoned about carefully. This sweep asked
+the adjacent question the row does not cover — what happens to the DP's other
+outbound cluster state, the per-tick loops that are not config sync at all
+(`rateLimitGossipLoop`, `revocationSyncLoop`, `auditPushLoop`, `metricsLoop`) —
+and found the same posture applied to data where it is **not** correct, in one
+case with a customer-visible, permanently self-sustaining denial.
+
+### 30.2 CL-20 — a rate-limit broadcast that never expired
+
+Cluster rate limiting is gossip: each DP reports hot IPs, the CP aggregates the
+fleet, and the DP adds the returned per-IP remote total to its own local count:
+
+```go
+localCount := len(b.timestamps)
+remoteCount := clusterCounts.Get(ip)
+if localCount+remoteCount >= limit { return false }
+```
+
+`clusterCounts.Apply` is reached from exactly one place — the gossip loop's
+SUCCESS branch. A failed `SyncRateLimits` logs and `continue`s. So the moment
+the CP became unreachable the last broadcast **froze in the map and was
+enforced for the rest of the process lifetime**.
+
+The reachable worst case needs no attacker and no unusual configuration: an IP
+whose cluster-wide total was at or above `limit` at the instant of the outage —
+an ordinary NAT or corporate egress address, which is exactly the kind of IP
+that gets hot — is thereafter denied on this node with `localCount = 0`. **A
+total blackhole for that client, on a healthy proxy, cleared only by the CP
+returning or a process restart.** The quieter half is worse to diagnose: any
+non-zero frozen remote count permanently shrinks the node's local allowance for
+that IP.
+
+It was also unfalsifiable from the outside. `RATE_LIMITED <ip>` is logged per
+request and names only the IP; nothing distinguished "this client is sending
+too fast" from "this node is enforcing an hour-old number from a Control Plane
+that has been gone since Tuesday".
+
+**The fix is arithmetic, not posture, and that matters.** `RemoteCounts` is
+defined as the total *in the current window*: a broadcast received at `T`
+describes timestamps in `[T-W, T]`, so at `now > T+W` every timestamp it
+counted has aged out and its contribution to the current window is exactly
+zero. Serving the frozen value is not a conservative choice — it is a wrong
+answer. `clusterCountStore` therefore stamps every applied broadcast and
+`FreshCount(ip, now, maxAge)` returns 0 past the window; there is deliberately
+no unconditional `Get` left, so the frozen-count path cannot be reintroduced by
+a future caller.
+
+**The Control Plane already applied this exact reasoning in the other
+direction.** `rateLimitAggregator.ClusterTotalsExcluding` prunes any node that
+has not reported for two minutes, precisely so a dead DP's counts stop
+suppressing fleet traffic. The rule existed on one side of the link and not the
+other — and the side that lacked it is the one that makes the allow/deny call
+on live traffic. That asymmetry, not the missing expiry itself, is the finding:
+**a staleness rule that is only half-applied is a staleness rule nobody
+reviewed as a pair.**
+
+Two implementation details are load-bearing:
+
+1. **The max-age is DERIVED from the live limiter** (`clusterRemoteCountMaxAge(rl.Window())`),
+   not a second constant. A hardcoded minute would silently disagree with any
+   operator who configured a different window, in the permissive direction.
+2. **A NEGATIVE age is stale, not fresh.** `age >= maxAge` alone reads a
+   future stamp (clock rollback between the stamp and the read) as brand new
+   and honours the broadcast for however far back the clock went. This was
+   caught by the sweep's own gate, against the first version of the fix: the
+   enforcement path and the reporting path had reached opposite verdicts on the
+   same condition. Two answers to one question is the defect; both now fail
+   toward the local decision, where every other failure on this path lands.
+
+Freshness is **evaluated, never latched** (`clusterRateLimitFreshness()` derives
+it from the stamp on every read), so recovery needs no clearing path and a
+gossip loop that wedges entirely still reports the truth to `/metrics` — the
+`ca_health.go` `Usable()` discipline.
+
+### 30.3 CL-21 — the DP→CP audit push queue dropped silently
+
+`internal/audit` bounds the DP push queue at 1000 entries and trims to the
+newest. The bound is correct — a DP that cannot reach its CP must not grow it
+without limit. The silence was not: there was **no counter, no metric and no
+log line**, three hundred lines below this package's own documented contract
+for the durable JSONL path ("count EVERY failure, log only the FIRST").
+
+Which entries are lost makes it worse rather than better. `Requeue` prepends
+the events that just failed to send, and the trim keeps the newest — so the
+first thing discarded is the **oldest unsent history**, the beginning of
+whatever happened during the outage. That is the half an investigation needs
+most, and losing it with no marker is CWE-778 in the same shape the
+durable-write counter exists to prevent. The local JSONL file on the node is
+unaffected; what acquires a hole is the CENTRALIZED trail, which is the surface
+an operator actually watches in a cluster.
+
+Both writers now go through one `trimPendingLocked` chokepoint so neither can
+drop without charging `PendingDrops()`; surfaced as
+`culvert_audit_cluster_push_drops_total` and, when non-zero,
+`auditClusterPushDrops` on `/healthz`.
+
+### 30.4 What shipped
+
+* Broadcast expiry at the rate-limit window, derived from the live limiter,
+  with the negative-age case failing toward local.
+* A freshness health plane: `culvert_cluster_ratelimit_{remote_stale,broadcast_age_seconds,stale_episodes_total}`
+  (emitted ONLY on a node where cluster rate limiting is armed — CHAOS-54's
+  rule), five read-only fields on `GET /api/cluster/rate-limits`, a Cluster-panel
+  banner, and one log line per TRANSITION in each direction (the gossip loop
+  ticks every 5s; a per-tick line would report an hour-long outage 720 times).
+* Counted audit push-queue drops with the package's first-failure-only log.
+* 17 gates in `cluster_ratelimit_freshness_chaos_test.go`. Every DEFECT gate was
+  verified failing against the pre-fix shape.
+
+**No new alert event.** A stale broadcast is always caused by the CP link,
+which already alerts and already carries a `cp_poll` row on `/ready`. A second
+event name for one root cause is two pages for one action.
+
+**The control gates are the point.** The cheapest way to pass every defect gate
+is to stop consulting remote counts at all — which would silently delete the
+distributed rate limiter. `TestChaos61_FreshBroadcastStillSuppresses` and
+`TestChaos61_BroadcastAppliesForTheWholeWindow` pin the healthy path from both
+sides, so a fix that passes by deleting the feature fails.
+
+### 30.4b Review follow-up — a defect in the fix itself (Codex, PR #1346)
+
+The freshness plane's emission rule is stated in its own header — a 0/1 gauge on
+a node that never had the feature is indistinguishable from a broken one, so
+emit only when ARMED — and the first version broke it in the same file. `Armed`
+checked only `clusterRateLimitEnabled`, but `rateLimitGossipLoop` sets that flag
+UNCONDITIONALLY when it starts and then skips every RPC while `rl.Enabled()` is
+false. That is the DEFAULT posture: `Configure` enables the limiter only for a
+limit > 0, so on a Data Plane with no rate limit configured no broadcast can
+ever be applied — and every freshness surface reported a permanent,
+un-clearable degradation on a node that is not rate limiting at all: gauge
+pinned at 1, an episode counted, a warning logged, the panel banner shown.
+
+The condition was applied to *"is gossip running"* but not to *"is anything
+being decided"*. `Armed` now requires BOTH halves of what the request path
+itself requires — the gossip loop running (so `AllowAuto` dispatches to the
+cluster-aware path) AND `rl.Enabled()` (`AllowClusterAware` returns true
+immediately when the limiter is off, before `FreshCount` is ever reached) — and
+an un-armed node is never `Stale`, because staleness is a statement about
+ENFORCEMENT, not about the age of a value nobody reads. `Applied` and `Age`
+stay honest there, so suppressing the ALARM does not blank the FACTS.
+
+Three gates, each verified failing against the pre-fix condition:
+`LimiterOffIsNeverReportedStale`, `LimiterOffStillReportsWhatArrived`, and
+`ArmedNeedsBothHalves` — the last being the control that suppressing the false
+alarm did not also silence the real one.
+
+The lesson is narrower than the finding: **a health surface's armed condition
+must be the same predicate as the code path it reports on.** The request path
+needs two facts to consult a remote count; the reporter checked one, and a
+false alarm on the default posture is the kind of noise that trains operators
+to ignore the gauge before the real outage arrives.
+
+### 30.5 What is deliberately left
+
+* **HA-1 itself is unchanged.** Config staleness is a posture decision with a
+  recorded owner; this sweep touched only data whose own definition makes it
+  expire.
+* **None of the four auxiliary DP loops back off** (`revocationSyncLoop` 3s,
+  `rateLimitGossipLoop` 5s, `auditPushLoop` 10s, `metricsLoop`). Against a
+  down CP each retries at a fixed cadence with a fixed log line, and none
+  jitters — WK-13/HA-11's herd shape, registered P2, and now with a second
+  instance recorded here. Only the config poll (`pollConfig`) backs off.
+* **`pollConfig` double-counts a failure.** It increments `failCount` and then
+  calls `backoff`, which increments it again — so the delay reaches its ceiling
+  in three failures rather than six, and the "3 consecutive failures" failover
+  threshold fires after two. Cosmetic; recorded rather than changed inside a
+  sweep about something else.
+* **A partitioned fleet still under-counts.** Nodes that reach the CP see totals
+  excluding those that cannot. Inherent to gossip aggregation.
+
+### 30.6 The process lesson
+
+> A staleness rule applied on one side of a link and not the other is not half
+> a rule — it is an unreviewed asymmetry. The Control Plane pruned dead Data
+> Planes for exactly the reason the Data Plane needed to expire a dead Control
+> Plane's broadcast, and the code that did it sits in the same repository, two
+> files away, with a comment explaining why. What was missing was ever asking
+> the question in both directions at once.
+
+Runbook: `docs/operator/cluster-rate-limit-freshness.md`.
+## 31. CHAOS-62 — The request-history store under a damaged data volume
+
+**Date:** 2026-08-29 · **Domain:** storage / persistence (`internal/logstore`) ·
+**Status:** shipped · **Gates:** `internal/storeguard/storeguard_test.go` (19),
+`internal/logstore/{resilient,enckey}_chaos_test.go` (13),
+`logstore_chaos_test.go` (5) · **Register rows:** R-E (CLOSED), LS-3, LS-4
+
+### 31.1 Why this domain
+
+§19.6 opened row **R-E** and marked it *"next sweep candidate"*: `logstore.OpenTTL`
+calls `badger.Open` with the same version and the same uncatchable-panic
+exposure that CHAOS-50 had just fixed for the community category store. It was
+deferred with a two-clause bound — *"bounded by being opt-in and already
+non-fatal on ERROR"* and *"its content is request history with retention
+semantics, [so] quarantining it silently is an evidence decision, not a cache
+decision."*
+
+Re-deriving both clauses from the wiring inverted them, which is §25.4.
+
+### 31.2 The panic, re-measured for THIS store
+
+CHAOS-50's table was measured with `catdb.Open`'s options. This store's differ —
+encryption on, 128 MiB value log — so the premise was re-measured rather than
+inherited. It reproduces exactly (badger v4.9.6):
+
+```
+panic: ... [recovered, repanicked]
+  table.(*Table).initBiggestAndSmallest ← table.OpenTable
+created by github.com/dgraph-io/badger/v4.newLevelsController in goroutine 21
+```
+
+A `recover()` in the frame directly above `OpenTTL` never fires: the panic is
+raised on a goroutine badger spawns. This is kept as a permanent DEFECT PROOF
+(`TestChaos62_BareOpenTTLPanicIsUncatchableAtTheCallSite`) so a future badger
+change cannot let the recovery gate quietly prove less than it claims.
+
+The same run also produced the table that forced `storeguard.Policy` to exist —
+on a KEYED store, three conditions are indistinguishable:
+
+| Injected condition | Error | Is the data intact? |
+|---|---|---|
+| passphrase changed | `saved logs use a different encryption key` | **yes** |
+| `.salt` sidecar truncated | `saved logs use a different encryption key` | **yes** |
+| KEYREGISTRY scrambled | `saved logs use a different encryption key` | no |
+| `MANIFEST` scrambled | `manifest has bad magic` | no |
+
+CHAOS-50's classifier lists `encryption key mismatch` as CORRUPTION, on the
+stated rationale *"this store is never opened with a key"* — correct for that
+store, false for this one. Reusing it unmodified would have moved a **healthy**
+history store aside over an ordinary passphrase change: data loss caused by the
+recovery mechanism (**LS-3**).
+
+### 31.3 What made this worse than the category store
+
+Two things, both from the wiring rather than the engine.
+
+**It is reachable at RUNTIME.** `enableLogStore` is called from `ui_config.go`'s
+history toggle, so a damaged store kills a gateway carrying production traffic
+the moment an admin flips a switch — no restart, no warning, and no error the
+handler could return, because the process is gone.
+
+**It LATCHES.** The toggle is durable in `admin_settings.json` and re-applied by
+`LoadAdminSettings` on every boot. Under the shipped compose file's
+`restart: unless-stopped`, one unclean kill that damages a table becomes an
+**unattended crash loop** — no proxy, no admin UI, no health endpoint, and no
+way to turn the setting back off, because that requires the admin UI the setting
+prevents from starting. The category store needed a CLI flag to reach that
+state; this one gets there from an admin's saved preference.
+
+### 31.4 The deferral's own reasoning, inverted
+
+- *"Quarantining it silently is an evidence decision"* — true, and it argues FOR
+  the fix. The CHAOS-05/07 contract **moves aside, never deletes**; the evidence
+  survives either way. What the deferral preserved was the alternative: a
+  crash-looping appliance whose history is equally unreadable and whose entire
+  service is down as well.
+- *"Bounded by being opt-in"* — opt-in means DURABLE (the latch) and reachable
+  from the LIVE ADMIN API (the runtime kill). The clause meant to bound the
+  severity was the mechanism that raised it.
+
+### 31.5 LS-4 — the read path destroyed the key
+
+Found by asking the obvious next question of the key path rather than the
+corruption path. `EncKey` minted and **wrote** a fresh 32-byte salt whenever the
+sidecar was unreadable or the wrong length — including next to an existing
+encrypted store. The key is a pure function of `(passphrase, salt)`, so the
+overwrite replaced the only value that could ever decrypt it; the resulting
+error is indistinguishable from a passphrase change, so the operator's remedy
+became *purge*, destroying history that was intact until the read ran. Reachable
+by exactly the fault this store must survive — a torn sidecar after an unclean
+kill (verified: `salt regenerated by EncKey: true`).
+
+**This codebase had already written the rule down.** `internal/alerts`
+(SEC-WHSIGN-1): *a failed decrypt never mints a key; creation happens on first
+encrypt.* Nothing was checking whether anywhere else did the same thing. The
+rule now holds here: mint only when there is no store to be locked out of,
+otherwise `ErrSaltUnusable` with the sidecar untouched — so restoring one 32-byte
+file recovers the whole history, a path that previously did not exist.
+
+### 31.6 What shipped
+
+`internal/storeguard` — the CHAOS-50 engine extracted verbatim and made
+store-agnostic. A second COPY was rejected: the badger message table is
+empirical and pinned by a test *precisely* so an upgrade that rewords a message
+fails the build rather than silently switching recovery off; two copies is how
+that protection rots. `catdb.OpenResilient` is now a thin adapter with an EMPTY
+policy, and its 21 recovery gates run unchanged against the extracted engine —
+21 test functions, 97 assertions, identical before and after, the only edits
+being identifier renames. That is the evidence the extraction is
+behaviour-preserving.
+
+`storeguard.Policy` can only ever **SUBTRACT**. There is deliberately no field
+for ADDING corruption signals: widening destruction from a call site is how a
+shared safety mechanism becomes an unsafe one.
+
+Plus `logstore.OpenResilientTTL` (exempting encryption errors both structurally
+and textually), the `EncKey` fix, the `request_history` contract row, three
+`culvert_logstore_*` series, the existing `state_file_corrupt` alert, and a
+distinct 409 for the salt case naming its own reversible remedy. **Not** wired
+into `/readyz` — a node with history degraded is fully able to serve.
+
+### 31.6b Review follow-up — a defect in the mechanism itself (LS-5)
+
+Raised by Codex against the extraction and **verified in both directions before
+fixing**. Discovery used `filepath.Glob(base + suffix + "*")`, so a glob
+metacharacter in the operator-configurable store path silently broke the
+mechanism:
+
+| Store path | `filepath.Glob` result | Consequence |
+|---|---|---|
+| `/data/hist[1]` | `[]` — reads `[1]` as a character class and looks for `hist1.opening.*` | the store's OWN poison marker is undiscoverable, so the next start hands badger the corrupt directory again — **the crash loop survives its own remedy** |
+| `/data/hist?` | matches `histX.opening.999` | a **healthy** store is quarantined on a NEIGHBOUR's evidence |
+
+The first row is the exact failure this package exists to prevent, reached
+through the package itself. It is inherited from CHAOS-50 — the shipped catdb
+code has it today — and is fixed here for both stores.
+
+Escaping the metacharacters would close only the first row and is
+platform-specific (Go's glob does not honour backslash escapes on Windows).
+Discovery is now a prefix match over the parent directory (`siblings`), which
+has no pattern semantics at all, so the class is gone rather than patched.
+Gates: `TestDiscovery_IsNotFooledByGlobMetacharactersInThePath` (4 paths),
+`TestDiscovery_DoesNotClaimANeighboursMarker`, both verified failing against the
+glob implementation.
+
+A second Codex finding (P2) corrected the health record: a runtime enable that
+fails to open returns BEFORE `adminSettingsSave`, so the persisted setting stays
+off — a record asserting `Enabled: true` reported a configuration that was never
+written. The field is now `SaveRequested` ("an open was attempted"), which is
+true on both the boot and admin paths, and the contract row no longer claims the
+feature is enabled.
+
+### 31.7 What is deliberately left
+
+- **Real KEYREGISTRY damage does not self-heal.** It is indistinguishable from
+  the two benign conditions, and of the four postures the only unacceptable one
+  is destroying intact history over a config change. Degrades loudly; the
+  operator purges. Recorded owner-visible trade.
+- **Recovery still costs one process death** for the panic case (inherited from
+  CHAOS-50 — the marker cannot act until the run after the crash).
+- **No circuit breaker on repeated quarantines**; the metric and the row are the
+  signal.
+- **Nothing backs up the `.salt` sidecar**, which is correctly excluded from
+  archives as key material. An operator who loses it with no backup still loses
+  the history. Whether the appliance should hold a second copy under the KEK is
+  a key-custody decision, not a patch — for an owner.
+- **No third unguarded BadgerDB open remains** in the tree; `catdb` and
+  `logstore` were the two.
+
+See `docs/engineering/CHAOS-ENGINEERING-REVIEW-2026-08-29.md` and
+`docs/operator/request-history-recovery.md`.
+## 32. CHAOS-63 — The public admin-login endpoint's untrusted username
+
+**Date:** 2026-09-05 · **Domain:** authentication / audit / persistence ·
+**Status:** shipped · **Closes:** AU-15, AU-16 ·
+**Gates:** `login_input_bounds_test.go` (10) + `internal/lockout/lockout_keybound_test.go` (9) ·
+**Runbook:** `docs/operator/admin-login-input-bounds.md`
+
+### 32.1 Why this domain
+
+Every sweep in this register so far has asked what happens when *infrastructure*
+fails: a volume wedges, a listener returns EMFILE, etcd is slow to boot, a hook
+does not return. This one asks a different question, and it is the question an
+in-line appliance answers worst:
+
+> What does an unauthenticated caller get to write, and how long does it live?
+
+Culvert's admin plane has exactly three routes on `uiAuthMiddleware`'s public
+allowlist that accept a body: `/api/setup/complete`, `/api/auth/logout`, and
+`/api/auth/login`. The first validates its username at 1–64 characters and keys
+its rate limiter on a FIXED sentinel (`setupKey`). The proxy-side credential
+path validated its own at `maxUsernameLen` (256) years ago
+(`proxy_portal.go:145`). The admin login endpoint — the one an attacker
+actually finds first, because it is what the UI posts to — validated nothing.
+
+Note the handler-vs-store split that §32.4 turns on: those 1–64 caps live in the
+API *handlers*. Neither `cfg.SetAuth` nor `cfg.SetUIUser` bounds a username, and
+`validateAuthStartupCredentials` validates only the password — so `-user` /
+`auth.user` and `--reset-password` can persist an admin whose name is longer
+than any of these limits.
+
+### 32.2 The shape of the miss
+
+`apiAuthLogin` decoded `body.User` and, from that point on, treated it as an
+identifier. It reached, in order:
+
+1. `loginLimiter.Check(clientIP, body.User)` — a map probe;
+2. on failure, `loginLimiter.RecordFailure(clientIP, body.User)` — which CREATES
+   an entry in **both** tiers, keyed on `ip + "\x00" + user` and on `user`;
+3. `auditEvent(r, "auth.login.fail", body.User, …)` — the 500-entry in-memory
+   ring **and** the durable JSONL;
+4. on a lockout trip, `fireAlert("auth_lockout", AlertPayload{Actor: body.User})`.
+
+None of those four is wrong on its own. What made them a defect together is that
+the only things in front of the handler are `securityMiddleware`'s **1 MiB body
+cap** and the **60-mutating-POSTs-per-minute** per-IP API limiter, and the value
+they admit is retained by every one of the four:
+
+- the lockout entries cannot be swept before `lockout.Window` (10 min) elapses —
+  `Cleanup` deliberately refuses to remove an entry inside its accumulating
+  window, because a future `RecordFailure` would reset it anyway;
+- the audit JSONL is a `fileutil.RotatingFile(path, 50)` keeping **one** archive
+  (`rotating.go` removes the previous `.1` before renaming), so the entire
+  retained compliance record is 100 MB.
+
+So one unauthenticated client, from one IP, inside the endpoint's own published
+rate limit, commits **~60 MiB/minute** of bytes it chooses into a 100 MB durable
+record and parks on the order of a **gigabyte** of heap for ten minutes at a
+time. The gate measures the first half directly: **4,195,672 bytes reached the
+audit file from eight requests.**
+
+### 32.3 Why this is a security finding, not a capacity one
+
+`internal/audit`'s own header already names this outcome as the thing its
+write-error counter exists to make visible:
+
+> *"An attacker who can fill the volume could therefore switch off durable audit
+> logging and then act with the record surviving only in a 500-entry buffer they
+> can evict by generating further events (CWE-778, OWASP A09:2021)."*
+
+That analysis is correct and the counter is the right instrument — for the fault
+it was written for. It does not fire here, and the reason is the interesting
+part: **every one of these writes SUCCEEDS.** There is no full disk, no EIO, no
+read-only remount. `writeErrors` stays zero, `storage_write_failed` never
+dispatches, the `audit_log_persistence` contract row stays green, and the
+durable record is destroyed anyway — by ordinary, successful, in-budget
+appends. The health plane was watching the volume; the loss came through the
+front door.
+
+The consequence is evidence destruction that an attacker can perform **before**
+the activity they want unrecorded: two minutes of oversize login POSTs rotate
+away every prior admin action, and sustaining them keeps the window rolling.
+
+### 32.4 The fix, and the two places it lives
+
+**At the entry point (`login_input_bounds.go` → `apiAuthLogin`).**
+`rejectOversizeLoginUser` refuses a username longer than `maxUsernameLen` (256 —
+the constant the proxy-auth path already uses for exactly this question) and
+returns **before** the limiter, the credential check and the alert. A rejected
+attempt therefore creates no limiter entry and leaves no attacker-sized bytes
+anywhere. 400 rather than 401 is deliberate: the length of a submitted username
+is not a secret and is not a credential oracle for a name that exists nowhere.
+
+**A CONFIGURED account is never refused, however long its name**, and the first
+draft of this change got that wrong. It asserted that no local account could
+carry such a name because `apiSetupComplete` and the user-creation API cap at
+64 — but those are handlers, not the stores (see §32.1), so an over-long
+username can already be a valid persisted admin and the guard would have locked
+that operator out of their own admin UI on upgrade: a hardening change turned
+into an outage for the one person who has to fix it. Raised by Codex review on
+PR #1320, against exactly the claim the code comment made. The guard now
+consults `cfg.LoginNameConfigured`, a non-retaining probe whose resolution MUST
+stay identical to `VerifyUIUser`'s (roster **or** legacy single user — the
+existing `UIUserExists` checks only the roster and would have missed the legacy
+case). `warnOversizeConfiguredUsernames` reports such an account once at boot,
+deliberately as a WARNING and never fatally: the stores never bounded the name,
+so failing the boot would brick an appliance whose config was legal when it was
+written.
+
+The narrow cost is that, for names past the bound only, a 400 rather than a 401
+says "no such account" — and an attacker must already have guessed the exact
+over-long name to learn anything from it. That is a far better trade than
+refusing a real admin's login.
+
+That exemption has a consequence in the leaf, and it is why the clamp there is
+**injective**: a configured over-long name now reaches the limiter, so a plain
+truncation would let an attacker who knew that admin's first 256 bytes submit an
+ordinary ≤256-byte name clamping to the SAME key and drive the tier-2 account
+lock against them — lockout-as-DoS, precisely what the two-tier design
+(RISK-012) exists to prevent. `boundUsername` appends a SHA-256 digest of the
+whole name to a rune-safe prefix, which keeps the key bounded and distinct
+names distinct (`TestBoundUsername_IsInjective`, verified failing against a
+plain truncation).
+
+**In the leaf (`internal/lockout`).** `Cleanup`'s doc claimed the maps were
+bounded against an unbounded-memory DoS; on the entry-count axis they were, and
+on the key-size axis they were not. `boundUsername` clamps to
+`MaxUsernameKeyLen` at **every** public entry point. The clamp is worth less
+than the handler bound and is not a substitute for it — it is what stops a
+future caller from reintroducing the exposure by forgetting.
+
+Applying it at *every* entry point is the load-bearing detail. A clamp on
+`RecordFailure` alone would have passed a byte-size assertion while splitting one
+attacker's failures across two counters — a fix that shrinks the maps and
+quietly weakens the lock. `TestOversizeUsername_CheckAndRecordAgree` is the
+control for exactly that, and `TestBoundedNames_BehaviourUnchanged` is the
+control that the clamp cannot be the reason an ordinary lockout stops working.
+
+**The attempt is still audited.** `auth.login.rejected` is written with a
+truncated, self-describing actor (`…[truncated, N bytes]`) and the observed
+length in the detail. Bounding the bytes must not delete the evidence that the
+admin plane is being probed — and the entry is O(1), at the same rate the
+ordinary `auth.login.fail` entry would have been written, so it adds no ring
+eviction capacity that the endpoint did not already have.
+
+**The rejection is on a metrics surface.** `culvert_login_oversize_rejected_total`
+is the operator's only signal: the caller gets a 400 and nothing else in the
+process changes. The log line is rate-limited to one per minute (onset
+immediately, magnitude in the counter) for the reason §22 gives — a mitigation
+for a write-amplification defect must not be one itself.
+
+### 32.5 Deliberately not done
+
+- **No byte cap inside `internal/audit`.** The obvious "make the sink
+  structurally safe" move is wrong here: the sink cannot distinguish attacker
+  bytes from a legitimate `auditEventDiff` before/after payload, and whole
+  policy objects are marshalled into those fields on purpose. A cap there would
+  destroy real compliance evidence to fix an input-validation defect. The bound
+  belongs where the untrusted value enters.
+- **No hard entry-count cap on the lockout maps.** Evicting at a cap would
+  evict a REAL lock, which is a security trade-off, not housekeeping. The count
+  axis stays bounded by the janitor plus the per-IP API limiter; the residual is
+  recorded below rather than traded away silently.
+- **No new lockout tier for oversize input.** An oversize name can never match a
+  local account, so this is not a credential-guessing channel a lock would have
+  to close, and the 60/min limiter already bounds the attempt rate.
+
+### 32.6 Residual risk
+
+- **PX-21 (NEW, open, and larger than the finding this sweep fixed).** The
+  identical class — an unbounded untrusted value copied into a rotating sink —
+  is live on the **proxy data path**, which every client on the network can
+  reach. `handleRequest` logs `sanitizeLog(r.Host)`; `sanitizeLog` neutralises
+  control characters and bounds nothing, and the proxy `http.Server` sets no
+  `MaxHeaderBytes`, so net/http admits ~1 MiB of request line plus headers.
+  Measured with a throwaway probe against `handleRequest` on the default-deny
+  path (200 KB host, `GET http://<host>/`):
+
+  ```
+  status=403  process-log bytes=204899  (host was 204812 bytes)
+  reqlog newest entry: host len=204812  status="POLICY_DEFAULT_DENY"
+  ```
+
+  This is deliberately **recorded rather than fixed here**. It is a different
+  domain with a different fix shape and a real design decision the owner should
+  make, not a reviewer: RFC 1035 caps a hostname at 253 bytes, so *rejecting*
+  an over-long host outright is defensible and probably correct — but that
+  changes data-plane behaviour and has to answer for IPv6 literals, non-DNS
+  authorities and the CONNECT form before it ships. Truncating only at the log
+  call sites is the smaller, safer move and does not close the request-log
+  field. Bundling either into an admin-auth fix would have shipped a data-path
+  behaviour change under a security-hardening title.
+
+- **AU-17 (count axis, open).** The lockout maps are still bounded only by
+  (attempt rate × `Window`). A distributed source with many IPs, each inside its
+  own 60/min budget, still grows both maps linearly — now at ≤ 256 bytes per
+  key instead of ≤ 1 MiB, so the exposure is reduced by ~4000× but not
+  eliminated. Capping it correctly means deciding which real lock to evict; that
+  is an owner decision.
+- **Ring eviction is unchanged and remains accepted.** 500 ordinary failed
+  logins still roll the in-memory audit ring. That is pre-existing, is what the
+  durable JSONL exists to survive, and is now actually survivable because the
+  JSONL can no longer be rotated away from the same endpoint.
+- **The 300 ms anti-brute-force sleep still holds a request goroutine** per
+  failed attempt. Bounded by the same 60/min limiter; not touched here.
+
+### 32.7 The process lesson
+
+§21 stated it for back ends, §22 for listeners, §23 for decisions, §24 for
+documented residuals. This sweep adds one about **health planes**:
+
+> A health signal watches a mechanism, not an outcome. `internal/audit` counts
+> writes that FAIL, because the analysis that produced it modelled the loss as a
+> failing volume. The same outcome — the compliance record destroyed, remotely,
+> by an unauthenticated caller — arrives through writes that all succeed, and
+> every instrument stays green. When a component names the outcome it is
+> protecting against, check whether the instrument it built can see that outcome
+> arrive by any other road.
+## 33. CHAOS-57 — The admin UI listener, and which plane is allowed to kill which
+
+**Date:** 2026-09-09 · **Domain:** admin/control plane ↔ proxy data plane coupling ·
+**Status:** shipped · **Gates:** `admin_ui_listener_chaos_test.go` (15)
+**Id allocated at the START of the sweep**, per the governance note in §0.
+
+### 33.1 Why this domain
+
+Every sweep in this register so far has asked *does this subsystem survive its
+own failure?* This one asks a different question: **when a subsystem fails, what
+else does it take with it?**
+
+Culvert runs several listeners in one process — the proxy port, the admin UI,
+SOCKS5, the control-plane gRPC server, optionally the MCP gateway. They are
+separate planes with different jobs and wildly different criticality, and they
+share one address space and one exit status. That sharing is not itself a
+defect; every appliance does it. The defect is when the *least* critical plane
+holds a lever over the *most* critical one.
+
+It does. The admin UI held the biggest lever there is.
+
+### 33.2 The finding
+
+`startUI` (ui.go) spawned a detached listen goroutine whose ONLY error branch
+was `logFatalf` — which `os.Exit(1)`s the process:
+
+```go
+go func() {
+    if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+        logFatalf("UI server error: %v", err)   // ← kills the whole appliance
+    }
+}()
+```
+
+Three of those, one per TLS mode. So **every way the admin UI's listener could
+fail terminated the proxy data plane with it.**
+
+This inverts the dependency the product is built on. The admin UI is the plane
+you manage enforcement *from*; it may degrade without the enforcement plane
+going with it, never the reverse. And `startUI` is called from the init block
+BEFORE the proxy listener starts and returns as soon as the goroutine is
+spawned, so the failure lands asynchronously against a process that is already
+announcing itself as up.
+
+**Both triggers were reproduced against the real binary.**
+
+*Trigger 1 — the admin port is occupied.* A predecessor container still
+draining, a host-network service on 9090, an operator collision.
+`validatePortCollisions` (main.go) checks only Culvert's own three ports against
+EACH OTHER; nothing on the host is visible to it. Observed log, verbatim, in
+this order:
+
+```
+UIHTTP: http://localhost:19090          ← claims the UI is listening
+Proxy:  http://localhost:18080          ← the data plane announces itself
+UI server error: listen tcp :19090: bind: address already in use   → exit 1
+```
+
+Note the first line. The success message was printed *before* the bind was
+attempted, so the process log actively claimed the admin UI was listening on a
+port it never acquired — and then the appliance died over it.
+
+*Trigger 2 — the custom UI certificate cannot be loaded.*
+`ListenAndServeTLS` reads `-tls-cert`/`-tls-key` at call time, so a rotation
+that briefly truncates, replaces or re-permissions those files (certbot,
+cert-manager, a Docker secret whose mount is not ready yet) is a boot that ends
+in `UI TLS error: tls: failed to find any PEM data in certificate input` and
+exit 1.
+
+Both are ROUTINE operational events, and under `restart: unless-stopped`
+(docker-compose.yml) each becomes an unattended crash loop: no proxy, no admin
+UI, no health endpoint, recoverable only with shell access. That is precisely
+the outcome §19 closed for the category store, arrived at from the opposite
+direction — §19 reached it from a damaged data file, this sweep from a busy TCP
+port.
+
+### 33.3 Why "it exits, so it fails closed" is wrong
+
+The obvious defence of the old behaviour is that exiting is the safe direction.
+It is not, and this is the part worth recording.
+
+**Process death picks no posture at all — it delegates the choice to the network
+topology.** An explicit-proxy fleet loses all egress: a total business outage
+from an admin-plane fault. A PAC/WPAD fleet with a `DIRECT` fallback, or a
+transparent deployment that bypasses a dead next hop, sends traffic straight out
+**unfiltered** — a fail-OPEN security outcome reached by a mechanism that looks
+like fail-closed. Whichever one a given customer gets is a property of their
+network, not of any decision Culvert made.
+
+The counter-argument that *does* have force is DX: a hard failure on first boot
+is honest about a misconfiguration, whereas a silently-degraded appliance could
+ship to production unmanageable. That argument is answered by making the
+degradation impossible to miss (§25.5) rather than by keeping the exit — because
+the exit's cost is paid by every *later* boot too, when the appliance is carrying
+production traffic and the fault is transient.
+
+### 33.4 The codebase already knew
+
+Two precedents, one of them inside the very function that carries the defect:
+
+- **In `startUI` itself**, a `selfSignedTLS()` failure does NOT exit. It degrades
+  to plain HTTP and records `uiTLSFallbackActive` for the operator. One of the
+  four failure modes in this function was already handled correctly.
+- **CHAOS-54 (§22)** made exactly this call for a listener: a SOCKS5 accept loop
+  that hits an unrecoverable socket error closes the listener, records DOWN, and
+  the process keeps serving. The *least* critical listener in the process already
+  had the *gentlest* failure posture, while the admin UI had the most violent one.
+
+So the fix borrows wholesale rather than inventing a second dialect.
+
+### 33.5 What shipped
+
+`serveAdminUIWithRetry` / `adminUIServeOnce` (ui.go) + `admin_ui_health.go`.
+
+1. **No listen path is fatal.** The bind is performed EXPLICITLY (`net.Listen`)
+   rather than through `ListenAndServe`, so the loop can distinguish a successful
+   bind from a serve that ended — which is what makes evidence-based recovery
+   implementable here at all.
+2. **Rate-bounded, never count-bounded retry** (1 s → 30 s ceiling, ±20 % jitter,
+   interruptible). Unbounded attempts are deliberate, on CHAOS-55's reasoning:
+   the terminal state of "give up" is an appliance nobody can manage, which is
+   the outcome being removed. "Avoid infinite retries" is satisfied the way §22
+   and §23 satisfy it — the retry is never SILENT.
+3. **The certificate is re-read on every attempt**, so a rotation that
+   momentarily breaks the pair self-heals with no restart.
+4. **The success log moved after the bind.** The pre-change line claimed a
+   listener that did not exist.
+5. **Recovery on OBSERVED evidence only** — a listener that actually bound.
+   Elapsed time never clears the state; a retry loop that has stopped failing
+   because it stopped attempting looks identical to a bound one.
+6. **Full observability, on the PROXY port** — `/health admin_ui`, a
+   report-only `/ready admin_ui` row, five `culvert_admin_ui_*` series, the
+   `admin_ui_listener` contract row, and a fire-once `admin_ui_unavailable`
+   alert whose text states that traffic is unaffected. The surface choice is the
+   point: **the admin port's own `/healthz` cannot report that the admin port is
+   unreachable** — a probe that dies with the plane it measures reports nothing.
+7. **The readiness row is REPORT-ONLY and that is load-bearing.** A node whose
+   admin UI cannot bind is proxying perfectly; gating the default verdict would
+   eject a healthy gateway from the load balancer over its management plane —
+   converting a management outage into the traffic outage the change exists to
+   prevent. Pinned as a control test.
+8. **The pair is validated BEFORE the listener is bound.**
+   `http.Server.ServeTLS` returns a certificate error WITHOUT closing the
+   listener it was handed, so a bind-first loop would leak one socket per attempt
+   against a persistently bad certificate — turning a recoverable config fault
+   into the descriptor exhaustion §22 spent its whole sweep on. Pinned by a
+   50-attempt FD-count gate.
+
+Verified end to end against the real binary: with the port held, the appliance
+stays up, `/health` reports `admin_ui: degraded`, and the proxy answers 200
+throughout; when the port frees at T+13 s the listener rebinds on its own and
+`/health` reports `admin_ui: ready` at T+22 s with a recovery line naming the 3
+suppressed log lines — no restart.
+
+### 33.6 Deliberately not done
+
+- **The other fatal listeners are NOT changed.** `runProxyUntilShutdown`'s
+  `logFatalf("Proxy error")` is CORRECT: the proxy *is* the product, and a
+  gateway that cannot serve should exit loudly rather than linger as a black
+  hole. `startSOCKS5`'s bind failure stays fatal too, and that one is a genuine
+  open question rather than a settled answer — see SOCKS5-BIND below.
+- **No admin-UI-down entry in the audit ring.** The admin plane being down is a
+  systems event, not an admin action, and the audit ring is 500 entries shared
+  with security events (the §13 anti-forensics rule).
+- **No `culvert_admin_ui_never_bound` series.** `_up` plus `_binds_total == 0`
+  already distinguishes "never came up" from "fell over", and the contract row
+  states it in words.
+
+### 33.7 Register rows
+
+| Row | Finding | Status |
+|---|---|---|
+| **AP-1** | Admin UI listen/serve failure calls `logFatalf`, terminating the proxy data plane. Reachable by an occupied port or an unreadable custom certificate; a crash loop under `restart: unless-stopped`. | **CLOSED** (§25) |
+| **AP-2** | The admin UI success log line was emitted BEFORE the bind was attempted, so the process log claimed a listener that never existed. | **CLOSED** (§25) |
+| **AP-3** | No health/metrics/diagnostics surface reported the admin plane's reachability, and the only surface that carried admin-plane posture was on the admin port itself. | **CLOSED** (§25) |
+| **AP-4** | The custom UI certificate was read exactly once, at boot, so a rotation that momentarily broke the pair required a restart. | **CLOSED** (§25) |
+| **SOCKS5-BIND** | `startSOCKS5` bind failure is still fatal, so an occupied SOCKS5 port takes down HTTP/HTTPS proxying too. Same class as AP-1, one plane over. Not fixed here: §22 deliberately settled the RUNTIME posture for this listener and left the BOOT posture alone, and changing it is a posture decision (is a SOCKS5 port that cannot bind a misconfiguration to refuse, or a subsystem to degrade?) rather than a mechanical extension. | **OPEN** (Medium) |
+| **R-F** | Three data-file boot loads still `logFatalf` on any error: `catStore.Load` (Layer-1 URL categories), `blocklist_startup.go`, and the policy-file load in `main.go`. Scoped by §19 and unchanged by this sweep — the question there is about authoritative *state*, not about plane coupling. | **OPEN** (carried from §19) |
+
+### 33.8 The lesson this sweep adds
+
+§21 stated its rule for back ends, §22 for listeners, §23 for decisions, §24 for
+documented residuals. This one is about **blast radius**:
+
+> A process that hosts several planes has, by construction, given every one of
+> them the ability to end all the others. Which planes are *allowed* to exercise
+> that is a design decision — and it is almost never made explicitly, because
+> the mechanism (`os.Exit` on a startup error) is idiomatic, local, and looks
+> obviously correct at the call site. The question "what else dies when this
+> line runs?" has no local answer, so it does not get asked. Here the answer was
+> "the entire reason the product exists", written in a goroutine three lines
+> long, about a port number.
+
+And a second, sharper one about the shape of the argument: *exiting is not a
+posture.* Fail-closed and fail-open are properties of what the system does to
+traffic, and a process that is gone does not act on traffic at all — the
+surrounding network does, differently for each customer. Any component that
+reaches for `os.Exit` as a safety measure should be made to say which of the two
+outcomes it is choosing, in terms of packets, for a named deployment topology.
+## 34. CHAOS-64 — Destination-host DNS resolution on the policy path
+
+> Same finding as §28, reached from the other end. §28 entered through the
+> GeoIP accessor and fixed the WARM path (cache-only accessor + bounded,
+> single-flighted off-path warmer); this sweep entered through the resolver
+> itself and added the DEADLINE, the process-wide resolver POOL with shedding,
+> stale-while-revalidate, and the `dns_resolution` health plane. Both shipped;
+> the implementations were reconciled onto one `hostIPCache` (one flight type,
+> one leader path) when this sweep landed. Read §28 first.
+
+**Date:** 2026-09-04 · **Domain:** DNS (never previously swept) · **Code:**
+`geoip.go`, `dns_health.go`, `alerts.go` · **Runbook:**
+`docs/operator/dns-resolution-health.md`
+
+> **Renumbered SEVEN TIMES before merge — CHAOS-57 → CHAOS-58 → CHAOS-59 →
+> CHAOS-60 → CHAOS-61 → CHAOS-62 → CHAOS-63 → CHAOS-64.** This sweep collided
+> with a concurrently-developed sweep on `main` on seven merges inside eight
+> days, and
+> lost the id every time for the same reason. Each rename picked the next id that
+> was free *at that instant*, and each time another in-flight branch merged that
+> id first.
+>
+> | # | Date | Collided with | Which had taken | This sweep became |
+> |---|---|---|---|---|
+> | 1 | 2026-09-04 | §25 the hijacked-tunnel plane | `CHAOS-57` | `CHAOS-58` / §26 |
+> | 2 | 2026-09-10 | §26 the LDAP directory that stalls | `CHAOS-58` | `CHAOS-59` / §27 |
+> | 3 | 2026-09-10 | §27 the intelligence-feed plane | `CHAOS-59` | `CHAOS-60` / §28 |
+> | 4 | 2026-09-11 | §28 the GeoIP resolution chain | `CHAOS-60` | `CHAOS-61` / §29 |
+> | 5 | 2026-09-11 | §30 the DP outbound cluster state | `CHAOS-61` | `CHAOS-62` / §31 |
+> | 6 | 2026-09-11 | §31 the request-history store | `CHAOS-62` | `CHAOS-63` / §32 |
+> | 7 | 2026-09-11 | §32 the admin-login username bound | `CHAOS-63` | `CHAOS-64` / §33 |
+>
+> The first was already the THIRD occurrence of the class the header records for
+> `CHAOS-50`. Collisions 2 and 3 landed on the same day, hours apart, against two
+> different branches. Collisions 4, 5, 6 and 7 all landed on the same day,
+> hours apart, against four more.
+>
+> **The section has ALSO moved THREE times without a rename** — §29 → §30 → §31
+> between collisions 4 and 5, and §33 → §34 after collision 7, when the admin-UI
+> listener sweep merged ahead of it. Each time an unrelated newly-merged sweep was
+> inserted ahead of it, displacing the section while leaving the id alone. Column five
+> records what each RENAME produced at the time, so rows 4 and 5 keep their
+> then-current locations and the displacements are not rows. The current location
+> is §34, and every pointer outside the register (`CLAUDE.md`, the runbook,
+> `internal/geoip/geoip.go`) was repointed with it each time. **A section move and
+> an id collision are different events and the table must not conflate them** —
+> the first costs a pointer sweep, the second costs a rename of every gate,
+> metric and comment naming the sweep.
+>
+> **Collisions 6 and 7 each arrived as a displacement AND a rename in ONE
+> merge**, where the first five had kept the two events separate. The
+> request-history-store sweep was inserted ahead of this section AND had taken
+> the id this section was holding, so a single fetch delivered both a
+> displacement (§31 → §32) and a rename (`CHAOS-62` → `CHAOS-63`). The
+> distinction above still holds and is worth more, not less, for having been
+> collapsed once: the displacement cost a pointer sweep of three files, the
+> collision cost 62 identifier renames across ten. Nothing about either merge
+> announced which of the two had happened — both surfaced as the same
+> conflict-free fast-forward, and the duplicate id was visible only to a
+> `uniq -d` over the section headers.
+>
+> **Collision 7 is the one that closes the argument.** It landed on the same day
+> as collisions 4, 5 and 6, against a sweep whose own commit message reads
+> *"renumber to CHAOS-63/§32 — the fifth collision, caused by the fourth fix"* —
+> so a sweep renaming itself to escape a collision took the id this sweep had
+> renamed itself into hours earlier, and both were racing the same free-id
+> scan. That is the mechanism stated as plainly as it can be: when two branches
+> both pick "the next free id" against `main`, the winner is decided by merge
+> order, which neither can observe. There is no version of renaming-at-merge
+> that survives this; only allocation does.
+>
+> **Collision 4 is the one the previous note predicted in writing, and it is the
+> sharpest case of all**: §28 is the sibling half of THIS finding — the same
+> subsystem reached through the GeoIP accessor rather than the resolver — and it
+> was developed on THIS BRANCH and merged to `main` ahead of this section. So the
+> id was taken by a sweep sharing this sweep's own `hostIPCache`, and the pair was
+> reconciled onto one flight type while still answering to one name. For a
+> window, §28 and this section (then §29) both read `CHAOS-60` with
+> `(second sweep)` appended to
+> distinguish them — a parenthetical is not an identifier, and that is the same
+> half-fix (correct the SECTION, leave the ID) recorded for collisions 1–3.
+>
+> **The rule applied all seven times, and it is not "last one loses".** The header
+> states renumbering is an owner decision *because* "identifiers three merged PRs
+> already reference" would have to be rewritten. That reason is **asymmetric**:
+> the MERGED side is referenced by merged code, gates and register rows, so it
+> keeps the id; the UNMERGED side has every reference inside one branch, where
+> changing them costs nothing. Renumbering the unmerged side is therefore not a
+> unilateral edit of shared history — it is the only moment at which the collision
+> is free to remove, and after merge it would be permanent. The other side's
+> references were left untouched in every pass, so `metrics.go` now carries one
+> line from §25, one from §28 and one from here, `CLAUDE.md` carries §26's, §27's
+> and §28's bullets beside this sweep's, and `geoip.go` carries both halves of the
+> §28/§34 pair.
+>
+> **Each of the seven merges was resolved by someone who fixed the duplicate
+> SECTION number and left the duplicate ID in place**, which is why the collision
+> survived to recur: a section renumber makes the register read correctly while
+> two sweeps still answer to one name, and collisions 2–7 were found only because
+> a later merge conflict forced someone to look again. Collision 6 did not even
+> produce a conflict — the merge was a clean fast-forward, and the duplicate would
+> have merged silently had this branch not re-run the `uniq -d` check by habit.
+>
+> **The prevention the header has named since `CHAOS-50` is now overdue, and this
+> sweep is the whole argument for it**: allocate the id in a committed placeholder
+> row at the START of a sweep. Renaming at merge time provably cannot work — the
+> id a rename picks is validated against `main` at the instant of the rename and
+> nothing reserves it afterwards, so the rename is itself a race. One branch lost
+> the id SEVEN times in eight days; catching each one was luck, not process.
+> Each revision of this note has predicted the next occurrence in writing and each
+> prediction has been met within the day — *"expect a fourth"* was followed by a
+> fourth from a sibling sweep on this very branch, the note that recorded the
+> fourth was overtaken by a fifth before it merged, and the note that recorded the
+> fifth — which said in these words that *"a sixth is not a prediction about luck;
+> it is what this process produces by construction"* — was overtaken by a sixth
+> the same day, before a reviewer had read it. **Owner action: add the
+> placeholder-allocation row.** The argument no longer needs a prediction to rest
+> on: the sentence claiming the process generates collisions by construction was
+> itself invalidated by one, which is as direct a demonstration as the register
+> can offer.
+>
+> **`CHAOS-57` is now stamped on THREE merged sections, and no branch can resolve
+> any of them.** §25 (the hijacked-tunnel plane, 2026-09-04), §29 (credential
+> verification, 2026-09-11) and §33 (the admin-UI listener, 2026-09-11) all carry
+> it. Every one is merged, so the asymmetry that resolved collisions 1–7 does not
+> apply: no side is free to move, and whichever is renumbered rewrites identifiers
+> that merged PRs already reference.
+>
+> It is also the collision that reached the CODE. All three sweeps name their gates
+> `TestChaos57_*` in the same `package main`, and the tree compiles only because
+> every suffix happens to differ — with two sweeps that was luck, with three it is
+> luck being asked to hold across a widening surface, and a future gate named for
+> any of them can now fail to build for a reason that has nothing to do with its
+> subject. **This section records the fact and renumbers nothing**: choosing which
+> merged sweep moves is exactly the owner decision the header reserves, and doing
+> it from an unrelated branch would edit three other sweeps' merged history.
+>
+> The progression is the argument. When this note first recorded the duplicate it
+> was a pair and the claim was that the process had produced something no branch
+> could resolve cheaply. Within the same day it became a triple — without anyone
+> making a mistake, because each sweep independently picked an id that was free
+> when it looked. **Renaming at merge cannot converge; only allocation can.**
+
+### 34.1 Reachability
+
+Two conditions, both ordinary in an enterprise deployment:
+
+1. A MaxMind database is loaded (`geoip.Enabled()`).
+2. At least one enabled access rule carries a `DestCountry`.
+
+Geo-scoped policy is a headline SWG feature, so this is a normal posture, not an
+exotic one. Under it, `matchDestNorm` (policy.go:1608) calls
+`geo.LookupCached(host)` once per such rule per request, on the **request
+goroutine**, and that needs an IP address before it can ask for a country.
+
+`policy.go:1221` already names the hazard:
+
+> the scan can block (matchDestNorm → geo.LookupCached → DNS on an uncached
+> DestCountry host) … so the lock must NOT be held across it
+
+That comment is correct and the mitigation it describes — releasing the
+evaluation lock before the scan — is the right fix for the *lock*. It is not a
+fix for the *request*, which still blocks.
+
+### 34.2 The three defects
+
+Each was reproduced against the pre-fix tree before any code was written.
+
+**D1 — no deadline.** `lookupHostFn` was `net.LookupHost`: no context, no
+timeout. The only bound was the operating system's, and `resolv.conf` ships
+`timeout:5 attempts:2` per nameserver. Measured: `resolveHost` had not returned
+after 1.5 s against a wedged resolver and would not until the resolver did. That
+goroutine holds a client connection, a per-IP `internal/connlimit` slot, and its
+place in the policy scan.
+
+**D2 — no single-flight.** The pre-fix comment stated the position explicitly —
+*"Concurrent misses for the same host may resolve in parallel; last write wins,
+which is benign (both hold live answers)"* — and it is benign for correctness
+and not for load. Measured: **200 resolver invocations for 200 concurrent
+requests to one host.** During a resolver brownout that is one blocked goroutine
+per request AND one query per request, fired at the resolver that is already
+failing. It is also what made the negative cache useless as a shock absorber: a
+negative entry is written only when a resolution *completes*, so during an
+outage every request kept missing for the full length of the outage.
+
+**D3 — no stale serving, and the security consequence.** An expired entry was
+discarded outright. Because the TTL is uniform (5 min) and entries are created
+by traffic, the whole working set expires within one window — so the first
+expiry during a resolver outage takes every popular host cold at the same
+moment. `LookupCached` then returns `("", false)`, and:
+
+```go
+if countrySet {
+    code, cached := geo.LookupCached(host)
+    if !cached || !matchCountry(rule.DestCountry, code) {
+        return false          // rule does not match
+    }
+}
+```
+
+A rule that does not match is **skipped**, and `evalAccessRules` continues to
+lower-priority rules. The in-code comment calls this fail-closed, and for an
+*allow* rule it is. For a *block* rule it is the exact opposite: a "block
+sanctioned countries" rule stops matching and a broad allow rule beneath it
+takes over. **Geo blocking silently stops enforcing because DNS is slow.**
+
+And none of it was visible. No counter, no log line, no alert, no health row on
+this path — every probe stayed green.
+
+### 34.3 What shipped
+
+| Property | Mechanism | Why this shape |
+|---|---|---|
+| Bounded in time | `dnsResolveTimeout` 2 s on a context-aware seam | The budget is what a client pays for a cache miss. A resolver that has not answered in 2 s is not about to make the request fast. |
+| Bounded per host | single-flight; followers inherit the leader's answer **and its deadline** | A timer on the follower would be worse than useless — it would release it to start a *second* lookup, which is the herd being collapsed. |
+| Bounded in total | 64-slot pool; saturation SHEDS, never queues | Single-flight collapses a herd on one host and does nothing across many, and the hostname is attacker-controlled. A queue would only relocate the pileup. |
+| Never blocks for a known host | stale-while-revalidate, ceiling `hostIPCacheStaleMax` 1 h | The address is used only for country attribution — the real connection is dialled through the transport's own resolution — and an IP's country changes on a timescale of months. The alternative to a stale answer here is not a fresher one, it is **no** answer. |
+| The refresh cannot make it worse | a negative result never overwrites a still-servable positive | A failed refresh writes a negative, and a negative is served as FRESH for its TTL — so without this guard the refresh introduced by the fix would itself take geo dark for exactly the window the stale answer existed to cover. |
+| Shed is not a fact about the host | shed results are not cached | Saturation is a statement about this node's load; caching it would suppress a legitimate destination for a full TTL. |
+| Followers can never hang | `finishFlight` is DEFERRED on every leader path | Otherwise a panic inside the resolution leaves followers blocked forever on a flight nobody completes — a bounded resolver fault converted into a permanent request-plane hang no upstream `recover()` can undo. |
+
+Observability, all reusing existing operator vocabulary: six
+`culvert_dns_resolve_*` series, the `dns_resolution` operator-contract row, and
+a fire-once-per-episode page on the **existing** `dns_failure` event (a new
+event name would be silently unsubscribed on every already-configured webhook —
+the cluster-CA `cert_expiry` precedent).
+
+Two discipline points carried from the earlier sweeps:
+
+- **Degradation is a DURATION (60 s), and NXDOMAIN never counts toward it.** An
+  authoritative "this name does not exist" is a resolver working perfectly, and
+  a gateway sees a steady stream of them from typos and malware beaconing to
+  sinkholed C2. Any count-based threshold pages on healthy traffic — and
+  because the hostname is **client-chosen**, it would let any client fabricate
+  the page on demand.
+- **Recovery is on OBSERVED evidence only.** One successful resolution clears
+  the episode; elapsed time never does. A gateway whose resolution failures stop
+  because traffic stopped has not recovered.
+
+### 34.4 The alert-plane defect found alongside
+
+`fireDNSFailureAlert` passed the raw `err.Error()` as the alert Detail.
+`Store.Dispatch` dedups on `event + ":" + Detail`, and a `*net.DNSError`'s text
+embeds the **queried hostname** and the resolver address — so every failure
+minted a distinct dedup key that the 30 s window could not suppress by
+construction, and the fan-out landed in the 500-entry retry queue where it
+evicts real threat alerts. That is WK-12/RS-5, and here it is remotely
+triggerable: the hostname is chosen by the client, so any client could both
+fabricate unbounded alert volume and write arbitrary strings into an operator's
+alert pipeline. Detail is now a bounded reason class; the full error was already
+logged at each of the four dial sites, so nothing is lost.
+
+### 34.5 Gates
+
+`dns_resolve_chaos_test.go` (23). D1/D2/D3 were each reproduced against the
+pre-fix tree with the equivalent assertion before the fix was written. Two
+**CONTROLS** are included for the CHAOS-56 reason: a resolver that always shed,
+or always served stale, or never refreshed, would pass every defect gate above
+while being far worse than the defect — so the suite proves the mechanism still
+resolves (`Control_HealthyResolutionStillWorks`) and still tells the truth about
+a genuinely unresolvable host (`Control_UnresolvableHostStillFailsAndIsCounted`).
+
+`geoip_hostcache_test.go`'s `TestResolveHost_TTLExpiry` was **inverted**: it
+pinned the synchronous-re-resolve-on-expiry behaviour, which is the defect. It
+now pins stale-serving, with `TestResolveHost_StaleCeilingForcesResolution`
+pinning the other end of the window.
+
+### 34.5a Review finding — stale serving is for POSITIVE entries only
+
+Codex review of PR #1312 (P1), verified and fixed before merge.
+
+The first implementation classified ANY entry past its TTL as stale-servable,
+negative entries included. A negative entry's stale value is `nil`, so the
+`resolveHost` stale branch returned nil immediately and left the repair entirely
+to the asynchronous refresh.
+
+That inverts the stated rationale for stale serving. Serving stale is justified
+because *"the alternative to a stale answer is not a fresher one, it is NO
+answer"* — true of an address, false of a negative, whose stale value **is** no
+answer. So it bought nothing and cost the exact thing the change exists to
+prevent: a host that failed to resolve ONCE kept returning nil on the
+synchronous path for up to `hostIPCacheStaleMax`, leaving a country-scoped DENY
+rule dark for an **hour** after DNS recovered instead of the 30 s the negative
+TTL promises. Worse, `refreshAsync` SHEDS when the resolver pool is saturated,
+so under sustained load the bypass could persist for the full window. And it was
+a REGRESSION against the pre-CHAOS-64 behaviour, which re-resolved synchronously
+the moment the negative TTL lapsed.
+
+Fixed by restricting the stale state to `e.ip != nil`. An expired negative is a
+MISS and takes the bounded, single-flighted blocking path, picking up a
+recovered resolver on the very next request. Pinned by
+`TestChaos58_ExpiredNegativeEntryIsNotStaleServed` and
+`TestChaos58_ExpiredNegativeStillReResolvesWhenTheResolverPoolIsSaturated`, both
+verified failing against the reintroduced pre-fix shape.
+
+**The lesson worth keeping:** a mechanism justified by one case (a usable
+address) was applied to every case, and the sibling case turned it into the
+defect it was built to remove. A degradation path needs its rationale checked
+against each state it can be in, not only the one that motivated it.
+
+### 34.6 Residual risk (owner decisions, recorded not fixed)
+
+- **DNS-1 — the fall-through posture is unchanged.** An unresolvable destination
+  still cannot match a geo rule in either direction. Making an unknown country
+  match a *block* rule would deny every destination this node cannot resolve —
+  a bounded security gap traded for an unbounded availability one. The
+  mitigation is the one-hour stale window (which removes the gap entirely for
+  any recently-seen destination), the alert and the metric. Operators needing
+  hard geo enforcement during a DNS outage should express it as an explicit deny
+  rule rather than relying on fall-through. **An admin-selectable
+  `geo_on_unresolvable: skip | deny` toggle is the natural next step** and is the
+  same shape the register already recommends for WK-1/PX-2.
+- **DNS-2 — the cgo resolver's `getaddrinfo` is uncancellable.** The deadline
+  reliably releases the request goroutine; the OS thread behind it is bounded
+  only by the Go runtime's own 500-thread cap on cgo lookups. The pure-Go
+  resolver honours the deadline fully.
+- **DNS-3 — the four dial sites still resolve without a Culvert-side bound.**
+  They run under a 10 s `net.Dialer` timeout, which bounds the dial including
+  resolution, so the unbounded case does not exist there; but they have no
+  single-flight either, so a brownout still produces one resolver query per
+  request on the dial path. That is inherent to dialling (each request really
+  does need its own connection) and is recorded rather than changed.
+
+### 34.7 GEO-1 — a latent process-kill armed by a comment (recorded, not fixed)
+
+Found while sweeping the domain adjacent to CHAOS-64 and **not reachable in the
+current tree**, but recorded because of how it is armed.
+
+`internal/geoip.InitGeoDB` claimed:
+
+> Call once at startup. **Subsequent calls replace the open reader atomically.**
+
+The pointer swap is atomic. The *close* is not safe, and the difference between
+those two is an error versus a process kill:
+
+```go
+// geoCache.lookup
+geoDBMu.RLock()
+db := geoDB
+geoDBMu.RUnlock()      // ← lock released
+...
+record, err := db.Country(ip)   // ← reader used here, unprotected
+```
+
+```go
+// InitGeoDB
+geoDB = r
+geoDBMu.Unlock()
+if old != nil { _ = old.Close() }   // ← immediately
+```
+
+`geoip2.Reader.Close` delegates to maxminddb's, which **`munmap`s the backing
+buffer** (`reader_mmap.go:55`). An in-flight lookup holding the old reader
+therefore reads unmapped memory: a **SIGSEGV/SIGBUS, which `recover()` cannot
+catch**, which `crashguard.go` never sees, and which leaves no log line. A total
+gateway outage with no evidence — the worst failure shape in the register,
+strictly worse than the panics CHAOS-24 was built to contain, because
+containment is not available at all.
+
+**Reachability today: none.** `loadGeoIP` (`geoip_startup.go`) is the only
+production caller and runs from `initGeoIP` (`main.go:198`) during startup,
+before the proxy listener serves. There is no SIGHUP path, no admin reload, and
+no CP→DP snapshot field for the GeoIP database.
+
+**Why it is recorded rather than fixed.** The danger is not the code, it is the
+comment: a runtime GeoIP reload is a natural next feature (CLAUDE.md mandates a
+GUI surface for every config option, and the register's WK-4 already asks for
+GeoIP staleness surfacing, which invites "so let me reload it"), and the comment
+told whoever adds it that the swap was already safe. Building reference counting
+for a path with no caller is the wrong trade. What shipped is the correction: the
+doc comment now states the hazard, names the three acceptable remedies (hold the
+read lock across `db.Country`, reference-count the reader, or never close the old
+one — a leaked mapping is strictly cheaper than a crash), and requires one of
+them **before** any reload path is added.
+
+**Owner action:** treat "add a GeoIP reload" as blocked on the reader-lifetime
+fix, not as a standalone feature.

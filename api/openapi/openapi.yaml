@@ -62,7 +62,7 @@ tags:
   - name: pac
     description: Proxy auto-config (PAC) settings.
   - name: settings
-    description: Appliance settings — logging, session, connection limits.
+    description: Node settings — logging, session, connection limits.
   - name: cluster
     description: Control-plane / data-plane cluster status and upstream pool.
   - name: support
@@ -207,7 +207,16 @@ components:
       required: [user, pass]
       additionalProperties: false
       properties:
-        user: { type: string }
+        user:
+          type: string
+          maxLength: 256
+          description: |
+            Admin username. Bounded at 256 bytes (CHAOS-61): this endpoint is
+            public, and an unbounded value here reaches the account-lockout
+            maps and the durable audit log. A longer value is rejected with
+            400 before any credential evaluation. A name that already belongs
+            to a configured account is never rejected, however long, so the
+            limit cannot lock out a real admin.
         pass: { type: string, format: password }
         totp:
           type: string
@@ -385,7 +394,7 @@ components:
         draft: { type: boolean }
     AuthPolicyList:
       type: object
-      required: [rules, count, defaultAction, note, version, updatedAt]
+      required: [rules, count, defaultAction, note, version, updatedAt, killSwitch]
       additionalProperties: false
       properties:
         rules: { type: array, items: { type: object, additionalProperties: true } }
@@ -397,6 +406,15 @@ components:
           format: int64
           description: RUNNING PolicyStore generation (never a draft candidate's) — echo via ?ifVersion= on mutations for atomic optimistic concurrency (2C.0a).
         updatedAt: { type: string, description: RFC3339 timestamp of the last running-rulebase mutation. }
+        killSwitch: { $ref: '#/components/schemas/AuthExemptKillSwitchStatus' }
+    AuthExemptKillSwitchStatus:
+      type: object
+      required: [envDisabled, runtimeDisabled, engaged]
+      additionalProperties: false
+      properties:
+        envDisabled: { type: boolean }
+        runtimeDisabled: { type: boolean }
+        engaged: { type: boolean }
     DefaultActionStatus:
       type: object
       required: [defaultAction]
@@ -436,6 +454,12 @@ components:
         failClosedTotal: { type: integer, format: int64 }
         revokedTotal: { type: integer, format: int64 }
         lastFailClosedAt: { type: string }
+        mtlsClientCertConfigured: { type: boolean, description: "True when an upstream mTLS client certificate (client_cert_file/client_key_file) is configured. Omitted when unset." }
+        mtlsClientCertLoaded: { type: boolean, description: "True when the configured client certificate loaded successfully and is active on the upstream transport. Present only when mtlsClientCertConfigured is true." }
+        mtlsClientCertFile: { type: string, description: "Configured client-certificate file path. Present only when mtlsClientCertConfigured is true." }
+        mtlsClientCertNotAfter: { type: string, format: date-time, description: "Expiry (RFC 3339) of the loaded client certificate. Present only when mtlsClientCertLoaded is true." }
+        mtlsClientCertDaysRemaining: { type: integer, description: "Days until the loaded client certificate expires (negative if already expired). Present only when mtlsClientCertLoaded is true." }
+        mtlsClientCertLastError: { type: string, description: "Most recent client-certificate load failure. Present only when the configured certificate failed to load." }
     SessionTimeout:
       type: object
       required: [hours]
@@ -683,6 +707,7 @@ components:
         ui_tls_fallback_reason: { type: string, description: "The self-sign error, when ui_tls_fallback is true." }
         ui_custom_cert_uploaded: { type: boolean, description: "True when a custom UI certificate uploaded via POST /api/certs/upload (target=ui) is saved to disk and will be used on the next restart." }
         ui_custom_cert_active: { type: boolean, description: "True when the running UI server was started using the uploaded custom certificate (i.e. it is already live, not just saved pending a restart)." }
+        ui_custom_cert_corrupt: { type: boolean, description: "True when the persisted custom UI certificate/key pair does not parse as a matching TLS pair (interrupted or corrupted upload). It is NOT active, and a restart will NOT fix this — the pair must be re-uploaded." }
     RewriteList:
       type: object
       required: [rules, count]
@@ -980,6 +1005,14 @@ components:
           type: object
           description: 2F-A per-pool tokens (pool id → etag) every pool PUT/DELETE must echo.
           additionalProperties: { type: string }
+        degraded:
+          type: object
+          description: >-
+            Keyed by profile ID ("default" for the legacy profile); present only for
+            a profile whose most recent PAC serve compiled with warnings (dropped
+            rule, unresolvable pool reference, secure-mode conflict). Empty when
+            every profile last served clean.
+          additionalProperties: true
     PACPostureInventory:
       type: object
       description: Direct-access PAC posture inventory (shape varies).
@@ -1297,6 +1330,15 @@ components:
         healthy: { type: integer }
         unhealthy: { type: integer }
         skipped: { type: integer, description: 'Credential-ineligible entries, not probed.' }
+    MaintAgentStatus:
+      type: object
+      description: >-
+        Health of the CP-local maintenance agent, read from its GET
+        /v1/status. `available:false` means the agent could not be reached
+        or is not configured, with `reason` carrying the cause; otherwise
+        carries agent_version, privilege_mode(+privilege_warning), and
+        compose_stack_up(+compose_error).
+      additionalProperties: true
     UpstreamConfig:
       type: object
       description: >-
@@ -1453,6 +1495,28 @@ components:
       additionalProperties: true
       properties:
         enabled: { type: boolean }
+        remote_counts_stale:
+          type: boolean
+          description: >-
+            True while the last Control Plane broadcast is older than the
+            rate-limit window, so other nodes' request counts are no longer
+            added to this node's local counts. Local rate limits are still
+            enforced; the cluster-wide aggregate is not.
+        remote_counts_applied:
+          type: boolean
+          description: Whether any Control Plane broadcast has ever been received by this node.
+        remote_counts_age_secs:
+          type: number
+          description: Age of the last applied broadcast, in seconds. Absent when none has ever been applied.
+        remote_counts_max_age_secs:
+          type: number
+          description: >-
+            How long an applied broadcast can still describe the current window
+            — the rate limiter's own window. Past it the broadcast counts
+            timestamps that have all aged out, so it contributes nothing.
+        remote_counts_stale_episodes:
+          type: integer
+          description: Times the broadcast went stale since startup (one continuous outage counts once).
     ClusterRevocations:
       type: object
       required: [local_revoked, cluster_mode]
@@ -3914,7 +3978,7 @@ paths:
       operationId: getOCSP
       tags: [security]
       summary: OCSP status
-      description: Returns OCSP revocation-check status and counters.
+      description: Returns OCSP revocation-check status and counters, plus the upstream mTLS client-certificate's load/expiry status (both are loaded together at startup).
       security:
         - sessionCookie: []
         - basicAuth: []
@@ -4145,8 +4209,8 @@ paths:
     get:
       operationId: getSettings
       tags: [settings]
-      summary: Appliance settings summary
-      description: Returns core appliance settings — auth state, admin user, ports, and default auth outcome (password never returned).
+      summary: Node settings summary
+      description: Returns core node settings — auth state, admin user, ports, and default auth outcome (password never returned).
       security:
         - sessionCookie: []
         - basicAuth: []
@@ -4158,7 +4222,7 @@ paths:
       x-culvert-introduced-version: 1.0.0
       responses:
         '200':
-          description: Appliance settings summary.
+          description: Node settings summary.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SettingsSummary' }
@@ -10233,6 +10297,70 @@ paths:
         '403': { $ref: '#/components/responses/PlainForbidden' }
         '409': { description: 'Version fence conflict ({error, currentVersion, yourVersion}); or — WITHOUT an ifVersion assertion — a request that conflicts with the CURRENT rulebase (name/priority already in use, a priority that now belongs to the other rule type, an order list that no longer covers the set), decided inside the coordinator fence: {error, currentVersion} — refresh and reapply, the mutation did not run.' }
         '500': { description: 'Durable persist failed — the reorder was rolled back.' }
+  /api/authpolicy/killswitch:
+    get:
+      operationId: getAuthPolicyKillSwitch
+      tags: [policy]
+      summary: Get Auth Exempt kill-switch status
+      description: >-
+        Reports the Auth Exempt break-glass kill switch: the read-once
+        CULVERT_AUTHBYPASS_DISABLE env layer, the admin-settable runtime
+        toggle, and the combined verdict the Stage-1 gate consults.
+      security:
+        - sessionCookie: []
+        - basicAuth: []
+      x-culvert-visibility: admin-supported
+      x-culvert-permission: viewer
+      x-culvert-tenant-scope: appliance
+      x-culvert-stability: stable
+      x-culvert-idempotency: safe
+      x-culvert-introduced-version: 1.0.0
+      responses:
+        '200':
+          description: Get Auth Exempt kill-switch status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthExemptKillSwitchStatus' }
+        '403': { $ref: '#/components/responses/PlainForbidden' }
+    put:
+      operationId: setAuthPolicyKillSwitch
+      tags: [policy]
+      summary: Engage or release the Auth Exempt kill switch
+      description: >-
+        Engages or releases ONLY the runtime toggle (no restart required); the
+        env layer is read-once and cannot be changed at runtime. Engaging the
+        switch fails every Auth Exempt rule (scoped and the global Open
+        default) closed to "authentication required" — it never affects
+        Stage-2 access decisions.
+      security:
+        - sessionCookie: []
+        - basicAuth: []
+      x-culvert-visibility: admin-supported
+      x-culvert-permission: admin
+      x-culvert-tenant-scope: appliance
+      x-culvert-stability: stable
+      x-culvert-idempotency: idempotent
+      x-culvert-introduced-version: 1.0.0
+      x-culvert-danger-level: high
+      x-culvert-audit-event: authpolicy.killswitch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disabled]
+              additionalProperties: false
+              properties:
+                disabled: { type: boolean }
+      responses:
+        '200':
+          description: Engage or release the Auth Exempt kill switch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthExemptKillSwitchStatus' }
+        '400': { $ref: '#/components/responses/PlainBadRequest' }
+        '403': { $ref: '#/components/responses/PlainForbidden' }
   /api/pac/analyze:
     post:
       operationId: analyzePAC
@@ -13377,9 +13505,37 @@ paths:
             schema:
               type: object
               required: [review_id, evidence_digest]
+              # Both constraints below are stated in `description`, NOT as machine-checkable
+              # `minLength`/`maxLength`/`pattern`. oasdiff classifies adding any of those to an
+              # EXISTING request property as a breaking change (it rejects values a previous
+              # client could send), so the breaking-change gate would demand the reviewed
+              # `api-breaking-approved` exception — a CODEOWNER-approved governance event. The
+              # handler is the authority and already enforces both (maxShadowExitReviewIDBytes and
+              # canary.ValidEvidenceDigest, the latter predating this change), so spending that
+              # exception to document behaviour the server already has would be disproportionate:
+              # the runtime contract is identical either way. Promote these to schema constraints
+              # at the next major-version bump — see docs/api/API-VERSIONING-POLICY.md.
               properties:
-                review_id: { type: string }
-                evidence_digest: { type: string }
+                review_id:
+                  type: string
+                  description: >-
+                    The exact Shadow Exit Review artifact / case id. Must be non-empty and at most
+                    256 bytes — it is the only free-text field that reaches the durable
+                    attestation record, so it is bounded at the trust boundary rather than
+                    inheriting the admin middleware's 1 MiB body cap. Over-bound input is rejected
+                    with 400, never truncated (a truncated identity would name a different review
+                    than the operator attested).
+                  example: SXR-2026-08-30-gateway-shadow-exit-review
+                evidence_digest:
+                  type: string
+                  description: >-
+                    Canonical lowercase-hex SHA-256 (exactly 64 characters matching
+                    ^[0-9a-f]{64}$) of the reviewed Shadow Exit evidence bundle — the "which
+                    evidence" binding. A non-empty but non-digest value is rejected with 400 so a
+                    review can never be attested against an unidentifiable evidence reference.
+                  # Quoted: an all-digit unquoted scalar is parsed by YAML as a NUMBER, which the
+                  # bundler rejects against `type: string`.
+                  example: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
       responses:
         '200': { description: Attestation created, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
         '400': { $ref: '#/components/responses/PlainBadRequest' }
@@ -13441,4 +13597,30 @@ paths:
       x-culvert-introduced-version: 1.0.0
       responses:
         '200': { description: Upstream health, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '403': { $ref: '#/components/responses/PlainForbidden' }
+  /api/maintenance-agent:
+    get:
+      operationId: getMaintenanceAgentStatus
+      tags: [support]
+      summary: Maintenance agent health
+      description: >-
+        Read-only health of the CP-local maintenance agent, sourced from its
+        GET /v1/status (agent version, privilege posture, compose-stack
+        state). Lets an admin confirm the host-root agent is reachable and
+        healthy without SSH access to the host.
+      security:
+        - sessionCookie: []
+        - basicAuth: []
+      x-culvert-visibility: admin-supported
+      x-culvert-permission: viewer
+      x-culvert-tenant-scope: appliance
+      x-culvert-stability: stable
+      x-culvert-idempotency: safe
+      x-culvert-introduced-version: 1.0.0
+      responses:
+        '200':
+          description: Maintenance agent health.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintAgentStatus' }
         '403': { $ref: '#/components/responses/PlainForbidden' }

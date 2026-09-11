@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,6 +29,14 @@ import (
 // Supports date filtering via ?from=UNIX_MS&to=UNIX_MS.
 // Use ?source=file to read from the persistent JSONL audit log file instead of
 // the in-memory ring buffer (default: memory for backwards compat) (Finding 6.2).
+// Use ?format=csv or ?format=json to download the matched entries as an
+// attachment instead of the normal paginated API response, mirroring
+// apiExport's traffic-log download shape (GAP-MON-02: the Audit panel had no
+// bulk-export parity with the traffic log's CSV/JSON buttons, forcing an
+// operator to script `curl /api/audit?source=file` for a compliance handoff).
+// An export request defaults to the persistent file (the durable compliance
+// record) and a higher entry cap, since the point is capturing history beyond
+// the in-memory ring — both stay overridable via the existing ?source=/&limit=.
 func apiAudit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -44,17 +53,59 @@ func apiAudit(w http.ResponseWriter, r *http.Request) {
 	if offset < 0 {
 		offset = 0
 	}
+	format := q.Get("format")
+	exporting := format == "csv" || format == "json"
 	if limit <= 0 || limit > 10000 {
-		limit = 500
+		if exporting {
+			limit = 10000
+		} else {
+			limit = 500
+		}
+	}
+	source := q.Get("source")
+	if exporting && source == "" {
+		source = "file"
 	}
 	var entries []AuditEntry
 	var total int
-	if q.Get("source") == "file" {
+	if source == "file" {
 		entries, total = auditGetPersistent(offset, limit, fromTS, toTS)
 	} else {
 		entries, total = auditGetMemory(offset, limit, fromTS, toTS)
 	}
+	if exporting {
+		writeAuditExport(w, format, entries)
+		return
+	}
 	jsonOK(w, map[string]any{"entries": entries, "count": len(entries), "total": total, "offset": offset, "limit": limit})
+}
+
+// writeAuditExport streams audit entries as a downloadable attachment, same
+// Content-Disposition convention as apiExport's traffic-log download.
+func writeAuditExport(w http.ResponseWriter, format string, entries []AuditEntry) {
+	ts := time.Now().Format("20060102-150405")
+	switch format {
+	case "csv":
+		w.Header().Set("Content-Type", "text/csv")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="culvert-audit-%s.csv"`, ts))
+		cw := csv.NewWriter(w)
+		cw.Write([]string{"timestamp", "time", "actor", "action", "object", "object_id", "detail", "before", "after"}) //nolint:errcheck // CSV write
+		for i := range entries {
+			e := &entries[i]
+			cw.Write([]string{ //nolint:errcheck // CSV write
+				fmt.Sprintf("%d", e.TS), e.Time, e.Actor, e.Action, e.Object, e.ObjectID, e.Detail, e.Before, e.After,
+			})
+		}
+		cw.Flush()
+	default: // json
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="culvert-audit-%s.json"`, ts))
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck // HTTP response write
+			"exported": ts,
+			"count":    len(entries),
+			"entries":  entries,
+		})
+	}
 }
 
 // GET /api/stats
@@ -531,6 +582,16 @@ func applyRetentionUpdate(w http.ResponseWriter, r *http.Request, enabled *bool,
 				http.Error(w, "saved logs use a different encryption key — purge saved logs, then enable again", http.StatusConflict)
 				return false
 			}
+			// A DIFFERENT remedy from the mismatch above, which is why it is a
+			// distinct sentinel: the saved history is still intact and still
+			// decryptable, but only by the salt sidecar that went missing. The
+			// key is never re-minted over an existing store (CHAOS-62), so
+			// restoring that one file recovers the history — purging is the
+			// fallback for an operator who cannot, and it is irreversible.
+			if errors.Is(err, errLogStoreSaltUnusable) {
+				http.Error(w, "saved logs exist but their encryption salt file is missing or damaged — restore the .salt sidecar next to the history store from a backup to recover them, or purge saved logs to start fresh (this discards the saved history)", http.StatusConflict)
+				return false
+			}
 			// Log the detail; return a generic message so a filesystem path
 			// can't leak in the HTTP response.
 			logger.Printf("WARN apiLogsRetention: enable failed: %v", err)
@@ -960,8 +1021,10 @@ func writeImportPreview(w http.ResponseWriter, r *http.Request, b *configBackup,
 // Replace mode swaps the whole set; merge mode UPSERTS by identity — match by
 // stable ULID first (idempotent re-import), then a one-time name fallback for
 // pre-ID / hand-authored backups, else create fresh — so a re-import does not
-// accumulate duplicates (POLICY-ARCHITECTURE-FUTURE §1).
-func importPolicyRules(b *configBackup, replaceMode bool) {
+// accumulate duplicates (POLICY-ARCHITECTURE-FUTURE §1). Returns one warning
+// string per rule that failed validation and was skipped, so the caller can
+// surface them to the admin instead of leaving them only in the process log.
+func importPolicyRules(b *configBackup, replaceMode bool) []string {
 	// Object-reference IDs are re-derived from the submitted NAMES, exactly like
 	// the interactive write path (stampObjectRefIDs): enforcement is
 	// ID-authoritative (failOpenScopeForRule, MatchesCategoryByID), so a backup
@@ -978,8 +1041,9 @@ func importPolicyRules(b *configBackup, replaceMode bool) {
 			stampObjectRefIDs(&rules[i])
 		}
 		policyStore.ReplaceAll(rules)
-		return
+		return nil
 	}
+	var warnings []string
 	// Index-based range: PolicyRule is a large struct (CLAUDE.md rangeValCopy).
 	for i := range b.PolicyRules {
 		rule := b.PolicyRules[i]
@@ -997,7 +1061,9 @@ func importPolicyRules(b *configBackup, replaceMode bool) {
 			editPriority = existing.Priority
 		}
 		if err := validatePolicyRule(rule, policyStore.List(), editPriority); err != nil {
-			logger.Printf("ConfigImport: skipping rule %q: %s", sanitizeLog(rule.Name), strings.ReplaceAll(err.Error(), "\n", ""))
+			reason := strings.ReplaceAll(err.Error(), "\n", "")
+			logger.Printf("ConfigImport: skipping rule %q: %s", sanitizeLog(rule.Name), reason)
+			warnings = append(warnings, fmt.Sprintf("policy rule %q skipped: %s", rule.Name, reason))
 			continue
 		}
 		if existing == nil {
@@ -1012,6 +1078,7 @@ func importPolicyRules(b *configBackup, replaceMode bool) {
 			policyStore.Add(rule)
 		}
 	}
+	return warnings
 }
 
 // POST /api/config/import — import configuration from an exported JSON file.
@@ -1170,8 +1237,10 @@ func apiConfigImport(w http.ResponseWriter, r *http.Request) {
 	importCategoryOverrides(&b, replaceMode)
 
 	// Policy rules — replace or upsert-by-identity (extracted to keep the
-	// handler under the nestif complexity threshold).
-	importPolicyRules(&b, replaceMode)
+	// handler under the nestif complexity threshold). Rules that failed
+	// validation are skipped (not aborted whole); collect why, so "ok:true"
+	// never hides a silently-dropped rule from the admin (see warnings below).
+	warnings := importPolicyRules(&b, replaceMode)
 	policyStore.Save()
 	if b.DefaultAction == "allow" || b.DefaultAction == "deny" {
 		setDefaultPolicyAction(b.DefaultAction)
@@ -1221,7 +1290,9 @@ func apiConfigImport(w http.ResponseWriter, r *http.Request) {
 	if replaceMode && len(b.ContentScanPatterns) > 0 {
 		if err := dpiScanner.Set(b.ContentScanPatterns); err != nil {
 			patternsOK = false
-			logger.Printf("ConfigImport: content scan patterns rejected: %s — skipping bypass-host import (shared envelope)", strings.ReplaceAll(err.Error(), "\n", ""))
+			reason := strings.ReplaceAll(err.Error(), "\n", "")
+			logger.Printf("ConfigImport: content scan patterns rejected: %s — skipping bypass-host import (shared envelope)", reason)
+			warnings = append(warnings, fmt.Sprintf("content scan patterns rejected, bypass hosts NOT imported: %s", reason))
 		}
 	} else {
 		for _, p := range b.ContentScanPatterns {
@@ -1251,8 +1322,17 @@ func apiConfigImport(w http.ResponseWriter, r *http.Request) {
 		ipf.ClearAll()
 	}
 	// Bulk load: one pass, one view publish (an Add loop is quadratic).
-	// Invalid entries stay silently skipped, as the Add loop did.
-	_ = ipf.AddAll(b.IPList)
+	// Invalid entries stay silently skipped, as the Add loop did — but the
+	// skip reason is now surfaced to the admin instead of only the log.
+	for _, bad := range ipf.AddAll(b.IPList) {
+		// bad.Err's message embeds the rejected entry verbatim (e.g.
+		// *net.AddrError), so sanitize the WHOLE error text, not just
+		// bad.Entry — otherwise a crafted backup entry reaches the log/API
+		// response a second time, unsanitized, via %v on the error.
+		reason := sanitizeLog(bad.Err.Error())
+		logger.Printf("ConfigImport: invalid IP filter entry %q: %s", sanitizeLog(bad.Entry), reason)
+		warnings = append(warnings, fmt.Sprintf("IP filter entry %q skipped: %s", bad.Entry, reason))
+	}
 	if b.RateLimitRPM > 0 {
 		rl.Configure(b.RateLimitRPM, time.Minute)
 	}
@@ -1323,7 +1403,9 @@ func apiConfigImport(w http.ResponseWriter, r *http.Request) {
 	// Block page template (Finding 10.3).
 	if b.BlockPageHTML != "" {
 		if err := setBlockPageHTML(b.BlockPageHTML); err != nil {
-			logger.Printf("ConfigImport: block page template error: %s", strings.ReplaceAll(err.Error(), "\n", ""))
+			reason := strings.ReplaceAll(err.Error(), "\n", "")
+			logger.Printf("ConfigImport: block page template error: %s", reason)
+			warnings = append(warnings, fmt.Sprintf("block page template rejected, not imported: %s", reason))
 		}
 	}
 
@@ -1363,6 +1445,14 @@ func apiConfigImport(w http.ResponseWriter, r *http.Request) {
 	// did not receive it (the local import still succeeded).
 	pubErr := publishCurrentConfigSnapshot()
 	resp := map[string]any{"ok": true, "mode": importMode, "exportedAt": b.ExportedAt}
+	// "ok:true" must never be the whole story: everything appended to
+	// warnings above was a section that was silently skipped rather than
+	// aborting the import, previously visible only in the process log — an
+	// admin restoring a backup after an incident needs to know before they
+	// walk away believing every rule/pattern/entry from the backup is live.
+	if len(warnings) > 0 {
+		resp["warnings"] = warnings
+	}
 	if upstreamResult != nil {
 		// 2F-D (C5): counts only — never an id, authority or credential.
 		resp["upstream"] = *upstreamResult
@@ -1931,6 +2021,7 @@ func apiNetworkSettings(w http.ResponseWriter, r *http.Request) {
 			"ui_tls_fallback_reason":  uiTLSFallbackReason,
 			"ui_custom_cert_uploaded": customUITLSFilesPresent(),
 			"ui_custom_cert_active":   uiCustomTLSActive,
+			"ui_custom_cert_corrupt":  uiCustomTLSCorrupt,
 		})
 	case http.MethodPost:
 		if !requireRole(w, r, RoleAdmin) {

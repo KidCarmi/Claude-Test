@@ -4,10 +4,12 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"os"
 	"sort"
 	"strings"
@@ -54,60 +56,244 @@ var (
 
 // ─── Time-series: requests per minute, last 60 minutes ───────────────────────
 
-// timeSeries deliberately keeps a plain mutex: an RLock+atomic fast path was
-// benchmarked (2026-07) and measured FLAT under parallelism — every request
-// increments the same current-minute bucket, so the shared cache line, not
-// the lock, is the bound. See store_stats_bench_test.go.
+// ── The current minute's counters are SHARDED ────────────────────────────────
+//
+// tsRecordResult runs on EVERY proxied request — HTTP, CONNECT, WebSocket,
+// SOCKS5 — from recordStats. It used to take one process-wide sync.Mutex and,
+// while HOLDING it, read the clock (tsAdvance's time.Now) before bumping three
+// counters. So every request in the process serialised on one lock across a
+// vDSO clock read, which is not a constant cost but a throughput CEILING: the
+// same shape as the internal/threatfeed, internal/connlimit, IP-filter and
+// latency-histogram findings already closed in this tree.
+//
+// The header this replaces recorded that an RLock+atomic fast path had been
+// benchmarked and measured FLAT, concluding "the shared cache line, not the
+// lock, is the bound". That conclusion was right about RWMutex and wrong about
+// the bound: swapping Mutex for RWMutex cannot help a path that MUTATES, and
+// the shared cache line is only inherent if the counter stays shared. Measured
+// on a 4-core box (Go 1.26, one record per iteration, n=4, ns/op):
+//
+//	                                    │ GOMAXPROCS=1 │ GOMAXPROCS=4 │
+//	mutex + clock INSIDE the lock (old) │     85.5     │    178.6     │
+//	mutex, clock hoisted out            │     83.1     │    144.9     │
+//	lock-free, counters still SHARED    │     78.9     │     62.2     │
+//	lock-free, counters SHARDED (this)  │     85.9     │     38.1     │
+//	time.Now().Unix()/60 alone (floor)  │     64.8     │     16.6     │
+//
+// Read the last row first: the clock is the irreducible floor, and at four
+// cores the old path spent 162 of its 179 ns NOT doing the work. Sharding
+// removes ~92% of that. Four cores went from 5.6M records/s (WORSE than one
+// core's 11.7M — adding cores subtracted throughput) to 26.2M, a 4.7x lift of
+// the old ceiling, and the gap widens on the 16- and 32-core hardware this
+// ships to.
+//
+// In this tree rather than the model, at GOMAXPROCS 1 / 4 (n=5):
+// BenchmarkTSRecordResultParallel 87.4 / 172.6 -> 78.6 / 36.1, and the whole
+// per-request stats fan-out, BenchmarkRecordStatsAllowedParallel, 142.9 /
+// 275.8 -> 130.0 / 131.2. There is no low-concurrency price to trade: one core
+// came out AHEAD too, because dropping the lock/unlock pair and collapsing the
+// verdict pair into a single atomic add (see tsLiveShard) together cost less
+// than picking a shard.
+//
+// Only the CURRENT minute is hot, so only it is sharded: the 60-bucket ring is
+// untouched and still mutex-guarded. Requests accumulate into `live`, and a
+// rollover folds those accumulators into the bucket they belong to. Readers
+// (tsGet — the SSE dashboard tick, /api/stats, the history-store estimate) sum
+// the shards in. That moves work read-ward, exactly as the sharded latency
+// histogram does: a read happens once per dashboard poll, a write once per
+// request.
+//
+// THE RING ITSELF MUST NOT BE SHARDED, and that is a separate, still-standing
+// rejection rather than an oversight. Sharding the ring was prototyped (60
+// buckets x 3 counters per shard, 16 shards, mutex and atomic variants) and did
+// not pay on 4-core hardware: the only shard key available here is a
+// rand.Uint64, and against an object that size its cost ate the gain. What
+// makes the CURRENT-MINUTE shard win instead is that it is 2 words rather than
+// 180, its shards are cache-line PADDED (16 unpadded shards still false-share),
+// and the verdict pair is PACKED into one atomic add rather than two or three —
+// so the same ~7 ns key stops mattering above one core. Do not re-derive this
+// as shared atomics either: removing the mutex without splitting the line
+// removes the BATCHING a lock holder gets (measured 62.2 ns/op at four cores
+// against this shape's 38.1). See the CLAUDE.md note for the paired
+// marginal-cost evidence.
+//
+// THE INVARIANT IS CONSERVATION, NOT INSTANT ATTRIBUTION. A request that reads
+// liveMin, is descheduled, and increments after a concurrent rollover lands in
+// the NEXT minute's accumulator rather than the one it read. Nothing is ever
+// lost — the fold SWAPS each shard to zero, so a late increment is simply
+// carried to the following fold — and the boundary shift is at most one bucket
+// on a 60-minute dashboard sparkline. Pinned by
+// TestTimeSeries_ConcurrentRecordsAreConserved.
+const (
+	// tsShardCount is a power of two so the shard index is a mask, not a
+	// division. 64 mirrors the per-IP rate limiter (rlShardCount) and
+	// internal/connlimit, which reached the same figure for the same reason.
+	tsShardCount = 64
+	// tsCacheLine is the padding target. Three int64s is 24 bytes, so without
+	// padding two shards share a line and incrementing one invalidates the
+	// other — false sharing that hands back most of what splitting just bought.
+	tsCacheLine = 64
+)
+
+// tsLiveShard is one padded slice of the current minute's counters.
+//
+// A request's counters live in ONE word, and that is a correctness requirement,
+// not a packing trick. With a separate total/allowed/blocked triple the writer
+// took two independent atomic adds and the fold three independent swaps, so a
+// fold landing between a writer's two adds banked its total in the OLD bucket
+// and its verdict in the NEW one. Whole-window conservation still held — which
+// is exactly why the window-sum tests passed — but the per-bucket invariant
+// allowed[i]+blocked[i] == buckets[i] was permanently broken for every request
+// in flight across a minute rollover, and /api/timeseries hands those three
+// arrays straight to the dashboard. (Codex review, PR #1286.)
+//
+// So the allow/block pair is packed into one word — allowed in the high 32
+// bits, blocked in the low 32 — and a verdict is a SINGLE atomic add. Requests
+// recorded without a verdict (tsRecord) get their own word. Each writer touches
+// exactly one of the two, so no request can be drained apart, and the fold's
+// two swaps are independent by construction rather than by luck.
+//
+// The 32-bit halves bound one shard's traffic between two folds, i.e. one
+// wall-clock minute: 4.29e9 requests on a single shard, which at 64 shards is
+// ~4.6 billion requests/second process-wide. That is not reachable on any
+// hardware this runs on, and the fold interval does not grow when traffic
+// stops (an idle shard accumulates nothing).
+type tsLiveShard struct {
+	verdicts int64 // allowed<<32 | blocked
+	plain    int64 // recorded without a verdict (tsRecord)
+	_        [tsCacheLine - 16]byte
+}
+
+const (
+	tsAllowedUnit int64 = 1 << 32   // one allowed request, added to verdicts
+	tsBlockedUnit int64 = 1         // one blocked request, added to verdicts
+	tsBlockedMask int64 = 1<<32 - 1 // low half of a packed verdicts word
+)
+
+// split decomposes a packed verdicts word. Both halves are non-negative, so
+// the shift and mask stay plain int64 arithmetic — no conversions.
+func tsSplitVerdicts(v int64) (allowed, blocked int64) {
+	return v >> 32, v & tsBlockedMask
+}
+
 type timeSeries struct {
+	// mu guards the 60-minute ring below. It is taken on a rollover (at most
+	// once per minute) and by readers — never by the per-request counting path.
 	mu      sync.Mutex
 	buckets [60]int64
 	allowed [60]int64
 	blocked [60]int64
 	cur     int
 	lastMin int64
+
+	// liveMin is the minute `live` belongs to; it is the only field the
+	// per-request path reads, and a plain atomic load is the whole check.
+	liveMin atomic.Int64
+	live    [tsShardCount]tsLiveShard
 }
 
 var ts = &timeSeries{}
 
-func tsAdvance() {
+// tsShardIndex picks the accumulator this request increments.
+//
+// Unlike every other sharded structure in this tree there is NO key to shard
+// on — a request contributes to a global count, not to a per-IP or per-host
+// slot — so the index comes from the runtime's per-P generator, which is
+// lock-free and needs no shared state of its own. The counters are only ever
+// SUMMED, so which shard a given request lands in is not observable.
+//
+// math/rand/v2 (aliased: this file's `rand` is crypto/rand) rather than a
+// shared atomic round-robin counter, which would reintroduce exactly the
+// contended cache line this change exists to remove.
+func tsShardIndex() uint64 {
+	return mrand.Uint64() & (tsShardCount - 1) // #nosec G404 -- shard spread, not crypto
+}
+
+// tsRecord counts a request without an allow/block verdict.
+func tsRecord() { ts.record(false, false) }
+
+// tsRecordResult counts a request and its allow/block verdict.
+func tsRecordResult(isAllowed bool) { ts.record(true, isAllowed) }
+
+// record is the per-request hot path: one clock read, one atomic load, and
+// exactly ONE atomic add against a shard nobody else is likely to be touching.
+// The single add is what keeps a request's counters in one bucket — see the
+// tsLiveShard comment.
+func (t *timeSeries) record(withVerdict, isAllowed bool) {
 	now := time.Now().Unix() / 60
-	if ts.lastMin == 0 {
-		ts.lastMin = now
+	if t.liveMin.Load() != now {
+		t.rollover(now)
 	}
-	diff := now - ts.lastMin
-	if diff > 0 {
-		if diff > 60 {
-			diff = 60
-		}
-		for i := int64(0); i < diff; i++ {
-			ts.cur = (ts.cur + 1) % 60
-			ts.buckets[ts.cur] = 0
-			ts.allowed[ts.cur] = 0
-			ts.blocked[ts.cur] = 0
-		}
-		ts.lastMin = now
+	s := &t.live[tsShardIndex()]
+	switch {
+	case !withVerdict:
+		atomic.AddInt64(&s.plain, 1)
+	case isAllowed:
+		atomic.AddInt64(&s.verdicts, tsAllowedUnit)
+	default:
+		atomic.AddInt64(&s.verdicts, tsBlockedUnit)
 	}
 }
 
-func tsRecord() {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	tsAdvance()
-	ts.buckets[ts.cur]++
+// rollover folds the live accumulators into the minute they belong to and
+// advances the ring. It runs at most once per minute on a busy proxy; the
+// re-check under the lock makes the losers of a concurrent rollover no-ops.
+func (t *timeSeries) rollover(now int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.liveMin.Load() == now {
+		return
+	}
+	t.foldLiveLocked()
+	t.advanceLocked(now)
+	t.liveMin.Store(now)
 }
 
-func tsRecordResult(isAllowed bool) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	tsAdvance()
-	ts.buckets[ts.cur]++
-	if isAllowed {
-		ts.allowed[ts.cur]++
-	} else {
-		ts.blocked[ts.cur]++
+// foldLiveLocked drains every shard into the CURRENT bucket. The swap-to-zero
+// is what makes conservation hold: an increment that arrives after the swap is
+// simply carried into the next fold instead of being overwritten. The two
+// swaps are safe to take independently because no single request writes both
+// words — see the tsLiveShard comment.
+func (t *timeSeries) foldLiveLocked() {
+	for i := range t.live {
+		s := &t.live[i]
+		allowed, blocked := tsSplitVerdicts(atomic.SwapInt64(&s.verdicts, 0))
+		plain := atomic.SwapInt64(&s.plain, 0)
+		t.allowed[t.cur] += allowed
+		t.blocked[t.cur] += blocked
+		t.buckets[t.cur] += allowed + blocked + plain
 	}
 }
 
+// advanceLocked moves the ring forward to `now`, zeroing each newly-current
+// bucket. Behaviour is carried over verbatim from the old tsAdvance, including
+// the first-record (lastMin == 0) and clock-went-backwards (diff <= 0) cases.
+func (t *timeSeries) advanceLocked(now int64) {
+	if t.lastMin == 0 {
+		t.lastMin = now
+		return
+	}
+	diff := now - t.lastMin
+	if diff <= 0 {
+		return
+	}
+	if diff > 60 {
+		diff = 60
+	}
+	for i := int64(0); i < diff; i++ {
+		t.cur = (t.cur + 1) % 60
+		t.buckets[t.cur] = 0
+		t.allowed[t.cur] = 0
+		t.blocked[t.cur] = 0
+	}
+	t.lastMin = now
+}
+
+// tsGet returns the last 60 minutes, oldest first. Like the version it
+// replaces it does NOT advance the ring, so an idle proxy keeps reporting the
+// window as it stood at the last request. The live shards belong to the
+// current bucket and are summed in WITHOUT draining — a read never mutates the
+// series, so two consecutive reads with no traffic between them agree.
 func tsGet() (total, allowed, blocked []int64) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
@@ -119,6 +305,13 @@ func tsGet() (total, allowed, blocked []int64) {
 		total[59-i] = ts.buckets[idx]
 		allowed[59-i] = ts.allowed[idx]
 		blocked[59-i] = ts.blocked[idx]
+	}
+	for i := range ts.live {
+		s := &ts.live[i]
+		a, b := tsSplitVerdicts(atomic.LoadInt64(&s.verdicts))
+		allowed[59] += a
+		blocked[59] += b
+		total[59] += a + b + atomic.LoadInt64(&s.plain)
 	}
 	return
 }
@@ -236,6 +429,7 @@ var (
 	requeueAuditEvents      = audit.Requeue
 	auditPersistActive      = audit.PersistActive
 	auditWriteErrors        = audit.WriteErrors
+	auditPendingDrops       = audit.PendingDrops
 )
 
 // InitAuditLog opens path for append-only JSONL audit persistence.
@@ -258,11 +452,34 @@ const authCacheTTL = 5 * time.Minute
 type authCacheEntry struct {
 	ok     bool
 	expiry time.Time
+
+	// client is the fairness key of whoever caused this entry to be written,
+	// and added is when. Neither participates in lookup — the map key is still
+	// the HMAC of (user, pass) alone — they exist only to decide WHO gets
+	// evicted when the cache is full. See evictOneLocked.
+	client string
+	added  time.Time
+}
+
+// authCacheBucket tracks one client's entries in insertion order, so eviction
+// can take that client's OLDEST without scanning the whole cache. head is the
+// index of the first key not yet consumed; live is how many of this client's
+// keys are still present in the map.
+type authCacheBucket struct {
+	keys []string
+	head int
+	live int
 }
 
 type authCacheStore struct {
 	mu      sync.Mutex
 	entries map[string]*authCacheEntry
+	buckets map[string]*authCacheBucket
+
+	// evictions counts entries dropped to stay under the cap. It is the
+	// operator's only signal that cached credentials are being displaced —
+	// every eviction costs somebody a full ~80 ms bcrypt on their next request.
+	evictions uint64
 }
 
 func (a *authCacheStore) get(user, pass string) (ok, hit bool) {
@@ -279,33 +496,194 @@ func (a *authCacheStore) get(user, pass string) (ok, hit bool) {
 // memory growth from credential-stuffing attacks with unique user/pass pairs.
 const maxAuthCacheSize = 5_000
 
-func (a *authCacheStore) set(user, pass string, ok bool) {
+// set records a verification outcome, evicting fairly if the cache is full.
+//
+// CHAOS-57. This cache is populated by UNAUTHENTICATED requests: any client
+// that presents the configured username with any password writes an entry,
+// because negative results are cached too (deliberately — not caching them
+// would make every wrong password a fresh bcrypt). So its EVICTION POLICY is a
+// security control, not housekeeping, exactly as internal/authstate's is.
+//
+// The pre-fix policy was "scan for an expired entry; if none, drop an
+// arbitrary one" — a Go map range that stops at the first key, i.e. a
+// uniformly random LIVE entry. Two defects followed:
+//
+//   - A flood of distinct passwords under a known username displaced OTHER
+//     clients' cached positives at random. Measured: a legitimate user's
+//     cached credential survived a flood of one times the cache capacity and
+//     was reliably gone by two times it. The victim then paid a full ~80 ms
+//     bcrypt on EVERY subsequent request, which turns the attacker's CPU
+//     amplification onto legitimate traffic — the flood makes the gateway slow
+//     for exactly the users it is supposed to serve.
+//
+//   - The expired-entry scan is O(cache) whenever nothing has expired, which
+//     is precisely the state a flood keeps it in, and it runs holding the
+//     process-wide auth mutex. Measured at 64 µs per insertion at capacity.
+//
+// The replacement is internal/authstate's policy, which was written for the
+// same shape of problem: entries are attributed to a client key, and eviction
+// always takes the OLDEST entry of the client holding the MOST (ties broken by
+// oldest entry, then by client key, so the victim never depends on Go's map
+// iteration order). A flooding source therefore evicts ITSELF until it is no
+// longer the largest holder, and a client holding a single entry cannot be
+// displaced until every other client is down to one entry too.
+func (a *authCacheStore) set(client, user, pass string, ok bool) {
+	now := time.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.entries == nil {
+		a.entries = map[string]*authCacheEntry{}
+	}
+	if a.buckets == nil {
+		a.buckets = map[string]*authCacheBucket{}
+	}
+
+	k := cacheKey(user, pass)
+	// Overwriting a live entry (same credential re-verified after its TTL) must
+	// not double-count it in its bucket.
+	if _, exists := a.entries[k]; exists {
+		a.removeLocked(k)
+	}
 	if len(a.entries) >= maxAuthCacheSize {
-		// Evict one expired entry first; if none found, drop an arbitrary one.
-		now := time.Now()
-		evicted := false
-		for k, e := range a.entries {
-			if now.After(e.expiry) {
-				delete(a.entries, k)
-				evicted = true
-				break
-			}
+		a.evictOneLocked(now)
+	}
+
+	a.entries[k] = &authCacheEntry{ok: ok, expiry: now.Add(authCacheTTL), client: client, added: now}
+	b := a.buckets[client]
+	if b == nil {
+		b = &authCacheBucket{}
+		a.buckets[client] = b
+	}
+	b.keys = append(b.keys, k)
+	b.live++
+	a.compactLocked(client, b)
+}
+
+// evictOneLocked drops exactly one entry: an already-expired one if any is
+// found, otherwise the oldest live entry of the client holding the most.
+//
+// Only bucket FRONTS are examined, which is both cheap (O(active clients), not
+// O(cache)) and sufficient: entries within a bucket are in insertion order and
+// every entry carries the same TTL, so a bucket's front is its oldest and
+// therefore the first to expire. An expired entry is preferred wherever it is
+// found because dropping it costs nobody anything — it would have been a cache
+// miss anyway — so the fairness ordering only has to arbitrate between LIVE
+// entries, which is the case it exists for.
+func (a *authCacheStore) evictOneLocked(now time.Time) {
+	var (
+		victimKey    string
+		victimClient string
+		victimLive   int
+		victimAdded  time.Time
+		found        bool
+	)
+	for client, b := range a.buckets {
+		k, e, okFront := a.frontLocked(client, b)
+		if !okFront {
+			continue
 		}
-		if !evicted {
-			for k := range a.entries {
-				delete(a.entries, k)
-				break
-			}
+		// An expired entry is free to drop and is always the better victim.
+		if now.After(e.expiry) {
+			a.removeLocked(k)
+			a.evictions++
+			return
+		}
+		if !found || betterAuthCacheVictim(b.live, e.added, client, victimLive, victimAdded, victimClient) {
+			victimKey, victimClient, victimLive, victimAdded, found = k, client, b.live, e.added, true
 		}
 	}
-	a.entries[cacheKey(user, pass)] = &authCacheEntry{ok: ok, expiry: time.Now().Add(authCacheTTL)}
+	if !found {
+		return
+	}
+	a.removeLocked(victimKey)
+	a.evictions++
+}
+
+// betterAuthCacheVictim reports whether candidate (live, added, client) is a
+// better eviction victim than the incumbent. Ordering: most live entries
+// first, then the oldest entry, then the lexicographically smaller client key
+// — total and deterministic, so the victim never depends on map order.
+func betterAuthCacheVictim(live int, added time.Time, client string, bestLive int, bestAdded time.Time, bestClient string) bool {
+	switch {
+	case live != bestLive:
+		return live > bestLive
+	case !added.Equal(bestAdded):
+		return added.Before(bestAdded)
+	default:
+		return client < bestClient
+	}
+}
+
+// frontLocked returns the client's oldest still-present entry, advancing head
+// past keys that have already been removed.
+func (a *authCacheStore) frontLocked(client string, b *authCacheBucket) (string, *authCacheEntry, bool) {
+	for b.head < len(b.keys) {
+		k := b.keys[b.head]
+		if e, present := a.entries[k]; present && e.client == client {
+			return k, e, true
+		}
+		b.head++
+	}
+	return "", nil, false
+}
+
+// removeLocked deletes one entry and decrements its bucket, dropping the
+// bucket entirely at zero so the map's cardinality tracks ACTIVE clients
+// rather than every client ever seen.
+func (a *authCacheStore) removeLocked(k string) {
+	e, present := a.entries[k]
+	if !present {
+		return
+	}
+	delete(a.entries, k)
+	b := a.buckets[e.client]
+	if b == nil {
+		return
+	}
+	b.live--
+	if b.live <= 0 {
+		delete(a.buckets, e.client)
+	}
+}
+
+// compactLocked drops consumed positions once a bucket's backing slice has
+// grown past a small multiple of what the client actually holds.
+//
+// The condition is on len(b.keys), NOT on the un-consumed window
+// len(b.keys)-b.head: under a sustained flood the window stays pinned at the
+// cap while head and len advance together forever, so a window-based test
+// never fires and the backing array grows with total request count — a memory
+// leak reachable by the same flood the eviction policy exists to survive.
+// (The identical trap is documented in internal/authstate.)
+func (a *authCacheStore) compactLocked(client string, b *authCacheBucket) {
+	if len(b.keys) <= 8 || len(b.keys) < 4*b.live {
+		return
+	}
+	kept := b.keys[:0]
+	for _, k := range b.keys[b.head:] {
+		if e, present := a.entries[k]; present && e.client == client {
+			kept = append(kept, k)
+		}
+	}
+	b.keys = kept
+	b.head = 0
+	if len(b.keys) == 0 {
+		delete(a.buckets, client)
+	}
+}
+
+// Evictions reports how many cached verification results have been displaced
+// to stay under the cap.
+func (a *authCacheStore) Evictions() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.evictions
 }
 
 func (a *authCacheStore) clear() {
 	a.mu.Lock()
 	a.entries = map[string]*authCacheEntry{}
+	a.buckets = map[string]*authCacheBucket{}
 	a.mu.Unlock()
 }
 
@@ -320,11 +698,42 @@ var cacheKeySecret = func() []byte {
 	return b
 }()
 
-// cacheKey derives an HMAC-SHA256 tag from (user+pass) so we never store
+// cacheKey derives an HMAC-SHA256 tag from (user, pass) so we never store
 // plaintext credentials as map keys in heap-visible memory.
+//
+// The inputs are LENGTH-FRAMED, and that is a correctness requirement, not a
+// stylistic one. The previous derivation hashed `user + ":" + pass`, which is
+// NOT injective as soon as either field can contain the separator:
+//
+//	("admin",   "a:b")  ->  "admin:a:b"
+//	("admin:a", "b")    ->  "admin:a:b"     <- same key, different credential
+//
+// That was latent while the cache was consulted only AFTER the presented
+// username had been confirmed equal to the configured one — every reachable
+// key then shared the same `user + ":"` prefix, so distinct passwords gave
+// distinct keys. CHAOS-57 moves the lookup ahead of that comparison (so a
+// client riding a warm cache never consumes a verification slot), which makes
+// the ambiguity reachable with a caller-chosen username and turns it into an
+// AUTHENTICATION BYPASS: with a colon anywhere in the configured password, a
+// caller could present a re-split of it and hit the cached positive.
+//
+// Framing each field with its length makes the encoding injective, so no two
+// distinct (user, pass) pairs can ever share a key. Pinned by
+// TestChaos57_CacheKeyIsInjective and by the end-to-end bypass gate
+// TestChaos57_ReSplitCredentialCannotAuthenticate.
+//
+// The key derivation is process-local (cacheKeySecret is random per start) and
+// the cache is memory-only, so changing the encoding invalidates nothing that
+// outlives a restart.
 func cacheKey(user, pass string) string {
 	mac := hmac.New(sha256.New, cacheKeySecret)
-	mac.Write([]byte(user + ":" + pass))
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(user)))
+	mac.Write(lenBuf[:])
+	mac.Write([]byte(user))
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(pass)))
+	mac.Write(lenBuf[:])
+	mac.Write([]byte(pass))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -508,12 +917,72 @@ func (c *Config) snapshotAuthBackend() authBackendSnapshot {
 }
 
 func (c *Config) verifyAuthWithSnapshot(snapshot authBackendSnapshot, user, pass string) bool {
+	return c.verifyAuthFrom(snapshot, "", user, pass)
+}
+
+// verifyAuthFrom is verifyAuthWithSnapshot with the caller's client-fairness
+// key threaded in, so the credential-verification cost governor
+// (internal/authcost, CHAOS-57) can attribute the bcrypt work it admits.
+//
+// The ORDER of the four steps below is a security contract, not a style
+// choice. Read it as: answer for free if you can, then buy permission to spend
+// 80 ms of CPU, and only then look at the credential.
+//
+//  1. CACHE FIRST, and unconditionally — before the username is compared.
+//     Moving the lookup ahead of the comparison changes no verdict (entries are
+//     only ever stored for the configured username, so a wrong username was
+//     always a miss and still is) and costs the same one HMAC + one map probe
+//     either way, but it means a client riding a warm cache never consumes a
+//     verification slot. Without that, a legitimate high-rate deployment would
+//     be throttled by a governor that exists to bound work it is not doing.
+//
+//  2. ADMISSION SECOND, and INDEPENDENTLY OF THE USERNAME. This is the part
+//     that must not be "simplified". RISK-008 equalises the wrong-username and
+//     wrong-password paths — the dummy comparison below exists for no other
+//     reason — so that neither is distinguishable by timing. A gate consulted
+//     only on the branch that reaches the real hash, or given a budget that
+//     differed between the branches, would make "over budget" fast for one and
+//     slow for the other and hand back the username-enumeration oracle the
+//     equalisation removed. The decision is therefore taken here, where the
+//     code has not yet looked at `user`. Pinned by
+//     TestChaos57_AdmissionDecisionIsUsernameIndependent.
+//
+//  3. REFUSAL IS A DENY. Fail closed: the cost of a spurious refusal is a 407
+//     the client retries, and the cost of admitting without a bound is a
+//     remotely triggerable CPU exhaustion of the whole data plane (~13 KB/s of
+//     unauthenticated traffic saturated all four cores of the reference box).
+//     It is never silent — see auth_cost_health.go.
+//
+//  4. THE SLOT IS HELD ACROSS BOTH comparison branches, and released by defer
+//     so a panic inside bcrypt cannot leak it.
+func (c *Config) verifyAuthFrom(snapshot authBackendSnapshot, client, user, pass string) bool {
 	if snapshot.provider != nil {
+		// External providers (LDAP bind, OIDC introspection) do not run bcrypt;
+		// their cost and their failure modes are governed by CHAOS-47's
+		// authProbeGate instead. Charging them a verification slot here would
+		// bound the wrong resource.
 		return snapshot.provider.Verify(user, pass)
 	}
 	if snapshot.user == "" {
 		return true // auth disabled
 	}
+
+	c.mu.RLock()
+	revisionCurrent := c.authRevision == snapshot.revision
+	var ok, hit bool
+	if revisionCurrent {
+		ok, hit = c.cache.get(user, pass)
+	}
+	c.mu.RUnlock()
+	if hit {
+		return ok
+	}
+
+	if !authCostAdmit(client) {
+		return false
+	}
+	defer authCostRelease(client)
+
 	if user != snapshot.user {
 		// RISK-008: equalise timing with the correct-username path so a wrong
 		// username is indistinguishable from a wrong password — defeats
@@ -521,18 +990,10 @@ func (c *Config) verifyAuthWithSnapshot(snapshot authBackendSnapshot, user, pass
 		_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(pass))
 		return false
 	}
+	ok = bcrypt.CompareHashAndPassword(snapshot.passHash, []byte(pass)) == nil
 	c.mu.RLock()
 	if c.authRevision == snapshot.revision {
-		if ok, hit := c.cache.get(user, pass); hit {
-			c.mu.RUnlock()
-			return ok
-		}
-	}
-	c.mu.RUnlock()
-	ok := bcrypt.CompareHashAndPassword(snapshot.passHash, []byte(pass)) == nil
-	c.mu.RLock()
-	if c.authRevision == snapshot.revision {
-		c.cache.set(user, pass, ok)
+		c.cache.set(client, user, pass, ok)
 	}
 	c.mu.RUnlock()
 	return ok
@@ -545,6 +1006,22 @@ func (c *Config) VerifyAuth(user, pass string) bool {
 	return c.verifyAuthWithSnapshot(c.snapshotAuthBackend(), user, pass)
 }
 
+// AuthCacheEvictions reports how many cached verification results have been
+// displaced to stay under the cache cap. A climbing counter is the operator's
+// signal that either the cap is undersized for real login volume or somebody
+// is flooding the credential path — each eviction costs the displaced client a
+// full bcrypt on its next request (CHAOS-57).
+func (c *Config) AuthCacheEvictions() uint64 { return c.cache.Evictions() }
+
+// VerifyAuthFrom is VerifyAuth with the caller's client-fairness key, so the
+// CHAOS-57 verification governor can attribute the bcrypt work. Data-plane
+// callers that know their peer MUST use this: the plain VerifyAuth passes the
+// empty key, which is valid but puts every such caller in one shared fairness
+// bucket where they can only throttle each other.
+func (c *Config) VerifyAuthFrom(client, user, pass string) bool {
+	return c.verifyAuthFrom(c.snapshotAuthBackend(), client, user, pass)
+}
+
 // resolveAuthIdentity preserves the legacy Config authentication selection but
 // returns a provider-derived identity when the configured backend supports it.
 // Non-identity providers and local bcrypt retain the historical caller username
@@ -553,7 +1030,17 @@ func (c *Config) resolveAuthIdentity(user, pass string) (*Identity, bool) {
 	return c.resolveAuthIdentityWithSnapshot(c.snapshotAuthBackend(), user, pass)
 }
 
+// resolveAuthIdentityFrom is resolveAuthIdentity carrying the caller's
+// client-fairness key through to the CHAOS-57 verification governor.
+func (c *Config) resolveAuthIdentityFrom(client, user, pass string) (*Identity, bool) {
+	return c.resolveAuthIdentityFromSnapshot(c.snapshotAuthBackend(), client, user, pass)
+}
+
 func (c *Config) resolveAuthIdentityWithSnapshot(snapshot authBackendSnapshot, user, pass string) (*Identity, bool) {
+	return c.resolveAuthIdentityFromSnapshot(snapshot, "", user, pass)
+}
+
+func (c *Config) resolveAuthIdentityFromSnapshot(snapshot authBackendSnapshot, client, user, pass string) (*Identity, bool) {
 	// VerifyAuth historically treats an empty backend as authentication disabled
 	// and succeeds for setup/UI compatibility. Presented proxy credentials must
 	// never turn that sentinel success into a caller-controlled identity.
@@ -565,7 +1052,7 @@ func (c *Config) resolveAuthIdentityWithSnapshot(snapshot authBackendSnapshot, u
 	}); ok {
 		return resolver.ResolveIdentity(user, pass)
 	}
-	if !c.verifyAuthWithSnapshot(snapshot, user, pass) {
+	if !c.verifyAuthFrom(snapshot, client, user, pass) {
 		return nil, false
 	}
 	return &Identity{Sub: user, Provider: "local"}, true
@@ -970,6 +1457,25 @@ func (c *Config) UIUserExists(username string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.uiUsers[username] != nil
+}
+
+// LoginNameConfigured reports whether username names an account VerifyUIUser
+// could authenticate — the roster, or the legacy single user.
+//
+// It exists for CHAOS-63's oversize-username guard (login_input_bounds.go),
+// which must never refuse a name that belongs to a real admin. Its resolution
+// MUST stay identical to VerifyUIUser's below: a name this returns false for is
+// a name the login endpoint may reject outright, so any divergence locks an
+// operator out of the admin UI.
+//
+// Deliberately NOT UIUserExists: that one checks only c.uiUsers, and a legacy
+// single-user deployment can carry a name that lives solely in c.user.
+// Deliberately not password-aware, and it retains nothing — the caller passes
+// untrusted input, so this is a hash-and-compare, never a store.
+func (c *Config) LoginNameConfigured(username string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.uiUsers[username] != nil || (c.user != "" && username == c.user)
 }
 
 func (c *Config) VerifyUIUser(username, password string) (UIRole, bool) {
@@ -1377,19 +1883,58 @@ type HostStat struct {
 	Count int64  `json:"count"`
 }
 
-// hostCounter follows the read-heavy contract the per-rule hit counters use
-// (ruleMetrics.RecordHit): counting an ALREADY-TRACKED host — the case ~all
+// hostCounter counts requests per destination host. Record runs on EVERY
+// allowed request (recordStats), so the tracked-host path — the case ~all
 // production traffic hits, since the distinct-host working set repeats
-// heavily — takes mu.RLock and bumps the counter atomically (concurrent RLock
-// holders share slots, hence *int64 values). The exclusive lock is reserved
-// for the rare mutations: inserting a new host, the decay pass, and Top.
+// heavily — must not serialise on a process-wide word.
+//
+// It used to take mu.RLock around the map read, on the reasoning that a reader
+// lock is cheap. It is not: sync.RWMutex.RLock/RUnlock are two atomic
+// read-modify-writes on ONE shared word, so every request in the process wrote
+// the same cache line purely to read a map that in steady state never changes.
+// That is not a constant cost but a THROUGHPUT CEILING, the same shape already
+// found and fixed in internal/threatfeed, internal/connlimit and the IP filter.
+//
+// The map is therefore a sync.Map, which is precisely the shape this access
+// pattern wants: a key's counter is written once at insert and read forever
+// after, so a steady-state Load is an atomic pointer load plus a map read with
+// NO read-modify-write on any shared word.
+//
+// Measured on a 4-core Xeon, 512-host working set, isolated runs of n=7,
+// medians, BenchmarkTopHostsRecord_HitParallel:
+//
+//	GOMAXPROCS │    1    │    2    │    4    │ 1→4 throughput
+//	RWMutex    │ 35.8 ns │ 92.6 ns │ 96.8 ns │ 0.37x  (cores SUBTRACTED throughput)
+//	sync.Map   │ 42.0 ns │ 26.1 ns │ 16.1 ns │ 2.6x
+//
+// So six times the throughput at four cores, and — the part that matters for an
+// appliance that ships onto 16- and 32-core hardware — a curve that IMPROVES
+// with core count instead of degrading. State the cost honestly too: at
+// GOMAXPROCS=1 this shape is ~17% slower (42.0 vs 35.8), because sync.Map.Load
+// costs one more indirection than a map read under an uncontended RLock. The
+// serial single-host benchmark (BenchmarkTopHostsRecord_Hit, n=8) shows no such
+// gap — 33.5 → 31.7 ns — so the cost appears only when rotating a working set
+// wide enough to miss cache, and a single-core gateway is not the shape this
+// product runs in.
+//
+// A 64-shard RWMutex (the internal/connlimit pattern) was built and measured
+// alongside it and NOT carried: it reached only ~37 ns/op at four cores and
+// cost ~31% at GOMAXPROCS=1, because it still pays a lock acquisition per call.
+// sync.Map pays none.
+//
+// mu now guards only the RARE mutations — inserting a new host, the decay
+// pass, and the Top snapshot — and is never taken by the tracked-host path.
+// n is the live-entry count that topHostsMaxEntries bounds; sync.Map has no
+// len(), and it is the memory bound that matters, so it is tracked explicitly.
 type hostCounter struct {
-	mu           sync.RWMutex
-	hosts        map[string]*int64
+	hosts sync.Map     // host string → *int64
+	n     atomic.Int64 // live entries in hosts — the quantity the cap bounds
+
+	mu           sync.Mutex
 	pendingDecay int // new-host drops since the last decay pass (amortization)
 }
 
-var topHosts = &hostCounter{hosts: map[string]*int64{}}
+var topHosts = &hostCounter{}
 
 // topHostsMaxEntries bounds the number of distinct hostnames the top-hosts
 // counter tracks. The hostname is attacker-controllable (any client can
@@ -1397,25 +1942,35 @@ var topHosts = &hostCounter{hosts: map[string]*int64{}}
 // unbounded memory-exhaustion DoS. A var (not const) so tests can lower it.
 var topHostsMaxEntries = 10000
 
+// size reports the number of live tracked hosts — the quantity
+// topHostsMaxEntries bounds.
+func (hc *hostCounter) size() int { return int(hc.n.Load()) }
+
+// count returns the current count for host, and whether it is tracked at all.
+func (hc *hostCounter) count(host string) (int64, bool) {
+	v, ok := hc.hosts.Load(host)
+	if !ok {
+		return 0, false
+	}
+	return atomic.LoadInt64(v.(*int64)), true
+}
+
 func (hc *hostCounter) Record(host string) {
-	// Fast path: already tracked — always count, never gated. The atomic add
-	// happens INSIDE the RLock so the decay pass (which mutates counters with
-	// plain ops under the exclusive lock) can never run concurrently with it.
-	hc.mu.RLock()
-	if p, ok := hc.hosts[host]; ok {
-		atomic.AddInt64(p, 1)
-		hc.mu.RUnlock()
+	// Fast path: already tracked — always count, never gated, and NO lock. The
+	// counter a key maps to is written once at insert and never replaced, so a
+	// stale-free Load plus an atomic add is the whole operation.
+	if v, ok := hc.hosts.Load(host); ok {
+		atomic.AddInt64(v.(*int64), 1)
 		return
 	}
-	hc.mu.RUnlock()
 
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
-	if p, ok := hc.hosts[host]; ok {
-		atomic.AddInt64(p, 1) // raced with another inserter — count, don't reset
+	if v, ok := hc.hosts.Load(host); ok {
+		atomic.AddInt64(v.(*int64), 1) // raced with another inserter — count, don't reset
 		return
 	}
-	if len(hc.hosts) >= topHostsMaxEntries {
+	if hc.size() >= topHostsMaxEntries {
 		// At capacity with a NEW host. Decaying (halve all counts, drop those
 		// that reach zero) evicts cold entries — including high-cardinality
 		// count-1 junk from a flood — so continuously-reinforced heavy hitters
@@ -1430,39 +1985,58 @@ func (hc *hostCounter) Record(host string) {
 		}
 		hc.pendingDecay = 0
 		hc.decayLocked()
-		if len(hc.hosts) >= topHostsMaxEntries {
+		if hc.size() >= topHostsMaxEntries {
 			return // still saturated with hot hosts — drop the newcomer
 		}
 	}
 	one := int64(1)
-	hc.hosts[host] = &one
+	hc.hosts.Store(host, &one)
+	hc.n.Add(1)
 }
 
 // decayLocked halves every count and deletes entries that reach zero. Caller
-// holds hc.mu (the EXCLUSIVE lock — plain counter access is safe because the
-// RLock-holding atomic writers are excluded). This is the eviction primitive:
-// cold entries (low counts) fall out while heavy hitters persist, keeping the
-// top-N ranking meaningful.
+// holds hc.mu, which excludes inserts, other decay passes and Top — but NOT
+// the lock-free tracked-host increments, so every counter mutation here is
+// atomic. This is the eviction primitive: cold entries (low counts) fall out
+// while heavy hitters persist, keeping the top-N ranking meaningful.
+//
+// The one residual of the lock-free reader: a Record that has already loaded a
+// counter's pointer can land its increment after this pass deletes that entry,
+// and the increment is then lost. It is bounded to entries being evicted —
+// whose count is 0 or 1 by construction, since only those halve to zero — and
+// a decay pass runs at most once per topHostsMaxEntries new-host drops, and
+// only while saturated. That is strictly inside the approximation this counter
+// already documents past the cap (counts become lower bounds; ranking stays
+// correct), and it can only ever UNDER-count a host that was already cold.
 func (hc *hostCounter) decayLocked() {
-	for h, p := range hc.hosts {
-		c := *p / 2
-		if c == 0 {
-			delete(hc.hosts, h)
-		} else {
-			*p = c
+	hc.hosts.Range(func(k, v any) bool {
+		p := v.(*int64)
+		for {
+			cur := atomic.LoadInt64(p)
+			half := cur / 2
+			if !atomic.CompareAndSwapInt64(p, cur, half) {
+				continue // a concurrent increment landed; re-read and halve that
+			}
+			if half == 0 {
+				hc.hosts.Delete(k)
+				hc.n.Add(-1)
+			}
+			return true
 		}
-	}
+	})
 }
 
 // Top returns the n most-requested hosts, sorted descending by count. The
-// snapshot runs under the exclusive lock so the plain pointer reads cannot
-// race the RLock-holding atomic increments.
+// snapshot runs under hc.mu so it cannot interleave with a decay pass; the
+// counters themselves are read atomically because the increment path is
+// lock-free.
 func (hc *hostCounter) Top(n int) []HostStat {
 	hc.mu.Lock()
-	all := make([]HostStat, 0, len(hc.hosts))
-	for h, p := range hc.hosts {
-		all = append(all, HostStat{Host: h, Count: *p})
-	}
+	all := make([]HostStat, 0, hc.size())
+	hc.hosts.Range(func(k, v any) bool {
+		all = append(all, HostStat{Host: k.(string), Count: atomic.LoadInt64(v.(*int64))})
+		return true
+	})
 	hc.mu.Unlock()
 
 	// Simple selection: sort descending.

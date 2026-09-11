@@ -151,6 +151,7 @@ func buildOperatorContract() OperatorContract {
 		checkConfigSnapshotApply(),
 		checkSAMLStatePosture(),
 		checkSAMLBaseURLPosture(),
+		checkOIDCBaseURLPosture(),
 		checkDefaultAuthOpen(),
 		checkYARAEnginePosture(),
 		checkConfigSourcePrecedence(),
@@ -160,11 +161,18 @@ func buildOperatorContract() OperatorContract {
 		checkConfigVersionsIntegrity(),
 		checkConfigRollbackValidation(cv),
 		checkKeyAtRest(),
+		checkPlaintextKeyBackups(),
 		checkAuditPersistence(),
 		checkCategoryFeedDB(),
+		checkThreatFeed(),
+		checkRequestHistory(),
+		checkBandwidthQoSEnforcement(),
 		checkSOCKS5Listener(),
+		checkAdminUIListener(),
+		checkDNSResolution(),
 		checkRequestLogPersistence(),
 		checkIdentityBackend(),
+		checkCredentialVerification(),
 		checkInteractiveLoginState(),
 		checkAlertWebhookSigning(),
 		checkUpstreamCredentials(),
@@ -567,6 +575,62 @@ func checkRequestLogPersistence() OperatorContractCheck {
 	}
 }
 
+// checkCredentialVerification reports whether the credential-verification cost
+// governor (CHAOS-57, internal/authcost) is refusing authentication attempts.
+//
+// It exists because a refusal DENIES a request whose credential was never
+// checked, and on every other surface that is indistinguishable from a user
+// typing the wrong password. Without this row the operator-visible symptom of
+// a credential flood is "intermittent 407s" against a healthy directory and a
+// healthy proxy, with nothing anywhere saying why.
+//
+// Read the two states as different incidents:
+//
+//   - refusing/degraded NOW — either a flood is in progress or the ceiling is
+//     genuinely undersized for this deployment's login volume. The reason
+//     breakdown separates them: `per_client` means ONE source is asking for
+//     more concurrent verifications than it should ever need, while
+//     queue_full/timeout means aggregate demand exceeded the whole ceiling.
+//   - refused earlier, fine now — a burst that the queue could not absorb.
+//     Some users saw a 407 and will have retried successfully.
+//
+// Counts and bounds only. The client key that triggered a per-client refusal
+// is deliberately NOT reproduced here: this contract is a VIEWER-role surface
+// with a standing no-sensitive-values guardrail, and a per-client identifier
+// on it would expose who is authenticating from where. It goes to the
+// admin-scoped sinks — the rate-limited log line and the alert.
+func checkCredentialVerification() OperatorContractCheck {
+	s := authCostHealthStatus()
+	if s.Refused == 0 {
+		return OperatorContractCheck{
+			Code:    "credential_verification",
+			Status:  diagOK,
+			Message: fmt.Sprintf("no credential verification refused since startup (ceiling %d concurrent, %d per client; peak %d in flight)", s.MaxConcurrent, s.MaxPerClient, s.PeakInFlight),
+		}
+	}
+	breakdown := fmt.Sprintf("%d per-client, %d queue-full, %d timeout", s.RefusedPerClient, s.RefusedQueueFull, s.RefusedTimeout)
+	if s.Refusing {
+		status := diagWarn
+		if s.Degraded {
+			status = diagFail
+		}
+		return OperatorContractCheck{
+			Code:   "credential_verification",
+			Status: status,
+			Message: fmt.Sprintf("credential verification has been refusing for %s — proxy authentication is failing closed for affected clients (%d refused since boot: %s; ceiling %d concurrent, %d queued now)",
+				s.RefusingFor.Round(time.Second), s.Refused, breakdown, s.MaxConcurrent, s.Queued),
+			OperatorAction: "Valid credentials may be denied while this persists. A high `per-client` share points at ONE source flooding the proxy-auth path — identify it from the access log and block it at the IP filter or the per-IP connection limiter, both of which ship disabled. A high `queue-full`/`timeout` share instead means aggregate login demand exceeds what this node's CPU can verify; add cores or spread load. Verification is bounded on purpose: bcrypt costs ~80 ms of a core, so an unbounded path lets ~13 KB/s of traffic saturate the whole gateway.",
+		}
+	}
+	return OperatorContractCheck{
+		Code:   "credential_verification",
+		Status: diagWarn,
+		Message: fmt.Sprintf("credential verification refused %d authentication attempt(s) earlier in this process and has spare capacity again (%s; %d episode(s), last at %s)",
+			s.Refused, breakdown, s.Episodes, s.Last.UTC().Format(time.RFC3339)),
+		OperatorAction: "Authentication has recovered; affected users saw a 407 and will have retried successfully. Investigate the burst — a synchronised cache expiry across a client fleet is benign, a sustained one from a single source is not.",
+	}
+}
+
 // checkIdentityBackend reports external identity-backend (LDAP / OIDC)
 // reachability (CHAOS-47).
 //
@@ -956,6 +1020,94 @@ func checkSAMLBaseURLPosture() OperatorContractCheck {
 		Status:  diagOK,
 		Message: "SAML SP Entity ID, metadata URL, and ACS URL have an explicit external base URL",
 	}
+}
+
+// checkOIDCBaseURLPosture is the OIDC sibling of checkSAMLBaseURLPosture.
+// resolveByIntrospection's redirect_uri is built by string concatenation —
+// proxyBaseURL(r) + "/auth/oidc/callback" — and proxyBaseURL falls back to
+// the REQUEST Host header whenever proxy.base_url is unset (auth_oidc_flow.go
+// proxyBaseURL). Most OIDC providers pin the client's redirect URI to one
+// exact registered value, so a Host-derived redirect_uri is a login that
+// works from whichever hostname the operator happened to test with and
+// silently breaks (or, behind a misconfigured trust_forwarded_headers, can
+// be steered) from any other — previously visible only as a one-line startup
+// log ("base_url not set") that a browser-side login failure never surfaces
+// to the operator.
+//
+// The parallel shape with checkSAMLBaseURLPosture is intentional, not an
+// accidental copy: the two ask the same five questions of the same value and
+// differ only in what the operator must go and change — Entity ID + ACS URL for
+// SAML, the registered redirect URI for OIDC. Factoring the ladder would couple
+// two protocols' operator guidance together, so a wording or threshold change
+// for one silently rewrote the other's; the mcp/limits Gateway-vs-Management
+// precedent keeps independent tunables independent for the same reason.
+//
+//nolint:dupl // intentional parallel shape across IdP protocols (see above)
+func checkOIDCBaseURLPosture() OperatorContractCheck {
+	if !hasEnabledOIDCProfile() {
+		return OperatorContractCheck{
+			Code:    "oidc_base_url",
+			Status:  diagOK,
+			Message: "no enabled OIDC IdP requires SP callback base URL validation",
+		}
+	}
+	baseURL := ""
+	if cfg != nil {
+		baseURL = strings.TrimSpace(cfg.ProxyBaseURL())
+	}
+	if baseURL == "" {
+		return OperatorContractCheck{
+			Code:           "oidc_base_url",
+			Status:         diagWarn,
+			Message:        "OIDC IdP enabled but proxy.base_url is unset",
+			OperatorAction: "Set proxy.base_url to the externally reachable UI origin, and register proxy.base_url + /auth/oidc/callback as the IdP client's redirect URI. Without it, redirect_uri is derived from the request Host header and can vary per request or load-balancer hop.",
+		}
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return OperatorContractCheck{
+			Code:           "oidc_base_url",
+			Status:         diagFail,
+			Message:        "OIDC IdP enabled but proxy.base_url is not a valid absolute URL",
+			OperatorAction: "Set proxy.base_url to a full external URL such as https://proxy.example.com or https://proxy.example.com/culvert, then update the IdP client's redirect URI to match.",
+		}
+	}
+	// redirect_uri is built by string concatenation from proxy.base_url, so a
+	// query, fragment, or userinfo component would silently produce a wrong
+	// redirect_uri — same rationale as checkSAMLBaseURLPosture.
+	if hasNonBaseURLComponents(u) {
+		return OperatorContractCheck{
+			Code:           "oidc_base_url",
+			Status:         diagFail,
+			Message:        "OIDC IdP enabled but proxy.base_url contains query, fragment, or userinfo components",
+			OperatorAction: "Set proxy.base_url to a bare external origin (optionally with a path prefix) such as https://proxy.example.com or https://proxy.example.com/culvert. Remove any \"?query\", \"#fragment\", or \"user:pass@\" parts, then update the IdP client's redirect URI to match.",
+		}
+	}
+	if isLocalhostBaseURL(u) {
+		return OperatorContractCheck{
+			Code:           "oidc_base_url",
+			Status:         diagWarn,
+			Message:        "OIDC IdP enabled but proxy.base_url points at localhost",
+			OperatorAction: "Use the externally reachable DNS name that browsers and the IdP can reach. Localhost is only safe for single-node local development.",
+		}
+	}
+	if u.Scheme != "https" {
+		return OperatorContractCheck{
+			Code:           "oidc_base_url",
+			Status:         diagWarn,
+			Message:        "OIDC IdP enabled but proxy.base_url is not HTTPS",
+			OperatorAction: "Use an HTTPS external URL for production OIDC. Most identity providers require HTTPS redirect URIs, and browser SSO cookies are safest behind TLS.",
+		}
+	}
+	return OperatorContractCheck{
+		Code:    "oidc_base_url",
+		Status:  diagOK,
+		Message: "OIDC redirect_uri has an explicit external base URL",
+	}
+}
+
+func hasEnabledOIDCProfile() bool {
+	return idpRegistry != nil && idpRegistry.HasEnabledOIDC()
 }
 
 func hasEnabledSAMLProfile() bool {

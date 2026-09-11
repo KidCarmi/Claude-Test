@@ -17,6 +17,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/fileblock"
 	"github.com/KidCarmi/Culvert/internal/fileutil"
 	"github.com/KidCarmi/Culvert/internal/geoip"
+	"github.com/KidCarmi/Culvert/internal/secscan"
 )
 
 // pendingCARotation holds a confirmation token for the two-step CA rotation flow.
@@ -349,17 +350,37 @@ func apiCertsUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := persistCustomUITLS(certPEM, keyPEM); err != nil {
 		logger.Printf("certs upload UI: persist failed: %v", err)
+		warning := "The uploaded certificate is valid but could not be saved — it will NOT " +
+			"be active after a restart, and the current UI certificate is unchanged. Restore " +
+			"write access to the data directory, then upload again."
+		if errors.Is(err, errUITLSRollbackFailed) {
+			// persistCustomUITLS could not restore the previously-persisted
+			// cert after the key write failed — the on-disk state is now
+			// indeterminate (possibly the rejected upload, possibly paired
+			// with neither the old nor the new key). Telling the admin
+			// "unchanged" here would be false and could mask a broken pair
+			// until the next restart.
+			warning = "The uploaded certificate is valid but could not be saved, AND the " +
+				"previous certificate could not be restored — the on-disk UI certificate may " +
+				"now be in an inconsistent state. Do not restart the proxy until this is " +
+				"resolved: check disk space/permissions on the data directory, then re-upload " +
+				"a known-good certificate pair."
+		}
 		auditEvent(r, "certs.upload_ui", "custom UI cert", "NOT PERSISTED — validation only")
 		jsonOK(w, map[string]any{
 			"status":    "ok",
 			"target":    "ui",
 			"persisted": false,
-			"warning": "The uploaded certificate is valid but could not be saved — it will NOT " +
-				"be active after a restart, and the current UI certificate is unchanged. Restore " +
-				"write access to the data directory, then upload again.",
+			"warning":   warning,
 		})
 		return
 	}
+	// The pair just written already passed certMgr.ParseTLSPair above, so any
+	// PRIOR corruption latch (a leftover pair from an earlier interrupted
+	// upload, surfaced as ui_custom_cert_corrupt) no longer describes what's
+	// on disk — clear it, or a successful re-upload would still show as
+	// "corrupt, restart won't help" until the next restart re-evaluates it.
+	uiCustomTLSCorrupt = false
 	auditEvent(r, "certs.upload_ui", "custom UI cert (requires restart)", "")
 	jsonOK(w, map[string]any{
 		"status":    "ok",
@@ -1439,7 +1460,15 @@ func apiScanSvcConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if globalRemoteScanner.Enabled() {
 		if err := globalRemoteScanner.Health(); err != nil {
-			resp["remote_status"] = "unreachable: " + err.Error()
+			// BOUNDED class only. The raw error is not renderable here: an
+			// unparseable base URL yields *url.Error{Op:"parse"} carrying the
+			// URL — password included — which would walk straight past the
+			// redaction applied to remote_url above, and a transport error
+			// still carries the username. Full cause goes to the log.
+			reason := secscan.ProbeFailureReason(err)
+			resp["remote_status"] = "unreachable: " + reason
+			logger.Printf("ScanSvc: health probe failed for %q: reason=%s",
+				sanitizeLog(redactURLUserinfo(globalRemoteScanner.URL())), sanitizeLog(reason))
 		} else {
 			resp["remote_status"] = "connected"
 		}
@@ -1795,13 +1824,30 @@ func apiOCSPConfig(w http.ResponseWriter, r *http.Request) {
 		if t := globalOCSP.LastFailClosedAt(); !t.IsZero() {
 			lastFailClosedAt = t.Format(time.RFC3339)
 		}
-		jsonOK(w, map[string]any{
+		resp := map[string]any{
 			"enabled":          globalOCSP.Enabled(),
 			"cacheLen":         globalOCSP.CacheLen(),
 			"failClosedTotal":  globalOCSP.FailClosedTotal(),
 			"revokedTotal":     globalOCSP.RevokedTotal(),
 			"lastFailClosedAt": lastFailClosedAt,
-		})
+		}
+		// Upstream mTLS client-cert health rides the same admin surface as
+		// OCSP — both are loaded together by loadMTLSAndOCSP — so an admin
+		// can tell "not configured" apart from "configured but failed to
+		// load / expiring soon" without SSH or a log grep.
+		if mc := mtlsClientCertHealth(); mc.configured {
+			resp["mtlsClientCertConfigured"] = true
+			resp["mtlsClientCertLoaded"] = mc.loaded
+			resp["mtlsClientCertFile"] = mc.file
+			if mc.loaded {
+				resp["mtlsClientCertNotAfter"] = mc.notAfter.UTC().Format(time.RFC3339)
+				resp["mtlsClientCertDaysRemaining"] = daysUntil(mc.notAfter)
+			}
+			if mc.lastError != "" {
+				resp["mtlsClientCertLastError"] = mc.lastError
+			}
+		}
+		jsonOK(w, resp)
 	case http.MethodPost:
 		if !requireRole(w, r, RoleAdmin) {
 			return

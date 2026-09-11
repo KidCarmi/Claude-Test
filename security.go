@@ -482,9 +482,149 @@ type RateLimiter struct {
 	exemptIPs  map[string]bool
 }
 
+// clientBucket is one IP's sliding window of in-window request stamps, held as
+// a CIRCULAR BUFFER rather than a plain slice.
+//
+// Allow runs on every proxied request (handleRequest, socks5.go) and its window
+// maintenance used to be a filter-and-copy over the WHOLE bucket:
+//
+//	valid := b.timestamps[:0]
+//	for _, t := range b.timestamps { if t.After(cutoff) { valid = append(valid, t) } }
+//	b.timestamps = valid
+//
+// so the per-request cost was proportional to the bucket's occupancy, which the
+// accept test bounds by the CONFIGURED LIMIT. That made the price of the gate
+// an operator's rate-limit setting, paid on every request from that IP and paid
+// while HOLDING the shard mutex — so it also blocked every other IP hashing to
+// the same shard (1/64 of the process's traffic). Measured on a 4-core Xeon
+// @2.80GHz, one window-maintenance-plus-accept at half occupancy
+// (security_ratelimit_window_bench_test.go, which benchmarks the verbatim
+// pre-change algorithm alongside this one so the comparison stays in-tree):
+//
+//	rate_limit (rpm) │  before   │  after   │ speedup
+//	─────────────────┼───────────┼──────────┼─────────
+//	        60       │   172 ns  │  24.6 ns │     7x
+//	       600       │  1.38 us  │  22.2 ns │    62x
+//	     6 000       │  13.2 us  │  22.8 ns │   578x
+//	    60 000       │   133 us  │  22.4 ns │  5917x
+//
+// (medians of n=3; the "before" column is measured in the SAME run, not quoted
+// from history — see the bench file.) End to end, Allow across 256 IPs each
+// sitting at their cap — the flood shape — is now flat at ~145-170 ns/op and
+// 0 allocs/op for both a 600/min and a 6000/min policy, at 1 and 4 cores.
+//
+// The scan was doing two things linearly that neither needs to be. Stamps are
+// APPENDED IN NON-DECREASING ORDER, so the expired entries are always a PREFIX:
+// the survivors need no predicate test at all, and the copy that moved them
+// back to index 0 exists only because a slice has no other way to drop a head.
+// A ring drops the head by advancing an index, so expire stops at the first
+// live entry and each stamp is examined exactly once over its whole lifetime —
+// amortized O(1) per request, flat in the configured limit.
+//
+// Memory is unchanged: the ring GROWS LAZILY (doubling, capped at the limit)
+// exactly as append did, so an IP that sends two requests under a 6000/min
+// policy still holds a handful of slots, not 6000. Pre-sizing to the limit
+// would have been simpler and is deliberately not done — at 10k tracked IPs it
+// would turn a 6000/min policy into ~1.4 GB of resident buckets.
+//
+// This is a COST change, not a POLICY change: for any sequence of arrivals with
+// non-decreasing stamps — which is every sequence a single goroutine produces —
+// the accept/reject decision is identical to the filter-and-copy form, pinned
+// against a verbatim copy of it by TestRateLimitWindow_DifferentialAgainstLegacy
+// over 300 randomized (limit, window, gap) shapes. The one case that is not
+// verdict-identical is a concurrent OUT-OF-ORDER arrival, and it is bounded and
+// fail-closed by construction — see the clamp on add.
 type clientBucket struct {
-	timestamps []time.Time
-	lastSeen   time.Time
+	// stamps is the ring storage; its LENGTH is the capacity. head indexes the
+	// oldest in-window stamp and n counts them, so the live entries are
+	// stamps[head], stamps[head+1], … modulo len(stamps).
+	stamps   []time.Time
+	head     int
+	n        int
+	lastSeen time.Time
+}
+
+// expire drops every stamp at or before cutoff, stopping at the first live
+// one. That is exact — not an approximation of the predicate scan it replaces —
+// because add maintains the ring in non-decreasing stamp order.
+//
+// The test is `!After(cutoff)` so the boundary matches the legacy loop's
+// `if t.After(cutoff)` keep-condition exactly (a stamp EQUAL to cutoff is
+// expired in both).
+func (b *clientBucket) expire(cutoff time.Time) {
+	for b.n > 0 && !b.stamps[b.head].After(cutoff) {
+		b.head++
+		if b.head == len(b.stamps) {
+			b.head = 0
+		}
+		b.n--
+	}
+}
+
+// add records one stamp, growing the ring first when it is full.
+//
+// ── Why the stamp is clamped ─────────────────────────────────────────────────
+//
+// Allow reads time.Now() BEFORE taking the shard lock, so two goroutines can
+// sample the clock in one order and reach the append in the other: the arrival
+// order is not the stamp order. The old filter-and-copy tested every entry, so
+// it did not care; prefix-expiry does, and an out-of-order stamp would make
+// expire stop early and leave an already-expired entry counted behind it.
+//
+// Clamping the new stamp up to the newest one present restores the ordering
+// invariant BY CONSTRUCTION, and it is the cheap half of the two available
+// fixes: the alternative — moving the clock read inside the shard lock — was
+// built and measured, and it costs ~45% of the end-to-end gate at 4 cores
+// (153 -> 230 ns/op) because it lengthens a critical section that 1/64 of all
+// traffic serialises on. The clamp is one comparison on a value already in
+// cache.
+//
+// What the clamp gives up is bounded and lands FAIL-CLOSED: an inverted stamp
+// is recorded as its predecessor's time, so it can only expire EARLIER than
+// its true arrival, never later — the window can never admit more than the
+// limit. The inversion is bounded by the gap between the clock read and the
+// lock acquisition (microseconds) against a window measured in seconds.
+func (b *clientBucket) add(t time.Time, limit int) {
+	if b.n == len(b.stamps) {
+		b.grow(limit)
+	}
+	i := b.head + b.n
+	if i >= len(b.stamps) {
+		i -= len(b.stamps)
+	}
+	if b.n > 0 {
+		j := i - 1
+		if j < 0 {
+			j = len(b.stamps) - 1
+		}
+		if newest := b.stamps[j]; t.Before(newest) {
+			t = newest
+		}
+	}
+	b.stamps[i] = t
+	b.n++
+}
+
+// grow doubles the ring (from 4), clamped to limit — the occupancy the accept
+// test already bounds the window by, so the clamp never truncates a live entry.
+// The `b.n+1` floor keeps that true even if the limit was lowered at runtime
+// below a bucket's current occupancy.
+func (b *clientBucket) grow(limit int) {
+	c := len(b.stamps) * 2
+	if c == 0 {
+		c = 4
+	}
+	if limit > 0 && c > limit {
+		c = limit
+	}
+	if c <= b.n {
+		c = b.n + 1
+	}
+	next := make([]time.Time, c)
+	// Re-lay the ring out linearly so head returns to 0.
+	k := copy(next, b.stamps[b.head:])
+	copy(next[k:], b.stamps[:b.head])
+	b.stamps, b.head = next, 0
 }
 
 var rl = newRateLimiter()
@@ -627,19 +767,13 @@ func (r *RateLimiter) Allow(ip string) bool {
 	}
 	b.lastSeen = now
 
-	// Evict old timestamps.
-	valid := b.timestamps[:0]
-	for _, t := range b.timestamps {
-		if t.After(cutoff) {
-			valid = append(valid, t)
-		}
-	}
-	b.timestamps = valid
+	// Evict old timestamps (amortized O(1) — see clientBucket).
+	b.expire(cutoff)
 
-	if len(b.timestamps) >= limit {
+	if b.n >= limit {
 		return false
 	}
-	b.timestamps = append(b.timestamps, now)
+	b.add(now, limit)
 	return true
 }
 
@@ -703,32 +837,129 @@ type RateLimitBroadcast struct {
 // clusterCounts holds per-IP request totals received from the Control Plane
 // (other nodes' aggregated counts). Protected by its own mutex to avoid
 // contention with the hot-path Allow() sharded locks.
+//
+// CHAOS-61 — a broadcast EXPIRES. RemoteCounts is, by its own definition, "the
+// total from other nodes IN THE CURRENT WINDOW": a broadcast received at T
+// describes request timestamps in [T-W, T], where W is the rate limiter's
+// sliding window. At now > T+W every timestamp it counted has aged out, so its
+// contribution to the current window is exactly zero. That is arithmetic, not a
+// posture choice — and until appliedAtNano existed the store had no way to say
+// it, because Apply is called ONLY from the DP gossip loop's success branch
+// (controlplane_client.go). A failed SyncRateLimits `continue`s, so the last
+// broadcast stayed frozen in this map for the rest of the process lifetime
+// while AllowClusterAware kept adding it to every local count. An IP whose
+// remote total happened to be near the limit when the Control Plane went away
+// was then denied on this node PERMANENTLY — a total blackhole for that client,
+// on a healthy proxy, cleared only by the CP returning or a restart.
+//
+// The Control Plane already applies this exact reasoning in the other
+// direction: rateLimitAggregator.ClusterTotalsExcluding prunes any node that
+// has not reported for two minutes, precisely so a dead DP's frozen counts stop
+// suppressing fleet traffic (controlplane.go). Nothing applied it to a dead CP,
+// which is the side that actually makes the allow/deny call on live traffic.
+//
+// The stamp is an atomic OUTSIDE the mutex so the hot path can rule a broadcast
+// stale with one atomic load and no lock at all — the case that matters is
+// exactly the one where the map is not being replaced and every request would
+// otherwise queue on the RWMutex for a value that cannot apply. Apply stores the
+// stamp AFTER releasing the write lock, so a reader that observes the new stamp
+// necessarily observes the new map.
 type clusterCountStore struct {
 	mu     sync.RWMutex
 	counts map[string]int // IP → remote cluster count in current window
+	// appliedAtNano is the wall-clock instant of the last APPLIED broadcast
+	// (0 = none ever received). Freshness is evaluated at read time against it;
+	// nothing latches, so recovery needs no separate clearing path.
+	appliedAtNano atomic.Int64
 }
 
 var clusterCounts = &clusterCountStore{counts: map[string]int{}}
 
-// Get returns the cluster-remote count for an IP.
-func (c *clusterCountStore) Get(ip string) int {
+// clusterRemoteCountFallbackMaxAge bounds a broadcast's usefulness when the
+// rate limiter reports no window (defensive — Configure always sets one). It
+// matches the only window the product ships, so the fallback can never be more
+// permissive than the real rule.
+const clusterRemoteCountFallbackMaxAge = time.Minute
+
+// clusterRemoteCountMaxAge is how long an applied broadcast can still describe
+// the current window: the window itself. Kept as a function so the rule stays
+// derived from the live limiter rather than duplicated as a second constant
+// that could drift away from it.
+func clusterRemoteCountMaxAge(window time.Duration) time.Duration {
+	if window <= 0 {
+		return clusterRemoteCountFallbackMaxAge
+	}
+	return window
+}
+
+// FreshCount returns the cluster-remote count for an IP, or 0 when the applied
+// broadcast is older than maxAge (or none has ever been applied). It is the ONLY
+// read accessor for enforcement — there is deliberately no unconditional Get, so
+// a future caller cannot reintroduce the frozen-count path by accident.
+// A NEGATIVE age (the clock moved back between the stamp and this read) is
+// stale, not fresh. `age >= maxAge` alone reads a future stamp as brand new and
+// would honour the broadcast for however far back the clock went — and it would
+// disagree with clusterRateLimitFreshness, which reports the same condition as
+// stale. Two answers to one question is the defect; both fail toward the local
+// decision, which is where every other failure on this path lands.
+func (c *clusterCountStore) FreshCount(ip string, now time.Time, maxAge time.Duration) int {
+	applied := c.appliedAtNano.Load()
+	if applied == 0 {
+		return 0
+	}
+	if age := now.Sub(time.Unix(0, applied)); age < 0 || age >= maxAge {
+		return 0
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.counts[ip]
 }
 
-// Apply replaces the cluster-remote counts with a new broadcast.
+// Apply replaces the cluster-remote counts with a new broadcast and stamps the
+// instant it landed. A nil/empty map is a legitimate broadcast (no hot IPs
+// anywhere else in the fleet) and correctly clears the previous one.
 func (c *clusterCountStore) Apply(remote map[string]int) {
 	c.mu.Lock()
 	c.counts = remote
 	c.mu.Unlock()
+	c.appliedAtNano.Store(time.Now().UnixNano())
 }
 
-// Count returns the number of IPs tracked.
+// AppliedAt returns the instant of the last applied broadcast and whether one
+// has ever been applied. Read-only; used by the freshness health surface.
+func (c *clusterCountStore) AppliedAt() (time.Time, bool) {
+	applied := c.appliedAtNano.Load()
+	if applied == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, applied), true
+}
+
+// Count returns the number of IPs tracked. This is the SIZE of the last applied
+// broadcast whether or not it is still fresh — the freshness surface reports
+// that separately, so an operator can tell "no hot IPs in the fleet" from "a
+// map we stopped consulting".
 func (c *clusterCountStore) Count() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.counts)
+}
+
+// resetForTest clears the store and its freshness stamp.
+func (c *clusterCountStore) resetForTest() {
+	c.mu.Lock()
+	c.counts = map[string]int{}
+	c.mu.Unlock()
+	c.appliedAtNano.Store(0)
+}
+
+// applyAtForTest applies a broadcast as if it had landed at ts, so a test can
+// age a broadcast without sleeping.
+func (c *clusterCountStore) applyAtForTest(remote map[string]int, ts time.Time) {
+	c.mu.Lock()
+	c.counts = remote
+	c.mu.Unlock()
+	c.appliedAtNano.Store(ts.UnixNano())
 }
 
 // ExportHotDeltas returns per-IP request count deltas for IPs that have
@@ -754,13 +985,12 @@ func (r *RateLimiter) ExportHotDeltas() []RateLimitDelta {
 		s := &r.shards[i]
 		s.mu.Lock()
 		for ip, b := range s.clients {
-			// Count only in-window timestamps.
-			count := 0
-			for _, t := range b.timestamps {
-				if t.After(cutoff) {
-					count++
-				}
-			}
+			// Count only in-window timestamps. Dropping the expired prefix
+			// here rather than counting past it is the same verdict (an
+			// expired stamp was never counted) and leaves less for the next
+			// Allow to walk.
+			b.expire(cutoff)
+			count := b.n
 			if count >= threshold {
 				deltas = append(deltas, RateLimitDelta{IP: ip, Count: count})
 			}
@@ -809,21 +1039,21 @@ func (r *RateLimiter) AllowClusterAware(ip string) bool {
 	}
 	b.lastSeen = now
 
-	// Evict old timestamps.
-	valid := b.timestamps[:0]
-	for _, t := range b.timestamps {
-		if t.After(cutoff) {
-			valid = append(valid, t)
-		}
-	}
-	b.timestamps = valid
+	// Evict old timestamps (amortized O(1) — see clientBucket).
+	b.expire(cutoff)
 
 	// Check local + remote cluster count against limit.
-	localCount := len(b.timestamps)
-	remoteCount := clusterCounts.Get(ip)
+	//
+	// CHAOS-61: the remote half is consulted only while the broadcast carrying
+	// it can still describe THIS window. Past that it is not a conservative
+	// estimate, it is a count of timestamps that have all aged out — so a
+	// Control-Plane outage degrades this node to plain local rate limiting
+	// instead of enforcing a frozen snapshot of the past forever.
+	localCount := b.n
+	remoteCount := clusterCounts.FreshCount(ip, now, clusterRemoteCountMaxAge(window))
 	if localCount+remoteCount >= limit {
 		return false
 	}
-	b.timestamps = append(b.timestamps, now)
+	b.add(now, limit)
 	return true
 }

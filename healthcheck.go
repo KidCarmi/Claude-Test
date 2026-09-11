@@ -20,6 +20,7 @@ type healthReport struct {
 	SSLInspection string `json:"ssl_inspection" redact:"internal"`
 	ClusterCA     string `json:"cluster_ca" redact:"internal"`
 	SOCKS5        string `json:"socks5" redact:"internal"`
+	AdminUI       string `json:"admin_ui" redact:"internal"`
 	// MCP is the MCP Agent Security Gateway capability state (RISK-027). It is
 	// omitted entirely on a node that never requested MCP: an always-present field
 	// would make every node look like it has the capability.
@@ -90,7 +91,14 @@ func computeHealth() healthReport {
 		// and the reason class (which would name descriptor exhaustion
 		// specifically) live only on the role-gated /api/diagnostics row, the
 		// alert, and the logs.
-		SOCKS5:            socks5ListenerStatus(),
+		SOCKS5: socks5ListenerStatus(),
+		// CHAOS-57. This field exists on the PROXY port specifically because
+		// the admin port's own /healthz cannot report that the admin port is
+		// unreachable — a probe that dies with the plane it measures reports
+		// nothing at all. Same fixed-enum discipline as the socks5 field: the
+		// posture is public, the resolution (attempt count, reason class) is
+		// not.
+		AdminUI:           adminUIListenerStatus(),
 		ThreatFeedEntries: tfEntries,
 	}
 }
@@ -444,6 +452,13 @@ func computeReadiness() (report readinessReport, code int) {
 	// 9b. SOCKS5 listener (CHAOS-54) — report-only, absent entirely when
 	// SOCKS5 is not configured. See appendSOCKS5ReadinessCheck.
 	appendSOCKS5ReadinessCheck(checks)
+
+	// 9b'. Admin UI listener (CHAOS-57) — REPORT-ONLY. A node whose admin UI
+	// cannot bind is still proxying traffic perfectly; gating the default
+	// verdict on it would eject a healthy gateway from rotation over its
+	// management plane, turning a management outage into the traffic outage
+	// this row exists to make visible. Strict callers opt in via ?strict=1.
+	appendAdminUIReadinessCheck(checks)
 
 	// 9c. MCP gateway (RISK-027) — REPORT-ONLY, absent entirely when MCP was never
 	// requested. It must NEVER gate the default verdict: MCP is an optional,

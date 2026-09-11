@@ -443,28 +443,62 @@ func handleOneShotCommands(s *startupState) {
 	}
 	// ── One-shot: password reset (Finding 5.1) ─────────────────────────────
 	if *s.resetPwUser != "" {
-		parts := strings.SplitN(*s.resetPwUser, ":", 2)
-		if len(parts) != 2 || parts[0] == "" || len(parts[1]) < 8 {
-			fmt.Fprintln(os.Stderr, "Usage: --reset-password username:newpassword (min 8 chars)")
+		if err := runResetPasswordCommand(s); err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		usersPath := *s.uiUsersFile
-		if usersPath == "" {
-			usersPath = filepath.Join(dataDir, "ui_users.json")
-		}
-		cfg.SetUIUsersFile(usersPath)
-		_ = cfg.LoadUIUsersFile() // may not exist yet, that's fine
-		if err := cfg.SetUIUser(parts[0], parts[1], RoleAdmin); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		if err := cfg.SaveUIUsersFile(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Password reset for %q (role=admin). You can now start the proxy.\n", parts[0])
 		os.Exit(0)
 	}
+}
+
+// runResetPasswordCommand handles the --reset-password one-shot admin
+// recovery command (Finding 5.1). Extracted so the dispatch table in
+// handleOneShotCommands stays flat, matching the run*Command convention
+// used by --backup/--restore/--cleanup-restore-leftovers.
+func runResetPasswordCommand(s *startupState) error {
+	parts := strings.SplitN(*s.resetPwUser, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || len(parts[1]) < 8 {
+		return fmt.Errorf("usage: --reset-password username:newpassword (min 8 chars)")
+	}
+	usersPath := *s.uiUsersFile
+	if usersPath == "" {
+		usersPath = filepath.Join(dataDir, "ui_users.json")
+	}
+	cfg.SetUIUsersFile(usersPath)
+	if err := cfg.LoadUIUsersFile(); err != nil {
+		// A missing file loads as nil (first-run case, handled below by
+		// SetUIUser creating the roster from scratch). CHAOS-05 quarantines
+		// present-but-corrupt JSON by moving the bad file aside BEFORE
+		// returning its parse error, so nothing left at usersPath means the
+		// failure was already handled and starting fresh is the intended
+		// recovery. Anything still present at usersPath here is an
+		// UNRESOLVED load failure — wrong file ownership after an image
+		// upgrade (the container runs as the non-root "proxy" user), a
+		// bind-mount source that resolved to the wrong file type, a
+		// transient I/O fault — and must never be silently overwritten:
+		// SetUIUser+SaveUIUsersFile below would replace an intact roster
+		// with a single freshly-created admin, destroying every other
+		// admin/operator/viewer account and TOTP enrollment for good.
+		//
+		// Proceed ONLY when Lstat itself affirmatively proves usersPath is
+		// gone (os.IsNotExist). Any other Lstat outcome — the path exists,
+		// or Lstat fails for its own reason (e.g. a transient EIO, or an
+		// ENOTDIR from a path component that resolved to the wrong file
+		// type) — is not proof of absence, so it must abort too: falling
+		// through here would still risk destroying an intact roster once
+		// storage recovers and the save below succeeds (Codex review).
+		if _, statErr := os.Lstat(usersPath); !os.IsNotExist(statErr) {
+			return fmt.Errorf("refusing to reset password: %s failed to load (%w) and its presence could not be ruled out (stat: %v); fix the underlying issue (permissions, file type) and retry — proceeding would risk destroying the existing admin roster", usersPath, err, statErr)
+		}
+	}
+	if err := cfg.SetUIUser(parts[0], parts[1], RoleAdmin); err != nil {
+		return fmt.Errorf("error: %w", err)
+	}
+	if err := cfg.SaveUIUsersFile(); err != nil {
+		return fmt.Errorf("error saving: %w", err)
+	}
+	fmt.Printf("Password reset for %q (role=admin). You can now start the proxy.\n", parts[0])
+	return nil
 }
 
 // runCleanupCommand parses cleanup-restore-leftovers flags and dispatches
@@ -561,6 +595,9 @@ func loadFileConfigAndFlags(s *startupState) {
 	// 8080 too). Must run before any of the three listeners bind, so a
 	// collision fails fast here instead of deep into startup with a bare
 	// OS-level "listen tcp :N: bind: address already in use".
+	if err := validatePortRanges(s.pPort, s.uPort, s.socks5PortVal); err != nil {
+		log.Fatalf("Invalid port configuration: %v", err)
+	}
 	if err := validatePortCollisions(s.pPort, s.uPort, s.socks5PortVal); err != nil {
 		log.Fatalf("Invalid port configuration: %v", err)
 	}
@@ -811,7 +848,7 @@ func initLogStore(s *startupState) {
 // Behaviour is unchanged — loader errors are logged (non-fatal) so
 // startup continues with in-memory defaults, matching the original body.
 func initFileBlocking(s *startupState) {
-	if err := loadFileBlocking(resolveFileBlockStartupConfig(s.fc, *s.fileProfilesFile)); err != nil {
+	if err := loadFileBlocking(resolveFileBlockStartupConfig(s.fc, *s.fileProfilesFile, dataDir)); err != nil {
 		logger.Printf("FileProfiles: load error (%v) — using in-memory defaults", err)
 	}
 }
@@ -1224,6 +1261,40 @@ func firstNonZero(vals ...int) int {
 		}
 	}
 	return 0
+}
+
+// validatePortRanges checks the three RESOLVED listener ports (proxy, admin
+// UI, SOCKS5 — already merged through firstNonZero(CLI, config.yaml,
+// default)) fall within the valid TCP port range 1-65535.
+// config.yaml's proxy.port/ui_port/socks5_port are range-checked by
+// FileConfig.validateLimits, but that check runs on the raw YAML fields
+// BEFORE CLI-flag overrides are merged in loadFileConfigAndFlags — a value
+// that reaches this function only via a CLI flag never passes through
+// validateLimits at all, and previously flowed straight to
+// http.Server{Addr: fmt.Sprintf(":%d", port)} unchecked, surfacing only as
+// a bare ListenAndServe error well into startup (after the admin UI is
+// already listening). Checking here, on the resolved values, closes that
+// gap for both the YAML and CLI paths identically — mirrors
+// validatePortCollisions's resolved-value approach and SOCKS5-disabled
+// exemption.
+func validatePortRanges(proxyPort, uiPort, socks5Port int) error {
+	named := []struct {
+		name string
+		port int
+	}{
+		{"proxy port", proxyPort},
+		{"UI port", uiPort},
+		{"SOCKS5 port", socks5Port},
+	}
+	for _, n := range named {
+		if n.port == 0 {
+			continue
+		}
+		if n.port < 1 || n.port > 65535 {
+			return fmt.Errorf("%s must be 1-65535, got %d", n.name, n.port)
+		}
+	}
+	return nil
 }
 
 // validatePortCollisions checks the three RESOLVED listener ports (proxy,

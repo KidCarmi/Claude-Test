@@ -33,9 +33,23 @@ package alerts
 //   "cluster_node_reenrolled" — expired-but-registered node re-enrolled with a fresh token (CHAOS-12)
 //   "ha_sync_panic"         — a standby HA sync round panicked and was contained: state replication
 //                             is stalled and this node's automatic failover is suppressed (CHAOS-25)
+//   "auth_verify_saturated" — the credential-verification cost governor has been refusing
+//                             authentication attempts for a sustained period: proxy auth is
+//                             failing CLOSED and valid credentials may be denied (CHAOS-57).
+//                             bcrypt costs ~80 ms of a core, so verification is bounded on
+//                             purpose; this fires when that bound is being hit, which means
+//                             either a credential flood or a genuinely undersized node.
+//                             Fired once per episode, never per denied request.
 //   "socks5_listener_down"  — the SOCKS5 accept loop has been unable to accept connections for a
 //                             sustained period, or has stopped entirely: SOCKS5 clients cannot
 //                             connect (CHAOS-54). Fired once per episode, never per retry.
+//   "threat_feed_stale"     — threat intelligence has not synced successfully for over 2x the sync
+//                             interval, or has NEVER synced on this node (CHAOS-59). The gateway
+//                             keeps enforcing last-known-good entries — nothing is wiped — so this
+//                             is degraded FRESHNESS, not a failing control; the never-synced case
+//                             means no threat-feed coverage at all and says so. Fired once per
+//                             episode, never per failed round; cleared only by an observed clean
+//                             sync. Detail carries a BOUNDED source class, never the fetch error.
 //   "mcp_gateway_down"      — MCP enablement was requested but the capability is not serving:
 //                             activation failed, the listener degraded, or it stopped while still
 //                             configured (RISK-027). Fired once per episode, never per request.

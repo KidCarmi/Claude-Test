@@ -251,6 +251,8 @@ func liveFeedWritePrometheus(w *strings.Builder) {
 	fmt.Fprintf(w, "# TYPE culvert_reqlog_skipped_lines_total counter\nculvert_reqlog_skipped_lines_total %d\n", reqlog.SkippedLines())
 	fmt.Fprintf(w, "\n# HELP culvert_audit_write_errors_total Admin-action audit entries that never reached the persistent JSONL file (disk full, read-only volume, failed reopen). Non-zero means the durable compliance record is incomplete\n")
 	fmt.Fprintf(w, "# TYPE culvert_audit_write_errors_total counter\nculvert_audit_write_errors_total %d\n", auditWriteErrors())
+	fmt.Fprintf(w, "\n# HELP culvert_audit_cluster_push_drops_total Audit entries discarded from the Data Plane→Control Plane push queue at its cap (Control Plane unreachable). Non-zero means the CENTRALIZED audit trail is incomplete; the local JSONL file on this node is unaffected\n")
+	fmt.Fprintf(w, "# TYPE culvert_audit_cluster_push_drops_total counter\nculvert_audit_cluster_push_drops_total %d\n", auditPendingDrops())
 	fmt.Fprintf(w, "\n# HELP culvert_logstore_dropped_total History-store entries dropped because the async write queue was full\n")
 	fmt.Fprintf(w, "# TYPE culvert_logstore_dropped_total counter\nculvert_logstore_dropped_total %d\n", logstore.Dropped())
 	fmt.Fprintf(w, "\n# HELP culvert_logstore_pruned_total History-store entries deleted by the size-retention janitor\n")
@@ -280,6 +282,15 @@ func liveFeedWritePrometheus(w *strings.Builder) {
 	fmt.Fprintf(w, "\n# HELP culvert_login_state_evictions_total Interactive-login callback state dropped at the cap before it could be redeemed. Non-zero means some SSO logins failed with \"invalid or expired state\"\n")
 	fmt.Fprintf(w, "# TYPE culvert_login_state_evictions_total counter\nculvert_login_state_evictions_total{store=\"oidc_pkce\"} %d\nculvert_login_state_evictions_total{store=\"saml\"} %d\n",
 		globalPKCEStore.Evictions(), globalSAMLStateStore.Evictions())
+
+	// CHAOS-63: admin logins refused for an over-long username. The admin login
+	// endpoint is public, and an unbounded username there was an unauthenticated
+	// write amplifier into the lockout maps and the durable audit log. The
+	// rejection is otherwise invisible (the caller gets a 400), so a climbing
+	// counter is the operator's only signal that a source is probing it.
+	fmt.Fprintf(w, "\n# HELP culvert_login_oversize_rejected_total Admin login attempts refused because the submitted username exceeded the byte limit. Sustained growth means an unauthenticated source is probing /api/auth/login\n")
+	fmt.Fprintf(w, "# TYPE culvert_login_oversize_rejected_total counter\nculvert_login_oversize_rejected_total %d\n",
+		loginOversizeRejected.Load())
 }
 
 // apiCountryTraffic returns the top destination countries for the dashboard.

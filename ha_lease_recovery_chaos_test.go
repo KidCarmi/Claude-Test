@@ -527,10 +527,22 @@ func TestChaos55_LeaseHealthReportsRecovering(t *testing.T) {
 		t.Errorf("lease_recovering = %v, want true — an operator must be able to tell "+
 			"'read-only and working on it' from 'read-only and stuck'", resp["lease_recovering"])
 	}
+	// The GUI's recovery banner (loadHA in static/index.html) needs the attempt
+	// count to say something more useful than "retrying" — both fields must be
+	// present (int64, so they render even at zero) whenever a lease is armed.
+	if _, ok := resp["lease_reacquire_attempts"].(int64); !ok {
+		t.Errorf("lease_reacquire_attempts = %v (%T), want an int64", resp["lease_reacquire_attempts"], resp["lease_reacquire_attempts"])
+	}
+	if _, ok := resp["lease_reacquired_total"].(int64); !ok {
+		t.Errorf("lease_reacquired_total = %v (%T), want an int64", resp["lease_reacquired_total"], resp["lease_reacquired_total"])
+	}
 
 	// Legacy mode carries neither field.
 	legacy := map[string]any{}
 	addLeaseHealth(legacy, &HAState{})
+	if _, ok := legacy["lease_reacquire_attempts"]; ok {
+		t.Error("legacy mode must not carry lease_reacquire_attempts")
+	}
 	if _, ok := legacy["lease_recovering"]; ok {
 		t.Error("legacy mode must not carry lease_recovering")
 	}
