@@ -252,6 +252,39 @@ enforcement owns its own populator; and six `culvert_geo_*` series, of which
 `culvert_geo_policy_unresolved_total` is the first signal an operator has ever
 had that a geo rule is evaluating against an unknown country. The first-request
 window is unchanged and recorded as an owner decision (WK-3c). See §28.
+**2026-09-06 — CHAOS-57 sweep (credential verification as an unbounded, unauthenticated CPU sink).**
+The register carried **AU-3** as an open Medium — *"correct-username + N wrong-passwords is a cache
+miss every time"* — which described an attack requiring a valid username and categorised the
+consequence as latency. Both halves understated it. **The cheap branch is the WRONG-username branch
+and the consequence is a gateway-wide outage.** `verifyAuthWithSnapshot` ran an unconditional bcrypt
+against a fixed dummy hash whenever the username did not match — RISK-008's timing equaliser, which
+exists for a good reason — but it sat BEFORE the result cache and never populated it, so a flood of
+distinct usernames was a guaranteed miss every time. No credential, no valid username, no knowledge
+of the deployment. And nothing stood in front of it: the per-IP connection limiter, the request rate
+limiter (`-rate-limit`, default 0) and the IP filter all ship DISABLED, and nothing capped
+concurrency. Measured on the 4-core reference box: **79.6 ms of exclusive CPU per ~200-byte request
+(51,631x a cached auth); 66 req/s — about 13 KB/s on the wire — consumed 100% of all four cores; other
+CPU work degraded 15.6x under 64 attacker connections.** Two amplifiers sat beside it: the result
+cache evicted **one arbitrary LIVE entry** at capacity, so a flood displaced honest users' cached
+positives (measured: gone by a 2x-capacity flood, after which the victim paid a full bcrypt on every
+request — the attacker's amplification landing on legitimate traffic, the `internal/authstate`
+finding standing unchanged one subsystem over), and its expired-entry scan is O(cache) under the
+process-wide mutex at 64 µs per insertion. **The finding inside the fix:** gating only the branch
+that reaches the real hash — the obvious fix, and the one written first — makes "over budget" fast
+for a wrong username and slow for a wrong password, handing back exactly the username-enumeration
+oracle RISK-008 removed. The admission decision is therefore taken BEFORE the username is compared
+and cannot depend on it; the gate that pins this was verified failing against that asymmetric shape.
+Shipped: `internal/authcost` (global ceiling of GOMAXPROCS/2, per-client ceiling of 1, bounded wait
+with a BOUNDED queue — an unbounded one would trade CPU exhaustion for goroutine exhaustion), the
+`internal/authstate` fair-eviction policy ported to the result cache, and a full observability plane
+(eight series, a `credential_verification` contract row, a rate-limited log pair, and a
+fire-once-per-episode `auth_verify_saturated` alert with evidence-based recovery). Bounds are
+CONSTANTS by design — a knob here could only widen a DoS window — with an order of magnitude of
+headroom over real demand. 34 gates; eleven defect gates verified failing against the shape each replaces. A SECOND finding inside the fix, caught in self-review and fixed on the branch: moving the cache lookup ahead of the username comparison made a latent NON-INJECTIVE cache key (`user + ":" + pass`) reachable with a caller-chosen username — an AUTHENTICATION BYPASS whenever the configured password contains a colon. `cacheKey` is now length-framed. **AU-3e**, a
+PRE-EXISTING username-enumeration oracle reached by repetition (wrong-username negatives are not
+cached, correct-username ones are), is recorded and deliberately NOT fixed here: closing it changes a
+security control's behaviour and deserves its own review. See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, §25,
+and `docs/operator/credential-verification-cost.md`.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -722,7 +755,11 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 |---|----------|---------|-----|----------|
 | AU-1 | Registry OIDC introspection has **no result cache** → one IdP round-trip per request, ×N providers, each 10s timeout. The legacy `OIDCAuth` *does* cache (2-min TTL); the newer registry path dropped it. | GAP | H | `auth_oidc_flow.go:344-363,608-627` (no cache field); loop `proxy.go:209-220`; contrast `auth_oidc.go:210-238` |
 | AU-2 | In-flight SSO sessions **survive IdP deletion** — no `RevokeProvider`; cookies are self-contained and keep full access up to TTL (default 8h). User-delete *does* revoke. | GAP | H | `auth_idp.go:319-330`, `ui_auth.go:517-529` vs `ui_auth.go:245` |
-| AU-3 | Proxy-path Basic-auth bcrypt is **not rate-limited** — correct-username + N wrong-passwords is a cache miss every time → full ~100ms bcrypt per request → CPU starvation. The `loginLimiter` guards only the admin UI. | GAP | M | `store.go:440-444`, limiter only at `ui_auth.go:48,116`, proxy call `proxy.go:223` |
+| AU-3 | Proxy-path Basic-auth bcrypt is **not rate-limited** — correct-username + N wrong-passwords is a cache miss every time → full ~100ms bcrypt per request → CPU starvation. The `loginLimiter` guards only the admin UI. **Understated: the WRONG-username branch is worse (AU-3a) and needs no valid username at all.** | GAP → **CLOSED** (CHAOS-57, §25: `internal/authcost` bounds concurrency globally + per client, fail-closed) | M → **C** | `store.go` `verifyAuthFrom`, `internal/authcost`, `auth_cost_health.go` |
+| AU-3a | The wrong-username branch runs an unconditional bcrypt against the dummy hash (RISK-008 timing equaliser), is reached BEFORE the result cache, and never populates it — so a flood of DISTINCT usernames is a guaranteed miss every time. Measured **79.6 ms of exclusive CPU per ~200-byte request (51,631x a cached auth)**; **66 req/s (~13 KB/s) consumed 100% of a 4-core box** and degraded other CPU work **15.6x**. Unauthenticated, remotely triggerable, and in the DEFAULT posture nothing stands in front of it — the connection limiter, rate limiter and IP filter all ship disabled. | GAP → **CLOSED** (CHAOS-57) | **C** | `store.go:521` (pre-fix), gates `TestChaos57_WrongUsernamePathIsGoverned`, `..._ConcurrentVerificationsAreBounded` |
+| AU-3c | The auth result cache evicted **one arbitrary LIVE entry** at capacity (a Go map range stopping at the first key), so a flood of distinct passwords under a known username displaced OTHER clients' cached positives. Measured: an honest client's cached credential survived a 1x-capacity flood and was reliably gone by 2x — after which that user paid a full ~80 ms bcrypt on EVERY request. The attacker's amplification lands on legitimate traffic. Same class as the `internal/authstate` finding. | GAP → **CLOSED** (CHAOS-57: `internal/authstate`'s fair-eviction policy ported — oldest entry of the largest holder, deterministic) | H | `store.go` `evictOneLocked`, gate `TestChaos57_FloodCannotDisplaceAnHonestClientsCachedResult` |
+| AU-3d | The at-capacity expired-entry scan is O(cache) whenever nothing has expired — precisely the state a flood keeps it in — and runs holding the process-wide auth mutex. Measured **64 µs per insertion** at the 5,000-entry cap. | GAP → **CLOSED** (CHAOS-57: bucket-indexed eviction, no full scan) | L/M | `store.go` `set` (pre-fix) |
+| AU-3e | **Username-enumeration timing oracle, PRE-EXISTING and deliberately NOT closed by CHAOS-57.** A negative result for the CORRECT username is cached; one for a wrong username is not (the branch returns before the cache). So repeating the SAME wrong (user, pass) pair twice is ~1.5 µs the second time for a valid username and ~80 ms for an invalid one — which is the oracle RISK-008's dummy-compare equalisation exists to prevent, reachable by repetition rather than by a single request. Closing it means caching wrong-username negatives, a behaviour change to a security control that deserves its own review. CHAOS-57 verifies only that it does not WIDEN it (`TestChaos57_AdmissionDecisionIsUsernameIndependent`). | GAP | M | `store.go` `verifyAuthFrom` — cache write is on the username-match branch only |
 | AU-4 | Lockout store is bounded + fail-closed, and TOTP failures now feed it. But it is **not persisted** (resets on restart) and **per-node** (attacker gets MaxAttempts per node in a cluster). | ✓ (+2 gaps) | M | `lockout.go:111-126,102-110`; per-node note `roadmap/edge-case-audit.md:138` |
 | AU-5 | LDAP proxy auth fails closed, but the 10s timeout covers only the **dial** — `Bind`/`Search` have no per-op deadline, so a server that accepts then stalls hangs the request goroutine. | GAP → **CLOSED** (CHAOS-58 §26: one 10s round-trip envelope, two non-redundant layers; re-scored **H** on discovery — the stall is unbounded, not slow, and it made the CHAOS-47 cooldown structurally unreachable) | ~~M~~ H | `auth_ldap.go` `verify`; gates `auth_ldap_stall_chaos_test.go` (9) |
 | AU-14 | The CHAOS-47 provider-wide cooldown is armed only by an error that RETURNS, so any identity-backend fault that HANGS is invisible to it by construction. Closed for LDAP by CHAOS-58; the OIDC leg is bounded by `http.Client{Timeout}` on every call, and SAML is browser-mediated. Recorded so the next backend added to the credential chain inherits the rule rather than rediscovering it. | GAP → **CLOSED for the shipped backends** (CHAOS-58 §26) | M | `auth_backend_health.go` `authProbeGate`; `noteVerifyError` `auth_ldap.go` |
@@ -924,7 +961,7 @@ touch security-critical paths that warrant isolated review.
 | CA-1 | Seed an expired CA via `SetCAForTest`; assert `GetCert` errors + alert. |
 | CA-2 | Point `caPath` at a read-only dir; drive `RotateIfNeeded`; assert a failure alert (not a success alert). |
 | AU-2 | Mint a session with `Provider:"idpA"`; delete idpA; assert the cookie now fails to decode. |
-| AU-3 | Assert the Nth rapid wrong-password attempt for a valid user is rejected before bcrypt runs. |
+| AU-3 | **DONE** (CHAOS-57): 19 root gates in `auth_cost_chaos_test.go` + 15 engine gates in `internal/authcost`. Eleven defect gates verified failing against the shape each replaces, including the asymmetric-gate variant that reintroduces the RISK-008 oracle, the non-injective cache key (an authentication bypass), and the immediate per-client refusal that denied a workstation's own parallel connections. |
 | PX-3 | Open a tunnel, half-close the client without FIN; assert goroutine count returns to baseline within the idle window. |
 | PX-6 | Global cap K; open K+1 conns across distinct IPs; assert rejection + stable FD count. |
 | HA-7 | Resume denied → etcd becomes reachable → assert `WriteAllowed()` becomes true within a bounded time with no operator action. |
@@ -4048,3 +4085,410 @@ outlives the test body that armed it, and `defer restore()` runs **before** any
 still reading it. Production never reassigns those vars, so this is harness-only,
 but `stubResolver` now waits for in-flight warms before restoring: a seam must
 outlive its users.
+## 29. CHAOS-57 — Credential verification as an unbounded, unauthenticated CPU sink
+
+**Date:** 2026-09-06
+**Scope:** the per-request proxy-authentication path for local accounts —
+`Config.verifyAuthFrom` (store.go), its two data-plane callers
+(`resolveRequestAuth` in proxy.go, `socks5Negotiate` in socks5.go), and the
+verification result cache.
+
+### 29.1 Why this domain
+
+The register has carried **AU-3** as an open Medium since the first sweep,
+framed as *"correct-username + N wrong-passwords is a cache miss every time →
+full ~100 ms bcrypt per request"*. That framing was too narrow in the one
+direction that mattered: it described an attack that requires knowing a valid
+username, and it categorised the consequence as latency.
+
+**The cheap branch is the wrong-username branch, and the consequence is a
+gateway-wide outage.**
+
+`verifyAuthWithSnapshot` ran an unconditional `bcrypt.CompareHashAndPassword`
+against a fixed dummy hash whenever the presented username did not match. That
+comparison exists for a good reason — RISK-008 equalises the wrong-username and
+wrong-password paths so neither is distinguishable by timing — but it sat
+**before** the result cache and never populated it, so a flood of *distinct*
+usernames was a guaranteed cache miss every single time. No valid username, no
+credential, no knowledge of the deployment.
+
+And nothing stood in front of it. The three front-door limiters that could have
+capped the arrival rate — the per-IP connection limiter, the request rate
+limiter (`-rate-limit`, default **0 = off**) and the IP filter — **all ship
+disabled**. Nothing capped concurrency either, so N simultaneous requests put N
+goroutines into bcrypt at once and the scheduler shared every core between them.
+
+### 29.2 The measurements
+
+Taken on the reference 4-core box against the pre-fix tree. The probe that
+produced them is preserved as the defect gates.
+
+| | |
+|---|---|
+| one wrong-username attempt | **79.6 ms of exclusive CPU** |
+| one cached successful authentication | 1.5 µs |
+| **amplification** | **51,631×** |
+| sustained attempt rate at full saturation | **66/s** |
+| bytes on the wire to achieve that | **~13 KB/s** |
+| degradation to other CPU work, 64 attacker connections | **15.6×** |
+
+So roughly **thirteen kilobytes per second from one unauthenticated source
+consumes an entire four-core gateway**, and everything else the appliance must
+do per request — TLS handshakes, DPI scanning, policy evaluation, relay copying
+— competes for what is left. That is a remotely triggerable denial of service
+against the data plane, in the shipped default configuration.
+
+The arithmetic generalises without needing a benchmark: one request buys ~80 ms
+of a core, so **12.5 × GOMAXPROCS requests per second saturates the machine**.
+
+### 29.3 Two amplifiers found alongside it
+
+**AU-3c — the cache evicted a random victim.** At capacity the cache scanned
+for an expired entry and, finding none, dropped *an arbitrary one* — a Go map
+range that stops at the first key, i.e. a uniformly random **live** entry. A
+flood of distinct passwords under a known username therefore displaced other
+clients' cached positives. Measured: an honest user's cached credential
+survived a flood of 1× the cache capacity and was **reliably gone by 2×**,
+after which that user paid a full ~80 ms bcrypt on *every* request. The
+attacker's amplification lands on legitimate traffic. This is precisely the
+finding `internal/authstate` closed for the login-state stores, standing
+unchanged one subsystem over.
+
+**AU-3d — the scan is O(cache) under the process-wide mutex.** The
+expired-entry scan walks the whole 5,000-entry map whenever nothing has
+expired, which is exactly the state a flood keeps it in. Measured **64 µs per
+insertion**, serialised against every other authentication in the process.
+
+### 29.4 The finding inside the fix
+
+The obvious fix — gate the branch that runs the expensive comparison — **is a
+security regression**, and it is subtle enough that it was written first.
+
+RISK-008's dummy comparison exists so that a wrong username and a wrong
+password take the same time. A governor consulted only on the branch that
+reaches the real hash makes "over budget" **fast for a wrong username and slow
+for a wrong password**, handing back exactly the username-enumeration oracle
+the equalisation removed. The bound would have been bought with the
+vulnerability it was protecting.
+
+So the rule is: **the admission decision is taken before the username is
+compared, and does not depend on it.** The code reads as *answer for free if you
+can, then buy permission to spend 80 ms, then look at the credential*:
+
+1. **Cache first, unconditionally** — ahead of the username comparison. This
+   changes no verdict (entries are only ever stored for the configured
+   username, so a wrong username was always a miss and still is) and costs the
+   same one HMAC + one map probe either way, but it means a client riding a
+   warm cache never consumes a slot. Without it, a legitimate high-rate
+   deployment would be throttled by a bound on work it is not doing.
+2. **Admission second**, username-independent.
+3. **Refusal is a deny** — fail closed.
+4. **The slot is held across both branches**, released by `defer` so a panic
+   inside bcrypt cannot leak it.
+
+`TestChaos57_AdmissionDecisionIsUsernameIndependent` is written to fail against
+the asymmetric shape, and was verified doing so.
+
+### 29.4b The second finding inside the fix — an authentication BYPASS
+
+Raised against this change during self-review, before it left the branch, and
+it is the more serious of the two.
+
+Moving the cache lookup ahead of the username comparison (§25.4 step 1) is
+necessary — without it a client riding a warm cache would consume a
+verification slot, and the governor would throttle work it is not doing. But
+the pre-existing key derivation hashed `user + ":" + pass`, which is **not
+injective** once either field can contain the separator:
+
+```
+("admin",   "a:b")  ->  "admin:a:b"
+("admin:a", "b")    ->  "admin:a:b"     <- same key, different credential
+```
+
+That was **latent and unreachable** while the cache was consulted only *after*
+the presented username had been confirmed equal to the configured one: every
+reachable key then shared the same `user + ":"` prefix, so distinct passwords
+gave distinct keys. Moving the lookup earlier makes the ambiguity reachable
+with a **caller-chosen username**, and it is then an authentication bypass —
+with a colon anywhere in the configured password, an attacker presents a
+re-split of the same concatenation, hits the cached POSITIVE, and is
+authenticated with a caller-controlled subject:
+
+```
+configured:  user="admin"    pass="a:b"
+presented:   user="admin:a"  pass="b"     -> cache hit, ok=true, Sub="admin:a"
+```
+
+Reproduced end to end against the branch before it was fixed. Passwords
+containing a colon are entirely ordinary, so this needed no unusual
+configuration.
+
+`cacheKey` now **length-frames** each field, making the encoding injective, so
+no two distinct `(user, pass)` pairs can share a key regardless of separator
+placement. The derivation is process-local (the HMAC key is random per start)
+and the cache is memory-only, so changing the encoding invalidates nothing that
+outlives a restart. Pinned by `TestChaos57_CacheKeyIsInjective` (unit) and
+`TestChaos57_ReSplitCredentialCannotAuthenticate` (end to end); both were
+verified failing against the concatenation-based key.
+
+**The lesson is about the shape of the change, not the bug.** Reordering two
+steps changed the *reachable input domain* of a hash that was only ever safe
+because of the ordering — and nothing in the original code recorded that
+dependency, because at the time it was not a dependency but a coincidence. A
+reordering is not a refactor when a downstream invariant is holding the old
+order up.
+
+### 29.4c The third finding inside the fix — the governor denying service itself
+
+Found by CI, not by the local suite, and it is the most instructive of the
+three because the fix was behaving exactly as designed and the design was
+wrong.
+
+The per-client rule originally REFUSED a client already at its cap, immediately.
+That reads as obviously correct — "one source, one slot" — until you ask what a
+single ordinary client actually does. A browser opens six to eight parallel
+connections. When their cached verification results expire together, all of them
+present the same credential at the same moment, and all but one were **denied**:
+
+```
+6 concurrent VALID authentications from one workstation
+  -> 1 admitted, 5 refused (reason: per_client)
+```
+
+Measured on the real authentication path. No attacker, no flood, no load —
+just a workstation behaving normally. **A control built to stop an attacker
+denying service was denying it unprompted**, which is precisely the failure the
+CONTROL gates in this file exist to catch; they missed it because they only
+exercised the *cached* path, where the governor is never consulted.
+
+It surfaced as a `Deep · determinism` failure on CI and not locally, and that
+difference is the tell: whether a client's parallel requests overlap enough to
+collide depends on machine load, so the same code passed a quiet box twice
+(non-race and race) and failed a loaded runner.
+
+**The fix is that a client at its cap WAITS for its own earlier verification
+rather than being refused.** Fairness is untouched — the cap still bounds how
+many slots one source holds *at any instant*, which is the whole property — and
+only the excess changes: serialised behind its predecessor (~80 ms each)
+instead of rejected. Parked waiters are counted against the SAME bounded
+waiter budget as the global queue, so the goroutine bound this engine insists
+on is unchanged; and the wait is bounded, so a burst deeper than roughly
+`maxWait / verification cost` (about a dozen from one client) still ends in a
+refusal, which is stated in the runbook rather than implied away.
+
+The wakeup is a close-and-replace generation channel read under the same mutex
+that releases the reservation, so a release can never be missed by a caller
+about to park.
+
+Gates: `TestClientAtItsCapWaitsRatherThanBeingRefused` and
+`TestWaitingDoesNotWidenThePerClientCap` (engine, the pair — one proves waiting
+happens, the other proves the cap still binds while a caller waits), plus
+`TestChaos57_OneWorkstationsParallelRequestsAreNotDenied` end to end through the
+real authentication path. The end-to-end gate uses a long wait budget
+deliberately: the property is "none of them is refused", and tying it to how
+long bcrypt happens to take on a given build would make it fail under `-race`
+for a reason unrelated to the property.
+
+**The lesson:** "one source, one slot" is a correct fairness rule and an
+incorrect *admission* rule. Fairness is about what a client may HOLD; admission
+is about what happens to the rest. Conflating them turned a bound into a denial.
+
+### 29.4d The fourth finding inside the fix — the alert that could never fire
+
+Raised by Codex review against the observability plane, as a P1, and correct.
+
+The refusal episode was cleared by any FAST-PATH admission. The reasoning
+behind that was sound as far as it went — a queued admission proves nothing, a
+fast one proves a slot was free — but it stops one step short: **a slot being
+free at an instant is not evidence that refusals have stopped**, and during a
+sustained flood the two coexist by construction. Every in-flight bcrypt
+eventually releases its slot, so some arrival wins the fast path roughly once
+per comparison while its siblings continue to be refused.
+
+The consequence is that the whole observability plane failed at its one job:
+
+- the episode restarted every ~80 ms and so could **never** reach
+  `authCostDegradedAfter`,
+- the `credential_verification` contract row flapped between "refusing" and
+  "recovered",
+- an `AUTH_VERIFY_RECOVERED` line was emitted per comparison — a log flood
+  produced by the flood-detection code,
+- and `auth_verify_saturated` **would never have fired for the primary attack
+  this governor exists to expose.**
+
+Recovery now requires BOTH halves of the evidence: a fast-path admission AND no
+refusal for `authCostRecoveryQuiet` (5 s — comfortably longer than the 1 s wait
+budget, so a client timing out once a second keeps the episode alive, and far
+short of the 30 s degradation threshold, so a real recovery is still reported
+promptly).
+
+This is not a retreat to "recovery on elapsed time", the rule `ca_health.go` and
+`storage_health.go` exist to enforce. Elapsed time alone still clears nothing —
+an admission is still required, so a gateway nobody is authenticating against
+stays reported as refusing rather than being declared healthy by silence. The
+window supplies the half of the evidence that was missing, it does not replace
+the half that was there.
+
+Gates: `TestChaos57_RefusalEpisodeSurvivesInterleavedFastAdmissions` (drives the
+exact refuse/admit interleaving a flood produces, and then checks the episode
+can still age into Degraded — the state the alert keys on) and the extended
+`TestChaos57_RecoveryRequiresObservedCapacity`. Both verified failing against
+the pre-fix shape.
+
+**The lesson, and it is the same one as §25.4c in a different costume:** the
+evidence has to match the claim. "A slot was free" and "refusals have stopped"
+are different propositions, and the recovery signal was keyed on the one that
+was easy to observe rather than the one it was asserting.
+
+### 29.5 What shipped
+
+**`internal/authcost`** — the admission governor. Two bounds and one fairness
+rule, all fail-closed:
+
+- **A global ceiling** of `GOMAXPROCS/2` (floored at 1) concurrent
+  verifications. Half, not all: the gateway's real work has to keep running
+  while somebody authenticates, and a ceiling equal to GOMAXPROCS bounds the
+  fault without preventing the outage. This is the bound that holds against a
+  **distributed** flood, where no per-client rule can help.
+- **A per-client ceiling of 1.** Without it the global ceiling contains the CPU
+  but not the outage: one source occupies every slot and denies everyone else.
+  A legitimate workstation authenticates serially and never notices.
+- **A bounded wait (1 s) with a bounded queue (8 × the ceiling).** A legitimate
+  synchronised burst is absorbed rather than refused, because graceful
+  degradation is the house preference — but the queue is capped, because an
+  unbounded one converts a CPU-exhaustion vector into a goroutine-and-memory
+  one. **Trading one exhaustion for another is not a fix**, so both are bounded
+  explicitly.
+
+The bounds are **constants**, deliberately: the only use for a knob here would
+be to widen a denial-of-service window. Headroom is large and checkable —
+successful results are cached for 5 minutes, so the sustained uncached rate is
+`active users / 300 s` (~1.7/s for 500 users) against a ceiling of ~25/s on
+four cores. The governor bites under attack, not under load.
+
+**Fair cache eviction.** `internal/authstate`'s policy ported verbatim in
+spirit: entries are attributed to a client key and eviction always takes the
+**oldest entry of the client holding the most** (ties broken by oldest entry,
+then by client key, so the victim never depends on map order). A flooding
+source evicts *itself* until it is no longer the largest holder; a client
+holding one entry is untouchable until every other client is down to one too.
+The bucket index also removes the O(cache) scan. The compaction condition is on
+`len(keys)`, not on the un-consumed window — the same trap `internal/authstate`
+documents, where a window-based test never fires under a sustained flood and
+the backing array grows with total request count.
+
+**Observability**, in the existing vocabulary: eight
+`culvert_auth_verify_*` / `culvert_auth_cache_evictions_total` series, a
+`credential_verification` operator-contract row (counts and bounds only — the
+client key is admin-scoped), a rate-limited `AUTH_VERIFY_REFUSED` /
+`AUTH_VERIFY_RECOVERED` log pair, and a fire-once-per-episode
+`auth_verify_saturated` alert. Recovery clears on **observed evidence** — a
+fast-path admission, meaning capacity genuinely exists — never on elapsed time
+and never on a merely-queued admission: a flood that stops *sending* looks
+identical to capacity returning.
+
+This matters more than usual because a refusal denies a request whose
+credential was never checked. Silent, its symptom would be *"users
+intermittently get 407"* against a healthy directory and a healthy proxy, with
+nothing anywhere saying why.
+
+### 29.6 Gates
+
+34 in total: 15 in `internal/authcost/authcost_test.go`, 19 in
+`auth_cost_chaos_test.go`. **Eleven defect gates were verified failing against
+the shape each replaces** — including the asymmetric-gate variant of §25.4,
+both halves of the §25.4b bypass, and the immediate-refusal shape of §25.4c
+(the engine's own first form, which the parallel-connection gate was
+reproduced against before it was changed) and both halves of the §25.4d
+recovery defect.
+
+The controls are load-bearing, because several defect gates would also pass
+against a "fix" that simply broke authentication:
+
+- `TestChaos57_CachedVerificationsDoNotConsumeTheGovernor` — a warm cache must
+  not be throttled, or the fix is a self-inflicted outage.
+- `TestChaos57_UnderBudgetBothBranchesStillEqualise` — under budget both
+  branches must *still* run a comparison. A "fix" that skipped bcrypt on the
+  wrong-username branch to save CPU would pass the oracle gate while
+  reintroducing the oracle in the opposite direction.
+- `TestChaos57_CacheStaysBounded` — a policy that never evicted would pass the
+  displacement gate while turning the cache into an unbounded map.
+- `TestChaos57_ExternalProvidersBypassTheGovernor` — LDAP/OIDC run no bcrypt;
+  charging them a slot would bound the wrong resource and let a slow directory
+  starve local authentication.
+- `TestChaos57_VerdictsAreUnchanged` — the governor changes no verdict.
+
+### 29.7 What is deliberately left
+
+- **AU-3e — a pre-existing username-enumeration oracle, reported not fixed.** A
+  negative result for the *correct* username is cached; one for a wrong
+  username is not. Repeating the same wrong pair twice is therefore ~1.5 µs for
+  a valid username and ~80 ms for an invalid one — the RISK-008 oracle reached
+  by repetition rather than by a single request. Closing it means caching
+  wrong-username negatives, which is a behaviour change to a security control
+  and deserves its own review rather than riding along in an availability fix.
+  CHAOS-57 verifies only that it does not *widen* it.
+- **The admin UI login path is untouched.** `VerifyUIUser` also runs bcrypt (two
+  comparisons, in fact) but is bounded by the brute-force lockout
+  (`loginLimiter`), which the proxy path never had.
+- **Per-client parked waiters share one budget** (§25.4c). Callers waiting on
+  their own client budget are counted against the same bounded waiter pool as
+  the global queue, and are not additionally capped per client — so one source
+  with many concurrent requests can occupy that pool and leave others unable to
+  QUEUE for a slot. It costs them no capacity (the fast path still admits
+  whenever a slot is genuinely free, and the flooding source still holds at
+  most its cap), so the fairness claim holds: a flood can take the queue, not
+  the slots. It is also strictly better than the shape it replaced, where those
+  requests were refused outright. Capping parked waiters per client would close
+  it; not done, because it adds a second bound to ration a wait that is already
+  bounded twice.
+- **The front-door limiters still ship disabled** (PX-6 remains open). The
+  governor bounds the *cost* of the flood; it does not stop the flood arriving.
+  The runbook says so explicitly and points at the three limiters.
+- **No configuration surface**, and therefore no GUI-parity obligation — the
+  bounds are constants derived from `GOMAXPROCS`. This is the recorded
+  deferral class of `jwksStaleMaxAge` and the M1-3 release thresholds: a knob
+  whose only use is widening a trust or availability window is not a feature.
+
+### 29.7b The cost that is actually paid: restart and mass reconnect
+
+The verification cache is memory-only, so a restart empties it and every active
+client's next request is an uncached verification arriving at once — the "mass
+reconnect storm" scenario. This is the one case where the governor legitimately
+refuses valid credentials, and it is worth stating plainly rather than
+discovering.
+
+The queue absorbs the first arrivals; the rest get a `407` and retry.
+Authentication drains at the ceiling rate (~25/s on four cores), so a
+1,000-client fleet re-authenticates over roughly 40–80 seconds with some clients
+seeing a retried 407.
+
+**That is strictly better than the behaviour it replaces**, and the comparison
+is the justification for the whole posture: pre-fix, the same 1,000 clients put
+1,000 goroutines into bcrypt simultaneously — ~40 seconds during which every
+core was consumed and **the proxy served nobody**, including clients that were
+already authenticated and only wanted to browse. The governor trades *slower
+authentication for some* against *the data plane keeps working for everyone*.
+
+The residual is real and recorded: a non-browser client that does not retry a
+`407` will see a hard failure during that window. The runbook names the three
+remedies (stagger restarts, move authentication to an IdP — which this control
+does not govern at all — or add cores) and, more importantly, says that a
+DECAYING post-restart spike is not an incident while a sustained one is.
+
+### 29.8 The process lesson
+
+AU-3 sat open at **Medium** for the whole review series because its register
+row described the attack that needs a valid username. The variant that needs
+nothing at all was one branch away in the same function, and it is Critical.
+The row was not wrong about what it described; it was wrong about being the
+worst case.
+
+The general shape — *an expensive operation reachable before authentication
+completes* — is worth sweeping for directly rather than finding one instance at
+a time. bcrypt is the obvious one because its cost is deliberate and
+documented. The same question should be asked of every cryptographic
+verification on an unauthenticated path.
+
+See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, `internal/authcost` (package comment),
+`auth_cost_health.go`, and `docs/operator/credential-verification-cost.md`.
