@@ -1195,6 +1195,41 @@ culvert_socks5_accept_backoff_seconds %g
 		)
 	}
 
+	// CHAOS-61: cluster rate-limit broadcast freshness. Emitted ONLY on a node
+	// where cluster-wide rate limiting is armed — `remote_stale 0` on a
+	// standalone proxy that never had a Control Plane is indistinguishable from
+	// a healthy clustered node, and the paging rule is `== 1` (the
+	// socks5_listener / cluster_ca gauge precedent).
+	//
+	// `remote_stale 1` means this node has stopped adding other nodes' request
+	// counts to its own: local rate limits are still enforced, the cluster-wide
+	// aggregate is not. It is a correctness gate, not an error — it is what
+	// stops a frozen broadcast from denying a client forever — but it is a
+	// degradation of the distributed limit and should be visible for as long as
+	// it lasts.
+	if crl := clusterRateLimitFreshness(); crl.Armed {
+		stale := 0
+		if crl.Stale {
+			stale = 1
+		}
+		_, _ = fmt.Fprintf(w, `# HELP culvert_cluster_ratelimit_remote_stale 1 while the Control Plane rate-limit broadcast is older than the rate-limit window, so other nodes' counts are no longer applied on this node
+# TYPE culvert_cluster_ratelimit_remote_stale gauge
+culvert_cluster_ratelimit_remote_stale %d
+
+# HELP culvert_cluster_ratelimit_broadcast_age_seconds Age of the last applied Control Plane rate-limit broadcast; -1 when none has ever been applied
+# TYPE culvert_cluster_ratelimit_broadcast_age_seconds gauge
+culvert_cluster_ratelimit_broadcast_age_seconds %g
+
+# HELP culvert_cluster_ratelimit_stale_episodes_total Times the cluster rate-limit broadcast went stale since startup (one long outage counts once)
+# TYPE culvert_cluster_ratelimit_stale_episodes_total counter
+culvert_cluster_ratelimit_stale_episodes_total %d
+`,
+			stale,
+			clusterRateLimitBroadcastAgeMetric(crl),
+			crl.Episodes,
+		)
+	}
+
 	// RISK-027: MCP Agent Security Gateway capability health. Emitted ONLY on a
 	// node that requested MCP — `culvert_mcp_gateway_up 0` on a node that never had
 	// MCP is indistinguishable from a dead listener, and the paging rule is `== 0`

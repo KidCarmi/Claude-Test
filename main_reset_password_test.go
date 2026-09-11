@@ -23,6 +23,27 @@ func listenUnix(t *testing.T, path string) net.Listener {
 	return ln
 }
 
+// restoreGlobalRosterPath saves and restores the PACKAGE-LEVEL `cfg` roster
+// path that runResetPasswordCommand mutates (main.go, `cfg.SetUIUsersFile`).
+//
+// In production that mutation is harmless: --reset-password is a one-shot
+// command and the process exits immediately after it. In a TEST binary the
+// same call leaks — the global is left pointing at this test's t.TempDir(),
+// which the cleanup then removes, and at a path this test deliberately made
+// unreadable (a unix socket). Every later test that persists the roster then
+// fails, which is what the shuffled determinism gate surfaces: the victim is
+// whichever test the shuffle happens to run next, not the one at fault.
+//
+// A test that mutates a package-level global must restore it; the alternative
+// is a failure whose reported location has nothing to do with its cause.
+func restoreGlobalRosterPath(t *testing.T) {
+	t.Helper()
+	cfg.mu.RLock()
+	prev := cfg.uiUsersFile
+	cfg.mu.RUnlock()
+	t.Cleanup(func() { cfg.SetUIUsersFile(prev) })
+}
+
 // TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten reproduces a
 // realistic deployment edge case for --reset-password (the documented admin
 // lockout recovery path, run e.g. via `docker compose --profile cli run
@@ -42,6 +63,7 @@ func listenUnix(t *testing.T, path string) net.Listener {
 // every other admin/operator/viewer account and TOTP enrollment with no
 // error, no quarantine copy, and no way back.
 func TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten(t *testing.T) {
+	restoreGlobalRosterPath(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ui_users.json")
 
@@ -121,6 +143,7 @@ func TestRunResetPasswordCommand_UnreadableRosterIsNotOverwritten(t *testing.T) 
 // roster once storage recovered. Only an affirmative os.IsNotExist result
 // may be trusted as "safe to create fresh".
 func TestRunResetPasswordCommand_LstatItselfFailingIsNotProofOfAbsence(t *testing.T) {
+	restoreGlobalRosterPath(t)
 	dir := t.TempDir()
 	// A regular file standing where a directory component is expected turns
 	// any Lstat/ReadFile under it into ENOTDIR — never ENOENT — regardless
