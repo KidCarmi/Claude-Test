@@ -252,6 +252,37 @@ enforcement owns its own populator; and six `culvert_geo_*` series, of which
 `culvert_geo_policy_unresolved_total` is the first signal an operator has ever
 had that a geo rule is evaluating against an unknown country. The first-request
 window is unchanged and recorded as an owner decision (WK-3c). See §28.
+**2026-09-09 — CHAOS-57 sweep (the admin UI listener, and which plane may kill which).**
+Every earlier sweep asked whether a subsystem survives its own failure. This one asked what
+a failing subsystem takes with it, and found the *least* critical listener in the process
+holding a lever over the *most* critical one. `startUI` spawned a detached listen goroutine
+whose ONLY error branch was `logFatalf` — `os.Exit(1)` — so **every way the ADMIN UI's
+listener could fail terminated the PROXY DATA PLANE with it**, asynchronously, against a
+process that had already announced itself as serving. Two triggers, both reproduced against
+the real binary and both routine operations: an occupied admin port (`validatePortCollisions`
+checks only Culvert's own three ports against each other, never the host) and an unreadable
+custom UI certificate (the pair is read at listen time, so any rotation that momentarily
+breaks it was a boot that ended in exit 1). Under `restart: unless-stopped` each becomes an
+unattended crash loop — no proxy, no admin UI, no health endpoint — which is exactly the
+outcome §19 closed for the category store, reached from the opposite direction. The defence
+that "exiting fails closed" does not survive contact: **process death picks no posture at
+all**, it delegates the choice to the topology — an explicit-proxy fleet loses all egress, a
+PAC fleet with a DIRECT fallback goes UNFILTERED. The codebase already knew the answer in two
+places, one of them inside the same function (a `selfSignedTLS()` failure degrades to HTTP
+rather than exiting; CHAOS-54 gave the SOCKS5 listener a gentler death than the admin UI had).
+Shipped: no listen path is fatal; an explicit bind so recovery can be declared on OBSERVED
+evidence; a rate-bounded, jittered, interruptible rebind loop; the certificate re-read on
+every attempt (so a rotation self-heals with no restart); the success log moved to AFTER the
+bind (it used to claim a listener that did not exist); and a full observability plane on the
+PROXY port — because the admin port's own `/healthz` cannot report that the admin port is
+unreachable. The `/ready` row is REPORT-ONLY by design and pinned as a control: failing it
+would eject a healthy gateway from the load balancer over its management plane. 15 gates; the
+defect gates were verified failing against the reintroduced pre-fix shape, where `logFatalf`
+kills the TEST BINARY mid-run and takes the package with it — so the defect cannot be
+reintroduced and kept green. **SOCKS5-BIND** (an occupied SOCKS5 port still takes down HTTP
+proxying) is recorded, not fixed: it is the same class one plane over, but a posture decision
+rather than a mechanical extension. See rows AP-1…AP-4/SOCKS5-BIND, §25, and
+`docs/operator/admin-ui-listener-recovery.md`.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -4048,3 +4079,202 @@ outlives the test body that armed it, and `defer restore()` runs **before** any
 still reading it. Production never reassigns those vars, so this is harness-only,
 but `stubResolver` now waits for in-flight warms before restoring: a seam must
 outlive its users.
+## 29. CHAOS-57 — The admin UI listener, and which plane is allowed to kill which
+
+**Date:** 2026-09-09 · **Domain:** admin/control plane ↔ proxy data plane coupling ·
+**Status:** shipped · **Gates:** `admin_ui_listener_chaos_test.go` (15)
+**Id allocated at the START of the sweep**, per the governance note in §0.
+
+### 29.1 Why this domain
+
+Every sweep in this register so far has asked *does this subsystem survive its
+own failure?* This one asks a different question: **when a subsystem fails, what
+else does it take with it?**
+
+Culvert runs several listeners in one process — the proxy port, the admin UI,
+SOCKS5, the control-plane gRPC server, optionally the MCP gateway. They are
+separate planes with different jobs and wildly different criticality, and they
+share one address space and one exit status. That sharing is not itself a
+defect; every appliance does it. The defect is when the *least* critical plane
+holds a lever over the *most* critical one.
+
+It does. The admin UI held the biggest lever there is.
+
+### 29.2 The finding
+
+`startUI` (ui.go) spawned a detached listen goroutine whose ONLY error branch
+was `logFatalf` — which `os.Exit(1)`s the process:
+
+```go
+go func() {
+    if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+        logFatalf("UI server error: %v", err)   // ← kills the whole appliance
+    }
+}()
+```
+
+Three of those, one per TLS mode. So **every way the admin UI's listener could
+fail terminated the proxy data plane with it.**
+
+This inverts the dependency the product is built on. The admin UI is the plane
+you manage enforcement *from*; it may degrade without the enforcement plane
+going with it, never the reverse. And `startUI` is called from the init block
+BEFORE the proxy listener starts and returns as soon as the goroutine is
+spawned, so the failure lands asynchronously against a process that is already
+announcing itself as up.
+
+**Both triggers were reproduced against the real binary.**
+
+*Trigger 1 — the admin port is occupied.* A predecessor container still
+draining, a host-network service on 9090, an operator collision.
+`validatePortCollisions` (main.go) checks only Culvert's own three ports against
+EACH OTHER; nothing on the host is visible to it. Observed log, verbatim, in
+this order:
+
+```
+UIHTTP: http://localhost:19090          ← claims the UI is listening
+Proxy:  http://localhost:18080          ← the data plane announces itself
+UI server error: listen tcp :19090: bind: address already in use   → exit 1
+```
+
+Note the first line. The success message was printed *before* the bind was
+attempted, so the process log actively claimed the admin UI was listening on a
+port it never acquired — and then the appliance died over it.
+
+*Trigger 2 — the custom UI certificate cannot be loaded.*
+`ListenAndServeTLS` reads `-tls-cert`/`-tls-key` at call time, so a rotation
+that briefly truncates, replaces or re-permissions those files (certbot,
+cert-manager, a Docker secret whose mount is not ready yet) is a boot that ends
+in `UI TLS error: tls: failed to find any PEM data in certificate input` and
+exit 1.
+
+Both are ROUTINE operational events, and under `restart: unless-stopped`
+(docker-compose.yml) each becomes an unattended crash loop: no proxy, no admin
+UI, no health endpoint, recoverable only with shell access. That is precisely
+the outcome §19 closed for the category store, arrived at from the opposite
+direction — §19 reached it from a damaged data file, this sweep from a busy TCP
+port.
+
+### 29.3 Why "it exits, so it fails closed" is wrong
+
+The obvious defence of the old behaviour is that exiting is the safe direction.
+It is not, and this is the part worth recording.
+
+**Process death picks no posture at all — it delegates the choice to the network
+topology.** An explicit-proxy fleet loses all egress: a total business outage
+from an admin-plane fault. A PAC/WPAD fleet with a `DIRECT` fallback, or a
+transparent deployment that bypasses a dead next hop, sends traffic straight out
+**unfiltered** — a fail-OPEN security outcome reached by a mechanism that looks
+like fail-closed. Whichever one a given customer gets is a property of their
+network, not of any decision Culvert made.
+
+The counter-argument that *does* have force is DX: a hard failure on first boot
+is honest about a misconfiguration, whereas a silently-degraded appliance could
+ship to production unmanageable. That argument is answered by making the
+degradation impossible to miss (§25.5) rather than by keeping the exit — because
+the exit's cost is paid by every *later* boot too, when the appliance is carrying
+production traffic and the fault is transient.
+
+### 29.4 The codebase already knew
+
+Two precedents, one of them inside the very function that carries the defect:
+
+- **In `startUI` itself**, a `selfSignedTLS()` failure does NOT exit. It degrades
+  to plain HTTP and records `uiTLSFallbackActive` for the operator. One of the
+  four failure modes in this function was already handled correctly.
+- **CHAOS-54 (§22)** made exactly this call for a listener: a SOCKS5 accept loop
+  that hits an unrecoverable socket error closes the listener, records DOWN, and
+  the process keeps serving. The *least* critical listener in the process already
+  had the *gentlest* failure posture, while the admin UI had the most violent one.
+
+So the fix borrows wholesale rather than inventing a second dialect.
+
+### 29.5 What shipped
+
+`serveAdminUIWithRetry` / `adminUIServeOnce` (ui.go) + `admin_ui_health.go`.
+
+1. **No listen path is fatal.** The bind is performed EXPLICITLY (`net.Listen`)
+   rather than through `ListenAndServe`, so the loop can distinguish a successful
+   bind from a serve that ended — which is what makes evidence-based recovery
+   implementable here at all.
+2. **Rate-bounded, never count-bounded retry** (1 s → 30 s ceiling, ±20 % jitter,
+   interruptible). Unbounded attempts are deliberate, on CHAOS-55's reasoning:
+   the terminal state of "give up" is an appliance nobody can manage, which is
+   the outcome being removed. "Avoid infinite retries" is satisfied the way §22
+   and §23 satisfy it — the retry is never SILENT.
+3. **The certificate is re-read on every attempt**, so a rotation that
+   momentarily breaks the pair self-heals with no restart.
+4. **The success log moved after the bind.** The pre-change line claimed a
+   listener that did not exist.
+5. **Recovery on OBSERVED evidence only** — a listener that actually bound.
+   Elapsed time never clears the state; a retry loop that has stopped failing
+   because it stopped attempting looks identical to a bound one.
+6. **Full observability, on the PROXY port** — `/health admin_ui`, a
+   report-only `/ready admin_ui` row, five `culvert_admin_ui_*` series, the
+   `admin_ui_listener` contract row, and a fire-once `admin_ui_unavailable`
+   alert whose text states that traffic is unaffected. The surface choice is the
+   point: **the admin port's own `/healthz` cannot report that the admin port is
+   unreachable** — a probe that dies with the plane it measures reports nothing.
+7. **The readiness row is REPORT-ONLY and that is load-bearing.** A node whose
+   admin UI cannot bind is proxying perfectly; gating the default verdict would
+   eject a healthy gateway from the load balancer over its management plane —
+   converting a management outage into the traffic outage the change exists to
+   prevent. Pinned as a control test.
+8. **The pair is validated BEFORE the listener is bound.**
+   `http.Server.ServeTLS` returns a certificate error WITHOUT closing the
+   listener it was handed, so a bind-first loop would leak one socket per attempt
+   against a persistently bad certificate — turning a recoverable config fault
+   into the descriptor exhaustion §22 spent its whole sweep on. Pinned by a
+   50-attempt FD-count gate.
+
+Verified end to end against the real binary: with the port held, the appliance
+stays up, `/health` reports `admin_ui: degraded`, and the proxy answers 200
+throughout; when the port frees at T+13 s the listener rebinds on its own and
+`/health` reports `admin_ui: ready` at T+22 s with a recovery line naming the 3
+suppressed log lines — no restart.
+
+### 29.6 Deliberately not done
+
+- **The other fatal listeners are NOT changed.** `runProxyUntilShutdown`'s
+  `logFatalf("Proxy error")` is CORRECT: the proxy *is* the product, and a
+  gateway that cannot serve should exit loudly rather than linger as a black
+  hole. `startSOCKS5`'s bind failure stays fatal too, and that one is a genuine
+  open question rather than a settled answer — see SOCKS5-BIND below.
+- **No admin-UI-down entry in the audit ring.** The admin plane being down is a
+  systems event, not an admin action, and the audit ring is 500 entries shared
+  with security events (the §13 anti-forensics rule).
+- **No `culvert_admin_ui_never_bound` series.** `_up` plus `_binds_total == 0`
+  already distinguishes "never came up" from "fell over", and the contract row
+  states it in words.
+
+### 29.7 Register rows
+
+| Row | Finding | Status |
+|---|---|---|
+| **AP-1** | Admin UI listen/serve failure calls `logFatalf`, terminating the proxy data plane. Reachable by an occupied port or an unreadable custom certificate; a crash loop under `restart: unless-stopped`. | **CLOSED** (§25) |
+| **AP-2** | The admin UI success log line was emitted BEFORE the bind was attempted, so the process log claimed a listener that never existed. | **CLOSED** (§25) |
+| **AP-3** | No health/metrics/diagnostics surface reported the admin plane's reachability, and the only surface that carried admin-plane posture was on the admin port itself. | **CLOSED** (§25) |
+| **AP-4** | The custom UI certificate was read exactly once, at boot, so a rotation that momentarily broke the pair required a restart. | **CLOSED** (§25) |
+| **SOCKS5-BIND** | `startSOCKS5` bind failure is still fatal, so an occupied SOCKS5 port takes down HTTP/HTTPS proxying too. Same class as AP-1, one plane over. Not fixed here: §22 deliberately settled the RUNTIME posture for this listener and left the BOOT posture alone, and changing it is a posture decision (is a SOCKS5 port that cannot bind a misconfiguration to refuse, or a subsystem to degrade?) rather than a mechanical extension. | **OPEN** (Medium) |
+| **R-F** | Three data-file boot loads still `logFatalf` on any error: `catStore.Load` (Layer-1 URL categories), `blocklist_startup.go`, and the policy-file load in `main.go`. Scoped by §19 and unchanged by this sweep — the question there is about authoritative *state*, not about plane coupling. | **OPEN** (carried from §19) |
+
+### 29.8 The lesson this sweep adds
+
+§21 stated its rule for back ends, §22 for listeners, §23 for decisions, §24 for
+documented residuals. This one is about **blast radius**:
+
+> A process that hosts several planes has, by construction, given every one of
+> them the ability to end all the others. Which planes are *allowed* to exercise
+> that is a design decision — and it is almost never made explicitly, because
+> the mechanism (`os.Exit` on a startup error) is idiomatic, local, and looks
+> obviously correct at the call site. The question "what else dies when this
+> line runs?" has no local answer, so it does not get asked. Here the answer was
+> "the entire reason the product exists", written in a goroutine three lines
+> long, about a port number.
+
+And a second, sharper one about the shape of the argument: *exiting is not a
+posture.* Fail-closed and fail-open are properties of what the system does to
+traffic, and a process that is gone does not act on traffic at all — the
+surrounding network does, differently for each customer. Any component that
+reaches for `os.Exit` as a safety measure should be made to say which of the two
+outcomes it is choosing, in terms of packets, for a named deployment topology.

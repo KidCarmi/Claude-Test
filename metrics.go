@@ -1195,6 +1195,56 @@ culvert_socks5_accept_backoff_seconds %g
 		)
 	}
 
+	// CHAOS-57: admin UI listener health. Emitted only when an admin UI was
+	// configured, for the reason the socks5 block states: `up 0` on a node that
+	// never had the listener is indistinguishable from a dead one and the
+	// documented paging rule is `== 0`.
+	//
+	// `up` is 0 whenever the listener is not currently accepting — including
+	// while it is retrying — because unlike SOCKS5 there is no terminal "down"
+	// state here: the loop rebinds for as long as the process lives. The
+	// alertable pair is `culvert_admin_ui_unavailable 1`, which is latched only
+	// after the fault has persisted past the threshold and so does not fire on
+	// the few seconds of rebinding that follow an ordinary redeploy.
+	//
+	// This series is emitted by the PROXY port's /metrics, which is what makes
+	// it reachable at all while the admin plane is down.
+	if au := adminUIListenerState(); au.Configured {
+		up, unavailable := 0, 0
+		if au.Serving {
+			up = 1
+		}
+		if au.Unavailable {
+			unavailable = 1
+		}
+		_, _ = fmt.Fprintf(w, `# HELP culvert_admin_ui_up 1 while the admin UI listener is accepting connections; 0 while it is not
+# TYPE culvert_admin_ui_up gauge
+culvert_admin_ui_up %d
+
+# HELP culvert_admin_ui_unavailable 1 while the admin UI has been unable to bind for longer than the unavailability threshold
+# TYPE culvert_admin_ui_unavailable gauge
+culvert_admin_ui_unavailable %d
+
+# HELP culvert_admin_ui_listen_failures_total Admin UI bind/serve failures since startup
+# TYPE culvert_admin_ui_listen_failures_total counter
+culvert_admin_ui_listen_failures_total %d
+
+# HELP culvert_admin_ui_binds_total Successful admin UI listener binds since startup
+# TYPE culvert_admin_ui_binds_total counter
+culvert_admin_ui_binds_total %d
+
+# HELP culvert_admin_ui_listen_backoff_seconds Current admin UI rebind backoff; 0 while the listener is serving
+# TYPE culvert_admin_ui_listen_backoff_seconds gauge
+culvert_admin_ui_listen_backoff_seconds %g
+`,
+			up,
+			unavailable,
+			au.Total,
+			au.Binds,
+			au.Backoff.Seconds(),
+		)
+	}
+
 	// RISK-027: MCP Agent Security Gateway capability health. Emitted ONLY on a
 	// node that requested MCP — `culvert_mcp_gateway_up 0` on a node that never had
 	// MCP is indistinguishable from a dead listener, and the paging rule is `== 0`
