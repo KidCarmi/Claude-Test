@@ -385,7 +385,7 @@ components:
         draft: { type: boolean }
     AuthPolicyList:
       type: object
-      required: [rules, count, defaultAction, note, version, updatedAt]
+      required: [rules, count, defaultAction, note, version, updatedAt, killSwitch]
       additionalProperties: false
       properties:
         rules: { type: array, items: { type: object, additionalProperties: true } }
@@ -397,6 +397,15 @@ components:
           format: int64
           description: RUNNING PolicyStore generation (never a draft candidate's) — echo via ?ifVersion= on mutations for atomic optimistic concurrency (2C.0a).
         updatedAt: { type: string, description: RFC3339 timestamp of the last running-rulebase mutation. }
+        killSwitch: { $ref: '#/components/schemas/AuthExemptKillSwitchStatus' }
+    AuthExemptKillSwitchStatus:
+      type: object
+      required: [envDisabled, runtimeDisabled, engaged]
+      additionalProperties: false
+      properties:
+        envDisabled: { type: boolean }
+        runtimeDisabled: { type: boolean }
+        engaged: { type: boolean }
     DefaultActionStatus:
       type: object
       required: [defaultAction]
@@ -10249,6 +10258,70 @@ paths:
         '403': { $ref: '#/components/responses/PlainForbidden' }
         '409': { description: 'Version fence conflict ({error, currentVersion, yourVersion}); or — WITHOUT an ifVersion assertion — a request that conflicts with the CURRENT rulebase (name/priority already in use, a priority that now belongs to the other rule type, an order list that no longer covers the set), decided inside the coordinator fence: {error, currentVersion} — refresh and reapply, the mutation did not run.' }
         '500': { description: 'Durable persist failed — the reorder was rolled back.' }
+  /api/authpolicy/killswitch:
+    get:
+      operationId: getAuthPolicyKillSwitch
+      tags: [policy]
+      summary: Get Auth Exempt kill-switch status
+      description: >-
+        Reports the Auth Exempt break-glass kill switch: the read-once
+        CULVERT_AUTHBYPASS_DISABLE env layer, the admin-settable runtime
+        toggle, and the combined verdict the Stage-1 gate consults.
+      security:
+        - sessionCookie: []
+        - basicAuth: []
+      x-culvert-visibility: admin-supported
+      x-culvert-permission: viewer
+      x-culvert-tenant-scope: appliance
+      x-culvert-stability: stable
+      x-culvert-idempotency: safe
+      x-culvert-introduced-version: 1.0.0
+      responses:
+        '200':
+          description: Get Auth Exempt kill-switch status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthExemptKillSwitchStatus' }
+        '403': { $ref: '#/components/responses/PlainForbidden' }
+    put:
+      operationId: setAuthPolicyKillSwitch
+      tags: [policy]
+      summary: Engage or release the Auth Exempt kill switch
+      description: >-
+        Engages or releases ONLY the runtime toggle (no restart required); the
+        env layer is read-once and cannot be changed at runtime. Engaging the
+        switch fails every Auth Exempt rule (scoped and the global Open
+        default) closed to "authentication required" — it never affects
+        Stage-2 access decisions.
+      security:
+        - sessionCookie: []
+        - basicAuth: []
+      x-culvert-visibility: admin-supported
+      x-culvert-permission: admin
+      x-culvert-tenant-scope: appliance
+      x-culvert-stability: stable
+      x-culvert-idempotency: idempotent
+      x-culvert-introduced-version: 1.0.0
+      x-culvert-danger-level: high
+      x-culvert-audit-event: authpolicy.killswitch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disabled]
+              additionalProperties: false
+              properties:
+                disabled: { type: boolean }
+      responses:
+        '200':
+          description: Engage or release the Auth Exempt kill switch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthExemptKillSwitchStatus' }
+        '400': { $ref: '#/components/responses/PlainBadRequest' }
+        '403': { $ref: '#/components/responses/PlainForbidden' }
   /api/pac/analyze:
     post:
       operationId: analyzePAC
