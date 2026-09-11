@@ -252,20 +252,30 @@ enforcement owns its own populator; and six `culvert_geo_*` series, of which
 `culvert_geo_policy_unresolved_total` is the first signal an operator has ever
 had that a geo rule is evaluating against an unknown country. The first-request
 window is unchanged and recorded as an owner decision (WK-3c). See §28.
-**2026-09-05 — CHAOS-60 sweep (the public admin-login endpoint's untrusted username).**
-*(Numbered CHAOS-60/§28 on merge, at the THIRD attempt — the FIFTH and SIXTH occurrences of the
-collision the §27 note anatomises, both on this one PR, both within three hours. It took
-`CHAOS-58`/`§25`, collided with the directory-stall sweep and moved to `CHAOS-59`/`§27`, then
-collided with the intelligence-feed sweep and moved here. The second round is the one worth
-recording, because it happened AFTER a full renumbering pass that was itself the remedy for the
-first: nothing in the repository allocates the id, so a correct fix for a collision cannot stop
-the next one. It also reproduced the §27 note's sharpest observation — the automatic main-merge
-renumbered the SECTION heading and left the `CHAOS-` id colliding, so the merge resolver looks
-like it handled the conflict while leaving the identifier that people search by duplicated. The
-first round additionally collided on the REGISTER (both sweeps took `AU-14`), which is worse than
-a duplicate section: the id is the key. Same rule applied each time — the already-merged sweep
-keeps the id, this one moves. That makes the header's placeholder-row recommendation, which §27
-called overdue, the one open item this sweep did not close and could not have.)*
+**2026-09-05 — CHAOS-61 sweep (the public admin-login endpoint's untrusted username).**
+*(Numbered CHAOS-61/§29 on merge, at the FOURTH attempt. This sweep took `CHAOS-58`/`§25`, collided
+with the directory-stall sweep and moved to `CHAOS-59`/`§27`; collided with the intelligence-feed
+sweep and moved to `CHAOS-60`/`§28`; collided with the GeoIP sweep — which was itself renumbering
+for the third time in the same window — and moved here. Three renumberings on ONE PR, spanning
+~20 hours. Same rule each time, the one §27 records: the already-merged sweep keeps the id, the
+unmerged one moves.
+**What these rounds add to the §27 analysis is a boundary on the remedy, not more evidence of the
+fault.** Round two already showed a renumbering cannot prevent the next collision. Round three
+shows the stronger thing: BOTH sweeps in that collision were mid-renumbering, so the two remedies
+raced each other — the GeoIP sweep moved onto `CHAOS-60` while this one was moving onto the same
+id, and neither could have observed the other, because until a merge lands there is nothing to
+observe. Renumbering is a reconciliation, and two reconciliations against an unallocated namespace
+do not converge; they take turns. That is why the placeholder row §27 calls overdue is not an
+improvement to the current practice but a replacement for it: allocation has to happen BEFORE the
+work, in a committed artifact, or the only mechanism available is discovery-after-the-fact.
+Two secondary observations from these rounds. The automatic main-merge renumbers the SECTION
+heading and leaves the `CHAOS-` id colliding, so the resolver looks like it handled the conflict
+while the identifier people search by stays duplicated (§27 saw this too — it reproduces every
+time). And round one collided on the REGISTER as well (both sweeps took `AU-14`), which is the
+worse half: a duplicate section heading is visible on sight, a duplicate register row is not.
+The residual cost is unchanged and is not the edit — it is that `CHAOS-58`, `CHAOS-59` and
+`CHAOS-60` each name a different sweep in this PR's commit messages, review threads and
+notifications than they name in the merged tree.)*
 The
 first sweep in this register to ask what an *unauthenticated caller gets to write*, rather than
 what happens when infrastructure fails. `apiAuthLogin` is on the public allowlist and bounded
@@ -279,7 +289,7 @@ same class on the **proxy data path** — `sanitizeLog(r.Host)` bounds nothing a
 no `MaxHeaderBytes`, so one request with a 200 KB host writes 204,899 bytes to the process log and a
 204,812-byte `Host` field to the request log, on a port every client can reach. Recorded OPEN as
 **PX-21** rather than bundled: rejecting an over-long host is probably the right fix and is a
-data-plane behaviour change that needs its own review. See §28.
+data-plane behaviour change that needs its own review. See §29.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -763,8 +773,8 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | AU-11 | Multi-IdP registry: compile is isolated (all-or-nothing staging swap; bad profile dropped, not fatal). But the **request-time provider loop is sequential and unguarded** — one slow IdP adds latency to every request that reaches it. | ✓ compile / GAP request | M | `auth_idp.go:159-165,354-376` vs loop `proxy.go:209-220` |
 | AU-12 | All admin-configured IdP URLs dial through `ssrfSafeDialContext`; HTTPS+non-private pre-validated; response bodies `io.LimitReader`-capped. | ✓ | — | `auth_oidc_flow.go:64,300`, `auth_idp.go:556-565` |
 | AU-13 | Registry introspection also lacks **negative caching / circuit breaker** — a permanently-invalid token amplifies one IdP call per provider per request forever. | GAP | M | `auth_oidc_flow.go:623-636`; breaker exists unused `internal/upstream/upstream.go:89-96` |
-| AU-15 | **The public admin-login endpoint accepted an UNBOUNDED username and copied it verbatim into durable state.** `apiAuthLogin` is on `uiAuthMiddleware`'s public allowlist; nothing between the 1 MiB body cap and the handler limited `body.User`, and every failed attempt wrote it into the two lockout maps (retained ≥ `lockout.Window`), the 500-entry audit ring, and the **durable audit JSONL** — a 50 MB rotating file keeping exactly ONE archive. At the endpoint's own rate limit (60 mutating POSTs/min/IP) one unauthenticated client commits ~60 MiB/min of chosen bytes, rotating the entire 100 MB retained compliance record away in **under two minutes**, with no disk fault and every write SUCCEEDING (so `writeErrors`/`storage_write_failed` never fire). Measured by the gate: **4,195,672 bytes into the audit file from 8 requests.** | NEW → **CLOSED** (CHAOS-60: bounded at the handler; `lockout.MaxUsernameKeyLen` is the structural half; `culvert_login_oversize_rejected_total`) | **H** | was: `ui_auth.go` `apiAuthLogin`; `internal/audit/audit.go:213` (`NewRotatingFile(path, 50)`); see §25 |
-| AU-16 | **`internal/lockout` bounded its maps by ENTRY COUNT but not by KEY SIZE.** `Cleanup`'s own doc claims the maps are bounded "against an unbounded-memory DoS" — true on the count axis, and the janitor cannot sweep an entry before its `Window` elapses, so the SIZE axis was the whole exposure: one caller retained (rate × Window × username size) bytes in a leaf package whose stated contract is to be bounded. | NEW → **CLOSED** (CHAOS-60: `boundUsername` applied at every public entry point; consistency pinned so `Check` and `RecordFailure` cannot disagree on the key) | M/H | was: `internal/lockout/lockout.go`; see §25 |
+| AU-15 | **The public admin-login endpoint accepted an UNBOUNDED username and copied it verbatim into durable state.** `apiAuthLogin` is on `uiAuthMiddleware`'s public allowlist; nothing between the 1 MiB body cap and the handler limited `body.User`, and every failed attempt wrote it into the two lockout maps (retained ≥ `lockout.Window`), the 500-entry audit ring, and the **durable audit JSONL** — a 50 MB rotating file keeping exactly ONE archive. At the endpoint's own rate limit (60 mutating POSTs/min/IP) one unauthenticated client commits ~60 MiB/min of chosen bytes, rotating the entire 100 MB retained compliance record away in **under two minutes**, with no disk fault and every write SUCCEEDING (so `writeErrors`/`storage_write_failed` never fire). Measured by the gate: **4,195,672 bytes into the audit file from 8 requests.** | NEW → **CLOSED** (CHAOS-61: bounded at the handler; `lockout.MaxUsernameKeyLen` is the structural half; `culvert_login_oversize_rejected_total`) | **H** | was: `ui_auth.go` `apiAuthLogin`; `internal/audit/audit.go:213` (`NewRotatingFile(path, 50)`); see §25 |
+| AU-16 | **`internal/lockout` bounded its maps by ENTRY COUNT but not by KEY SIZE.** `Cleanup`'s own doc claims the maps are bounded "against an unbounded-memory DoS" — true on the count axis, and the janitor cannot sweep an entry before its `Window` elapses, so the SIZE axis was the whole exposure: one caller retained (rate × Window × username size) bytes in a leaf package whose stated contract is to be bounded. | NEW → **CLOSED** (CHAOS-61: `boundUsername` applied at every public entry point; consistency pinned so `Check` and `RecordFailure` cannot disagree on the key) | M/H | was: `internal/lockout/lockout.go`; see §25 |
 
 ### 2.6 Background Workers / Feeds / Scanning / Alerting
 
@@ -4079,7 +4089,7 @@ outlives the test body that armed it, and `defer restore()` runs **before** any
 still reading it. Production never reassigns those vars, so this is harness-only,
 but `stubResolver` now waits for in-flight warms before restoring: a seam must
 outlive its users.
-## 29. CHAOS-60 — The public admin-login endpoint's untrusted username
+## 29. CHAOS-61 — The public admin-login endpoint's untrusted username
 
 **Date:** 2026-09-05 · **Domain:** authentication / audit / persistence ·
 **Status:** shipped · **Closes:** AU-15, AU-16 ·
@@ -4103,7 +4113,7 @@ path validated its own at `maxUsernameLen` (256) years ago
 (`proxy_portal.go:145`). The admin login endpoint — the one an attacker
 actually finds first, because it is what the UI posts to — validated nothing.
 
-Note the handler-vs-store split that §28.4 turns on: those 1–64 caps live in the
+Note the handler-vs-store split that §29.4 turns on: those 1–64 caps live in the
 API *handlers*. Neither `cfg.SetAuth` nor `cfg.SetUIUser` bounds a username, and
 `validateAuthStartupCredentials` validates only the password — so `-user` /
 `auth.user` and `--reset-password` can persist an admin whose name is longer
@@ -4174,7 +4184,7 @@ is not a secret and is not a credential oracle for a name that exists nowhere.
 **A CONFIGURED account is never refused, however long its name**, and the first
 draft of this change got that wrong. It asserted that no local account could
 carry such a name because `apiSetupComplete` and the user-creation API cap at
-64 — but those are handlers, not the stores (see §28.1), so an over-long
+64 — but those are handlers, not the stores (see §29.1), so an over-long
 username can already be a valid persisted admin and the guard would have locked
 that operator out of their own admin UI on upgrade: a hardening change turned
 into an outage for the one person who has to fix it. Raised by Codex review on
