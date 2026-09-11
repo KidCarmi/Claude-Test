@@ -9,6 +9,59 @@ version is `info.version` in `api/openapi/openapi.yaml` and follows
 
 ### Security
 
+- OCSP revocation checking accepted responses it should have refused
+  (CHAOS-65). Every input the checker acts on comes from the peer's own
+  certificate — the responder URLs live in its AIA extension — so the party
+  being checked chooses which responder is asked and therefore what comes
+  back. `ParseResponse` was called with a nil certificate, which takes the
+  first status in the response and never compares the serial, so a genuine
+  CA-signed "good" about any *other* certificate of the same issuer was
+  accepted as this one's verdict: a revoked certificate went through, with no
+  network position required. Alongside it, `ThisUpdate`/`NextUpdate` were
+  parsed and never checked (the request carries no nonce and OCSP rides
+  plaintext HTTP, so a pre-revocation "good" replayed indefinitely); an
+  `unknown` status — which a CA returns for a certificate it never issued —
+  was treated as a pass while an *unreachable* responder failed closed; and
+  the verdict cache was keyed on the certificate serial alone, which is unique
+  only within an issuer, so a cached "good" could admit a revoked certificate
+  from a different CA. Responses are now bound to the certificate under test
+  (`ParseResponseForCert`), validated for freshness with a 5-minute skew
+  tolerance and a 24-hour ceiling, accepted only when affirmative, and cached
+  under the full RFC 6960 CertID.
+- The OCSP responder URL was an unguarded SSRF sink: it was fetched with
+  `http.DefaultClient` with no scheme allow-list, no private-address check and
+  redirects followed, so any operator of any destination the gateway reaches
+  could name an internal address and have the proxy POST to it. It is now
+  guarded inline, dialed through the SSRF-controlled dialer, and redirects are
+  refused. The responder list was also walked in full under a *per-responder*
+  5-second timeout: a certificate listing 200 blackholed responders held a
+  request goroutine — and its connection, file descriptor and per-IP limiter
+  slot — for about seventeen minutes inside one TLS handshake while aiming 200
+  outbound requests at hosts it chose. At most four responders are now
+  consulted, all inside one 5-second envelope, single-flighted per
+  certificate.
+- **Behaviour change for operators running `security.ocsp_check: true`:**
+  responder queries are now made directly and no longer honour `HTTP(S)_PROXY`
+  from the environment, and a responder on a private address is refused. An
+  egress-restricted deployment must allow the responder hosts named in its
+  upstreams' certificates. See `docs/operator/ocsp-revocation-checking.md`.
+
+### Changed
+
+- OCSP now reports which TLS handshakes it actually covers. Enabling it
+  installs the check on the shared upstream transport only, which for a
+  forward proxy means the handshake to an `https://` parent proxy — inspected
+  HTTPS origin handshakes build their own TLS config and are **not**
+  revocation-checked. Because every counter reads zero either way, "found
+  nothing wrong" and "never consulted" were the same reading. The appliance now
+  says so in a warning at the moment the control is enabled, in a banner on the
+  OCSP panel, in `coverage`/`uncheckedEnforcingPaths` on `GET /api/ocsp`, and
+  in `culvert_ocsp_path_checked{path}` — alongside a new `culvert_ocsp_*`
+  series set (the only OCSP surface before this was an admin JSON endpoint
+  nothing scrapes). Covering inspected HTTPS is tracked as an owner decision:
+  doing it fail-closed would make every inspected HTTPS request depend on
+  outbound port 80 to arbitrary responder hosts.
+
 - Scan-service credential exposure on the viewer-role read surfaces
   (`GET /api/security-scan/svc`, `GET /api/security-scan/status`). The
   userinfo redaction added for those surfaces returned unparseable input
