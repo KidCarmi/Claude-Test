@@ -404,7 +404,10 @@ func socks5Negotiate(conn net.Conn, clientIP string) bool {
 	if _, err := io.ReadFull(conn, passwd); err != nil {
 		return false
 	}
-	authOK := cfg.VerifyAuth(string(uname), string(passwd))
+	// CHAOS-57: charge the bcrypt comparison to this peer's fairness key.
+	// SOCKS5 carries no forwarding header, so the raw peer address IS the
+	// client — there is nothing here for realClientIP to resolve.
+	authOK := cfg.VerifyAuthFrom(clientFairnessKey(clientIP), string(uname), string(passwd))
 	// B5: Zero credentials from memory immediately after auth check.
 	clear(uname)
 	clear(passwd)

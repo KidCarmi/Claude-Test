@@ -40,7 +40,21 @@ func authStateClientKey(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
-	ip := net.ParseIP(realClientIP(r))
+	return clientFairnessKey(realClientIP(r))
+}
+
+// clientFairnessKey collapses a resolved client address into the fairness key
+// described above. It is split out from authStateClientKey so callers that
+// have no *http.Request — the SOCKS5 negotiator, whose peer address is the
+// only thing it ever sees — derive the SAME key shape rather than inventing a
+// second one (CHAOS-57).
+//
+// The caller is responsible for having resolved the address correctly:
+// authStateClientKey goes through realClientIP so a forwarded header counts
+// only from a trusted proxy, while SOCKS5 passes the raw peer because that
+// protocol carries no forwarding header at all.
+func clientFairnessKey(addr string) string {
+	ip := net.ParseIP(addr)
 	if ip == nil {
 		return ""
 	}

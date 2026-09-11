@@ -19157,6 +19157,14 @@ function resetBlockPage() {
              keep being enforced throughout — this is degraded freshness, not a dark
              control. Fires once per episode, cleared by an observed clean sync. -->
         <label style="display:flex;align-items:center;gap:5px;font-size:.84rem"><input type="checkbox" class="wh-event" value="threat_feed_stale"> Threat feed stale (intelligence not refreshing)</label>
+        <!-- CHAOS-57: the credential-verification cost governor has been refusing
+             authentication attempts for a sustained period. bcrypt costs ~80 ms of a
+             core and runs on the per-request proxy-auth path, so verification is
+             bounded deliberately; hitting that bound means either a credential flood
+             or a node undersized for its login volume. Proxy auth fails CLOSED while
+             it persists, so valid credentials may be denied. Fires once per episode,
+             never per denied request. -->
+        <label style="display:flex;align-items:center;gap:5px;font-size:.84rem"><input type="checkbox" class="wh-event" value="auth_verify_saturated"> Credential verification saturated (auth failing closed)</label>
         <!-- RISK-027 / OVN-16: MCP Agent Security Gateway enablement was requested but
              the capability is not serving (port in use, startup failure, or the
              listener stopped on its own). Fires once per episode, evaluated on a
