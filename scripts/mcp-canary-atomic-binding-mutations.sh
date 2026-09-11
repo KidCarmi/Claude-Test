@@ -297,7 +297,7 @@ run_mutation M12 \
   'the latch trusts the callers unlocked verdict instead of re-deriving under the lock' \
   'TestAtomicBinding_I_PreExecutorLatchNeverInventsABreach' \
   . "$ADM" \
-  's/\tcode := ""\n\tif trust != nil \{\n\t\tcode = trust\(\)\.DriftCode\n\t\}\n/\tcode := "tool_fingerprint_drift"\n/'
+  's/\t\tcode = reviewedFirstCause\(cr\.reviewed, trust\(\)\)/\t\tcode = "tool_fingerprint_drift"/'
 
 run_mutation M13 \
   'a pre-executor drift seen in the publication gap latches the next activation' \

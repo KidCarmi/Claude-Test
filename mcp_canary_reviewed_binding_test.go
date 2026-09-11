@@ -1522,3 +1522,108 @@ func TestReviewedBinding_C22Control2_AReviewedMatchNeverSilencesTheProbe(t *test
 	}
 	r.assertLatched(t, "tool_fingerprint_drift")
 }
+
+// ── 23 ───────────────────────────────────────────────────────────────────────────────────────
+// CROSS-PATH CAUSE PARITY — one state, one recorded cause, whichever path observed it.
+//
+// This is the structural closure for the class that has produced four findings on this PR: a new
+// fact taught to one consumer of the authoritative target and not the other (ServerUsable in round
+// 26, RegistryPinDiverged in round 27, ReviewedTenantDrift's evidence key in round 28, and the
+// first-cause ordering in round 29). Each was closed where it was found. Nothing held the general
+// property, so the next instance was always free to appear.
+//
+// There are exactly two paths that can stop the experiment for a moved reviewed target, and they
+// are reached by DISJOINT populations of requests — the admission transaction only sees requests
+// that survive authentication, inspection, policy and rollout scope, and the observation sink is
+// the only observer for every request that does not. An operator reads ONE abort code and cannot
+// tell which path produced it, so a disagreement is not a cosmetic inconsistency: it means the
+// recorded cause of an irreversible stop depends on facts about the request rather than about the
+// state.
+//
+// The table is the state space this PR has had to reason about, each entry a real published
+// transition rather than a synthetic struct.
+func TestReviewedBinding_C23_BothLatchPathsRecordTheSameCause(t *testing.T) {
+	cases := []struct {
+		name string
+		// move applies a real inventory transition and returns the decision fingerprint a request
+		// arriving afterwards would carry.
+		move func(t *testing.T, r *reviewedRig) string
+		want string
+	}{
+		{
+			name: "fingerprint moves, identity untouched",
+			move: func(t *testing.T, r *reviewedRig) string { return r.moveToF2(t) },
+			want: "tool_fingerprint_drift",
+		},
+		{
+			name: "identity rotates and the catalog re-ingests (both publications landed)",
+			move: func(t *testing.T, r *reviewedRig) string {
+				republishWithIdentity(t, r.sid, r.tool, "rotated", `{"type":"object"}`)
+				return r.fp1
+			},
+			want: "server_identity_drift",
+		},
+		{
+			name: "registry repinned, catalog not yet re-ingested (inside the window)",
+			move: func(t *testing.T, r *reviewedRig) string {
+				reg, _ := mcpInventory.sharedInventory()
+				if reg == nil {
+					t.Fatal("premise: a shared registry must be published")
+				}
+				if _, err := reg.Repin(registry.ServerID(r.sid), registry.Identity("rotated"), canaryRuntimeTestNow); err != nil {
+					t.Fatalf("repin: %v", err)
+				}
+				return r.fp1
+			},
+			want: "server_identity_drift",
+		},
+		{
+			name: "the reviewed server is disabled",
+			move: func(t *testing.T, r *reviewedRig) string {
+				disableSeededServer(t, r.sid, r.tool)
+				return r.fp1
+			},
+			want: "server_identity_drift",
+		},
+		{
+			name: "the reviewed pair is reassigned to another tenant",
+			move: func(t *testing.T, r *reviewedRig) string {
+				republishUnderTenant(t, r.sid, r.tool, "other-tenant")
+				return r.fp1
+			},
+			want: "reviewed_target_tenant_drift",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run("admission/"+tc.name, func(t *testing.T) {
+			r := newReviewedRig(t)
+			fp := tc.move(t, r)
+			if r.request(fp, r.now) {
+				t.Fatal("SECURITY: a moved reviewed target must not be admitted")
+			}
+			assertCause(t, r, tc.want)
+		})
+		t.Run("observation/"+tc.name, func(t *testing.T) {
+			r := newReviewedRig(t)
+			tc.move(t, r)
+			canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+				Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
+			})
+			assertCause(t, r, tc.want)
+		})
+	}
+}
+
+// assertCause proves the Canary stopped and names the single first cause it recorded.
+func assertCause(t *testing.T, r *reviewedRig, want string) {
+	t.Helper()
+	if !r.rt.abortedNow(r.capb) {
+		t.Fatalf("SECURITY: the reviewed target moved (%s) and the experiment did not stop", want)
+	}
+	if got := r.rt.abortCodeNow(r.capb); got != want {
+		t.Fatalf("recorded cause = %q, want %q. The two latch paths serve disjoint populations of "+
+			"requests and an operator reads only the code, so a disagreement makes the recorded "+
+			"cause of an irreversible stop a property of the request rather than of the state", got, want)
+	}
+}
