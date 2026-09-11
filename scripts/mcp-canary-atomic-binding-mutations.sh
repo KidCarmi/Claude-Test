@@ -291,13 +291,13 @@ run_mutation M11 \
   'the pre-executor path counts the drift as evidence and never latches' \
   'TestPreAdmissionDrift_E2E_ServerIdentityDriftStopsTheActivation' \
   . "$ADM" \
-  's/\tglobalCanaryRuntime\.latchDriftUnderActivation\(.*?\n\t\}\)\n/\t_ = capb\n\t_ = now\n/s'
+  's/\tlatch := globalCanaryRuntime\.latchDriftUnderActivation\(.*?\n\t\}\)\n/\tlatch := canaryDriftLatch\{\}\n\t_ = capb\n\t_ = now\n/s'
 
 run_mutation M12 \
   'the latch trusts the callers unlocked verdict instead of re-deriving under the lock' \
   'TestAtomicBinding_I_PreExecutorLatchNeverInventsABreach' \
   . "$ADM" \
-  's/\t\tcode = reviewedFirstCause\(cr\.reviewed, trust\(\)\)/\t\tcode = "tool_fingerprint_drift"/'
+  's/\t\tcode = canaryDriftCause\(cr\.reviewed, trust\(\)\)/\t\tcode = "tool_fingerprint_drift"/'
 
 run_mutation M13 \
   'a pre-executor drift seen in the publication gap latches the next activation' \
@@ -381,13 +381,13 @@ run_mutation M25 \
   'a moved reviewed target is downgraded to a request-scoped denial and latches nothing' \
   'TestReviewedBinding_C03_FingerprintDriftWithLiveApprovalLatches' \
   . "$ADM" \
-  's/\t\treturn rt\.latchDriftLocked\(cr, capb, string\(v\), gen, now\)\n\t\}\n/\t\treturn canaryAdmission\{Denial: canaryAdmitUntrusted, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n/'
+  's/\tif code := canaryDriftCause\(cr\.reviewed, obs\); code != "" \{\n\t\treturn rt\.latchDriftLocked\(cr, capb, code, gen, now\)\n\t\}/\tif code := canaryDriftCause(cr.reviewed, obs); code != "" \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitUntrusted, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid\}\n\t\}/'
 
 run_mutation M26 \
   'EVERY non-matching reviewed verdict is classified as drift (the control)' \
   'TestReviewedBinding_C13_UnreviewedTargetIsRequestScopedNotDrift' \
   . "$ADM" \
-  's/\tcase canary\.ReviewedOutOfScope:\n/\tcase canary\.ReviewedVerdict\("__unreachable__"\):\n/'
+  's/\tcase v == canary\.ReviewedOutOfScope:\n\t\treturn ""\n/\tcase v == canary.ReviewedOutOfScope:\n\t\treturn "tool_fingerprint_drift"\n/'
 
 run_mutation M27 \
   'the lock-free view hands out its shared records instead of copies' \
@@ -418,7 +418,7 @@ run_mutation M29 \
   'an unusable reviewed server compares as ReviewedMatches and latches nothing' \
   'TestReviewedBinding_C1[45]' \
   . "$ADM" \
-  's/\tif !obs\.Usable \|\| obs\.RegistryPinDiverged \{/\tif obs.RegistryPinDiverged \{/'
+  's/\t\tAnchorLost: !obs\.Usable \|\| obs\.RegistryPinDiverged,/\t\tAnchorLost: obs.RegistryPinDiverged,/'
 
 run_mutation M30 \
   'the pinned identity is re-read from a second inventory lookup (the torn (F1,I2) pair)' \
@@ -467,7 +467,7 @@ run_mutation M35 \
   'the observation path ignores a divergent registry pin (taught to one consumer only)' \
   'TestReviewedBinding_C19_ObservationPathLatchesTheRepinWindow' \
   . "$ADM" \
-  's/\tif !obs\.Usable \|\| obs\.RegistryPinDiverged \{/\tif !obs.Usable \{/'
+  's/\t\tAnchorLost: !obs\.Usable \|\| obs\.RegistryPinDiverged,/\t\tAnchorLost: !obs.Usable,/'
 
 # ── (15) ROUND 28: THE TRANSITION WINDOW AFTER THE OBSERVATION ─────────────
 # A reviewed pair reassigned A→B between the early observation and the live-gate callback made the
@@ -479,7 +479,7 @@ run_mutation M36 \
   'the resolved-but-other-tenant target is discarded, so admission never compares' \
   'TestReviewedBinding_C21_TenantReassignmentLatchesAtAdmission' \
   . mcp_live_gate.go \
-  's/\t\t\tif live\.Resolved \{\n\t\t\t\treturn canaryTrustObservation\{Found: true, Current: live\.Authoritative\}\n\t\t\t\}\n//'
+  's/\t\tif !live\.Eligible \&\& live\.Resolved \{.*?\n\t\t\}\n/\t\tif false \{\n\t\t\treturn canaryTrustObservation\{\}\n\t\t\}\n/s'
 
 run_mutation M37 \
   'the tenant-drift code is dropped from the evidence allowlist (abort with no named cause)' \

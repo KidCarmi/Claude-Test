@@ -170,18 +170,14 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 			}
 		}
 		if !live.Eligible {
-			// Ineligible splits in two, and collapsing them loses a breach.
+			// NOTHING RESOLVED — the only ineligible case left, because the branch above already
+			// reported every one that did. There is nothing to compare against, and a transient
+			// inventory gap must not stop the experiment (Codex P1, PR #1360, round 6).
 			//
-			// If the (server, tool) RESOLVES — just not to this request's tenant — that is evidence
-			// about the reviewed target: it may be the reviewed pair under a new owner. Report it so
-			// the transaction can compare, with Trusted false so nothing is authorized by it. An
-			// unrelated target simply compares out-of-scope and stays request-scoped.
-			//
-			// If nothing resolves at all, there is nothing to compare and a transient inventory gap
-			// must not stop the experiment (Codex P1, PR #1360, round 6).
-			if live.Resolved {
-				return canaryTrustObservation{Found: true, Current: live.Authoritative}
-			}
+			// Round 31 left a second, unreachable copy of the resolved case here. It was harmless
+			// in production (the branch above returns first) and NOT harmless in the campaign: the
+			// mutation that deletes the live branch was still satisfied by the dead one, so M36
+			// survived while claiming to prove that a target under a new owner is carried out.
 			return canaryTrustObservation{}
 		}
 		// The CURRENT authoritative target, including the pinned server identity, for the
