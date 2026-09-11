@@ -252,7 +252,7 @@ enforcement owns its own populator; and six `culvert_geo_*` series, of which
 `culvert_geo_policy_unresolved_total` is the first signal an operator has ever
 had that a geo rule is evaluating against an unknown country. The first-request
 window is unchanged and recorded as an owner decision (WK-3c). See §28.
-**2026-09-04 — CHAOS-60 sweep (destination-host DNS resolution on the policy path).** The
+**2026-09-04 — CHAOS-61 sweep (destination-host DNS resolution on the policy path).** The
 sweep took the one failure domain the register had never entered: **DNS**, listed in the original
 scope and never swept, because it looks like somebody else's dependency. It is not — a
 `DestCountry` policy rule puts the customer's resolver on the critical path of every request that
@@ -4087,7 +4087,7 @@ outlives the test body that armed it, and `defer restore()` runs **before** any
 still reading it. Production never reassigns those vars, so this is harness-only,
 but `stubResolver` now waits for in-flight warms before restoring: a seam must
 outlive its users.
-## 29. CHAOS-60 (second sweep) — Destination-host DNS resolution on the policy path
+## 29. CHAOS-61 — Destination-host DNS resolution on the policy path
 
 > Same finding as §28, reached from the other end. §28 entered through the
 > GeoIP accessor and fixed the WARM path (cache-only accessor + bounded,
@@ -4101,23 +4101,34 @@ outlive its users.
 `geoip.go`, `dns_health.go`, `alerts.go` · **Runbook:**
 `docs/operator/dns-resolution-health.md`
 
-> **Renumbered THREE TIMES before merge — CHAOS-57 → CHAOS-58 → CHAOS-59 →
-> CHAOS-60.** This sweep collided with a concurrently-developed sweep on `main`
-> on three consecutive merges inside one week, and lost the id every time for the
-> same reason. Each rename picked the next id that was free *at that instant*, and
-> each time another in-flight branch merged that id first.
+> **Renumbered FOUR TIMES before merge — CHAOS-57 → CHAOS-58 → CHAOS-59 →
+> CHAOS-60 → CHAOS-61.** This sweep collided with a concurrently-developed sweep
+> on `main` on four consecutive merges inside eight days, and lost the id every
+> time for the same reason. Each rename picked the next id that was free *at that
+> instant*, and each time another in-flight branch merged that id first.
 >
 > | # | Date | Collided with | Which had taken | This sweep became |
 > |---|---|---|---|---|
 > | 1 | 2026-09-04 | §25 the hijacked-tunnel plane | `CHAOS-57` | `CHAOS-58` / §26 |
 > | 2 | 2026-09-10 | §26 the LDAP directory that stalls | `CHAOS-58` | `CHAOS-59` / §27 |
 > | 3 | 2026-09-10 | §27 the intelligence-feed plane | `CHAOS-59` | `CHAOS-60` / §28 |
+> | 4 | 2026-09-11 | §28 the GeoIP resolution chain | `CHAOS-60` | `CHAOS-61` / §29 |
 >
 > The first was already the THIRD occurrence of the class the header records for
 > `CHAOS-50`. Collisions 2 and 3 landed on the same day, hours apart, against two
 > different branches.
 >
-> **The rule applied all three times, and it is not "last one loses".** The header
+> **Collision 4 is the one the previous note predicted in writing, and it is the
+> sharpest case of all**: §28 is the sibling half of THIS finding — the same
+> subsystem reached through the GeoIP accessor rather than the resolver — and it
+> was developed on THIS BRANCH and merged to `main` ahead of this section. So the
+> id was taken by a sweep sharing this sweep's own `hostIPCache`, and the pair was
+> reconciled onto one flight type while still answering to one name. For a
+> window, §28 and §29 both read `CHAOS-60` with `(second sweep)` appended to
+> distinguish them — a parenthetical is not an identifier, and that is the same
+> half-fix (correct the SECTION, leave the ID) recorded for collisions 1–3.
+>
+> **The rule applied all four times, and it is not "last one loses".** The header
 > states renumbering is an owner decision *because* "identifiers three merged PRs
 > already reference" would have to be rewritten. That reason is **asymmetric**:
 > the MERGED side is referenced by merged code, gates and register rows, so it
@@ -4126,23 +4137,26 @@ outlive its users.
 > unilateral edit of shared history — it is the only moment at which the collision
 > is free to remove, and after merge it would be permanent. The other side's
 > references were left untouched in every pass, so `metrics.go` now carries one
-> line from §25 and one from here, and `CLAUDE.md` carries §26's and §27's bullets
-> beside this sweep's.
+> line from §25, one from §28 and one from here, `CLAUDE.md` carries §26's, §27's
+> and §28's bullets beside this sweep's, and `geoip.go` carries both halves of the
+> §28/§29 pair.
 >
-> **Each of the three merges was resolved by someone who fixed the duplicate
+> **Each of the four merges was resolved by someone who fixed the duplicate
 > SECTION number and left the duplicate ID in place**, which is why the collision
 > survived to recur: a section renumber makes the register read correctly while
-> two sweeps still answer to one name, and the second and third collisions were
-> found only because a later merge conflict forced someone to look again.
+> two sweeps still answer to one name, and collisions 2–4 were found only because
+> a later merge conflict forced someone to look again.
 >
 > **The prevention the header has named since `CHAOS-50` is now overdue, and this
 > sweep is the whole argument for it**: allocate the id in a committed placeholder
 > row at the START of a sweep. Renaming at merge time provably cannot work — the
 > id a rename picks is validated against `main` at the instant of the rename and
 > nothing reserves it afterwards, so the rename is itself a race. One branch lost
-> the same id three times in one week; catching each one was luck, not process.
-> **Owner action: add the placeholder-allocation row.** Until it exists, expect a
-> fourth.
+> the same id four times in eight days; catching each one was luck, not process.
+> The previous revision of this note ended *"until it exists, expect a fourth"* —
+> and the fourth arrived within the day, from a sibling sweep on this very branch.
+> **Owner action: add the placeholder-allocation row.** A fifth is not a
+> prediction about luck; it is what this process produces by construction.
 
 ### 29.1 Reachability
 
@@ -4286,7 +4300,7 @@ synchronous path for up to `hostIPCacheStaleMax`, leaving a country-scoped DENY
 rule dark for an **hour** after DNS recovered instead of the 30 s the negative
 TTL promises. Worse, `refreshAsync` SHEDS when the resolver pool is saturated,
 so under sustained load the bypass could persist for the full window. And it was
-a REGRESSION against the pre-CHAOS-60 behaviour, which re-resolved synchronously
+a REGRESSION against the pre-CHAOS-61 behaviour, which re-resolved synchronously
 the moment the negative TTL lapsed.
 
 Fixed by restricting the stale state to `e.ip != nil`. An expired negative is a
@@ -4326,7 +4340,7 @@ against each state it can be in, not only the one that motivated it.
 
 ### 29.7 GEO-1 — a latent process-kill armed by a comment (recorded, not fixed)
 
-Found while sweeping the domain adjacent to CHAOS-60 and **not reachable in the
+Found while sweeping the domain adjacent to CHAOS-61 and **not reachable in the
 current tree**, but recorded because of how it is armed.
 
 `internal/geoip.InitGeoDB` claimed:

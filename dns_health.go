@@ -1,13 +1,13 @@
 package main
 
-// dns_health.go — CHAOS-60: destination-host DNS resolution on the policy path.
+// dns_health.go — CHAOS-61: destination-host DNS resolution on the policy path.
 //
 // Why this file exists.
 //
 // `geo.LookupCached` runs inside `matchDestNorm` (policy.go), on the REQUEST
 // goroutine, once per enabled access rule carrying a `DestCountry`. Behind it
 // sits `resolveHost` → `lookupPublicHostIP` → the system resolver. Before
-// CHAOS-60 that call had no deadline, no single-flight and no concurrency
+// CHAOS-61 that call had no deadline, no single-flight and no concurrency
 // bound, and its failures were counted nowhere.
 //
 // Three consequences, each reproduced against the pre-fix tree
