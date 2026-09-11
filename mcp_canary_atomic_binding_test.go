@@ -39,7 +39,18 @@ func newAtomicRig(t *testing.T) *atomicRig {
 
 func (r *atomicRig) arm(t *testing.T, total int) uint64 {
 	t.Helper()
-	if _, err := r.rt.beginCanaryActivation(r.capb, runtimeTestBudget(total), canaryRuntimeTestNow); err != nil {
+	return r.armFor(t, total)
+}
+
+// armFor arms an activation reviewed for EXPLICIT targets. Tests that seed a real inventory and
+// then observe drift on it must use this: since round 31 the reviewed set decides whether an
+// activation may be stopped at all, so an activation armed with the canonical SYNTHETIC target
+// (server-a/tool-a) is correctly immune to drift on a different, real one — and a test that arms
+// synthetically while observing `controlled/t` proves nothing about the latch it is named for.
+func (r *atomicRig) armFor(t *testing.T, total int, targets ...canary.ReviewedTarget) uint64 {
+	t.Helper()
+	spec := testActivationSpec(runtimeTestBudget(total), canaryRuntimeTestNow, targets...)
+	if _, err := r.rt.beginCanaryActivation(r.capb, spec); err != nil {
 		t.Fatalf("begin activation: %v", err)
 	}
 	g := r.rt.currentGeneration(r.capb)
@@ -68,11 +79,30 @@ func (r *atomicRig) admit(trust canaryTrustProbe) canaryAdmission {
 	}, trust)
 }
 
-// probeDrift returns a probe reporting an authoritative drift.
-func probeDrift(code string) canaryTrustProbe { return func() (bool, string) { return false, code } }
+// probeDrift returns a probe reporting an authoritative drift ON A RESOLVED TARGET.
+//
+// The target is carried because a code without one is not a shape production can produce: every
+// return in mcpLiveTrustPrecheck that sets DriftCode also sets Resolved, which
+// TestReviewedBinding_C28 pins structurally. It matters because round 31 made the reviewed set
+// decide WHETHER a cause may stop the activation — an observation with nothing to compare against
+// latches nothing, since scope cannot be established for it. Carrying the canonical reviewed
+// target keeps these cases exercising the drift path they are about rather than the
+// nothing-resolved path.
+func probeDrift(code string) canaryTrustProbe {
+	return func() canaryTrustObservation {
+		return canaryTrustObservation{DriftCode: code, Found: true, Current: testReviewedTarget()}
+	}
+}
 
 // probeTrusted returns a probe reporting healthy trust.
-func probeTrusted() canaryTrustProbe { return func() (bool, string) { return true, "" } }
+// probeTrusted reports an authorized request whose CURRENT target is exactly the canonical
+// synthetic reviewed target, so the transaction's reviewed comparison matches and the test
+// exercises what it is about rather than tripping the new gate.
+func probeTrusted() canaryTrustProbe {
+	return func() canaryTrustObservation {
+		return canaryTrustObservation{Found: true, Current: testReviewedTarget(), Trusted: true}
+	}
+}
 
 // ── A. Normal drift ──────────────────────────────────────────────────────────
 
@@ -123,9 +153,10 @@ func TestAtomicBinding_B_DemotionRacingTheObservationNeverLatchesTheReplacement(
 		_ = r.rt.demoteCanary(r.capb)
 	}()
 
-	adm := r.admit(func() (bool, string) {
+	drift := probeDrift("tool_fingerprint_drift")
+	adm := r.admit(func() canaryTrustObservation {
 		close(released) // the demotion is now runnable and MUST be unable to proceed
-		return false, "tool_fingerprint_drift"
+		return drift()  // production-shaped: a code always carries the target it drifted from
 	})
 	wg.Wait()
 
@@ -159,12 +190,18 @@ func TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation(t *tes
 		defer wg.Done()
 		<-released
 		_ = r.rt.demoteCanary(r.capb)
-		_, _ = r.rt.beginCanaryActivation(r.capb, runtimeTestBudget(3), canaryRuntimeTestNow)
+		_, _ = testBeginActivation(r.rt, r.capb, runtimeTestBudget(3), canaryRuntimeTestNow)
 	}()
 
-	adm := r.admit(func() (bool, string) {
+	// probeDrift, not a bare code: the replacement activation is armed with the SAME canonical
+	// reviewed target, so with the generation re-verification removed this drift WOULD latch it.
+	// A bare code carries no target, and since round 31 an observation with nothing to compare
+	// against latches nothing at all — which made this gate pass for the wrong reason and let
+	// mutation M08 survive.
+	drift := probeDrift("tool_fingerprint_drift")
+	adm := r.admit(func() canaryTrustObservation {
 		close(released)
-		return false, "tool_fingerprint_drift"
+		return drift()
 	})
 	wg.Wait()
 
@@ -196,9 +233,9 @@ func TestAtomicBinding_D_PublicationGapDeniesAndPoisonsNothing(t *testing.T) {
 	r := newAtomicRig(t) // deliberately NOT armed: this is the gap
 
 	probed := false
-	adm := r.admit(func() (bool, string) {
+	adm := r.admit(func() canaryTrustObservation {
 		probed = true
-		return false, "tool_fingerprint_drift"
+		return probeDrift("tool_fingerprint_drift")()
 	})
 
 	if adm.Denial != canaryAdmitNoActivation {
@@ -241,12 +278,12 @@ func TestAtomicBinding_E_TrustAndReservationShareOneGeneration(t *testing.T) {
 		defer wg.Done()
 		<-released
 		_ = r.rt.demoteCanary(r.capb)
-		_, _ = r.rt.beginCanaryActivation(r.capb, runtimeTestBudget(3), canaryRuntimeTestNow)
+		_, _ = testBeginActivation(r.rt, r.capb, runtimeTestBudget(3), canaryRuntimeTestNow)
 	}()
 
-	adm := r.admit(func() (bool, string) {
+	adm := r.admit(func() canaryTrustObservation {
 		close(released) // a replacement activation is now racing the reservation below
-		return true, ""
+		return canaryTrustObservation{Found: true, Current: testReviewedTarget(), Trusted: true}
 	})
 	wg.Wait()
 
@@ -330,10 +367,10 @@ func TestAtomicBinding_TrustProbeRunsUnderTheActivationLock(t *testing.T) {
 		close(tried)
 	}()
 
-	r.admit(func() (bool, string) {
+	r.admit(func() canaryTrustObservation {
 		close(released)
 		<-tried // deterministic: the probe does not return until the peer has actually tried
-		return true, ""
+		return canaryTrustObservation{Found: true, Current: testReviewedTarget(), Trusted: true}
 	})
 	wg.Wait()
 
@@ -363,18 +400,43 @@ func TestAtomicBinding_TrustProbeMayNotReEnterTheRuntime(t *testing.T) {
 	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
 
 	r := newAtomicRig(t)
-	r.arm(t, 3)
 
 	// The PRODUCTION probe, shaped exactly as the gate supplies it under the lock.
-	realProbe := func() (bool, string) {
+	realProbe := func() canaryTrustObservation {
 		live := mcpLiveTrustPrecheck(ttTenant, sid, tool, fpHex)
-		if live.DriftCode != "" {
-			return false, live.DriftCode
+		if !live.Eligible && live.Resolved {
+			// Exactly the shape mcpLiveSideEffectGate builds: every fact carried, none
+			// pre-classified, so the transaction's ordering rule decides scope and cause.
+			return canaryTrustObservation{
+				DriftCode: live.DriftCode, Found: true,
+				Current: live.Authoritative, AnchorLost: live.AnchorLost,
+			}
 		}
-		return live.Eligible, ""
+		if !live.Eligible {
+			return canaryTrustObservation{}
+		}
+		return canaryTrustObservation{
+			Found: true,
+			Current: canary.ReviewedTarget{
+				Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
+				Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
+				ServerIdentity: live.ServerIdentity,
+			},
+			Trusted: true,
+		}
 	}
-	if ok, code := realProbe(); !ok || code != "" {
-		t.Fatalf("premise: the composed fixture must be trusted with no drift, got ok=%v code=%q", ok, code)
+	obs := realProbe()
+	if !obs.Trusted || obs.DriftCode != "" {
+		t.Fatalf("premise: the composed fixture must be trusted with no drift, got %+v", obs)
+	}
+	// Arm the activation against the SAME target the composed fixture publishes, so this test's
+	// subject stays the lock order rather than a reviewed-target mismatch.
+	if _, err := r.rt.beginCanaryActivation(r.capb, canaryActivationSpec{
+		Budget:          runtimeTestBudget(3),
+		ReviewedTargets: []canary.ReviewedTarget{obs.Current},
+		StartedAt:       canaryRuntimeTestNow,
+	}); err != nil {
+		t.Fatalf("begin activation: %v", err)
 	}
 
 	done := make(chan canaryAdmission, 1)
@@ -412,9 +474,9 @@ func TestAtomicBinding_InactiveRuntimeIsNotAnActivation(t *testing.T) {
 	cr.mu.Unlock()
 
 	probed := false
-	adm := r.admit(func() (bool, string) {
+	adm := r.admit(func() canaryTrustObservation {
 		probed = true
-		return false, "tool_fingerprint_drift"
+		return probeDrift("tool_fingerprint_drift")()
 	})
 
 	if adm.Denial != canaryAdmitNoActivation {
@@ -438,9 +500,9 @@ func TestAtomicBinding_ActiveWithZeroGenerationIsNotAnActivation(t *testing.T) {
 	cr.mu.Unlock()
 
 	probed := false
-	adm := r.admit(func() (bool, string) {
+	adm := r.admit(func() canaryTrustObservation {
 		probed = true
-		return false, "tool_fingerprint_drift"
+		return probeDrift("tool_fingerprint_drift")()
 	})
 
 	if adm.Denial != canaryAdmitNoActivation {
@@ -662,10 +724,10 @@ func TestAtomicBinding_PreExecutorLatchHoldsTheActivationLockAcrossItsProbe(t *t
 		close(tried)
 	}()
 
-	r.latchDrift(func() (bool, string) {
+	r.latchDrift(func() canaryTrustObservation {
 		close(released)
 		<-tried
-		return false, "tool_fingerprint_drift"
+		return probeDrift("tool_fingerprint_drift")()
 	})
 	wg.Wait()
 
@@ -747,27 +809,34 @@ func TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction(t *testing.T) {
 
 // ── The rug-pull latches inside the transaction ──────────────────────────────
 
-// TestAtomicBinding_RugPullLatchesAtAdmission is the gate for the round-20/23 hole, and it is the
-// reason the pre-executor path no longer needs an activation binding of its own.
+// TestAtomicBinding_RugPullLatchesAtAdmission is the gate for the round-20/23 hole, now decided
+// against the ACTIVATION's reviewed snapshot rather than against an approval.
 //
 // After a rug-pull the catalog settles at F2. Every later request is DECIDED against F2, so the
-// fingerprint comparison in the precheck sees F2 == F2 and reports no drift — those requests were
+// fingerprint comparison in the precheck sees F2 == F2 and reports no drift; those requests were
 // being denied merely for lacking an approval, which is indistinguishable from ordinary
-// unauthorized traffic. The approval pinned to F1 is the evidence that the reviewed tool moved, and
-// it is available exactly where the transaction already holds the activation lock.
+// unauthorized traffic. The evidence that the reviewed tool moved is the activation's own record
+// of what it was reviewed against — F1 — which the transaction compares under the lock.
+//
+// Note what this test does NOT do: it supplies no approval saying "F1 was reviewed". The approval
+// store is empty of anything relevant (approvalOK returns unauthorized). That is the Round-24
+// property — drift is detected with no surviving approval at all.
 func TestAtomicBinding_RugPullLatchesAtAdmission(t *testing.T) {
 	r := newAtomicRig(t)
-	g := r.arm(t, 4)
+	// Reviewed against F1.
+	if _, err := r.rt.beginCanaryActivation(r.capb, testActivationSpec(runtimeTestBudget(4), canaryRuntimeTestNow, reviewedAt(fpF1))); err != nil {
+		t.Fatalf("begin activation: %v", err)
+	}
+	g := r.rt.currentGeneration(r.capb)
 
-	// The approval store answers as it does after a rug-pull: nothing satisfies this target, but an
-	// active approval exists for the same tool pinned to the REVIEWED (now superseded) fingerprint.
+	// The catalog has settled at F2 and NO approval covers the request.
 	gate := &mcpLiveSideEffectGate{
 		capb:          r.capb,
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
-		trustPrecheck: stubTrustPrecheckEligible,
+		trustPrecheck: stubTrustPrecheckAt(fpF2),
 		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
-			return false, "tool_fingerprint_drift"
+			return false, "" // unauthorized, and saying nothing about what was reviewed
 		},
 		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 			return r.rt.admitLiveExecution(r.capb, now, ident, trust)

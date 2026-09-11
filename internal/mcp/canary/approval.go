@@ -32,6 +32,14 @@ const (
 type ToolApprovalBinding struct {
 	Target   LiveTarget
 	Approval *tooltrust.ToolApproval
+
+	// ServerIdentity is the server's PINNED, verified identity as observed in the SAME
+	// authoritative read that resolved Target. It takes no part in approval matching — approvals
+	// record no identity, and LiveTarget deliberately stays the exact key an approval binds to.
+	// It rides here so the activation's reviewed-target snapshot (reviewed.go) is a pure
+	// projection of what the preflight PROVED, resolved at one instant, rather than a second
+	// lookup that reconstructs what "must have been" reviewed at some later one.
+	ServerIdentity string
 }
 
 // ValidateScopeApprovals enforces §3/§4: EVERY exact (tenant, tool) the Canary scope admits must

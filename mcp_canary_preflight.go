@@ -300,8 +300,21 @@ func buildLiveApprovalBindings(scope rollout.ScopeSpec) []canary.ToolApprovalBin
 				Fingerprint:       ti.target.Fingerprint,
 				FingerprintFormat: ti.target.FingerprintFormatVersion,
 			}
+			// The server's pinned identity comes from the SAME registry snapshot loadTarget
+			// resolved the target from, so the activation binds the identity and the fingerprint
+			// as they were actually observed together (§3).
+			//
+			// A second lookup would not do, and the comment that used to sit here claimed an
+			// atomicity the code did not have: Registry.Repin and the catalog re-ingest that
+			// follows it are separate publications, so between them a fresh read returns I2 while
+			// this target still carries F1. Persisting that (F1, I2) pair as reviewed would make a
+			// later identity rotation compare as REVIEWED — an approval issued for I1 authorizing
+			// execution under I2 (Codex P1, PR #1360, round 3).
+			ident := ti.pinnedIdentity
 			for _, a := range byTool[liveApprovalKey{tenant: tenant, serverID: st.Server, toolName: st.Name}] {
-				bindings = append(bindings, canary.ToolApprovalBinding{Target: target, Approval: a})
+				bindings = append(bindings, canary.ToolApprovalBinding{
+					Target: target, Approval: a, ServerIdentity: ident,
+				})
 			}
 		}
 	}
@@ -404,4 +417,106 @@ func mcpCanaryStatus() map[string]any {
 			"read_first":             true,
 		},
 	}
+}
+
+// mcpAuthoritativeTarget is what the inventory currently says about one tool identity: whether it
+// resolves at all, whether the server behind it is still usable, and the target itself. The three
+// are returned together because they come from ONE snapshot read and must not be re-derived
+// separately (see the pinnedIdentity field comment in mcp_tooltrust.go).
+type mcpAuthoritativeTarget struct {
+	// Found reports that the tool resolves to an authoritative target.
+	Found bool
+	// Usable reports that the server behind it is still usable — present, enabled, and identity-
+	// verified. Meaningful only when Found.
+	Usable bool
+	// RegistryPinDiverged reports that the registry's CURRENT pin is not the identity the catalog
+	// record was built against — the repin/re-ingest window. The target below describes the
+	// catalog's coherent view, so a request routed by the registry's pin would not reach the
+	// workload this target names. Meaningful only when Found.
+	RegistryPinDiverged bool
+	// Target is the reviewed-shaped record, valid only when Found.
+	Target canary.ReviewedTarget
+}
+
+// mcpCurrentAuthoritativeTarget reads the CURRENT authoritative target for one tool identity —
+// the same registry + catalog fusion the live-trust precheck uses, and the same pointer-published
+// inventory, so it carries the lock profile the §5 audit established and adds no new edge.
+//
+// It deliberately takes NO decision fingerprint and makes NO eligibility judgement. Its one caller
+// is the reviewed-target comparison, which asks "what is this tool NOW?" so it can be held against
+// what the activation was reviewed for. Folding an eligibility check in here would reintroduce the
+// defect that made this path necessary: eligibility is scope- and decision-relative, and a target
+// that moved is exactly the case those relations reject before the question can be asked.
+//
+// Found=false means the tool does not resolve at all (absent from the catalog, or no inventory
+// composed). The caller treats that as "nothing to compare", never as drift.
+//
+// Usable is reported SEPARATELY from the target because "the tool still carries the reviewed
+// fingerprint and identity" and "the server the experiment was authorized against is still in
+// force" are two different facts, and only the first is a property of the reviewed record. An
+// unusable server is an authoritative breach here for exactly the reason mcpLiveTrustPrecheck
+// already gives it one (see its !ServerUsable branch): the trust anchor the activation was
+// approved against is gone, and the safe response is to stop changing reality. Reporting it here
+// too is what keeps the two paths from answering the same question differently — this one now runs
+// for EVERY dispatched request, so it is the path that has to carry the verdict when a policy or
+// inspection rejection stops the precheck from ever running (Codex P1, PR #1360, round 3).
+func mcpCurrentAuthoritativeTarget(serverID, toolName string) mcpAuthoritativeTarget {
+	if mcpToolTrust == nil {
+		return mcpAuthoritativeTarget{}
+	}
+	ti := mcpToolTrust.loadTarget(serverID, toolName)
+	if !ti.found {
+		return mcpAuthoritativeTarget{}
+	}
+	return mcpAuthoritativeTarget{
+		Found:               true,
+		Usable:              ti.target.ServerUsable,
+		RegistryPinDiverged: ti.registryPinDiverged,
+		Target: canary.ReviewedTarget{
+			Tenant:            ti.target.Tenant,
+			ServerID:          serverID,
+			ToolName:          toolName,
+			Fingerprint:       ti.target.Fingerprint,
+			FingerprintFormat: ti.target.FingerprintFormatVersion,
+			// From the SAME snapshot as the fingerprint above — never a second lookup. See the
+			// pinnedIdentity field comment in mcp_tooltrust.go.
+			ServerIdentity: ti.pinnedIdentity,
+		},
+	}
+}
+
+// reviewedTargetsFromBindings projects the approval bindings the activation preflight just PROVED
+// into the activation's reviewed-target snapshot (§3).
+//
+// Each binding's Target is the CURRENT authoritative target resolved from the registry + catalog,
+// and canary.ValidateScopeApprovals has already established that every scoped (tenant, server,
+// tool) carries its own valid, four-eyes, exact-target live approval bound to it. So this is a
+// projection of what the review passed on — not a later reconstruction of what "must have been"
+// reviewed, which is exactly the move §3 forbids.
+//
+// Duplicates are left for canary.CanonicalizeReviewedTargets to judge: several approvals may bind
+// the same target, and it is that function's job — not this one's — to decide whether identical
+// entries collapse or disagreeing ones are refused. Resolving ambiguity here by overwriting would
+// be the "last one wins" §4 rules out.
+//
+// It performs NO lookup of its own: every field, the server identity included, comes from the
+// binding the preflight validated. A second read here would sample the inventory at a later
+// instant than the one the review passed on, which is precisely the reconstruction §3 forbids.
+func reviewedTargetsFromBindings(bindings []canary.ToolApprovalBinding) []canary.ReviewedTarget {
+	if len(bindings) == 0 {
+		return nil
+	}
+	out := make([]canary.ReviewedTarget, 0, len(bindings))
+	for i := range bindings { // index-based: the binding carries a 32-byte digest
+		t := bindings[i].Target
+		out = append(out, canary.ReviewedTarget{
+			Tenant:            t.Tenant,
+			ServerID:          t.ServerID,
+			ToolName:          t.ToolName,
+			Fingerprint:       t.Fingerprint,
+			FingerprintFormat: t.FingerprintFormat,
+			ServerIdentity:    bindings[i].ServerIdentity,
+		})
+	}
+	return out
 }

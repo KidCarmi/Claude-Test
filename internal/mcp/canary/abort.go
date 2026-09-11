@@ -62,6 +62,11 @@ func AbortConditions() []AbortCondition {
 			WhyCanaryWide: "the executed tool no longer matches the reviewed+approved fingerprint (rug-pull)"},
 		{Code: "server_identity_drift", Scope: AbortCanary,
 			WhyCanaryWide: "the upstream server's pinned identity changed — the approved trust anchor is gone"},
+		{Code: "reviewed_target_tenant_drift", Scope: AbortCanary,
+			WhyCanaryWide: "the reviewed (server, tool) now belongs to a different tenant. Tenancy is the isolation " +
+				"boundary the approval was granted within, so a target that changed hands is not the target that was " +
+				"reviewed — and because the reviewed lookup keys on tenant, the reassignment would otherwise read as " +
+				"an unrelated target and stay silent"},
 		{Code: "outcome_evidence_loss", Scope: AbortCanary,
 			WhyCanaryWide: "a real side effect occurred without a durable record — the Canary is no longer reconstructable"},
 		{Code: "credential_safety_failure", Scope: AbortCanary,

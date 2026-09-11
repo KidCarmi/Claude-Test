@@ -73,6 +73,14 @@ var errRolloutCanaryActivationFailed = mcperr.New(mcperr.ReasonRolloutTransition
 // demote → re-activate cycle that begins a fresh generation with the new budget (Codex P2 round-6).
 var errRolloutCanaryBudgetChanged = errors.New("canary_budget_changed_requires_reactivation")
 
+// errRolloutCanaryReviewedTargetsChanged marks a SAME-MODE live update whose reviewed-target set
+// differs from the one the active generation was armed with. The generation is not re-begun on
+// such an update, so letting it through would leave generation G executing against targets it was
+// never reviewed for — the control plane performing exactly the drift the runtime exists to catch.
+// It is rejected fail-closed; a reviewed-set change must go through demote → re-activate, which
+// begins a fresh generation bound to the new set (§10).
+var errRolloutCanaryReviewedTargetsChanged = errors.New("canary_reviewed_targets_changed_requires_reactivation")
+
 // mcpRollout is the process-wide, DISABLED-BY-DEFAULT PR-11 rollout composition.
 // It owns the two capability-local rollout states (Gateway + Management) and the
 // bounded low-cardinality rollout metrics. Gateway and Management are physically
@@ -365,6 +373,7 @@ func (r *mcpRollout) commitRolloutTransitionCore(tgt commitTransitionTarget, cfg
 	// authoritative approval/budget store does not exist (the probe returns empties) and the live
 	// tier is never armed, so a Canary/Production transition ALWAYS fails here.
 	var activationBudget canary.Budget
+	var activationReviewed []canary.ReviewedTarget
 	if cfg.Mode.RequiresLiveExecution() {
 		// Evaluate the FULL activation verdict INSIDE the serialized section, against THIS rollout's
 		// state, so a mutable fail-closed fact that changed after the caller's checks — an
@@ -395,6 +404,13 @@ func (r *mcpRollout) commitRolloutTransitionCore(tgt commitTransitionTarget, cfg
 		// node-authoritative state (the probe), never the signed config, and was just proven valid by the
 		// preflight.
 		activationBudget = ai.Budget
+		// The reviewed-target snapshot for beginCanaryActivation below (§3). It is derived from the
+		// SAME bindings the preflight just proved — each binding's Target is the CURRENT authoritative
+		// target (registry + catalog via loadTarget, never a request value) and canary.ValidateScopeApprovals
+		// has just established that every scoped (tenant, server, tool) has its own valid, four-eyes,
+		// exact-target live approval bound to it. So this is not a reconstruction of what "must have
+		// been" reviewed: it is the exact set the review passed on. No wildcard, and no later lookup.
+		activationReviewed = reviewedTargetsFromBindings(ai.ToolApprovals)
 	}
 	// Snapshot the prior state for a fail-closed rollback if persistence fails, and
 	// for the scope-change continuity check below.
@@ -449,7 +465,11 @@ func (r *mcpRollout) commitRolloutTransitionCore(tgt commitTransitionTarget, cfg
 	// (5) Canary activation RUNTIME reconciliation (§7), BEFORE the transition is marked
 	// recovered/counted: a runtime-init failure must REJECT the whole transition (rolling the durable
 	// rollout state back), not report a durable live activation the runtime cannot back.
-	if err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevMode, prevCfg, prevEvidence, activationBudget, actor, now); err != nil {
+	if err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevMode, prevCfg, prevEvidence, canaryActivationSpec{
+		Budget:          activationBudget,
+		ReviewedTargets: activationReviewed,
+		StartedAt:       now,
+	}, actor, now); err != nil {
 		return err
 	}
 	tgt.setStatus("recovered")
@@ -473,7 +493,7 @@ func (r *mcpRollout) commitRolloutTransitionCore(tgt commitTransitionTarget, cfg
 // repair it (prevMode is now live ⇒ enteringLive=false on the re-apply). We therefore roll the durable
 // rollout state back to the prior mode and return errRolloutCanaryActivationFailed, so the caller and a
 // replay see a clean prior-mode state a retry re-attempts cleanly (Codex P1, PR #1290).
-func (r *mcpRollout) reconcileCanaryRuntimeAfterCommit(tgt commitTransitionTarget, cfg *rollout.SignedConfig, prevMode rollout.Mode, prevCfg rollout.SignedConfig, prevEvidence rollout.EvidenceSummary, activationBudget canary.Budget, actor string, now time.Time) error {
+func (r *mcpRollout) reconcileCanaryRuntimeAfterCommit(tgt commitTransitionTarget, cfg *rollout.SignedConfig, prevMode rollout.Mode, prevCfg rollout.SignedConfig, prevEvidence rollout.EvidenceSummary, activation canaryActivationSpec, actor string, now time.Time) error {
 	if !tgt.reconcileRuntime {
 		return nil
 	}
@@ -481,7 +501,7 @@ func (r *mcpRollout) reconcileCanaryRuntimeAfterCommit(tgt commitTransitionTarge
 	leavingLive := !cfg.Mode.RequiresLiveExecution() && prevMode.RequiresLiveExecution()
 	switch {
 	case enteringLive:
-		if _, err := globalCanaryRuntime.beginCanaryActivation(cfg.Capability, activationBudget, now); err != nil {
+		if _, err := globalCanaryRuntime.beginCanaryActivation(cfg.Capability, activation); err != nil {
 			// The runtime is already disarmed and its durable record removed by the failed begin; roll the
 			// step-(4) rollout persist back to the prior (non-live) mode and reject the transition.
 			return r.rejectActivationAndRollback(tgt, cfg, prevMode, prevCfg, prevEvidence, actor, now, err)
@@ -492,8 +512,21 @@ func (r *mcpRollout) reconcileCanaryRuntimeAfterCommit(tgt commitTransitionTarge
 		// this update differs, a tightened total/rate/window/identity cap would go unenforced — reject
 		// fail-closed. A budget change must go through a demote → re-activate cycle, which begins a fresh
 		// generation with the new budget (Codex P2 round-6, PR #1290). A same-budget scope update proceeds.
-		if active, ok := globalCanaryRuntime.activeBudget(cfg.Capability); ok && active != activationBudget {
+		if active, ok := globalCanaryRuntime.activeBudget(cfg.Capability); ok && active != activation.Budget {
 			return r.rejectActivationAndRollback(tgt, cfg, prevMode, prevCfg, prevEvidence, actor, now, errRolloutCanaryBudgetChanged)
+		}
+		// §10: the running generation's REVIEWED-TARGET set is immutable for its whole life. A
+		// same-mode update that would bind a different set is refused fail-closed for the same reason
+		// a budget change is: generation G keeps enforcing what it was armed with, so letting the
+		// update through would leave G executing against targets it was never reviewed for — the
+		// control plane performing exactly the drift the runtime exists to catch. A demote →
+		// re-activate cycle begins a fresh generation with the new reviewed set. An IDENTICAL set is
+		// not a change and proceeds (a scope revision that renames nothing re-supplies the same set).
+		if reviewed, ok := globalCanaryRuntime.activeReviewedTargets(cfg.Capability); ok {
+			cand, rr := canary.CanonicalizeReviewedTargets(activation.ReviewedTargets)
+			if rr != canary.ReviewedOK || !reviewed.Equal(cand) {
+				return r.rejectActivationAndRollback(tgt, cfg, prevMode, prevCfg, prevEvidence, actor, now, errRolloutCanaryReviewedTargetsChanged)
+			}
 		}
 	case leavingLive:
 		// UN-ARM the live tier (close admission), then invalidate the Canary generation. Both steps are

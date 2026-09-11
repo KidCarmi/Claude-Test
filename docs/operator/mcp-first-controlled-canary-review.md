@@ -1782,11 +1782,49 @@ fifteen reasons a GO is forbidden, not the prohibition.
 6. ~~**The budget does not bound physical upstream invocations (§9).**~~ **CLOSED** — see
    "Blocker 6 closure" below. Idempotent read retries could send the POST ~3× per single budget
    reservation; the Canary path is now retry-free and the bound is proven at the wire.
-7. **Whole-Canary auto-abort is incomplete (§14/§16) — a product defect.** **REOPENED; closure
-   pending a clean adversarial review round on the atomic-binding follow-up.** The first pass wired every declared `AbortCanary` code
+7. ~~**Whole-Canary auto-abort is incomplete (§14/§16) — a product defect.**~~ **CLOSED** — the
+   activation-bound reviewed-target snapshot closes the last open Round-24 P1. The five closure rows
+   now hold:
+
+   | row | state | where it is proven |
+   |---|---|---|
+   | atomic activation binding | COMPLETE | `admitLiveExecution` decides the whole predicate under ONE acquisition of `cr.mu`; `mcp_canary_atomic_binding_test.go`. The comparison is ALSO reached on a scope-independent path, because a Canary scope pins the reviewed fingerprint and a fingerprint move therefore removes the request from every scope-gated path — `Deps.CanaryTargetObserved` + `latchReviewedDriftUnderActivation`, proven reachable in `internal/mcp/runtime/canary_reviewed_target_test.go` (Codex P1, PR #1360) |
+   | durable reviewed-target binding | COMPLETE | `canaryRuntimeState.ReviewedTargets` (schema 2), canonicalized before persistence; `mcp_canary_reviewed_durable_test.go` |
+   | approval-lifetime independence | COMPLETE | drift is decided against the activation's own record, never against an approval; matrix cases 2/4/5 |
+   | restart preservation | COMPLETE | restore re-canonicalizes and fails closed; matrix case 7 + the durable suite |
+   | same-generation immutability | COMPLETE | a same-mode update that would rebind the set is refused (`errRolloutCanaryReviewedTargetsChanged`); matrix case 10 |
+
+   **What was still missing when this was REOPENED, and why it mattered.** The atomic transaction
+   was correct, but the fact it compared was the wrong one: drift was inferred from an approval
+   still pinned to the reviewed fingerprint. Approval lifetime was therefore doing duty as drift
+   memory — and those are different security facts. An approval answers *is this request authorized
+   right now?*; the activation's snapshot answers *is this still the exact target this experiment
+   was reviewed against?* A first Canary window may run for `FirstCanaryMaxWindowCeiling` (7 days)
+   while a live-execution approval may live at most `MaxInitialCanaryApprovalTTL` (24 hours), so for
+   six of those seven days the approval store could no longer say what the activation had been
+   reviewed against. An attacker who simply WAITED OUT the TTL and then republished the tool met an
+   ordinary "not approved" denial instead of a whole-experiment abort. Worse, a later valid approval
+   for the NEW fingerprint could make the moved target look authorized to a generation that was
+   never reviewed for it.
+
+   **The fix, in one line:** an activation now carries an immutable, durable snapshot of the exact
+   targets it was reviewed and authorized to execute (`canary.ReviewedTargetSet` —
+   tenant/server/tool/fingerprint/format plus the pinned server identity), the comparison is made
+   against THAT inside the same activation transaction, and the approval-pinned proxy has been
+   removed. Empty or non-canonical reviewed targets fail the activation CLOSED; a durable active
+   record that cannot prove what it was reviewed for — including one written by a build predating
+   the field — does not restore executable authority; and generation G's set is immutable for its
+   whole life, so a change requires demote → re-activate. Proofs: `mcp_canary_reviewed_binding_test.go`
+   (the 12-case deterministic matrix), `mcp_canary_reviewed_durable_test.go` (durable compatibility),
+   `mcp_canary_reviewed_antivacuity_test.go` (every negative gate proves the request produced the
+   expected observation first, and the drifted target reaches zero upstream calls beside a positive
+   control that crosses exactly once).
+
+   The record of how the transaction itself was arrived at is kept below, because each correction
+   was a wrong turn taken in good faith and is worth not repeating. The first pass wired every declared `AbortCanary` code
    onto the one `AbortController`, made both rate detectors reachable inside the 3-execution corpus,
    and made the deadline absolute and self-enforcing — but it shipped with two open Round-19 P1
-   findings in the pre-admission drift path, and was merged in that state. It is recorded as
+   findings in the pre-admission drift path, and was merged in that state. It was recorded as
    REOPENED rather than quietly amended, because for a release-readiness gate "CLOSED with two open
    P1s" is not a status, it is a contradiction.
 

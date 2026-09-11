@@ -301,7 +301,7 @@ func armCanaryWithRealPeerFull(t *testing.T, p *controlledPeer, budgetTotal int,
 	if err := mcpLiveTierFor(rollout.CapabilityGateway).arm(true, "armed"); err != nil {
 		t.Fatalf("arm: %v", err)
 	}
-	if _, err := globalCanaryRuntime.beginCanaryActivation(rollout.CapabilityGateway, runtimeTestBudget(budgetTotal), time.Unix(0, 1)); err != nil {
+	if _, err := testBeginActivation(globalCanaryRuntime, rollout.CapabilityGateway, runtimeTestBudget(budgetTotal), time.Unix(0, 1)); err != nil {
 		t.Fatalf("beginCanaryActivation: %v", err)
 	}
 	return &peerRig{cfg: cfg, events: ev}

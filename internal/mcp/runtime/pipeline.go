@@ -574,6 +574,26 @@ func (p *pipeline) processMessage(ctx context.Context, req Request, rb *recBuild
 			// overstating exactly the overload rate an operator would alert on.
 			return p.reject(rb, 503, reason, "")
 		}
+		// A REVIEWED SERVER THAT IS NO LONGER USABLE IS REJECTED HERE, ABOVE dispatchPolicy —
+		// which is why the reviewed-target observation has to be made here too.
+		//
+		// identity.Resolve performs the registry existence + Usable() check
+		// (identity/context.go, resolveCapabilityRefs) and fails with
+		// ReasonRegistryServerUnavailable. So for the entire time a reviewed server is disabled,
+		// EVERY request for it ends on this line and dispatchPolicy never runs: the observation
+		// emitted at the top of that function, and the !obs.Usable latch behind it, are both
+		// unreachable. Disabling and later re-enabling the server would resume the original
+		// activation with nothing recorded (Codex P1, PR #1360, round 4).
+		//
+		// Gating on THIS reason specifically is what keeps it safe. The pre-auth step
+		// deliberately does not consult the registry (OVN-08, gatewayServerID above), so an
+		// existence/usability rejection can only be produced by identity.Resolve — after the
+		// credential is cryptographically validated. An unauthenticated caller therefore cannot
+		// reach this emission, and cannot use it to enumerate servers or to stop an experiment.
+		// Every other authentication failure is attacker-mintable and emits nothing.
+		if reason == mcperr.ReasonRegistryServerUnavailable {
+			p.observeCanaryReviewedTarget(req, msg)
+		}
 		p.ctr.authFailures.Add(1)
 		// PR-8: route the pre-identity authentication failure into the isolated
 		// denial lane (attacker-mintable; no tenant attribution). Never blocks.

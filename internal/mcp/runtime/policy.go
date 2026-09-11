@@ -37,6 +37,32 @@ const policyErrorCode = -32050
 // provider, or an upstream MCP server, and NEVER fabricates execution success:
 // even an ALLOW-class decision returns an execution-not-implemented result.
 func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Request, msg jsonrpc.Message, ident *identity.ResolvedContext, now time.Time) Outcome {
+	// Report the tool this request NAMES to the Canary reviewed-target sink FIRST, before
+	// any decision this function makes can end the request — and that placement is the
+	// whole point, twice over.
+	//
+	// A Canary scope pins the reviewed fingerprint in its tool selector, so a tool that
+	// moves F1→F2 puts every later request OUT of scope; resolveEnforcing then routes them
+	// to the shadow or record-only fallback, and the record-only branch returns without
+	// ever reaching dispatchExecute, the executor, or the activation transaction. Worse,
+	// the SAME F1→F2 change is what makes a new schema reject arguments the old one
+	// accepted, so semantic inspection hard-fails those requests and dispatchPolicy exits
+	// above the executor entirely (Codex P1, PR #1360, round 2). The snapshot-unavailable
+	// and budget-expired returns are the same shape. Reporting from any point downstream
+	// of one of those returns cannot see the one sequence the reviewed snapshot exists to
+	// catch: the experiment's reviewed target has changed underneath it and the change is
+	// exactly what hides the evidence.
+	//
+	// The identity is therefore derived from the request and the JSON-RPC message ALONE —
+	// no policy snapshot, no catalog record, no inspection verdict — so nothing this
+	// function can fail on is upstream of it.
+	//
+	// What is reported is an identity, not a verdict. The root compares the CURRENT
+	// authoritative target against the activation's reviewed snapshot under the activation
+	// lock, so a tool this activation was never reviewed for latches nothing, and a
+	// rejected request drifts a Canary only when its reviewed target really has moved.
+	p.observeCanaryReviewedTarget(req, msg)
+
 	snap := p.policy.PolicySnapshot(p.capability)
 	if snap == nil {
 		// Fail closed — never fall back to permissive observe mode.
@@ -57,11 +83,7 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 		recordInspection(rb, insp.result.Summary)
 		applyInspectionToInput(&in, insp.result.Summary)
 		if insp.result.HardFail {
-			p.ctr.requestsRejected.Add(1)
-			rb.rec.PolicyAction = "BLOCKED_BY_INSPECTION"
-			rb.rec.PolicyReason = insp.result.HardReason.Code()
-			body := inspectionError(msg.ID, insp.result.HardReason)
-			return p.finish(rb, Outcome{Status: 200, Disposition: DispRejected, Reason: insp.result.HardReason, ResponseBody: body})
+			return p.rejectTyped(rb, msg, "BLOCKED_BY_INSPECTION", insp.result.HardReason)
 		}
 	}
 
@@ -110,11 +132,7 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 		// PR #1234). Reading only the monotonic kill flag can only make the outcome more
 		// restrictive, so it does not reopen the single-resolution TOCTOU.
 		if p.executor.KillActive() {
-			p.ctr.requestsRejected.Add(1)
-			rb.rec.PolicyAction = "BLOCKED_BY_EMERGENCY_KILL"
-			rb.rec.PolicyReason = mcperr.ReasonRolloutEmergencyActive.Code()
-			body := inspectionError(msg.ID, mcperr.ReasonRolloutEmergencyActive)
-			return p.finish(rb, Outcome{Status: 200, Disposition: DispRejected, Reason: mcperr.ReasonRolloutEmergencyActive, ResponseBody: body})
+			return p.rejectTyped(rb, msg, "BLOCKED_BY_EMERGENCY_KILL", mcperr.ReasonRolloutEmergencyActive)
 		}
 	}
 
@@ -124,11 +142,7 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 		// transform, residual secret, stale/missing profile ⇒ block, never a pretend
 		// redaction.
 		if d.Action == policy.ActionAllowWithRedaction && !p.satisfyRedaction(rb, insp, d) {
-			p.ctr.requestsRejected.Add(1)
-			rb.rec.PolicyAction = "REDACTION_FAILED"
-			rb.rec.PolicyReason = mcperr.ReasonRedactionFailed.Code()
-			body := inspectionError(msg.ID, mcperr.ReasonRedactionFailed)
-			return p.finish(rb, Outcome{Status: 200, Disposition: DispRejected, Reason: mcperr.ReasonRedactionFailed, ResponseBody: body})
+			return p.rejectTyped(rb, msg, "REDACTION_FAILED", mcperr.ReasonRedactionFailed)
 		}
 		// PR-8: DURABLY COMMIT the sanitized decision event BEFORE the (still
 		// not-implemented) execution response. A CRITICAL operation whose event
@@ -159,6 +173,63 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 // identity, the live registry/catalog snapshots and the operation. All facts are
 // read BEFORE evaluation (the evaluator itself does no I/O). It carries no raw
 // arguments — only the tool name (an operand identity) and one-way fingerprints.
+// rejectTyped is the ONE shape every non-policy rejection in dispatchPolicy takes: count it, record
+// the sanitized action and reason on the observation, and return the deterministic typed JSON-RPC
+// error. Written once because the three sites that use it — inspection hard fail, emergency kill,
+// failed redaction — must not drift apart in WHAT they record; a rejection that forgets its counter
+// or its reason is a hole in the evidence, not a cosmetic difference.
+//
+// The snapshot-unavailable rejection deliberately does NOT use it: that one answers with a policy
+// error carrying an action and a policy.Reason, a different contract with a different body.
+func (p *pipeline) rejectTyped(rb *recBuilder, msg jsonrpc.Message, action string, reason mcperr.Reason) Outcome {
+	p.ctr.requestsRejected.Add(1)
+	rb.rec.PolicyAction = action
+	rb.rec.PolicyReason = reason.Code()
+	return p.finish(rb, Outcome{
+		Status: 200, Disposition: DispRejected, Reason: reason,
+		ResponseBody: inspectionError(msg.ID, reason),
+	})
+}
+
+// observeCanaryReviewedTarget reports the tool this request NAMES to the Canary reviewed-target
+// sink. It is called as the FIRST statement of dispatchPolicy, before any decision that function
+// makes can end the request — see the comment at the call site for why that placement is the whole
+// point, and canary_reviewed_target_test.go for the gates that hold it there.
+func (p *pipeline) observeCanaryReviewedTarget(req Request, msg jsonrpc.Message) {
+	serverID, toolName := p.canaryObservedTarget(req, msg)
+	p.deps.noteCanaryTargetObserved(p.capability.String(), CanaryTargetObservation{
+		// Read BEFORE any of dispatchPolicy's work, so it names an activation at least as old as
+		// the one this request was decided under. The root refuses a superseded generation, so an
+		// activation landing mid-request costs evidence, never a latch against the wrong reviewed
+		// set.
+		Generation: p.deps.canaryGenerationAt(p.capability.String()),
+		ServerID:   serverID,
+		ToolName:   toolName,
+	})
+}
+
+// canaryObservedTarget names the tool this request is FOR, derived from the request and
+// the JSON-RPC message ALONE. It deliberately reproduces the exact gate buildPolicyInput
+// uses to populate in.Tool — Gateway capability, tools/call, a params name — so the
+// identity reported to the Canary reviewed-target sink is the same one the executor path
+// would have reported, only reachable before anything in dispatchPolicy can fail.
+//
+// It must NOT consult the catalog: a tool whose catalog record is absent still reaches
+// buildPolicyInput as a named (quarantined) tool, and a reviewed target that has
+// DISAPPEARED is precisely a target the activation can no longer be executing against.
+// Any divergence between this gate and buildPolicyInput's is a silent hole, so the two
+// are pinned against each other by test.
+func (p *pipeline) canaryObservedTarget(req Request, msg jsonrpc.Message) (serverID, toolName string) {
+	if p.capability != protocol.Gateway || msg.Method != "tools/call" {
+		return "", ""
+	}
+	name := toolNameFromParams(msg.Params)
+	if name == "" {
+		return "", ""
+	}
+	return req.ServerID, name
+}
+
 func (p *pipeline) buildPolicyInput(req Request, msg jsonrpc.Message, ctx *identity.ResolvedContext, polRev policy.Revision, now time.Time) policy.DecisionInput {
 	capNS := policyCapability(p.capability)
 	in := policy.DecisionInput{
