@@ -198,7 +198,15 @@ Run these once when bringing up a new node, in order:
    SP Entity ID / Audience, and the ACS URL is
    `proxy.base_url + /auth/saml/callback`. `trust_forwarded_headers` helps
    request-derived URLs, but it does not replace `proxy.base_url` for SAML
-   SP metadata built at startup.
+   SP metadata built at startup. `trust_forwarded_headers` is a global,
+   unscoped trust of `X-Forwarded-Host`/`X-Forwarded-Proto` from *any*
+   direct peer (there is no CIDR allowlist for it, unlike
+   `trusted_proxy_cidrs`, and it plays no role in admin-UI client-IP
+   resolution — see RISK-019 in
+   `docs/engineering/TECHNICAL-RISK-REGISTER.md`). Only enable it when
+   Culvert is not directly reachable by untrusted clients — e.g. always
+   fronted by a proxy that overwrites those headers — otherwise a direct
+   client can forge the derived callback host itself.
 7. **First admin user.** Visit the UI, complete the setup wizard, and
    create the first admin account.
 8. **Open the Diagnostics page** (Infrastructure → Diagnostics). Resolve
