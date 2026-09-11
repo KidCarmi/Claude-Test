@@ -423,7 +423,7 @@ unchanged and green, `logstore.OpenResilientTTL`, the `EncKey` refusal, and a fu
 alert). 37 new gates; every defect gate verified failing against the reintroduced pre-fix shape, plus
 a permanent defect proof that the bare open still panics uncatchably. R-E CLOSED. See §25 and
 `docs/engineering/CHAOS-ENGINEERING-REVIEW-2026-08-29.md`.
-**2026-09-04 — CHAOS-62 sweep (destination-host DNS resolution on the policy path).** The
+**2026-09-04 — CHAOS-63 sweep (destination-host DNS resolution on the policy path).** The
 sweep took the one failure domain the register had never entered: **DNS**, listed in the original
 scope and never swept, because it looks like somebody else's dependency. It is not — a
 `DestCountry` policy rule puts the customer's resolver on the critical path of every request that
