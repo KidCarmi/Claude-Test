@@ -10,7 +10,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// CHAOS-62 — the admin login endpoint's attacker-controlled username
+// CHAOS-63 — the admin login endpoint's attacker-controlled username
 //
 // POST /api/auth/login is on uiAuthMiddleware's PUBLIC allowlist: no session,
 // no credential, no cluster membership. Every failed attempt copied the caller's
