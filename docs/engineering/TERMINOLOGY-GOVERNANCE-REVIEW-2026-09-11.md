@@ -58,7 +58,8 @@ a 195-file, backend-heavy window, and no carry-over item moved — so the score 
 
 ## Carried-Over Findings (unchanged)
 
-All twelve previously-open finding IDs remain open, unchanged, and re-confirmed against the current tree:
+All fourteen previously-open finding IDs (thirteen backlog entries, since T-21 and T-32 are tracked as one
+paired item) remain open, unchanged, and re-confirmed against the current tree:
 T-9, T-11, T-12, T-13 (residual), T-17, T-18, T-21+T-32 (paired), T-25 (residual), T-29, T-30, T-33, T-34,
 T-39. Full descriptions and the priority-ordered refactoring plan are unchanged from
 `TERMINOLOGY-GOVERNANCE-REVIEW-2026-09-09.md` and are not restated here to avoid drift between two
@@ -75,8 +76,8 @@ numbered backlog, per 2026-09-09's reasoning.
 
 No production-worthy NEW terminology improvement was identified this pass: the 31-merge window audited
 was backend reliability/observability engineering with disciplined internal naming (confirmed
-cross-surface for every new subsystem) and no admin-facing vocabulary change. The twelve-item carry-over
-backlog is unchanged and was independently re-confirmed (not merely assumed unchanged) for three of its
+cross-surface for every new subsystem) and no admin-facing vocabulary change. The fourteen-ID (thirteen-
+entry) carry-over backlog is unchanged and was independently re-confirmed (not merely assumed unchanged) for three of its
 higher-visibility items. No cosmetic or preference-driven renames are proposed. This report itself — the
 audit record and backlog reconciliation — is the deliverable of this pass; per the DEBT-014 process
 lesson, it was written only after a fresh sync against `origin/main` immediately before opening its PR.
