@@ -31,7 +31,7 @@ import (
 // (not a direct call) so tests can stub the resolver deterministically and
 // count invocations; production never reassigns it.
 //
-// CHAOS-61 made the seam CONTEXT-AWARE. It used to be `net.LookupHost`, whose
+// CHAOS-62 made the seam CONTEXT-AWARE. It used to be `net.LookupHost`, whose
 // only bound is the operating system's — `resolv.conf` ships `timeout:5
 // attempts:2` per nameserver, so a wedged resolver held the request goroutine
 // for 10 s+ and, with a multi-nameserver configuration, considerably longer.
@@ -91,7 +91,7 @@ type hostIPCache struct {
 	//
 	// Without it, concurrent misses for the SAME host each ran their own
 	// resolution — measured 200 resolver invocations for 200 concurrent
-	// requests to one host (CHAOS-61). During a resolver brownout that is one
+	// requests to one host (CHAOS-62). During a resolver brownout that is one
 	// blocked request goroutine per request AND one query per request aimed at
 	// the resolver that is already failing: the WK-13 herd, pointed at the
 	// customer's own DNS at the moment it is least able to answer. It is also
@@ -129,7 +129,7 @@ const (
 	// hostIPCacheStaleMax is how long PAST its expiry an entry may still be
 	// SERVED, while a refresh runs behind it (stale-while-revalidate).
 	//
-	// Before CHAOS-61 an expired entry was discarded outright, which made the
+	// Before CHAOS-62 an expired entry was discarded outright, which made the
 	// first expiry during a resolver outage a synchronized stampede: every
 	// popular host went cold within the same 5-minute window, every request
 	// blocked on a resolver that could not answer, and geo.LookupCached started
@@ -240,7 +240,7 @@ func (c *hostIPCache) lookup(host string, now time.Time) (ip net.IP, state hostI
 		// promises. Worse, the repair would depend entirely on the asynchronous
 		// refresh, which SHEDS when the resolver pool is saturated — so under
 		// sustained load the bypass could persist for the full hour. That is the
-		// pre-CHAOS-61 dark window, reintroduced by the mechanism meant to close
+		// pre-CHAOS-62 dark window, reintroduced by the mechanism meant to close
 		// it, and it is a REGRESSION against the old behaviour, which re-resolved
 		// synchronously the moment the negative TTL lapsed.
 		//
@@ -265,7 +265,7 @@ func (c *hostIPCache) resolving(host string) bool {
 // get reports a FRESH cache entry (ok=true with a nil ip is a fresh negative
 // entry). It is the cache-only accessor: unlike lookup it never reports a
 // stale entry as servable, so callers that must not consume a stale address
-// keep the pre-CHAOS-61 semantics.
+// keep the pre-CHAOS-62 semantics.
 func (c *hostIPCache) get(host string) (net.IP, bool) {
 	ip, state, _ := c.lookup(host, time.Now())
 	if state != hostIPFresh {
@@ -508,7 +508,7 @@ func (c *hostIPCache) refreshAsync(host string) {
 // private-only answers — the shared SSRF posture).
 //
 // Every outcome is charged to the health record (dns_health.go), because before
-// CHAOS-61 a total resolution outage on this path was counted nowhere, logged
+// CHAOS-62 a total resolution outage on this path was counted nowhere, logged
 // nowhere and alerted nowhere: geo-scoped policy simply stopped matching while
 // every probe stayed green.
 func lookupPublicHostIP(host string) net.IP {

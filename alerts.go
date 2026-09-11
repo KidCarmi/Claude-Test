@@ -72,7 +72,7 @@ func init() {
 // churn on top of the outage. When a subscriber exists the dispatch is
 // byte-identical to the previous inline call.
 //
-// CHAOS-61 bounded the Detail. It used to be the raw err.Error(), and
+// CHAOS-62 bounded the Detail. It used to be the raw err.Error(), and
 // Store.Dispatch dedups on `event + ":" + Detail`: a *net.DNSError's text
 // embeds the QUERIED HOSTNAME and the resolver address, so every failure
 // produced a DISTINCT dedup key that the 30 s window could not suppress by

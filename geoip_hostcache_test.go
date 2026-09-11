@@ -36,7 +36,7 @@ func stubResolver(addrs []string, err error) (calls *atomic.Int64, restore func(
 	resolvedHostCache.mu.Unlock()
 	resetDNSResolveHealthForTest()
 	return &counter, func() {
-		// CHAOS-61 made the stale path refresh ASYNCHRONOUSLY, so a background
+		// CHAOS-62 made the stale path refresh ASYNCHRONOUSLY, so a background
 		// goroutine can still be reading lookupHostFn when the test returns.
 		// Restoring the seam over a live reader is a data race the -race gate
 		// catches, and it is the same test-isolation class swapAutoExclude
@@ -124,11 +124,11 @@ func TestResolveHost_NegativeCache(t *testing.T) {
 	}
 }
 
-// TestResolveHost_TTLExpiry pins the CHAOS-61 stale-while-revalidate contract:
+// TestResolveHost_TTLExpiry pins the CHAOS-62 stale-while-revalidate contract:
 // past its TTL but inside hostIPCacheStaleMax, the cached address is still
 // SERVED (the caller never blocks) and a refresh runs behind it.
 //
-// The pre-CHAOS-61 contract was a synchronous re-resolve on expiry, which is
+// The pre-CHAOS-62 contract was a synchronous re-resolve on expiry, which is
 // what made the first expiry during a resolver outage a synchronized stampede
 // — see the hostIPCacheStaleMax comment in geoip.go.
 func TestResolveHost_TTLExpiry(t *testing.T) {

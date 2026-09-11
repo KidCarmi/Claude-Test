@@ -338,7 +338,7 @@ clustered node, counted audit-push drops, and 17 gates with every defect gate ve
 against the pre-fix tree. No new alert event: a stale broadcast is always the CP link, which
 already alerts. See rows CL-20/CL-21, §30 (CHAOS-61), and
 `docs/operator/cluster-rate-limit-freshness.md`.
-**2026-09-04 — CHAOS-61 sweep (destination-host DNS resolution on the policy path).** The
+**2026-09-04 — CHAOS-62 sweep (destination-host DNS resolution on the policy path).** The
 sweep took the one failure domain the register had never entered: **DNS**, listed in the original
 scope and never swept, because it looks like somebody else's dependency. It is not — a
 `DestCountry` policy rule puts the customer's resolver on the critical path of every request that
@@ -4775,7 +4775,7 @@ to ignore the gauge before the real outage arrives.
 > the question in both directions at once.
 
 Runbook: `docs/operator/cluster-rate-limit-freshness.md`.
-## 31. CHAOS-61 — Destination-host DNS resolution on the policy path
+## 31. CHAOS-62 — Destination-host DNS resolution on the policy path
 
 > Same finding as §28, reached from the other end. §28 entered through the
 > GeoIP accessor and fixed the WARM path (cache-only accessor + bounded,
@@ -4789,11 +4789,12 @@ Runbook: `docs/operator/cluster-rate-limit-freshness.md`.
 `geoip.go`, `dns_health.go`, `alerts.go` · **Runbook:**
 `docs/operator/dns-resolution-health.md`
 
-> **Renumbered FOUR TIMES before merge — CHAOS-57 → CHAOS-58 → CHAOS-59 →
-> CHAOS-60 → CHAOS-61.** This sweep collided with a concurrently-developed sweep
-> on `main` on four consecutive merges inside eight days, and lost the id every
-> time for the same reason. Each rename picked the next id that was free *at that
-> instant*, and each time another in-flight branch merged that id first.
+> **Renumbered FIVE TIMES before merge — CHAOS-57 → CHAOS-58 → CHAOS-59 →
+> CHAOS-60 → CHAOS-61 → CHAOS-62.** This sweep collided with a
+> concurrently-developed sweep on `main` on five merges inside eight days, and
+> lost the id every time for the same reason. Each rename picked the next id that
+> was free *at that instant*, and each time another in-flight branch merged that
+> id first.
 >
 > | # | Date | Collided with | Which had taken | This sweep became |
 > |---|---|---|---|---|
@@ -4801,17 +4802,23 @@ Runbook: `docs/operator/cluster-rate-limit-freshness.md`.
 > | 2 | 2026-09-10 | §26 the LDAP directory that stalls | `CHAOS-58` | `CHAOS-59` / §27 |
 > | 3 | 2026-09-10 | §27 the intelligence-feed plane | `CHAOS-59` | `CHAOS-60` / §28 |
 > | 4 | 2026-09-11 | §28 the GeoIP resolution chain | `CHAOS-60` | `CHAOS-61` / §29 |
+> | 5 | 2026-09-11 | §30 the DP outbound cluster state | `CHAOS-61` | `CHAOS-62` / §31 |
 >
 > The first was already the THIRD occurrence of the class the header records for
 > `CHAOS-50`. Collisions 2 and 3 landed on the same day, hours apart, against two
-> different branches.
+> different branches. Collisions 4 and 5 also landed on the same day, hours
+> apart, against two more.
 >
-> **This section is now §30, and that was not a fifth rename.** The id
-> `CHAOS-61` is unaffected; the SECTION was displaced by a later merge of `main`
-> that inserted a newly-merged sweep ahead of it. Column five above records what
-> each rename produced at the time, so row 4 reads `§29` and is left as history —
-> the current location is §30 and every pointer outside the register (`CLAUDE.md`,
-> the runbook, `internal/geoip/geoip.go`) was repointed with it.
+> **Between collisions 4 and 5 the section ALSO moved twice without a rename**
+> (§29 → §30 → §31): an unrelated newly-merged sweep was inserted ahead of it
+> each time, displacing the section while leaving the id alone. Column five
+> records what each RENAME produced at the time, so rows 4 and 5 keep their
+> then-current locations and the displacements are not rows. The current location
+> is §31, and every pointer outside the register (`CLAUDE.md`, the runbook,
+> `internal/geoip/geoip.go`) was repointed with it each time. **A section move and
+> an id collision are different events and the table must not conflate them** —
+> the first costs a pointer sweep, the second costs a rename of every gate,
+> metric and comment naming the sweep.
 >
 > **Collision 4 is the one the previous note predicted in writing, and it is the
 > sharpest case of all**: §28 is the sibling half of THIS finding — the same
@@ -4835,12 +4842,12 @@ Runbook: `docs/operator/cluster-rate-limit-freshness.md`.
 > references were left untouched in every pass, so `metrics.go` now carries one
 > line from §25, one from §28 and one from here, `CLAUDE.md` carries §26's, §27's
 > and §28's bullets beside this sweep's, and `geoip.go` carries both halves of the
-> §28/§30 pair.
+> §28/§31 pair.
 >
-> **Each of the four merges was resolved by someone who fixed the duplicate
+> **Each of the five merges was resolved by someone who fixed the duplicate
 > SECTION number and left the duplicate ID in place**, which is why the collision
 > survived to recur: a section renumber makes the register read correctly while
-> two sweeps still answer to one name, and collisions 2–4 were found only because
+> two sweeps still answer to one name, and collisions 2–5 were found only because
 > a later merge conflict forced someone to look again.
 >
 > **The prevention the header has named since `CHAOS-50` is now overdue, and this
@@ -4848,13 +4855,15 @@ Runbook: `docs/operator/cluster-rate-limit-freshness.md`.
 > row at the START of a sweep. Renaming at merge time provably cannot work — the
 > id a rename picks is validated against `main` at the instant of the rename and
 > nothing reserves it afterwards, so the rename is itself a race. One branch lost
-> the same id four times in eight days; catching each one was luck, not process.
-> The previous revision of this note ended *"until it exists, expect a fourth"* —
-> and the fourth arrived within the day, from a sibling sweep on this very branch.
-> **Owner action: add the placeholder-allocation row.** A fifth is not a
-> prediction about luck; it is what this process produces by construction.
+> the id FIVE times in eight days; catching each one was luck, not process.
+> Each revision of this note has predicted the next occurrence in writing and each
+> prediction has been met within the day — *"expect a fourth"* was followed by a
+> fourth from a sibling sweep on this very branch, and the note that recorded the
+> fourth was overtaken by a fifth before it merged. **Owner action: add the
+> placeholder-allocation row.** A sixth is not a prediction about luck; it is what
+> this process produces by construction, and the rate is now more than one per day.
 >
-> **The fifth landed the same day, and it is already ON `main`.** §29 — the
+> **A SEPARATE duplicate is already ON `main` and no branch can resolve it.** §29 — the
 > credential-verification-cost sweep, merged 2026-09-11 — is stamped `CHAOS-57`,
 > which §25 has held since 2026-09-04. Both are merged, so the asymmetry that
 > resolved collisions 1–4 does not apply: neither side is free to move, and
@@ -5011,7 +5020,7 @@ synchronous path for up to `hostIPCacheStaleMax`, leaving a country-scoped DENY
 rule dark for an **hour** after DNS recovered instead of the 30 s the negative
 TTL promises. Worse, `refreshAsync` SHEDS when the resolver pool is saturated,
 so under sustained load the bypass could persist for the full window. And it was
-a REGRESSION against the pre-CHAOS-61 behaviour, which re-resolved synchronously
+a REGRESSION against the pre-CHAOS-62 behaviour, which re-resolved synchronously
 the moment the negative TTL lapsed.
 
 Fixed by restricting the stale state to `e.ip != nil`. An expired negative is a
@@ -5051,7 +5060,7 @@ against each state it can be in, not only the one that motivated it.
 
 ### 31.7 GEO-1 — a latent process-kill armed by a comment (recorded, not fixed)
 
-Found while sweeping the domain adjacent to CHAOS-61 and **not reachable in the
+Found while sweeping the domain adjacent to CHAOS-62 and **not reachable in the
 current tree**, but recorded because of how it is armed.
 
 `internal/geoip.InitGeoDB` claimed:
