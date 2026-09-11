@@ -1627,3 +1627,82 @@ func assertCause(t *testing.T, r *reviewedRig, want string) {
 			"cause of an irreversible stop a property of the request rather than of the state", got, want)
 	}
 }
+
+// ── 24 ───────────────────────────────────────────────────────────────────────────────────────
+// COMBINED TRANSITIONS — anchor state outranks the comparison verdict on BOTH paths.
+//
+// C23 walks each transition on its own, and that is exactly what it misses: two of them at once.
+// A reviewed pair reassigned A→B whose registry identity is THEN repinned before the catalog
+// re-ingests leaves one published state that the two paths read differently. The observation sink
+// checks the anchor facts before comparing and says server_identity_drift; the live precheck
+// returned at the tenant gate before it ever looked at them, so admission compared the carried
+// target and said reviewed_target_tenant_drift. Whichever request arrived first decided the
+// immutable first cause (Codex P2, PR #1360, round 30).
+//
+// The ordering the observation path uses is the deliberate one, recorded at its own branch: an
+// anchor that is no longer in force outranks whatever the target happens to compare as, because
+// losing the trust anchor is the stronger statement about what the experiment was authorized
+// against. The precheck now checks the same facts in the same order.
+func TestReviewedBinding_C24_AnchorLossOutranksTenantDriftOnBothPaths(t *testing.T) {
+	move := func(t *testing.T, r *reviewedRig) {
+		t.Helper()
+		republishUnderTenant(t, r.sid, r.tool, "other-tenant")
+		reg, _ := mcpInventory.sharedInventory()
+		if reg == nil {
+			t.Fatal("premise: a shared registry must be published")
+		}
+		if _, err := reg.Repin(registry.ServerID(r.sid), registry.Identity("rotated"), canaryRuntimeTestNow); err != nil {
+			t.Fatalf("repin: %v", err)
+		}
+		cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+		if !cur.Found || !cur.RegistryPinDiverged {
+			t.Fatalf("premise: both transitions must be live — found=%v diverged=%v", cur.Found, cur.RegistryPinDiverged)
+		}
+		if cur.Target.Tenant == ttTenant {
+			t.Fatal("premise: the target must have changed hands")
+		}
+	}
+
+	t.Run("admission", func(t *testing.T) {
+		r := newReviewedRig(t)
+		move(t, r)
+		if r.request(r.fp1, r.now) {
+			t.Fatal("SECURITY: a request against a reassigned, repinned target must not be admitted")
+		}
+		assertCause(t, r, "server_identity_drift")
+	})
+	t.Run("observation", func(t *testing.T) {
+		r := newReviewedRig(t)
+		move(t, r)
+		canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+			Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
+		})
+		assertCause(t, r, "server_identity_drift")
+	})
+}
+
+// CONTROL for C24: with the anchor INTACT, a tenant reassignment still reports tenant drift on
+// both paths. Without this, "anchor loss outranks the comparison" could be satisfied by a form
+// that reports server_identity_drift for every wrong-tenant request, which would erase the
+// tenant-drift verdict round 28 exists to produce.
+func TestReviewedBinding_C24Control_AHealthyAnchorStillReportsTenantDrift(t *testing.T) {
+	t.Run("admission", func(t *testing.T) {
+		r := newReviewedRig(t)
+		republishUnderTenant(t, r.sid, r.tool, "other-tenant")
+		if mcpCurrentAuthoritativeTarget(r.sid, r.tool).RegistryPinDiverged {
+			t.Fatal("premise: the anchor must be intact")
+		}
+		if r.request(r.fp1, r.now) {
+			t.Fatal("SECURITY: a reassigned target must not be admitted")
+		}
+		assertCause(t, r, "reviewed_target_tenant_drift")
+	})
+	t.Run("observation", func(t *testing.T) {
+		r := newReviewedRig(t)
+		republishUnderTenant(t, r.sid, r.tool, "other-tenant")
+		canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+			Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
+		})
+		assertCause(t, r, "reviewed_target_tenant_drift")
+	})
+}

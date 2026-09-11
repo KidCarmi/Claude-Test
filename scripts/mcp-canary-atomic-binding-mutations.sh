@@ -518,6 +518,24 @@ run_mutation M41 \
   . mcp_live_gate.go \
   's/\t\t\tDriftCode: "tool_fingerprint_drift", Resolved: true, Authoritative: authoritative,/\t\t\tDriftCode: "tool_fingerprint_drift",/'
 
+# ── (17) ROUND 30: TWO TRANSITIONS AT ONCE ─────────────────────────────────
+# Each transition on its own agreed across both latch paths; the COMBINATION did not. A reviewed
+# pair reassigned A→B whose registry identity is then repinned before the catalog re-ingests made
+# the precheck return at the tenant gate before it ever looked at the anchor facts, so the cause
+# depended on which path observed it.
+
+run_mutation M42 \
+  'the tenant gate returns before the anchor facts are consulted (cause decided by path)' \
+  'TestReviewedBinding_C24_AnchorLossOutranksTenantDriftOnBothPaths' \
+  . mcp_live_gate.go \
+  's/\tif !ti\.target\.ServerUsable \{\n\t\treturn liveTrustPrecheck\{DriftCode: "server_identity_drift"\}\n\t\}\n/\tif ti.target.Tenant == "" || ti.target.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative\}\n\t\}\n\tif !ti.target.ServerUsable \{\n\t\treturn liveTrustPrecheck\{DriftCode: "server_identity_drift"\}\n\t\}\n/'
+
+run_mutation M43 \
+  'every wrong-tenant request reads as anchor loss, erasing the tenant-drift verdict' \
+  'TestReviewedBinding_C24Control_AHealthyAnchorStillReportsTenantDrift' \
+  . mcp_live_gate.go \
+  's/\tif ti\.target\.Tenant == "" \|\| ti\.target\.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative\}\n\t\}/\tif ti.target.Tenant == "" || ti.target.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{DriftCode: "server_identity_drift"\}\n\t\}/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

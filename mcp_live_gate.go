@@ -427,21 +427,34 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 		FingerprintFormat: ti.target.FingerprintFormatVersion,
 		ServerIdentity:    ti.pinnedIdentity,
 	}
-	if ti.target.Tenant == "" || ti.target.Tenant != tenant {
-		// Request-scoped for AUTHORIZATION — this request is not the owner — but the target is
-		// carried out so the reviewed comparison can still see that the reviewed pair changed
-		// hands. Eligible stays false, so nothing here authorizes anything.
-		return liveTrustPrecheck{Resolved: true, Authoritative: authoritative}
-	}
-	// The reviewed server must still be usable at the boundary (P1b): an operator disable or a lost
-	// identity verification after runExecute snapshotted in.Server fails closed here.
+	// ANCHOR STATE IS CHECKED BEFORE THE TENANT GATE, and the order is the finding.
 	//
-	// WHOLE-CANARY. This one signal conflates two causes — an operator disabling the server and the
-	// server losing identity verification — and they are not separable from the data available
-	// here (a distinguishable peer-freshness source is blocker #11). The conservative reading is
-	// taken deliberately: in BOTH cases the trust anchor the experiment was authorized against is
-	// no longer the one in force, and the safe response to "the approved anchor is gone" is to stop
-	// changing reality, not to keep going because one of the two possible causes was benign.
+	// Both of the branches below say the same thing — the trust anchor the experiment was
+	// authorized against is no longer the one in force — and the scope-independent observation
+	// path (latchReviewedDriftUnderActivation) has always checked exactly these two facts BEFORE
+	// its reviewed comparison, on the recorded reasoning that an absent anchor outranks whatever
+	// the target happens to compare as. This path returned at the tenant gate first, so for ONE
+	// published state carrying BOTH transitions — a reviewed pair reassigned A→B whose registry
+	// identity is then repinned before the catalog re-ingests — admission compared the carried
+	// target and latched reviewed_target_tenant_drift while the observation sink latched
+	// server_identity_drift. Whichever request arrived first decided the immutable first cause
+	// (Codex P2, PR #1360, round 30).
+	//
+	// Neither branch carries Resolved/Authoritative, deliberately: reviewedFirstCause can only
+	// sharpen a cause when a target rides along, and here there is nothing to sharpen TO — an
+	// anchor-class cause already outranks every verdict Compare could return, so carrying the
+	// target could only downgrade it.
+	//
+	// This does not widen what latches. The observation sink runs for every dispatched request
+	// naming a tool and already latches this state; only the recorded cause differed.
+	//
+	// WHOLE-CANARY. The usability signal conflates two causes — an operator disabling the server
+	// and the server losing identity verification — and they are not separable from the data
+	// available here (a distinguishable peer-freshness source is blocker #11). The conservative
+	// reading is taken deliberately: in BOTH cases the approved anchor is gone, and the safe
+	// response is to stop changing reality, not to keep going because one of the two possible
+	// causes was benign. An operator disable or a lost identity verification after runExecute
+	// snapshotted in.Server fails closed here (P1b).
 	if !ti.target.ServerUsable {
 		return liveTrustPrecheck{DriftCode: "server_identity_drift"}
 	}
@@ -452,6 +465,13 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 	// not the one in force (Codex P1, PR #1360, round 4).
 	if ti.registryPinDiverged {
 		return liveTrustPrecheck{DriftCode: "server_identity_drift"}
+	}
+	// The anchor is sound; only now does ownership decide. Request-scoped for AUTHORIZATION — this
+	// request is not the owner — but the target is carried out so the reviewed comparison can still
+	// see that the reviewed pair changed hands. Eligible stays false, so nothing here authorizes
+	// anything.
+	if ti.target.Tenant == "" || ti.target.Tenant != tenant {
+		return liveTrustPrecheck{Resolved: true, Authoritative: authoritative}
 	}
 	// Bind trust to the DECISION's fingerprint, not merely whichever fingerprint is current (P1a): the
 	// current target must STILL equal the fingerprint this request was decided against, so an
