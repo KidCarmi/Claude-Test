@@ -394,12 +394,12 @@ func TestExemptBenchFixturesProbeWhatTheyClaim(t *testing.T) {
 
 	// The realistic fixture must also hit on its single-IP probe and miss on
 	// the shared miss probe, for the same reason.
-	real := newRateLimiter()
-	_ = real.AddExemptions(benchExemptRealistic)
-	if !real.IsExempt("198.51.100.7") {
+	realistic := newRateLimiter()
+	_ = realistic.AddExemptions(benchExemptRealistic)
+	if !realistic.IsExempt("198.51.100.7") {
 		t.Error("benchExemptRealistic does not exempt 198.51.100.7: BenchmarkIsExempt_Hit measures a miss")
 	}
-	if real.IsExempt(benchExemptProbeIP) {
+	if realistic.IsExempt(benchExemptProbeIP) {
 		t.Errorf("benchExemptRealistic exempts %s: the realistic miss benchmark measures a hit", benchExemptProbeIP)
 	}
 
