@@ -418,7 +418,7 @@ run_mutation M29 \
   'an unusable reviewed server compares as ReviewedMatches and latches nothing' \
   'TestReviewedBinding_C1[45]' \
   . "$ADM" \
-  's/\tif !obs\.Usable \{\n\t\tres := rt\.tripLockedForGeneration\(cr, capb, "server_identity_drift", gen, now\)\n\t\treturn canaryDriftLatch\{\n\t\t\tActive: true, Generation: gen, DriftCode: "server_identity_drift",\n\t\t\tLatched: res == canary\.TripCanaryLatched,\n\t\t\}\n\t\}\n//'
+  's/\tif !obs\.Usable \|\| obs\.RegistryPinDiverged \{/\tif obs.RegistryPinDiverged \{/'
 
 run_mutation M30 \
   'the pinned identity is re-read from a second inventory lookup (the torn (F1,I2) pair)' \
