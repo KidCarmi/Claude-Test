@@ -234,6 +234,19 @@ func DriftVerdicts() []ReviewedVerdict {
 	}
 }
 
+// IsDriftVerdict reports whether v is one of the breach verdicts — the ones that stop the
+// experiment. It is DERIVED from DriftVerdicts rather than written out again, so a verdict added
+// to that list is classified here without a second edit; the exhaustiveness wall beside this file
+// is what makes an unclassified verdict loud rather than silent.
+func IsDriftVerdict(v ReviewedVerdict) bool {
+	for _, d := range DriftVerdicts() {
+		if v == d {
+			return true
+		}
+	}
+	return false
+}
+
 // NonBreachVerdicts returns the verdicts that deliberately do NOT stop the experiment.
 func NonBreachVerdicts() []ReviewedVerdict {
 	return []ReviewedVerdict{ReviewedMatches, ReviewedOutOfScope}

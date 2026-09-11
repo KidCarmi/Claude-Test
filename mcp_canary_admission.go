@@ -189,9 +189,10 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 	}
 
 	// (4) An authoritative drift the probe itself established is a whole-Canary breach: latch it
-	// against G, durably, fail-closed.
+	// against G, durably, fail-closed — under the cause the activation's reviewed record
+	// establishes when it can speak, not merely the one this request could see (reviewedFirstCause).
 	if obs.DriftCode != "" {
-		return rt.latchDriftLocked(cr, capb, obs.DriftCode, gen, now)
+		return rt.latchDriftLocked(cr, capb, reviewedFirstCause(cr.reviewed, obs), gen, now)
 	}
 
 	// (5) THE REVIEWED COMPARISON — the fact this transaction exists to decide.
@@ -240,6 +241,41 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 		Denial: denial, Active: true, Generation: gen, Trusted: true, Outcome: outcome,
 		Latched: !cr.aborter.ExecutionEligible(gen),
 	}
+}
+
+// reviewedFirstCause resolves WHICH cause a drift latch is charged to when the trust probe
+// established one from live inventory AND a current authoritative target came back with it.
+//
+// The two inputs answer the same question from different sides. The probe's code is derived from
+// the REQUEST — its decision fingerprint against current inventory — so it reports what that
+// request could see at the instant it was decided. The reviewed record is derived from the
+// ACTIVATION, and orders its own causes deliberately: a moved server identity outranks a moved
+// fingerprint (ReviewedTargetSet.Compare), because losing the trust anchor is the stronger
+// statement about what the experiment was authorized against.
+//
+// They can agree that there is a breach and disagree about its cause, and the disagreement is
+// reachable by an ordinary sequence rather than a contrived one. Registry.Repin and the catalog
+// re-ingest that follows it are SEPARATE publications. A request decided against fingerprint F1
+// that arrives after BOTH have landed finds the registry and the catalog agreeing on I2, so
+// registryPinDiverged is false and the probe can only see the stale fingerprint: it says
+// tool_fingerprint_drift. The activation's reviewed record still pins I1 and says
+// server_identity_drift. Charging whichever side happened to observe it makes the recorded cause
+// an artifact of the transition window the request landed in — and that cause is IMMUTABLE
+// evidence, because the abort latches a first cause once and never revises it. It must be a
+// property of the state, not of the timing (Codex P2, PR #1360, round 29).
+//
+// The reviewed verdict therefore wins whenever it is itself a drift. It can only ever SHARPEN the
+// cause: ReviewedMatches and ReviewedOutOfScope leave the probe's code standing untouched, so this
+// never turns a breach the probe established into silence, and an observation carrying no
+// authoritative target (nothing resolved) is returned unchanged.
+func reviewedFirstCause(reviewed canary.ReviewedTargetSet, obs canaryTrustObservation) string {
+	if obs.DriftCode == "" || !obs.Found {
+		return obs.DriftCode
+	}
+	if v := reviewed.Compare(obs.Current); canary.IsDriftVerdict(v) {
+		return string(v)
+	}
+	return obs.DriftCode
 }
 
 // latchDriftLocked latches an authoritative drift against gen and returns the denial, with cr.mu
@@ -391,7 +427,11 @@ func (rt *canaryRuntime) latchDriftUnderActivation(capb rollout.Capability, want
 	gen := cr.generation
 	code := ""
 	if trust != nil {
-		code = trust().DriftCode
+		// Same first-cause rule as admitLiveExecution: the probe establishes THAT there is a
+		// breach, the reviewed record sharpens WHICH one, and the two paths must not disagree
+		// about the cause for the same state (the "two paths, same question, opposite answers"
+		// defect this file has closed twice already).
+		code = reviewedFirstCause(cr.reviewed, trust())
 	}
 	if code == "" {
 		// The drift did not reproduce against live state under the lock. It may have been repaired,
@@ -551,6 +591,13 @@ func canaryPreAdmissionDrift(capability string, obs mcpruntime.CanaryDriftTarget
 		// the activation critical section for nothing (Codex round 22). The precheck reads only
 		// pointer-published inventory.
 		live := mcpLiveTrustPrecheck(obs.Tenant, obs.ServerID, obs.ToolName, obs.DecisionFP)
+		if live.Resolved {
+			// Carried so latchDriftUnderActivation can charge the reviewed record's cause. Trusted
+			// stays false and is never consulted on this path: the request is already refused.
+			return canaryTrustObservation{
+				DriftCode: live.DriftCode, Found: true, Current: live.Authoritative,
+			}
+		}
 		return canaryTrustObservation{DriftCode: live.DriftCode}
 	})
 }

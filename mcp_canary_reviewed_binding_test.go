@@ -1394,3 +1394,131 @@ func TestReviewedBinding_C21Control_AnUnresolvableToolIsStillSilent(t *testing.T
 			"this path cannot tell an absence from a transient inventory gap", r.rt.abortCodeNow(r.capb))
 	}
 }
+
+// ── 22 ───────────────────────────────────────────────────────────────────────────────────────
+// The recorded FIRST CAUSE is a property of the state, not of the transition window the request
+// landed in.
+//
+// Registry.Repin and the catalog re-ingest that follows it are separate publications. C18/C19 cover
+// the window BETWEEN them, where the two disagree and the divergence is charged as
+// server_identity_drift. This is the window AFTER both have landed: the registry and the catalog
+// now AGREE on the new identity, so registryPinDiverged is false and the precheck can see only that
+// the request's decision fingerprint is stale — it says tool_fingerprint_drift. The activation's
+// reviewed record still pins the ORIGINAL identity and says server_identity_drift, which the
+// reviewed comparison deliberately ranks above a fingerprint move.
+//
+// The same physical event — a server identity rotation — was therefore recorded under two different
+// causes depending on which side of the second publication the request arrived on, and the abort
+// latches a first cause ONCE and never revises it. The cause the operator reads must be decided
+// from the state (Codex P2, PR #1360, round 29).
+func TestReviewedBinding_C22_FirstCauseDoesNotDependOnTheTransitionWindow(t *testing.T) {
+	r := newReviewedRig(t)
+
+	// Complete BOTH publications: the identity rotates and the catalog re-ingests against it.
+	const schema = `{"type":"object"}`
+	fp2 := republishWithIdentity(t, r.sid, r.tool, "rotated", schema)
+	if fp2 == r.fp1 {
+		t.Fatal("premise: the catalog fingerprint folds in the identity, so a rotation must move it")
+	}
+	cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+	if !cur.Found || !cur.Usable {
+		t.Fatalf("premise: the target must still resolve and be usable, got %+v", cur)
+	}
+	if cur.RegistryPinDiverged {
+		t.Fatal("premise: this is the window AFTER the re-ingest — the registry and the catalog " +
+			"agree, so there is no divergence for the precheck to charge")
+	}
+	if cur.Target.ServerIdentity != "rotated" {
+		t.Fatalf("premise: the authoritative target must carry the rotated identity, got %q",
+			cur.Target.ServerIdentity)
+	}
+	// The precheck, asked about a request still decided against F1, can only see the stale
+	// fingerprint. This is the observation the transaction must NOT charge verbatim.
+	if live := mcpLiveTrustPrecheck(ttTenant, r.sid, r.tool, r.fp1); live.DriftCode != "tool_fingerprint_drift" {
+		t.Fatalf("premise: the probe alone must report the stale fingerprint, got %q", live.DriftCode)
+	}
+
+	if r.request(r.fp1, r.now) {
+		t.Fatal("SECURITY: a request against a rotated server identity must not be admitted")
+	}
+	if !r.rt.abortedNow(r.capb) {
+		t.Fatal("SECURITY: the reviewed server identity moved — the whole Canary must stop")
+	}
+	if code := r.rt.abortCodeNow(r.capb); code != "server_identity_drift" {
+		t.Fatalf("first cause = %q, want \"server_identity_drift\". The reviewed record pins the "+
+			"ORIGINAL identity and ranks an anchor move above a fingerprint move; charging the "+
+			"probe's view instead makes the immutable evidence an artifact of which transition "+
+			"window observed the breach", code)
+	}
+}
+
+// C22, again through the OBSERVATION path. The pre-executor latch re-derives the drift from the
+// same precheck, so it reaches the identical disagreement — and the two paths must not record two
+// different causes for one state (the "same question, opposite answers" defect this matrix has
+// closed twice before).
+func TestReviewedBinding_C22B_TheObservationPathAgreesOnTheFirstCause(t *testing.T) {
+	r := newReviewedRig(t)
+	republishWithIdentity(t, r.sid, r.tool, "rotated", `{"type":"object"}`)
+	if mcpCurrentAuthoritativeTarget(r.sid, r.tool).RegistryPinDiverged {
+		t.Fatal("premise: both publications have landed, so nothing diverges")
+	}
+	canaryPreAdmissionDrift(r.capb.String(), mcpruntime.CanaryDriftTarget{
+		Generation: r.gen, Tenant: ttTenant, ServerID: r.sid, ToolName: r.tool,
+		DecisionFP: r.fp1, Code: "tool_fingerprint_drift",
+	})
+	if !r.rt.abortedNow(r.capb) {
+		t.Fatal("SECURITY: the pre-executor path must latch a rotated server identity")
+	}
+	if code := r.rt.abortCodeNow(r.capb); code != "server_identity_drift" {
+		t.Fatalf("first cause = %q, want \"server_identity_drift\" — the same state must produce the "+
+			"same cause whichever path observed it", code)
+	}
+}
+
+// CONTROL for C22: a fingerprint that moved with the identity UNCHANGED is still recorded as
+// tool_fingerprint_drift.
+//
+// Without it, "let the reviewed record decide the cause" could be satisfied by a form that always
+// reports server_identity_drift, or that drops the probe's code whenever the reviewed comparison
+// has nothing to add. The rule is a SHARPENING, never a replacement: the reviewed verdict wins only
+// when it is itself a drift, and ReviewedMatches leaves the probe's code standing.
+func TestReviewedBinding_C22Control_AFingerprintOnlyMoveKeepsItsOwnCause(t *testing.T) {
+	r := newReviewedRig(t)
+	r.moveToF2(t) // schema moves, identity stays exactly as reviewed
+	if cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool); cur.Target.ServerIdentity != "id" {
+		t.Fatalf("premise: the identity must be untouched, got %q", cur.Target.ServerIdentity)
+	}
+	if r.request(r.fp1, r.now) {
+		t.Fatal("SECURITY: a request against a moved fingerprint must not be admitted")
+	}
+	r.assertLatched(t, "tool_fingerprint_drift")
+}
+
+// SECOND CONTROL for C22, and the one that pins the direction of the rule.
+//
+// C22Control proves the cause is not ALWAYS server_identity_drift. This proves the reviewed record
+// never SILENCES a probe code it has nothing to say about. Reviewed and current are identical here
+// — Compare returns ReviewedMatches — while the request carries a decision fingerprint that matches
+// neither. The probe's tool_fingerprint_drift must stand.
+//
+// The wrong shape is not hypothetical: reading the rule as "the reviewed verdict decides the cause"
+// rather than "a reviewed DRIFT sharpens it" makes the code empty here, the latch is skipped, and
+// because the reviewed target really does still match and a live approval really does cover it, the
+// request is ADMITTED — a stale-decision execution authorized by the very change meant to make the
+// evidence sharper.
+func TestReviewedBinding_C22Control2_AReviewedMatchNeverSilencesTheProbe(t *testing.T) {
+	r := newReviewedRig(t)
+	const staleFP = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	if staleFP == r.fp1 {
+		t.Fatal("premise: the decision fingerprint must differ from the reviewed one")
+	}
+	if cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool); !cur.Found ||
+		cur.Target.ServerIdentity != "id" {
+		t.Fatalf("premise: the target must be exactly as reviewed, got %+v", cur)
+	}
+	if r.request(staleFP, r.now) {
+		t.Fatal("SECURITY: a request decided against a fingerprint the target never carried must " +
+			"not be admitted")
+	}
+	r.assertLatched(t, "tool_fingerprint_drift")
+}

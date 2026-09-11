@@ -487,6 +487,37 @@ run_mutation M37 \
   . "$ADM" \
   's/\t"reviewed_target_tenant_drift": \{\},\n//'
 
+# ── (16) ROUND 29: THE FIRST CAUSE MUST NOT BE AN ARTIFACT OF TIMING ───────
+# Repin and re-ingest are two publications. After BOTH land, the registry and the catalog agree,
+# so the probe can only see the stale decision fingerprint while the activation's reviewed record
+# still pins the old identity. Charging the probe's view verbatim made the immutable first cause
+# depend on which window the request arrived in — and the opposite error (letting the reviewed
+# verdict REPLACE the code rather than sharpen it) silently admits a stale-decision request.
+
+run_mutation M38 \
+  'the admission transaction charges the probe verdict verbatim (timing decides the cause)' \
+  'TestReviewedBinding_C22_FirstCauseDoesNotDependOnTheTransitionWindow' \
+  . "$ADM" \
+  's/return rt\.latchDriftLocked\(cr, capb, reviewedFirstCause\(cr\.reviewed, obs\), gen, now\)/return rt.latchDriftLocked(cr, capb, obs.DriftCode, gen, now)/'
+
+run_mutation M39 \
+  'the pre-executor path charges the probe verdict verbatim (two paths, two causes, one state)' \
+  'TestReviewedBinding_C22B_TheObservationPathAgreesOnTheFirstCause' \
+  . "$ADM" \
+  's/\t\tcode = reviewedFirstCause\(cr\.reviewed, trust\(\)\)/\t\tcode = trust().DriftCode/'
+
+run_mutation M40 \
+  'the reviewed verdict REPLACES the probe code, so a reviewed match silences a real breach' \
+  'TestReviewedBinding_C22Control2_AReviewedMatchNeverSilencesTheProbe' \
+  . "$ADM" \
+  's/\tif v := reviewed\.Compare\(obs\.Current\); canary\.IsDriftVerdict\(v\) \{\n\t\treturn string\(v\)\n\t\}\n\treturn obs\.DriftCode/\tv := reviewed.Compare(obs.Current)\n\tif v == canary.ReviewedOutOfScope \{\n\t\treturn obs.DriftCode\n\t\}\n\treturn string(v)/'
+
+run_mutation M41 \
+  'the stale-fingerprint branch drops the authoritative target, so nothing can sharpen the cause' \
+  'TestReviewedBinding_C22_FirstCauseDoesNotDependOnTheTransitionWindow' \
+  . mcp_live_gate.go \
+  's/\t\t\tDriftCode: "tool_fingerprint_drift", Resolved: true, Authoritative: authoritative,/\t\t\tDriftCode: "tool_fingerprint_drift",/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

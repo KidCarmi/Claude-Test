@@ -159,6 +159,14 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	}, func() canaryTrustObservation {
 		live := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
 		if live.DriftCode != "" {
+			// A probe-established code, plus the authoritative target when one resolved, so the
+			// transaction can charge the cause the reviewed record establishes rather than only the
+			// one this request could see. It never softens the verdict — a drift stays a drift.
+			if live.Resolved {
+				return canaryTrustObservation{
+					DriftCode: live.DriftCode, Found: true, Current: live.Authoritative,
+				}
+			}
 			return canaryTrustObservation{DriftCode: live.DriftCode}
 		}
 		if !live.Eligible {
@@ -457,7 +465,15 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 		return liveTrustPrecheck{}
 	}
 	if hex.EncodeToString(ti.target.Fingerprint[:]) != decisionFP {
-		return liveTrustPrecheck{DriftCode: "tool_fingerprint_drift"}
+		// Resolved/Authoritative ride along with the code. The code alone says only what THIS
+		// request could see — its decision fingerprint against current inventory — and that is not
+		// always the strongest available statement about the breach. Carrying the target lets the
+		// activation's own reviewed record speak too, so the recorded first cause is decided from
+		// state rather than from which transition window the request landed in. See
+		// reviewedFirstCause in mcp_canary_admission.go (Codex P2, PR #1360, round 29).
+		return liveTrustPrecheck{
+			DriftCode: "tool_fingerprint_drift", Resolved: true, Authoritative: authoritative,
+		}
 	}
 	return liveTrustPrecheck{
 		Eligible: true,
