@@ -987,6 +987,14 @@ components:
           type: object
           description: 2F-A per-pool tokens (pool id → etag) every pool PUT/DELETE must echo.
           additionalProperties: { type: string }
+        degraded:
+          type: object
+          description: >-
+            Keyed by profile ID ("default" for the legacy profile); present only for
+            a profile whose most recent PAC serve compiled with warnings (dropped
+            rule, unresolvable pool reference, secure-mode conflict). Empty when
+            every profile last served clean.
+          additionalProperties: true
     PACPostureInventory:
       type: object
       description: Direct-access PAC posture inventory (shape varies).
