@@ -24,9 +24,10 @@
 #                           rest when CULVERT_LOG_PASSPHRASE (or CULVERT_CA_PASSPHRASE)
 #                           is set; /data/logstore.salt holds the per-store KDF salt.
 #
-# YARA rules (/app/yara in the proxy container):
-#   Starter rules are bundled in the image (yara/sample_rules.yar).
-#   Override: mount a host directory over /app/yara, then reload at runtime via
+# YARA rules (/data/yara in the proxy container):
+#   Starter rules are bundled in the image and seeded into /data/yara on
+#   first boot, while it's still empty (yara/sample_rules.yar).
+#   Override: mount a host directory over /data/yara, then reload at runtime via
 #   POST /api/security-scan/yara/reload
 
 services:
@@ -100,7 +101,7 @@ services:
     volumes:
       - proxy-data:/data
       # Uncomment to use your own YARA rules without rebuilding the image:
-      # - ./yara:/app/yara:ro
+      # - ./yara:/data/yara:ro
       # Uncomment to use a custom config file:
       # - ./config.yaml:/app/config.yaml:ro
       # To let the admin UI's Release Management reach the host maintenance
