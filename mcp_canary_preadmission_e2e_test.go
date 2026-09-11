@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/KidCarmi/Culvert/internal/mcp/canary"
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
@@ -33,7 +34,7 @@ func TestPreAdmissionDrift_E2E_ServerIdentityDriftStopsTheActivation(t *testing.
 	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
 
 	r := newAtomicRig(t)
-	g := r.arm(t, 4)
+	g := r.armFor(t, 4, seededReviewedTarget(t, sid, tool, fpHex))
 
 	// Precondition: with the approved target intact, the sink must latch NOTHING. Without this the
 	// test could pass by latching unconditionally.
@@ -147,7 +148,8 @@ func TestPreAdmissionDrift_E2E_StaleObservationCannotStopTheReplacement(t *testi
 	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
 
 	r := newAtomicRig(t)
-	g1 := r.arm(t, 4)
+	reviewed := seededReviewedTarget(t, sid, tool, fpHex)
+	g1 := r.armFor(t, 4, reviewed)
 
 	// Real, authoritative drift: the server is republished disabled.
 	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + ttTenant + `","servers":[
@@ -165,7 +167,7 @@ func TestPreAdmissionDrift_E2E_StaleObservationCannotStopTheReplacement(t *testi
 
 	// G1 goes away and G2 takes its place while the observation is in flight.
 	r.rt.demoteCanary(r.capb)
-	g2 := r.arm(t, 4)
+	g2 := r.armFor(t, 4, reviewed)
 	if g2 == g1 {
 		t.Fatalf("premise: a re-activation must never reuse a generation (%d)", g1)
 	}
@@ -207,6 +209,8 @@ func TestPreAdmissionDrift_E2E_GenerationZeroLatchesNothing(t *testing.T) {
 	_, fn := liveFakeClock()
 	composeToolTrust(t, fn)
 	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+	// Captured while the target is still healthy — this is what the activation is reviewed FOR.
+	reviewed := seededReviewedTarget(t, sid, tool, fpHex)
 
 	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + ttTenant + `","servers":[
 	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"id","enabled":false,
@@ -222,7 +226,10 @@ func TestPreAdmissionDrift_E2E_GenerationZeroLatchesNothing(t *testing.T) {
 	publishMCPInventory(mcpInvLoaded, "", reg2, cat2)
 
 	r := newAtomicRig(t)
-	g := r.arm(t, 4)
+	// Armed for the target the observation names, so ONLY the zero-generation rule prevents the
+	// latch. Armed synthetically, nothing would latch for a different reason and the wildcard
+	// this test exists to forbid could be reintroduced unnoticed (mutation M23).
+	g := r.armFor(t, 4, reviewed)
 
 	canaryPreAdmissionDrift(rollout.CapabilityGateway.String(), mcpruntime.CanaryDriftTarget{
 		Generation: 0, Code: "server_identity_drift", Tenant: ttTenant,
@@ -231,5 +238,26 @@ func TestPreAdmissionDrift_E2E_GenerationZeroLatchesNothing(t *testing.T) {
 	if !r.rt.executionEligible(r.capb, canaryRuntimeTestNow) {
 		t.Fatalf("SECURITY (§7): an observation naming NO activation stopped activation %d — "+
 			"generation 0 is being read as \"whatever is current\"", g)
+	}
+}
+
+// seededReviewedTarget shapes the CURRENTLY authoritative target for the seeded inventory as a
+// reviewed record, read through the same precheck the production probe uses.
+//
+// The E2E tests in this file seed a real `controlled/t` inventory and then observe drift on it, so
+// their activation must be reviewed for THAT target. Arming with the canonical synthetic one
+// (server-a/tool-a) makes every latch in them unreachable — correctly, since round 31 — and the
+// tests would then pass without exercising the path they are named for.
+func seededReviewedTarget(t *testing.T, sid, tool, fpHex string) canary.ReviewedTarget {
+	t.Helper()
+	live := mcpLiveTrustPrecheck(ttTenant, sid, tool, fpHex)
+	if !live.Eligible {
+		t.Fatalf("fixture: %s/%s must resolve to an eligible target before the drift is published, got %+v",
+			sid, tool, live)
+	}
+	return canary.ReviewedTarget{
+		Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
+		Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
+		ServerIdentity: live.ServerIdentity,
 	}
 }

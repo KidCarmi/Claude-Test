@@ -39,7 +39,18 @@ func newAtomicRig(t *testing.T) *atomicRig {
 
 func (r *atomicRig) arm(t *testing.T, total int) uint64 {
 	t.Helper()
-	if _, err := testBeginActivation(r.rt, r.capb, runtimeTestBudget(total), canaryRuntimeTestNow); err != nil {
+	return r.armFor(t, total)
+}
+
+// armFor arms an activation reviewed for EXPLICIT targets. Tests that seed a real inventory and
+// then observe drift on it must use this: since round 31 the reviewed set decides whether an
+// activation may be stopped at all, so an activation armed with the canonical SYNTHETIC target
+// (server-a/tool-a) is correctly immune to drift on a different, real one — and a test that arms
+// synthetically while observing `controlled/t` proves nothing about the latch it is named for.
+func (r *atomicRig) armFor(t *testing.T, total int, targets ...canary.ReviewedTarget) uint64 {
+	t.Helper()
+	spec := testActivationSpec(runtimeTestBudget(total), canaryRuntimeTestNow, targets...)
+	if _, err := r.rt.beginCanaryActivation(r.capb, spec); err != nil {
 		t.Fatalf("begin activation: %v", err)
 	}
 	g := r.rt.currentGeneration(r.capb)
