@@ -117,7 +117,8 @@ func TestRLExemptView_DifferentialAgainstLegacy_Shapes(t *testing.T) {
 }
 
 func TestRLExemptView_DifferentialAgainstLegacy_Randomized(t *testing.T) {
-	rng := rand.New(rand.NewSource(0xC0FFEE))
+	// #nosec G404 -- deterministic seeded generator for reproducible test data
+	rng := rand.New(rand.NewSource(20260911))
 
 	randV4 := func() string {
 		return fmt.Sprintf("%d.%d.%d.%d", rng.Intn(256), rng.Intn(256), rng.Intn(256), rng.Intn(256))
