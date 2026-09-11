@@ -286,7 +286,7 @@ cached, correct-username ones are), is recorded and deliberately NOT fixed here:
 security control's behaviour and deserves its own review. See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, §25,
 and `docs/operator/credential-verification-cost.md`.
 **2026-09-05 — CHAOS-61 sweep (the public admin-login endpoint's untrusted username).**
-*(Numbered CHAOS-61/§29 on merge, at the FOURTH attempt. This sweep took `CHAOS-58`/`§25`, collided
+*(Numbered CHAOS-61/§30 on merge, at the FOURTH attempt. This sweep took `CHAOS-58`/`§25`, collided
 with the directory-stall sweep and moved to `CHAOS-59`/`§27`; collided with the intelligence-feed
 sweep and moved to `CHAOS-60`/`§28`; collided with the GeoIP sweep — which was itself renumbering
 for the third time in the same window — and moved here. Three renumberings on ONE PR, spanning
@@ -322,7 +322,7 @@ same class on the **proxy data path** — `sanitizeLog(r.Host)` bounds nothing a
 no `MaxHeaderBytes`, so one request with a 200 KB host writes 204,899 bytes to the process log and a
 204,812-byte `Host` field to the request log, on a port every client can reach. Recorded OPEN as
 **PX-21** rather than bundled: rejecting an over-long host is probably the right fix and is a
-data-plane behaviour change that needs its own review. See §29.
+data-plane behaviour change that needs its own review. See §30.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -4557,7 +4557,7 @@ path validated its own at `maxUsernameLen` (256) years ago
 (`proxy_portal.go:145`). The admin login endpoint — the one an attacker
 actually finds first, because it is what the UI posts to — validated nothing.
 
-Note the handler-vs-store split that §29.4 turns on: those 1–64 caps live in the
+Note the handler-vs-store split that §30.4 turns on: those 1–64 caps live in the
 API *handlers*. Neither `cfg.SetAuth` nor `cfg.SetUIUser` bounds a username, and
 `validateAuthStartupCredentials` validates only the password — so `-user` /
 `auth.user` and `--reset-password` can persist an admin whose name is longer
@@ -4628,7 +4628,7 @@ is not a secret and is not a credential oracle for a name that exists nowhere.
 **A CONFIGURED account is never refused, however long its name**, and the first
 draft of this change got that wrong. It asserted that no local account could
 carry such a name because `apiSetupComplete` and the user-creation API cap at
-64 — but those are handlers, not the stores (see §29.1), so an over-long
+64 — but those are handlers, not the stores (see §30.1), so an over-long
 username can already be a valid persisted admin and the guard would have locked
 that operator out of their own admin UI on upgrade: a hardening change turned
 into an outage for the one person who has to fix it. Raised by Codex review on
