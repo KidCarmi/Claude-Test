@@ -973,6 +973,16 @@ func checkSAMLBaseURLPosture() OperatorContractCheck {
 // be steered) from any other — previously visible only as a one-line startup
 // log ("base_url not set") that a browser-side login failure never surfaces
 // to the operator.
+//
+// The parallel shape with checkSAMLBaseURLPosture is intentional, not an
+// accidental copy: the two ask the same five questions of the same value and
+// differ only in what the operator must go and change — Entity ID + ACS URL for
+// SAML, the registered redirect URI for OIDC. Factoring the ladder would couple
+// two protocols' operator guidance together, so a wording or threshold change
+// for one silently rewrote the other's; the mcp/limits Gateway-vs-Management
+// precedent keeps independent tunables independent for the same reason.
+//
+//nolint:dupl // intentional parallel shape across IdP protocols (see above)
 func checkOIDCBaseURLPosture() OperatorContractCheck {
 	if !hasEnabledOIDCProfile() {
 		return OperatorContractCheck{
