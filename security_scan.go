@@ -128,7 +128,7 @@ func safeDPIScan(data []byte) (pattern string, matched bool) {
 
 // scanBlock sends a 403 Forbidden response to a plain http.ResponseWriter.
 func scanBlock(w http.ResponseWriter, host, reason, source string) {
-	logger.Printf("SecurityScan: blocked host=%s source=%s reason=%q", host, source, reason)
+	logger.Printf("SecurityScan: blocked host=%q source=%s reason=%q", sanitizeLog(host), source, reason)
 	body := fmt.Sprintf("Blocked by %s scan: %s", strings.ToUpper(source), reason)
 	http.Error(w, body, http.StatusForbidden)
 }
@@ -136,7 +136,7 @@ func scanBlock(w http.ResponseWriter, host, reason, source string) {
 // scanBlockConn sends a 403 Forbidden HTTP/1.1 response to a raw connection
 // (used inside SSL-inspect tunnels where http.ResponseWriter is not available).
 func scanBlockConn(br blockResponder, host, reason, source string) {
-	logger.Printf("SecurityScan: blocked host=%s source=%s reason=%q", host, source, reason)
+	logger.Printf("SecurityScan: blocked host=%q source=%s reason=%q", sanitizeLog(host), source, reason)
 	body := fmt.Sprintf("Blocked by %s scan: %s\r\n", strings.ToUpper(source), reason)
 	br.blockBeforeResponse("text/plain; charset=utf-8", body)
 }
