@@ -372,6 +372,51 @@ func TestRLExemptView_AddExemptionsMatchesAddLoop(t *testing.T) {
 	}
 }
 
+// TestExemptBenchFixturesProbeWhatTheyClaim guards the benchmark fixtures
+// themselves. A "hit" benchmark whose probe silently misses measures the miss
+// path twice and cannot detect a regression in the hit path at all — which is
+// exactly what happened on this PR: benchExemptCIDRs derives its octets as
+// (i/256, i%256), so for n<=256 the high octet is always 0, and the original
+// 10.255.255.1 probe was outside every generated prefix (caught in review).
+// Prose alone could not catch that; the numbers simply came out wrong.
+func TestExemptBenchFixturesProbeWhatTheyClaim(t *testing.T) {
+	miss := newRateLimiter()
+	_ = miss.AddExemptions(benchExemptCIDRs(256))
+	if !miss.IsExempt(benchExemptCIDRHitIP) {
+		t.Errorf("benchExemptCIDRHitIP (%s) is not inside benchExemptCIDRs(256): "+
+			"the CIDR-hit benchmark and alloc posture are measuring a MISS",
+			benchExemptCIDRHitIP)
+	}
+	if miss.IsExempt(benchExemptProbeIP) {
+		t.Errorf("benchExemptProbeIP (%s) is inside benchExemptCIDRs(256): "+
+			"the miss benchmarks are measuring a hit", benchExemptProbeIP)
+	}
+
+	// The realistic fixture must also hit on its single-IP probe and miss on
+	// the shared miss probe, for the same reason.
+	real := newRateLimiter()
+	_ = real.AddExemptions(benchExemptRealistic)
+	if !real.IsExempt("198.51.100.7") {
+		t.Error("benchExemptRealistic does not exempt 198.51.100.7: BenchmarkIsExempt_Hit measures a miss")
+	}
+	if real.IsExempt(benchExemptProbeIP) {
+		t.Errorf("benchExemptRealistic exempts %s: the realistic miss benchmark measures a hit", benchExemptProbeIP)
+	}
+
+	// And no client IP the end-to-end Allow benchmark uses may be exempt, or it
+	// would skip the limiter entirely and measure nothing.
+	for _, n := range []int{0, 16, 256} {
+		r := newRateLimiter()
+		_ = r.AddExemptions(benchExemptCIDRs(n))
+		for _, ip := range benchClientIPs(256) {
+			if r.IsExempt(ip) {
+				t.Fatalf("benchClientIPs contains %s which is exempt under benchExemptCIDRs(%d): "+
+					"BenchmarkRateLimitAllow_WithExemptions would bypass the limiter", ip, n)
+			}
+		}
+	}
+}
+
 // ─── Cost-shape gates ───────────────────────────────────────────────────────
 
 // TestBenchGate_IsExemptTakesNoLock is STRUCTURAL, not timing-based: it holds
@@ -581,7 +626,7 @@ func TestBenchGate_IsExemptAllocsFree(t *testing.T) {
 		{"realistic/miss", benchExemptRealistic, benchExemptProbeIP},
 		{"realistic/hit", benchExemptRealistic, "198.51.100.7"},
 		{"cidrs=256/miss", benchExemptCIDRs(256), benchExemptProbeIP},
-		{"cidrs=256/hit", benchExemptCIDRs(256), "10.255.255.1"},
+		{"cidrs=256/hit", benchExemptCIDRs(256), benchExemptCIDRHitIP},
 		{"v6", []string{"2001:db8::/32"}, "2001:db8::1"},
 	}
 

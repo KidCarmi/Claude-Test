@@ -108,13 +108,13 @@ endpoints for credentialed parents.
   limit is configured it runs on every proxied request; it took a
   process-wide `RWMutex` read lock and then ran a linear `net.IPNet.Contains`
   scan, which made the length of an operator's exempt list the price of the
-  gate for every *other* client. On a 4-core box it measured 59.2 ns with no
-  exemptions and 3.62 µs at 256 exempt CIDRs (~13.9 ns per configured CIDR);
+  gate for every *other* client. On a 4-core box it measured 59.7 ns with no
+  exemptions and 3.95 µs at 256 exempt CIDRs (~15 ns per configured CIDR);
   reading an immutable view and probing a prefix-length-bucketed set it
-  measures 3.08 ns and 63.1 ns — flat from 1 to 256 prefixes. End to end the
+  measures 3.06 ns and 63.9 ns — flat from 1 to 256 prefixes. End to end the
   whole `Allow` gate goes 1176 → 279 ns at 256 exempt CIDRs at four cores,
-  and the per-op cost now falls with core count (4.0x from 1→4) where it used
-  to rise (0.69x). The prefix-bucketing machinery is now one implementation
+  and the per-op cost now falls with core count (3.99x from 1→4) where it used
+  to rise (0.65x). The prefix-bucketing machinery is now one implementation
   (`prefixSet`) shared with the IP filter rather than a second copy. Verdicts
   are preserved exactly, including an IPv4-mapped probe continuing *not* to
   match a plain-v4 single-IP exemption — canonicalising that would widen an

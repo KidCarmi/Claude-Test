@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -50,7 +51,29 @@ var benchExemptRealistic = []string{"198.51.100.7", "198.51.100.8", "192.0.2.0/2
 
 const benchExemptProbeIP = "203.0.113.47" // TEST-NET-3: never inside any fixture above
 
-var benchExemptSink bool
+// benchExemptCIDRHitIP is inside the LAST /24 benchExemptCIDRs generates, so
+// the CIDR-hit benchmarks actually hit. benchExemptCIDRs derives its octets as
+// (i/256, i%256), so for n<=256 the high octet is always 0 and the prefixes run
+// 10.0.0.0/24 … 10.0.255.0/24 — an address like 10.255.255.1 misses every one
+// of them and would silently turn a "hit" benchmark into a second miss
+// measurement (caught in review on this PR).
+const benchExemptCIDRHitIP = "10.0.255.1"
+
+// benchExemptSink keeps the benchmarked calls alive against dead-code
+// elimination without putting a shared package-level write in a measured loop.
+// In a parallel benchmark that write would be a data race under -race AND would
+// measure false sharing on this cache line instead of the lookup — which is
+// precisely the contention these benchmarks exist to show is absent. Same
+// contract, and the same reason, as internal/blocklist's keepAliveSink.
+var benchExemptSink atomic.Bool
+
+// keepExemptAlive is called ONCE per benchmark loop (per worker, in the
+// parallel forms), after the loop, so no iteration pays for it.
+func keepExemptAlive(v bool) {
+	if v {
+		benchExemptSink.Store(v)
+	}
+}
 
 // ─── Core-count axis ────────────────────────────────────────────────────────
 
@@ -59,11 +82,11 @@ func BenchmarkIsExempt_NoExemptionsParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		var sink bool // per-worker sink: a shared one is false sharing, not the measurement
+		var sink bool // per-worker local: a shared write here is false sharing, not the measurement
 		for pb.Next() {
 			sink = r.IsExempt(benchExemptProbeIP)
 		}
-		benchExemptSink = sink
+		keepExemptAlive(sink)
 	})
 }
 
@@ -76,7 +99,7 @@ func BenchmarkIsExempt_RealisticParallel(b *testing.B) {
 		for pb.Next() {
 			sink = r.IsExempt(benchExemptProbeIP)
 		}
-		benchExemptSink = sink
+		keepExemptAlive(sink)
 	})
 }
 
@@ -88,9 +111,11 @@ func BenchmarkIsExempt_CIDRScale(b *testing.B) {
 			r := newBenchRateLimiter(benchExemptCIDRs(n))
 			b.ReportAllocs()
 			b.ResetTimer()
+			var sink bool
 			for i := 0; i < b.N; i++ {
-				benchExemptSink = r.IsExempt(benchExemptProbeIP)
+				sink = r.IsExempt(benchExemptProbeIP)
 			}
+			keepExemptAlive(sink)
 		})
 	}
 }
@@ -102,18 +127,22 @@ func BenchmarkIsExempt_Hit(b *testing.B) {
 	r := newBenchRateLimiter(benchExemptRealistic)
 	b.ReportAllocs()
 	b.ResetTimer()
+	var sink bool
 	for i := 0; i < b.N; i++ {
-		benchExemptSink = r.IsExempt("198.51.100.7")
+		sink = r.IsExempt("198.51.100.7")
 	}
+	keepExemptAlive(sink)
 }
 
 func BenchmarkIsExempt_CIDRHit(b *testing.B) {
 	r := newBenchRateLimiter(benchExemptCIDRs(256))
 	b.ReportAllocs()
 	b.ResetTimer()
+	var sink bool
 	for i := 0; i < b.N; i++ {
-		benchExemptSink = r.IsExempt("10.255.255.1") // last /24 in the fixture
+		sink = r.IsExempt(benchExemptCIDRHitIP)
 	}
+	keepExemptAlive(sink)
 }
 
 // ─── End-to-end gate cost ───────────────────────────────────────────────────
@@ -136,7 +165,7 @@ func BenchmarkRateLimitAllow_WithExemptions(b *testing.B) {
 					sink = r.Allow(ips[i&255])
 					i++
 				}
-				benchExemptSink = sink
+				keepExemptAlive(sink)
 			})
 		})
 	}
@@ -150,4 +179,80 @@ func benchClientIPs(n int) []string {
 		out = append(out, net.IPv4(203, 0, 113, byte(i)).String())
 	}
 	return out
+}
+
+// ─── Legacy arm (before/after in ONE run) ───────────────────────────────────
+
+// The benchmarks below measure the VERBATIM pre-change shape — exemptMu.RLock
+// plus a linear net.IPNet.Contains scan — through oracleIsExempt, which is the
+// oracle the differential test already uses (security_ratelimit_exempt_view_test.go).
+//
+// Keeping the old algorithm benchmarked in the SAME run is this repo's
+// convention (see security_ratelimit_window_bench_test.go): it makes the
+// before/after comparison reproducible in-tree and machine-independent, rather
+// than a pair of numbers someone has to trust from a commit message.
+//
+//	go test -run XXX -bench 'BenchmarkIsExempt_CIDR' -benchtime=300ms -count=3 .
+
+func BenchmarkIsExempt_CIDRScale_Legacy(b *testing.B) {
+	for _, n := range []int{0, 1, 4, 16, 64, 256} {
+		b.Run(fmt.Sprintf("cidrs=%d", n), func(b *testing.B) {
+			r := newBenchRateLimiter(benchExemptCIDRs(n))
+			b.ReportAllocs()
+			b.ResetTimer()
+			var sink bool
+			for i := 0; i < b.N; i++ {
+				sink = r.oracleIsExempt(benchExemptProbeIP)
+			}
+			keepExemptAlive(sink)
+		})
+	}
+}
+
+func BenchmarkIsExempt_CIDRHit_Legacy(b *testing.B) {
+	r := newBenchRateLimiter(benchExemptCIDRs(256))
+	b.ReportAllocs()
+	b.ResetTimer()
+	var sink bool
+	for i := 0; i < b.N; i++ {
+		sink = r.oracleIsExempt(benchExemptCIDRHitIP)
+	}
+	keepExemptAlive(sink)
+}
+
+func BenchmarkIsExempt_Hit_Legacy(b *testing.B) {
+	r := newBenchRateLimiter(benchExemptRealistic)
+	b.ReportAllocs()
+	b.ResetTimer()
+	var sink bool
+	for i := 0; i < b.N; i++ {
+		sink = r.oracleIsExempt("198.51.100.7")
+	}
+	keepExemptAlive(sink)
+}
+
+func BenchmarkIsExempt_NoExemptionsParallel_Legacy(b *testing.B) {
+	r := newBenchRateLimiter(nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var sink bool
+		for pb.Next() {
+			sink = r.oracleIsExempt(benchExemptProbeIP)
+		}
+		keepExemptAlive(sink)
+	})
+}
+
+func BenchmarkIsExempt_RealisticParallel_Legacy(b *testing.B) {
+	r := newBenchRateLimiter(benchExemptRealistic)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var sink bool
+		for pb.Next() {
+			sink = r.oracleIsExempt(benchExemptProbeIP)
+		}
+		keepExemptAlive(sink)
+	})
 }
