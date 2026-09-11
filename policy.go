@@ -1421,10 +1421,12 @@ func evalAccessRules(rules []*PolicyRule, in *accessEvalInput, now func() time.T
 // Returns nil when no rule matches (caller should default to Deny — Zero Trust).
 func (ps *PolicyStore) Evaluate(clientIP, identity, authSource, host string, groups []string) *PolicyMatch {
 	// Snapshot the slice header under RLock, then release BEFORE the scan: the
-	// scan can block (matchDestNorm → geo.LookupCached → DNS on an uncached
-	// DestCountry host; category lookups hit the community DB), so the lock must
-	// NOT be held across it — otherwise a config-plane List()/Save() (exclusive
-	// Lock) waiting on a DNS-blocked scan would stall all policy evaluation.
+	// scan can block (category lookups hit the community DB, a BadgerDB read
+	// txn per domain label), so the lock must NOT be held across it — otherwise
+	// a config-plane List()/Save() (exclusive Lock) waiting on a blocked scan
+	// would stall all policy evaluation. The geo half no longer blocks at all
+	// (CHAOS-60: geo.LookupCached is cache-only and warms off-path), but the
+	// release stays load-bearing for the category half.
 	rules := ps.evaluationSnapshot()
 
 	// Enforcement path: the canonical core with the wall clock and no trace (the
@@ -1896,12 +1898,21 @@ func matchDestNorm(rule *PolicyRule, host, normHost string, sc *hostCatScratch) 
 	if catGroupSet && !categoryGroupMatchesHostScratch(rule, sc) {
 		return false
 	}
-	// Geo-IP country check — cache-only to avoid blocking the request goroutine.
+	// Geo-IP country check — cache-only, so it never blocks the request
+	// goroutine: LookupCached answers from the host→IP and IP→country caches
+	// and arms an off-path warm on a miss (CHAOS-60, geoip_resolve_health.go).
 	// Fail-closed: on a cache miss the country is unknown and the rule does NOT
 	// match, preventing unclassified traffic from matching geo-restricted rules.
+	// The miss is COUNTED — for an allow-rule it is a user-visible block and for
+	// a deny-rule it is traffic falling through to a lower-priority rule, and
+	// either way the operator's only signal is culvert_geo_policy_unresolved_total.
 	if countrySet {
 		code, cached := geo.LookupCached(host)
-		if !cached || !matchCountry(rule.DestCountry, code) {
+		if !cached {
+			noteGeoCountryUnresolved()
+			return false
+		}
+		if !matchCountry(rule.DestCountry, code) {
 			return false
 		}
 	}

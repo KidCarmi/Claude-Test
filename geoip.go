@@ -38,6 +38,17 @@ var lookupHostFn = net.LookupHost
 // lookupHostFn above; production never reassigns it.
 var geoTrackEnabledFn = geoip.Enabled
 
+// geoEnabledFn / geoLookupIPFn / geoLookupCachedIPFn are the internal/geoip
+// engine seams. Same convention (and same production-never-reassigns rule) as
+// lookupHostFn and geoTrackEnabledFn above: the engine's cache is keyed on a
+// loaded .mmdb, and there is no MaxMind fixture in-tree, so the country half of
+// the resolution chain is only testable through a seam.
+var (
+	geoEnabledFn        = geoip.Enabled
+	geoLookupIPFn       = geoip.LookupByIP
+	geoLookupCachedIPFn = geoip.LookupCachedByIP
+)
+
 // hostIPCache memoises resolveHost's hostname→public-IP resolutions with a
 // TTL. The internal/geoip engine caches IP→country, but before this cache the
 // host→IP step in front of it re-ran a BLOCKING net.LookupHost on every call:
@@ -61,14 +72,42 @@ var geoTrackEnabledFn = geoip.Enabled
 // thrash-avoidance posture as internal/geoip. Cached net.IP values are shared
 // across goroutines and must be treated as READ-ONLY by callers (all current
 // callers only read: isPrivateIP, ip.String()).
+//
+// CHAOS-60: a cache MISS used to be resolved by whichever goroutine observed
+// it, so N concurrent requests for the same uncached host fired N blocking
+// resolutions, and the negative entry that would have stopped the next one is
+// only written when a lookup RETURNS. During a resolver brownout — the window
+// where every lookup runs to the resolver's full budget — that turns the
+// proxy into a 1:1 amplifier of client request rate into DNS query rate
+// against an already-failing resolver. Misses are now SINGLE-FLIGHTED through
+// `inflight`: the first caller resolves, every concurrent caller for the same
+// host waits on its result. Same discipline as the jwksCache in
+// auth_oidc_flow.go (leader publishes to followers).
 type hostIPCache struct {
-	mu      sync.RWMutex
-	entries map[string]hostIPEntry
+	mu       sync.RWMutex
+	entries  map[string]hostIPEntry
+	inflight map[string]*hostResolveCall
 }
 
 type hostIPEntry struct {
 	ip     net.IP // nil = negative entry (resolution failed or private-only)
 	expiry time.Time
+}
+
+// hostResolveCall is one in-flight resolution. The leader closes done after
+// storing ip; followers read ip only after done is closed, so the field needs
+// no lock of its own (the channel close is the happens-before edge).
+//
+// `once` makes publication IDEMPOTENT. A claim can be handed back on more than
+// one path — the leader resolves and publishes, or the warmer decides not to
+// resolve after all because the pool was saturated — and an unguarded second
+// publish would close a closed channel and panic. Idempotence lets every one
+// of those paths call finish unconditionally, which is what makes "a claim is
+// never stranded" checkable rather than a matter of reasoning about ordering.
+type hostResolveCall struct {
+	once sync.Once
+	done chan struct{}
+	ip   net.IP
 }
 
 const (
@@ -79,7 +118,10 @@ const (
 // hostIPCacheMaxEntries bounds the cache. A var (not const) so tests can lower it.
 var hostIPCacheMaxEntries = 10_000
 
-var resolvedHostCache = &hostIPCache{entries: map[string]hostIPEntry{}}
+var resolvedHostCache = &hostIPCache{
+	entries:  map[string]hostIPEntry{},
+	inflight: map[string]*hostResolveCall{},
+}
 
 func (c *hostIPCache) get(host string) (net.IP, bool) {
 	c.mu.RLock()
@@ -117,16 +159,98 @@ func (c *hostIPCache) put(host string, ip net.IP) {
 	c.mu.Unlock()
 }
 
+// begin claims the resolution of host for this caller. It returns the call to
+// wait on and whether this caller is the LEADER (the one that must perform the
+// lookup and then call finish). A follower must never resolve.
+//
+// The cache is re-probed under the write lock so a caller that lost the race
+// to a resolution that has just completed gets the fresh entry instead of
+// starting a second one (hit == true).
+func (c *hostIPCache) begin(host string) (call *hostResolveCall, leader, hit bool, cached net.IP) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[host]; ok && !time.Now().After(e.expiry) {
+		return nil, false, true, e.ip
+	}
+	if existing, ok := c.inflight[host]; ok {
+		return existing, false, false, nil
+	}
+	call = &hostResolveCall{done: make(chan struct{})}
+	c.inflight[host] = call
+	return call, true, false, nil
+}
+
+// finish publishes the leader's result to every follower and releases the
+// single-flight slot. Called by the leader exactly once, on every exit path.
+// Idempotent: only the first call publishes, so every path that might have to
+// hand a claim back can call it unconditionally.
+func (c *hostIPCache) finish(host string, call *hostResolveCall, ip net.IP) {
+	call.once.Do(func() {
+		call.ip = ip
+		c.mu.Lock()
+		// Only clear the slot this call owns: a slot replaced by a later
+		// resolution must not be deleted out from under its own leader.
+		if c.inflight[host] == call {
+			delete(c.inflight, host)
+		}
+		c.mu.Unlock()
+		close(call.done)
+	})
+}
+
+// resolving reports whether a resolution for host is already in flight. Used
+// by the warmer to avoid spawning a goroutine whose only job would be to wait.
+func (c *hostIPCache) resolving(host string) bool {
+	c.mu.RLock()
+	_, ok := c.inflight[host]
+	c.mu.RUnlock()
+	return ok
+}
+
+// geoHostKey strips any :port and reports the bare host. Shared by the
+// blocking and cache-only entry points so both key the cache identically.
+func geoHostKey(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
+// resolveHostCached is resolveHost's NON-BLOCKING half: it answers only from
+// an IP literal or a live cache entry and NEVER touches the resolver.
+//
+// ok=false means "unknown — nothing cached"; ok=true with a nil ip is a
+// resolved-but-unusable host (NXDOMAIN, resolver failure, or private-only
+// answers, all negative-cached). The two are deliberately distinct: only the
+// first is worth warming.
+func resolveHostCached(host string) (ip net.IP, ok bool) {
+	host = geoHostKey(host)
+	if lit := net.ParseIP(host); lit != nil {
+		if isPrivateIP(lit) {
+			return nil, true
+		}
+		return lit, true
+	}
+	return resolvedHostCache.get(host)
+}
+
 // resolveHost returns the first public IP for a given host (or parses it
 // directly). IP literals never touch the cache or the resolver; hostname
 // resolutions are memoised in resolvedHostCache (blocking DNS at most once per
-// host per TTL instead of per call). The returned net.IP may be shared with
-// other goroutines — callers must not mutate it.
+// host per TTL instead of per call) and single-flighted, so concurrent misses
+// for the same host cost ONE resolution. The returned net.IP may be shared
+// with other goroutines — callers must not mutate it.
+//
+// This function BLOCKS: net.LookupHost takes no context, so a resolution runs
+// to the system resolver's own budget (resolv.conf timeout × attempts ×
+// nameservers — tens of seconds on a blackholed resolver). It is therefore
+// reachable only from callers that are bounded some other way: the
+// destination-country tracker (geoTrackSem, 256, drop-on-full), node
+// enrollment (admin-rate), and the policy warmer (geoWarmSem, drop-on-full).
+// The per-request policy path calls resolveHostCached instead — see
+// geoResolver.LookupCached.
 func resolveHost(host string) net.IP {
-	h, _, err := net.SplitHostPort(host)
-	if err == nil {
-		host = h
-	}
+	host = geoHostKey(host)
 	ip := net.ParseIP(host)
 	if ip != nil {
 		if isPrivateIP(ip) {
@@ -134,18 +258,42 @@ func resolveHost(host string) net.IP {
 		}
 		return ip
 	}
-	if cached, ok := resolvedHostCache.get(host); ok {
+	call, leader, hit, cached := resolvedHostCache.begin(host)
+	if hit {
 		return cached
 	}
-	resolved := lookupPublicHostIP(host)
-	resolvedHostCache.put(host, resolved)
-	return resolved
+	if leader {
+		return resolveAsLeader(host, call)
+	}
+	// Follower: wait for the leader's answer rather than starting a second
+	// resolution. A follower never blocks longer than the leader does, because
+	// resolveAsLeader publishes on every exit path.
+	<-call.done
+	return call.ip
+}
+
+// resolveAsLeader performs the one resolution the single-flight elected this
+// caller to perform, and PUBLISHES IT ON EVERY EXIT PATH.
+//
+// The publish is deferred rather than written after the call, and that is
+// load-bearing: a leader that returns without publishing leaves every current
+// follower blocked forever AND leaves the single-flight slot occupied, so
+// every LATER caller for that host also becomes a permanently-blocked
+// follower — one panic in the resolver seam would take out that hostname for
+// the life of the process. On the panic path the named return is nil, which is
+// the fail-closed answer and is negative-cached for the short TTL, and the
+// panic still propagates to the caller's own guard.
+func resolveAsLeader(host string, call *hostResolveCall) (ip net.IP) {
+	defer func() {
+		resolvedHostCache.put(host, ip)
+		resolvedHostCache.finish(host, call, ip)
+	}()
+	return lookupPublicHostIP(host)
 }
 
 // lookupPublicHostIP is resolveHost's uncached core: resolve the hostname and
 // return the first public answer (nil on failure or private-only answers —
-// the shared SSRF posture). Concurrent misses for the same host may resolve in
-// parallel; last write wins, which is benign (both hold live answers).
+// the shared SSRF posture).
 func lookupPublicHostIP(host string) net.IP {
 	addrs, err := lookupHostFn(host) //nolint:noctx // pre-existing resolver call moved verbatim during the internal/geoip split (ADR-0002); context-aware DNS is a separate, out-of-scope change to this SSRF-adjacent path
 	if err != nil || len(addrs) == 0 {
@@ -175,32 +323,66 @@ func (geoResolver) Lookup(host string) string {
 	return code
 }
 
-// LookupFull returns the country code and full name for a host.
+// LookupFull returns the country code and full name for a host. It BLOCKS on
+// DNS for an uncached hostname — only callers that are bounded some other way
+// may use it (see resolveHost's contract).
 func (geoResolver) LookupFull(host string) (code, name string) {
-	if !geoip.Enabled() {
+	if !geoEnabledFn() {
 		return "", ""
 	}
 	ip := resolveHost(host)
 	if ip == nil {
 		return "", ""
 	}
-	return geoip.LookupByIP(ip)
+	return geoLookupIPFn(ip)
 }
 
-// LookupCached returns the country code only if already in the geo cache —
-// it never triggers a new geo-DB lookup. Host→IP resolution is memoised in
-// resolvedHostCache, so the policy hot path resolves a hostname (blocking DNS)
-// at most once per host per TTL rather than on every evaluation.
-// Returns ("", false) on cache miss or when GeoIP is disabled.
+// LookupCached returns the country code only if BOTH halves of the resolution
+// chain — host→IP and IP→country — are already cached. It never resolves and
+// never touches the geo DB, so it is safe on the per-request policy path.
+//
+// CHAOS-60: this used to be true of the geo half only. The host half called
+// the blocking resolveHost, so on an uncached hostname the request goroutine
+// sat in an uncancellable net.LookupHost inside policy evaluation — the exact
+// thing the call site in matchDestNorm says it avoids, and the thing register
+// row WK-3 recorded as already-safe. It regressed silently when the host→IP
+// cache was introduced in front of it: the cache made the COMMON path fast,
+// which is why nothing noticed that the MISS path still blocked.
+//
+// A miss now arms a bounded, single-flighted, off-path warm (warmGeoHost) and
+// returns ("", false) — the fail-closed answer the call site already documents
+// for an unknown country. The warm fills both caches, so the next request for
+// the same host matches. That also removes an accidental coupling: before it,
+// the ONLY thing populating the IP→country cache on the request path was
+// trackDestinationCountry, a best-effort dashboard sampler that runs solely on
+// the ALLOW branch and drops its work when saturated — so country-scoped
+// ENFORCEMENT silently depended on a telemetry goroutine having won a
+// semaphore slot earlier. See geoip_resolve_health.go.
 func (geoResolver) LookupCached(host string) (code string, ok bool) {
-	if !geoip.Enabled() {
+	if !geoEnabledFn() {
 		return "", false
 	}
-	ip := resolveHost(host)
+	ip, resolved := resolveHostCached(host)
+	if !resolved {
+		// Host→IP unknown: warm it off the request path.
+		warmGeoHost(host)
+		return "", false
+	}
 	if ip == nil {
+		// Negative-cached (NXDOMAIN / resolver down / private-only). There is
+		// no country to learn, and the negative TTL already governs when the
+		// resolution is retried — warming here would re-block on every request.
 		return "", false
 	}
-	return geoip.LookupCachedByIP(ip)
+	if code, ok = geoLookupCachedIPFn(ip); ok {
+		return code, true
+	}
+	// Host→IP known, IP→country not. The geo lookup itself is an mmap read,
+	// but it is kept off the request path for the same cost reason the
+	// cache-only accessor exists; the warm makes it a one-request delay
+	// instead of a permanent dependency on the dashboard sampler.
+	warmGeoHost(host)
+	return "", false
 }
 
 // ---------------------------------------------------------------------------
