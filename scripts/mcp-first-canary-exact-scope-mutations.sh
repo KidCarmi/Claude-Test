@@ -256,7 +256,7 @@ run_mutation M07 \
   'a WILDCARD identifier is accepted as a name' \
   'TestFirstCanary_RejectionMatrix' \
   "$CANARY" "$FC" \
-  's/\t\tcase strings\.ContainsAny\(v, firstCanaryGlobChars\):\n\t\t\treturn FirstCanaryWildcardIdentifier\n//'
+  's/\t\t\treturn FirstCanaryWildcardIdentifier\n/\t\t\t_ = firstCanaryGlobChars\n/'
 
 run_mutation M08 \
   'a PERCENTAGE sub-sample is accepted' \
