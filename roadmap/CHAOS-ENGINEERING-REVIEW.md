@@ -4562,13 +4562,21 @@ See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, `internal/authcost` (package comment),
 > `CHAOS-50`. Collisions 2 and 3 landed on the same day, hours apart, against two
 > different branches.
 >
+> **This section is now §30, and that was not a fifth rename.** The id
+> `CHAOS-61` is unaffected; the SECTION was displaced by a later merge of `main`
+> that inserted a newly-merged sweep ahead of it. Column five above records what
+> each rename produced at the time, so row 4 reads `§29` and is left as history —
+> the current location is §30 and every pointer outside the register (`CLAUDE.md`,
+> the runbook, `internal/geoip/geoip.go`) was repointed with it.
+>
 > **Collision 4 is the one the previous note predicted in writing, and it is the
 > sharpest case of all**: §28 is the sibling half of THIS finding — the same
 > subsystem reached through the GeoIP accessor rather than the resolver — and it
 > was developed on THIS BRANCH and merged to `main` ahead of this section. So the
 > id was taken by a sweep sharing this sweep's own `hostIPCache`, and the pair was
 > reconciled onto one flight type while still answering to one name. For a
-> window, §28 and §29 both read `CHAOS-60` with `(second sweep)` appended to
+> window, §28 and this section (then §29) both read `CHAOS-60` with
+> `(second sweep)` appended to
 > distinguish them — a parenthetical is not an identifier, and that is the same
 > half-fix (correct the SECTION, leave the ID) recorded for collisions 1–3.
 >
@@ -4583,7 +4591,7 @@ See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, `internal/authcost` (package comment),
 > references were left untouched in every pass, so `metrics.go` now carries one
 > line from §25, one from §28 and one from here, `CLAUDE.md` carries §26's, §27's
 > and §28's bullets beside this sweep's, and `geoip.go` carries both halves of the
-> §28/§29 pair.
+> §28/§30 pair.
 >
 > **Each of the four merges was resolved by someone who fixed the duplicate
 > SECTION number and left the duplicate ID in place**, which is why the collision
@@ -4601,6 +4609,21 @@ See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, `internal/authcost` (package comment),
 > and the fourth arrived within the day, from a sibling sweep on this very branch.
 > **Owner action: add the placeholder-allocation row.** A fifth is not a
 > prediction about luck; it is what this process produces by construction.
+>
+> **The fifth landed the same day, and it is already ON `main`.** §29 — the
+> credential-verification-cost sweep, merged 2026-09-11 — is stamped `CHAOS-57`,
+> which §25 has held since 2026-09-04. Both are merged, so the asymmetry that
+> resolved collisions 1–4 does not apply: neither side is free to move, and
+> whichever is renumbered rewrites identifiers that merged PRs already reference.
+> It is also the first collision to reach the CODE: both sweeps name their gates
+> `TestChaos57_*` in the same `package main`, and the tree compiles only because
+> every suffix happens to differ — a future gate named for either sweep can now
+> fail to build for a reason that has nothing to do with its subject. **This
+> section records the fact and renumbers nothing**: choosing which merged sweep
+> moves is exactly the owner decision the header reserves, and doing it from an
+> unrelated branch would edit two other sweeps' merged history. It is stated here
+> because the argument above stops being a prediction at this point — the process
+> has now produced a duplicate that no branch can resolve cheaply.
 
 ### 30.1 Reachability
 

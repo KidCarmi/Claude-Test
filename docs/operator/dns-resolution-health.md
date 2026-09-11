@@ -6,7 +6,7 @@ neither, none of this runs and every surface below reports the feature as
 unused.
 
 **Finding:** CHAOS-61 · **Code:** `geoip.go` (resolver), `dns_health.go`
-(health plane) · **Register:** `roadmap/CHAOS-ENGINEERING-REVIEW.md` §29
+(health plane) · **Register:** `roadmap/CHAOS-ENGINEERING-REVIEW.md` §30
 
 ---
 
