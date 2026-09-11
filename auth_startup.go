@@ -56,7 +56,7 @@ func loadAuth(auth authStartupConfig) {
 }
 
 // warnOversizeConfiguredUsernames reports admin accounts whose name exceeds the
-// login endpoint's maxUsernameLen bound (CHAOS-61).
+// login endpoint's maxUsernameLen bound (CHAOS-62).
 //
 // Such an account still authenticates — rejectOversizeLoginUser exempts any
 // configured name — so this is deliberately a WARNING and never fatal: the

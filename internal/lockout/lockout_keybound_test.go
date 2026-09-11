@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// ─── CHAOS-61 — the limiter's map keys are bounded in SIZE, not just in count ──
+// ─── CHAOS-62 — the limiter's map keys are bounded in SIZE, not just in count ──
 //
 // Cleanup's own doc claims the maps are bounded "against an unbounded-memory
 // DoS", and on the ENTRY-COUNT axis they are. They were not bounded on the

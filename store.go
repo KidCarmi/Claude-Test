@@ -1462,7 +1462,7 @@ func (c *Config) UIUserExists(username string) bool {
 // LoginNameConfigured reports whether username names an account VerifyUIUser
 // could authenticate — the roster, or the legacy single user.
 //
-// It exists for CHAOS-61's oversize-username guard (login_input_bounds.go),
+// It exists for CHAOS-62's oversize-username guard (login_input_bounds.go),
 // which must never refuse a name that belongs to a real admin. Its resolution
 // MUST stay identical to VerifyUIUser's below: a name this returns false for is
 // a name the login endpoint may reject outright, so any divergence locks an
