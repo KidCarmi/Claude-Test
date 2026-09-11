@@ -164,7 +164,23 @@ func PrivateIP(ip net.IP) bool {
 // proxy CONNECT to loopback, RFC 1918, link-local, or metadata endpoints.
 // Results are cached in the package DNS cache (30s TTL) to avoid redundant
 // DNS lookups.
+//
+// The lookup on the miss path is UNBOUNDED — it runs under
+// context.Background(), so a wedged resolver blocks the calling goroutine for
+// the system resolver's full budget. Callers on a request goroutine should use
+// PrivateHostContext and pass the deadline they are already working to.
 func PrivateHost(hostport string) error {
+	return PrivateHostContext(context.Background(), hostport)
+}
+
+// PrivateHostContext is PrivateHost with the DNS lookup bounded by ctx.
+//
+// Added by CHAOS-65: the OCSP responder URL is read from the peer's own
+// certificate and guarded on a TLS handshake running on the request goroutine,
+// so the guard itself must not become the unbounded call. Behaviour is
+// otherwise identical, cache included; PrivateHost delegates here with a
+// background context so every existing caller is byte-identical.
+func PrivateHostContext(ctx context.Context, hostport string) error {
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host = hostport // no port
@@ -176,7 +192,7 @@ func PrivateHost(hostport string) error {
 		}
 		return nil
 	}
-	ips, err := net.DefaultResolver.LookupHost(context.Background(), host)
+	ips, err := net.DefaultResolver.LookupHost(ctx, host)
 	if err != nil {
 		// Fail closed: unresolvable hosts are rejected to prevent DNS-rebinding
 		// attacks where the check resolves to a public IP but Dial resolves to

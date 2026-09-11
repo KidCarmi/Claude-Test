@@ -407,6 +407,94 @@ func TestChaos65_ConcurrentHandshakesSingleFlight(t *testing.T) {
 	}
 }
 
+// TestChaos65_SingleFlightStillCountsEveryRefusedHandshake — found in
+// self-review of the single-flight fix, not in the original sweep.
+//
+// Collapsing N queries into one must not collapse N REFUSALS into one.
+// culvert_ocsp_fail_closed_total means "handshakes refused for want of a usable
+// verdict" and is what an operator alerts on; the pre-existing cached
+// fail-closed path already charges every hit for exactly this reason, so a
+// follower that inherits a fail-closed verdict has to charge it as well. Left
+// unfixed, a fail-closed storm would have under-reported itself by however many
+// handshakes happened to arrive concurrently — worst exactly when the storm is
+// worst.
+func TestChaos65_SingleFlightStillCountsEveryRefusedHandshake(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	// A responder that answers slowly with nothing usable, so every caller
+	// lands on the fail-closed path and the late ones join the flight.
+	url, _ := staticResponder(t, func() []byte {
+		time.Sleep(80 * time.Millisecond)
+		return []byte("not an ocsp response")
+	})
+	leaf := ca.issueLeaf(t, 31, url)
+
+	oc := New()
+	oc.Enable()
+	const n = 12
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err == nil {
+				t.Error("an unusable response must fail closed")
+			}
+		}()
+	}
+	wg.Wait()
+
+	if oc.SingleFlightJoinedTotal() == 0 {
+		t.Fatal("no handshake joined an in-flight query — the test did not exercise the follower path")
+	}
+	if got := oc.FailClosedTotal(); got != n {
+		t.Fatalf("FailClosedTotal() = %d after %d refused handshakes, want %d — "+
+			"single-flight collapsed the refusals along with the queries, so a "+
+			"fail-closed storm under-reports itself exactly when it is worst", got, n, n)
+	}
+	if got := oc.RevokedTotal(); got != 0 {
+		t.Fatalf("RevokedTotal() = %d — it counts responder CONFIRMATIONS, and none were made", got)
+	}
+}
+
+// TestChaos65_SSRFGuardIsBoundedByTheQueryBudget — also from self-review.
+//
+// ssrf.PrivateHost resolves under context.Background(). Reaching for it from a
+// TLS handshake on the request goroutine would have made the GUARD the
+// unbounded call — the CHAOS-64 fault re-imported through the fix for
+// CHAOS-65's SSRF hole, and worse than what it replaced, because the hostname
+// is written by the peer. The guard now runs under the same envelope as the
+// query it guards.
+func TestChaos65_SSRFGuardIsBoundedByTheQueryBudget(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	// A hostname under .invalid never resolves; on a host whose resolver
+	// blackholes rather than answering NXDOMAIN this is where the unbounded
+	// wait happened. The assertion is the bound, not the verdict.
+	leaf := ca.issueLeaf(t, 32,
+		"http://ocsp.chaos65-nonexistent.invalid/",
+		"http://ocsp.chaos65-nonexistent-2.invalid/",
+		"http://ocsp.chaos65-nonexistent-3.invalid/",
+		"http://ocsp.chaos65-nonexistent-4.invalid/",
+	)
+
+	oc := New()
+	oc.Enable()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}})
+	}()
+	select {
+	case <-done:
+	case <-time.After(queryBudget + 10*time.Second):
+		t.Fatalf("the SSRF pre-check outlived the %v query envelope — it must not be "+
+			"the unbounded call inside a TLS handshake", queryBudget)
+	}
+}
+
 // ── CONTROL gates ───────────────────────────────────────────────────────────
 //
 // A checker that simply refused every certificate would pass every defect gate

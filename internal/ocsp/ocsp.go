@@ -408,6 +408,18 @@ func (oc *Checker) resolve(key string, leaf, issuer *x509.Certificate) (revoked,
 		oc.flightMu.Unlock()
 		oc.singleFlightTotal.Add(1)
 		<-f.done
+		if f.revoked && f.failClosed {
+			// A follower's handshake is refused too, so it must be counted
+			// too. failClosedTotal means "handshakes refused for want of a
+			// usable verdict" — the cached-fail-closed path in
+			// VerifyPeerCertificate already charges every hit for exactly this
+			// reason, and collapsing N queries into one must not also collapse
+			// N refusals into one. revokedTotal is deliberately NOT charged
+			// here: it counts responder CONFIRMATIONS, and the cached
+			// confirmed-revocation path does not charge it either.
+			oc.failClosedTotal.Add(1)
+			oc.lastFailClosedUTC.Store(time.Now().Unix())
+		}
 		return f.revoked, f.failClosed
 	}
 	f := &flight{done: make(chan struct{}), revoked: true, failClosed: true}
@@ -505,7 +517,12 @@ func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate
 		oc.blockedTotal.Add(1)
 		return 0, fmt.Errorf("ocsp: responder scheme %q not allowed", u.Scheme)
 	}
-	if err := ssrf.PrivateHost(u.Host); err != nil {
+	// PrivateHostContext, not PrivateHost: the plain form resolves under
+	// context.Background(), so on a wedged resolver the GUARD becomes the
+	// unbounded call inside a TLS handshake on the request goroutine — the
+	// CHAOS-64 fault re-imported through the fix for CHAOS-65's SSRF hole.
+	// The budget it runs under is the same envelope the query itself gets.
+	if err := ssrf.PrivateHostContext(ctx, u.Host); err != nil {
 		oc.blockedTotal.Add(1)
 		return 0, fmt.Errorf("ocsp: responder blocked: %w", err)
 	}
