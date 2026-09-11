@@ -182,9 +182,15 @@ func TestAtomicBinding_C_ObservationCanNeverLatchTheReplacementActivation(t *tes
 		_, _ = testBeginActivation(r.rt, r.capb, runtimeTestBudget(3), canaryRuntimeTestNow)
 	}()
 
+	// probeDrift, not a bare code: the replacement activation is armed with the SAME canonical
+	// reviewed target, so with the generation re-verification removed this drift WOULD latch it.
+	// A bare code carries no target, and since round 31 an observation with nothing to compare
+	// against latches nothing at all — which made this gate pass for the wrong reason and let
+	// mutation M08 survive.
+	drift := probeDrift("tool_fingerprint_drift")
 	adm := r.admit(func() canaryTrustObservation {
 		close(released)
-		return canaryTrustObservation{DriftCode: "tool_fingerprint_drift"}
+		return drift()
 	})
 	wg.Wait()
 
@@ -218,7 +224,7 @@ func TestAtomicBinding_D_PublicationGapDeniesAndPoisonsNothing(t *testing.T) {
 	probed := false
 	adm := r.admit(func() canaryTrustObservation {
 		probed = true
-		return canaryTrustObservation{DriftCode: "tool_fingerprint_drift"}
+		return probeDrift("tool_fingerprint_drift")()
 	})
 
 	if adm.Denial != canaryAdmitNoActivation {
@@ -387,8 +393,13 @@ func TestAtomicBinding_TrustProbeMayNotReEnterTheRuntime(t *testing.T) {
 	// The PRODUCTION probe, shaped exactly as the gate supplies it under the lock.
 	realProbe := func() canaryTrustObservation {
 		live := mcpLiveTrustPrecheck(ttTenant, sid, tool, fpHex)
-		if live.DriftCode != "" {
-			return canaryTrustObservation{DriftCode: live.DriftCode}
+		if !live.Eligible && live.Resolved {
+			// Exactly the shape mcpLiveSideEffectGate builds: every fact carried, none
+			// pre-classified, so the transaction's ordering rule decides scope and cause.
+			return canaryTrustObservation{
+				DriftCode: live.DriftCode, Found: true,
+				Current: live.Authoritative, AnchorLost: live.AnchorLost,
+			}
 		}
 		if !live.Eligible {
 			return canaryTrustObservation{}
@@ -454,7 +465,7 @@ func TestAtomicBinding_InactiveRuntimeIsNotAnActivation(t *testing.T) {
 	probed := false
 	adm := r.admit(func() canaryTrustObservation {
 		probed = true
-		return canaryTrustObservation{DriftCode: "tool_fingerprint_drift"}
+		return probeDrift("tool_fingerprint_drift")()
 	})
 
 	if adm.Denial != canaryAdmitNoActivation {
@@ -480,7 +491,7 @@ func TestAtomicBinding_ActiveWithZeroGenerationIsNotAnActivation(t *testing.T) {
 	probed := false
 	adm := r.admit(func() canaryTrustObservation {
 		probed = true
-		return canaryTrustObservation{DriftCode: "tool_fingerprint_drift"}
+		return probeDrift("tool_fingerprint_drift")()
 	})
 
 	if adm.Denial != canaryAdmitNoActivation {
@@ -705,7 +716,7 @@ func TestAtomicBinding_PreExecutorLatchHoldsTheActivationLockAcrossItsProbe(t *t
 	r.latchDrift(func() canaryTrustObservation {
 		close(released)
 		<-tried
-		return canaryTrustObservation{DriftCode: "tool_fingerprint_drift"}
+		return probeDrift("tool_fingerprint_drift")()
 	})
 	wg.Wait()
 
