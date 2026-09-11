@@ -280,7 +280,7 @@ func withAdminPanicRecovery(next http.Handler) http.Handler {
 			if v == http.ErrAbortHandler {
 				panic(v)
 			}
-			recordCrash("admin", r.Header.Get("X-Request-ID"), v)
+			recordCrash("admin", r.Header.Get(headerRequestID), v)
 			if !tw.wrote { // never double-commit / never inject into a streamed body
 				http.Error(tw.ResponseWriter, "Internal Server Error", http.StatusInternalServerError)
 				return
