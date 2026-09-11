@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -25,6 +28,11 @@ const adminUIShutdownTimeout = 5 * time.Second
 // error is the underlying http.Server.Shutdown error — typically nil on
 // clean drain, or context.DeadlineExceeded if the cap fires. P1.1 / S4.AdminUI.
 func shutdownAdminUI(ctx context.Context, srv *http.Server) error {
+	// CHAOS-57: interrupt the rebind loop FIRST so a listener that is currently
+	// sleeping out a backoff does not keep trying to bind behind the shutdown,
+	// and does not have to be waited out. Ordered before the nil check because
+	// the loop can be running on a boot that never assigned the handle.
+	stopAdminUIListener()
 	if srv == nil {
 		return nil
 	}
@@ -144,45 +152,200 @@ func newAdminUIServer(port int) *http.Server {
 // startUI launches the admin UI HTTP server and returns the *http.Server
 // handle so runProxyUntilShutdown can call Shutdown(ctx) on it. The actual
 // listen goroutine is spawned internally; the returned server is the
-// shutdown handle. Errors from ListenAndServe* that are not http.ErrServerClosed
-// remain fatal — only the clean-shutdown sentinel is filtered.
+// shutdown handle.
+//
+// CHAOS-57: a listen/serve failure is NEVER fatal. Until this change every
+// error branch here called logFatalf, so an admin-plane fault — a port already
+// bound, an unreadable custom certificate — terminated the PROXY DATA PLANE
+// with it, asynchronously, against a process that had already announced itself
+// as serving. The management plane may degrade without the enforcement plane
+// going with it; never the reverse. See admin_ui_health.go for the full
+// finding, the reproduction and the observability contract.
 func startUI(port int, certFile, keyFile string, noTLS bool) *http.Server {
 	srv := newAdminUIServer(port)
+	noteAdminUIConfigured(port)
 
-	if certFile != "" && keyFile != "" {
-		logger.Printf("UITLS: https://localhost:%d (custom cert)", port)
-		go func() {
-			if err := srv.ListenAndServeTLS(certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logFatalf("UI TLS error: %v", err)
+	// Auto self-signed TLS — only when explicitly requested, and only when no
+	// operator-supplied pair was configured. Resolved ONCE here rather than per
+	// attempt: a self-signed certificate is minted in memory, so re-minting it
+	// on every rebind would hand a different certificate to the operator's
+	// browser after each transient fault.
+	if certFile == "" || keyFile == "" {
+		if !noTLS {
+			tlsCfg, err := selfSignedTLS()
+			if err != nil {
+				uiTLSFallbackActive = true
+				uiTLSFallbackReason = err.Error()
+				logger.Printf("TLS self-sign failed (%v), falling back to HTTP", err)
+			} else {
+				srv.TLSConfig = tlsCfg
 			}
-		}()
-		return srv
-	}
-
-	// Auto self-signed TLS — only when explicitly requested.
-	if !noTLS {
-		tlsCfg, err := selfSignedTLS()
-		if err != nil {
-			uiTLSFallbackActive = true
-			uiTLSFallbackReason = err.Error()
-			logger.Printf("TLS self-sign failed (%v), falling back to HTTP", err)
-		} else {
-			srv.TLSConfig = tlsCfg
-			logger.Printf("UITLS: https://localhost:%d (self-signed)", port)
-			go func() {
-				if err := srv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-					logFatalf("UI TLS error: %v", err)
-				}
-			}()
-			return srv
 		}
 	}
 
-	logger.Printf("UIHTTP: http://localhost:%d", port)
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logFatalf("UI server error: %v", err)
-		}
-	}()
+	go serveAdminUIWithRetry(srv, port, certFile, keyFile, armAdminUIStop())
 	return srv
+}
+
+// The retry loop's interrupt channel, so the shutdown hook can wake it out of a
+// backoff sleep.
+//
+// One dedicated mutex covers the channel AND the closed flag. A sync.Once plus
+// an atomic.Pointer would be shorter, but the test reset has to re-arm both, and
+// re-arming a Once is only safe under the same lock its reader takes — so the
+// lock is the thing that actually makes reset correct, and adding the Once on
+// top would just be a second, weaker guard over the same state.
+var (
+	adminUIStopMu     sync.Mutex
+	adminUIStopCh     chan struct{}
+	adminUIStopClosed bool
+)
+
+// armAdminUIStop creates the interrupt channel for a fresh listener.
+func armAdminUIStop() <-chan struct{} {
+	adminUIStopMu.Lock()
+	defer adminUIStopMu.Unlock()
+	adminUIStopCh = make(chan struct{})
+	adminUIStopClosed = false
+	return adminUIStopCh
+}
+
+// stopAdminUIListener interrupts the rebind loop. Idempotent, and safe to call
+// when no UI was ever started.
+func stopAdminUIListener() {
+	adminUIStopMu.Lock()
+	defer adminUIStopMu.Unlock()
+	if adminUIStopCh != nil && !adminUIStopClosed {
+		close(adminUIStopCh)
+		adminUIStopClosed = true
+	}
+}
+
+// resetAdminUIStopForTest re-arms the stop machinery between tests. Test
+// isolation only; see resetAdminUIHealthForTest, which calls it.
+func resetAdminUIStopForTest() {
+	adminUIStopMu.Lock()
+	defer adminUIStopMu.Unlock()
+	adminUIStopCh = nil
+	adminUIStopClosed = false
+}
+
+// serveAdminUIWithRetry binds and serves the admin UI, rebinding with a
+// jittered, interruptible backoff for as long as the process lives.
+//
+// The bind is performed EXPLICITLY (net.Listen) rather than through
+// ListenAndServe so the loop can tell a successful bind from a serve that
+// ended — which is what makes "recovery is declared on observed evidence, never
+// on elapsed time" implementable here at all.
+//
+// The rate is bounded; the attempt count deliberately is not. See the
+// adminUIListenBackoff* commentary in admin_ui_health.go.
+func serveAdminUIWithRetry(srv *http.Server, port int, certFile, keyFile string, stop <-chan struct{}) {
+	defer recoverGoroutine("admin-ui-listener")
+
+	addr := fmt.Sprintf(":%d", port)
+	backoff := adminUIListenBackoffInitial
+
+	for {
+		select {
+		case <-stop:
+			noteAdminUIStopped()
+			return
+		default:
+		}
+
+		err := adminUIServeOnce(srv, addr, certFile, keyFile)
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			// Shutdown/Close — the only clean exit. Never a fault, never an alert.
+			noteAdminUIStopped()
+			return
+		}
+
+		reason := classifyAdminUIListenError(err)
+		wait := jitterDuration(backoff, adminUIListenJitter)
+		if noteAdminUIListenFailure(reason, backoff, time.Now()) {
+			// The FULL error goes here and nowhere else: the contract row, the
+			// alert and the readiness detail all carry the bounded class only.
+			// logErrorf applies sanitizeLog (CWE-117) to the whole line.
+			logErrorf("admin UI listener on port %d unavailable (%s): %v — retrying in %s; "+
+				"the proxy data plane is unaffected and is still enforcing policy",
+				port, reason, err, wait.Round(time.Millisecond))
+		}
+
+		if !haSleepInterruptible(stop, wait) {
+			noteAdminUIStopped()
+			return
+		}
+		if backoff *= 2; backoff > adminUIListenBackoffMax {
+			backoff = adminUIListenBackoffMax
+		}
+	}
+}
+
+// adminUIServeOnce performs one bind-and-serve attempt. It returns
+// http.ErrServerClosed once the server has been Shutdown/Closed, and any other
+// error for a fault the caller should retry.
+//
+// The operator-supplied certificate is re-read on EVERY attempt, which is what
+// makes a rotation that briefly leaves the pair unreadable self-healing: the
+// attempt that runs after the rotation completes picks up the new material with
+// no restart.
+func adminUIServeOnce(srv *http.Server, addr, certFile, keyFile string) error {
+	// Load the operator-supplied pair BEFORE binding, for two reasons.
+	//
+	//  1. http.Server.ServeTLS returns a certificate error WITHOUT closing the
+	//     listener it was handed, so a bind-first loop would leak one socket per
+	//     attempt against a persistently bad certificate — turning a recoverable
+	//     config fault into descriptor exhaustion.
+	//  2. It is what lets the failure be classified as `tls_certificate` rather
+	//     than matching on crypto/tls error text.
+	//
+	// The loaded pair is then DISCARDED and ServeTLS re-reads the files below.
+	// That deliberate double read is what keeps HTTP/2 working: ServeTLS calls
+	// setupHTTP2_ServeTLS, which srv.Serve(tls.NewListener(...)) does not, so
+	// hand-rolling the TLS listener here would silently drop ALPN h2 from the
+	// admin UI that ListenAndServeTLS used to negotiate.
+	customTLS := certFile != "" && keyFile != ""
+	if customTLS {
+		if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+			return fmt.Errorf("%w: %w", errAdminUITLSMaterial, err)
+		}
+	}
+
+	lc := &net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	// The bind is the EVIDENCE. Announce only now: the pre-change code logged
+	// "UIHTTP: http://localhost:%d" before attempting to bind, so the process
+	// log actively claimed the admin UI was listening on a port it had never
+	// acquired.
+	if suppressed := noteAdminUIServing(); suppressed > 0 {
+		logger.Printf("admin UI listener recovered on %s (%d further failure log lines were suppressed while it was down)",
+			addr, suppressed)
+	}
+	switch {
+	case customTLS:
+		logger.Printf("UITLS: https://localhost%s (custom cert)", addr)
+	case srv.TLSConfig != nil:
+		logger.Printf("UITLS: https://localhost%s (self-signed)", addr)
+	default:
+		logger.Printf("UIHTTP: http://localhost%s", addr)
+	}
+
+	// Serve closes ln on return; the extra Close is a deterministic backstop for
+	// the ServeTLS path, which can return a certificate error without closing
+	// the listener it was handed (see the pre-validation above — this covers the
+	// residual race in which the pair is broken between validating and serving).
+	defer ln.Close() //nolint:errcheck // idempotent teardown; Serve has normally closed it already
+
+	if customTLS {
+		return srv.ServeTLS(ln, certFile, keyFile)
+	}
+	if srv.TLSConfig != nil {
+		return srv.ServeTLS(ln, "", "")
+	}
+	return srv.Serve(ln)
 }
