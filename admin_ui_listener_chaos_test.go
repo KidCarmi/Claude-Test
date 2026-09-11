@@ -638,7 +638,9 @@ func TestChaos57_ServerShutdownEndsTheLoop(t *testing.T) {
 	}
 }
 
-// TestChaos57_RepeatedFailuresDoNotLeakListeners.
+// TestChaos57_RepeatedFailuresDoNotLeakListeners pins that a persistently
+// invalid certificate pair costs no descriptors, however many times the retry
+// loop runs.
 //
 // http.Server.ServeTLS returns a certificate error WITHOUT closing the listener
 // it was handed. A retry loop that bound first and validated second would leak
