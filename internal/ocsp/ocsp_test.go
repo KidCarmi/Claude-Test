@@ -180,6 +180,10 @@ func unreachableResponderURL(t *testing.T) string {
 // seconds-long responder blip hard-fails all TLS to the affected upstream
 // for an hour after the responder recovers.
 func TestOCSPChecker_IndeterminateVerdictShortTTL(t *testing.T) {
+	// The fixture responder is on loopback, which the CHAOS-65 SSRF guard
+	// refuses before dialing. Permit it here so the test still exercises an
+	// UNREACHABLE responder rather than a blocked one.
+	allowLoopback(t)
 	oc := New()
 	oc.Enable()
 	rawCerts := makeLeafWithResponder(t, unreachableResponderURL(t))
@@ -192,7 +196,11 @@ func TestOCSPChecker_IndeterminateVerdictShortTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry, ok := oc.cache[leaf.SerialNumber.Text(16)]
+	issuer, err := x509.ParseCertificate(rawCerts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := oc.cache[certKey(leaf, issuer)]
 	if !ok {
 		t.Fatal("indeterminate verdict should be cached")
 	}
@@ -214,8 +222,8 @@ func TestOCSPChecker_IndeterminateVerdictShortTTL(t *testing.T) {
 
 	// Once the short TTL lapses, the checker re-queries instead of serving
 	// the stale outage verdict (simulated by expiring the entry).
-	oc.cache[leaf.SerialNumber.Text(16)].expiresAt = time.Now().Add(-time.Second)
-	if _, _, found := oc.checkCached(leaf.SerialNumber.Text(16)); found {
+	oc.cache[certKey(leaf, issuer)].expiresAt = time.Now().Add(-time.Second)
+	if _, _, found := oc.checkCached(certKey(leaf, issuer)); found {
 		t.Fatal("expired indeterminate verdict must not be served from cache")
 	}
 }
@@ -372,6 +380,7 @@ func buildLeafWithResponder(t *testing.T, responderURL string) (leaf, issuer *x5
 func TestOCSPChecker_CheckRespondersFailClosedIncrementsCounters(t *testing.T) {
 	// Port 1 is a reserved, never-listening TCP port — the connection is
 	// refused immediately instead of timing out, keeping the test fast.
+	allowLoopback(t) // see TestOCSPChecker_IndeterminateVerdictShortTTL
 	leaf, issuer, _ := buildLeafWithResponder(t, "http://127.0.0.1:1")
 
 	oc := New()
@@ -397,6 +406,7 @@ func TestOCSPChecker_CachedFailClosedKeepsCounterCurrent(t *testing.T) {
 	// last-occurrence must still advance, or the OCSP panel would show only
 	// the first cache miss and under-report the ongoing outage (Codex P2 on
 	// PR #581).
+	allowLoopback(t) // see TestOCSPChecker_IndeterminateVerdictShortTTL
 	leaf, issuer, _ := buildLeafWithResponder(t, "http://127.0.0.1:1")
 	oc := New()
 	oc.Enable()
@@ -428,12 +438,13 @@ func TestOCSPChecker_CachedFailClosedKeepsCounterCurrent(t *testing.T) {
 	}
 	// A cached CONFIRMED revocation (failClosed=false) must return early
 	// WITHOUT touching the fail-closed counter — only the outage path does.
-	if _, failClosed, found := oc.checkCached(leaf.SerialNumber.Text(16)); !found || !failClosed {
+	if _, failClosed, found := oc.checkCached(certKey(leaf, issuer)); !found || !failClosed {
 		t.Fatal("the cached verdict for this serial must be marked fail-closed")
 	}
 }
 
 func TestOCSPChecker_VerifyPeerCertificateRevokedIncrementsCounter(t *testing.T) {
+	allowLoopback(t) // see TestOCSPChecker_IndeterminateVerdictShortTTL
 	var issuerCert *x509.Certificate
 	var issuerKey *ecdsa.PrivateKey
 	var leafCert *x509.Certificate
