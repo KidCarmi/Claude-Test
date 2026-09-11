@@ -149,6 +149,16 @@ func TestReviewedTargetSet_CompareVerdicts(t *testing.T) {
 		{"another tenant", target("t2", "s1", "tool", 0xF1, "spiffe://x/s1"), ReviewedOutOfScope},
 		{"another server", target("t1", "s2", "tool", 0xF1, "spiffe://x/s1"), ReviewedOutOfScope},
 		{"another tool", target("t1", "s1", "other", 0xF1, "spiffe://x/s1"), ReviewedOutOfScope},
+		// A CURRENT target reporting NO identity is drift, not a match.
+		//
+		// The reviewed side can never be empty — CanonicalizeReviewedTargets refuses
+		// ReviewedNoServerIdentity, pinned above — so the "" == "" match that would make an
+		// identity rotation invisible is unreachable from a canonical set. This is the other
+		// half: a current read that yields "" (a registry path that bypassed the Add-time
+		// rejection, an unpublished pin) must be charged as drift rather than quietly comparing
+		// equal to something. The code already does this, because "" != the reviewed identity;
+		// what was missing was anything holding it there.
+		{"current reports no identity", target("t1", "s1", "tool", 0xF1, ""), ReviewedServerIdentityDrift},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if v := set.Compare(tc.cur); v != tc.want {
