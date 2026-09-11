@@ -322,13 +322,13 @@ run_mutation M18 \
   'an identifier past the rollout value bound is accepted' \
   'TestFirstCanary_RejectionMatrix' \
   "$CANARY" "$FC" \
-  's/\t\tcase len\(v\) > maxBytes:\n\t\t\treturn FirstCanaryIdentifierTooLong\n//'
+  's/\t\t\treturn FirstCanaryIdentifierTooLong\n/\t\t\t_ = maxBytes\n/'
 
 run_mutation M19 \
   'a tool selector need not pin server+name+fingerprint' \
   'TestFirstCanary_RejectionMatrix' \
   "$CANARY" "$FC" \
-  's/\t\tif t\.Server == "" \|\| t\.Name == "" \|\| t\.Fingerprint == "" \{\n\t\t\treturn FirstCanaryToolIncomplete\n\t\t\}\n//'
+  's/\t\t\treturn FirstCanaryToolIncomplete\n/\t\t\t_ = t\n/'
 
 run_mutation M20 \
   'the gate stops rejecting a MANAGEMENT-capability scope' \
@@ -355,7 +355,7 @@ run_mutation M22 \
 run_mutation M23 \
   'the exact-scope row is downgraded so a wider scope no longer holds the verdict back' \
   'TestExactScope_WiderScopeCannotBeReadyEvenWithEverythingElseSatisfied' \
-  "$CANARY" internal/mcp/canary/readiness.go \
+  . internal/mcp/canary/readiness.go \
   's/\t\{func\(f Facts\) bool \{ return f\.ScopeExactFirstCanary \}, ReasonScopeNotExactFirstCanary, factActivation\},\n//'
 
 run_mutation M24 \
@@ -390,7 +390,7 @@ run_mutation M28 \
   'a governed selector class is dropped from the enumeration, so a new one could arrive un-ruled' \
   'TestFirstCanary_GovernsEverySelectorClass' \
   "$CANARY" "$FC" \
-  's/\t"Groups",             \/\/ must be EMPTY\n//'
+  's/\t"Groups",            \/\/ must be EMPTY\n//'
 
 run_mutation M29 \
   'exactness is implemented by GLOBALLY redefining the Canary architecture cap (the forbidden shortcut)' \
@@ -401,7 +401,7 @@ run_mutation M29 \
 run_mutation M30 \
   'the exact-scope reason is dropped from the advertised vocabulary, so operators never see the prerequisite' \
   'TestExactScope_ReadinessRowIsActivationLevelAndFailClosed' \
-  "$CANARY" internal/mcp/canary/readiness.go \
+  . internal/mcp/canary/readiness.go \
   's/\t\tReasonScopeNotExactFirstCanary,\n//'
 
 run_mutation M31 \
@@ -409,7 +409,7 @@ run_mutation M31 \
   'TestExactScope_EveryActivationInputCarriesTheSignedScope' \
   . mcp_rollout.go \
   's/\t\t\tScope:              cfg\.Scope,/\t\t\tScope:              narrowedCanaryScope(cfg.Scope, ai.ToolApprovals),/' \
-  's/^func \(r \*mcpRollout\) commitRolloutTransitionAt/func narrowedCanaryScope(s rollout.ScopeSpec, _ []canary.ToolApprovalBinding) rollout.ScopeSpec \{ return s \}\n\nfunc (r *mcpRollout) commitRolloutTransitionAt/'
+  's/\nfunc \(r \*mcpRollout\) commitRolloutTransitionAt/\nfunc narrowedCanaryScope(s rollout.ScopeSpec, _ []canary.ToolApprovalBinding) rollout.ScopeSpec \{ return s \}\n\nfunc (r *mcpRollout) commitRolloutTransitionAt/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
