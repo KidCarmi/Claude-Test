@@ -5594,12 +5594,13 @@ outcomes it is choosing, in terms of packets, for a named deployment topology.
 > different branches. Collisions 4, 5, 6 and 7 all landed on the same day,
 > hours apart, against four more.
 >
-> **Between collisions 4 and 5 the section ALSO moved twice without a rename**
-> (§29 → §30 → §31): an unrelated newly-merged sweep was inserted ahead of it
-> each time, displacing the section while leaving the id alone. Column five
+> **The section has ALSO moved THREE times without a rename** — §29 → §30 → §31
+> between collisions 4 and 5, and §33 → §34 after collision 7, when the admin-UI
+> listener sweep merged ahead of it. Each time an unrelated newly-merged sweep was
+> inserted ahead of it, displacing the section while leaving the id alone. Column five
 > records what each RENAME produced at the time, so rows 4 and 5 keep their
 > then-current locations and the displacements are not rows. The current location
-> is §33, and every pointer outside the register (`CLAUDE.md`, the runbook,
+> is §34, and every pointer outside the register (`CLAUDE.md`, the runbook,
 > `internal/geoip/geoip.go`) was repointed with it each time. **A section move and
 > an id collision are different events and the table must not conflate them** —
 > the first costs a pointer sweep, the second costs a rename of every gate,
@@ -5649,7 +5650,7 @@ outcomes it is choosing, in terms of packets, for a named deployment topology.
 > references were left untouched in every pass, so `metrics.go` now carries one
 > line from §25, one from §28 and one from here, `CLAUDE.md` carries §26's, §27's
 > and §28's bullets beside this sweep's, and `geoip.go` carries both halves of the
-> §28/§33 pair.
+> §28/§34 pair.
 >
 > **Each of the seven merges was resolved by someone who fixed the duplicate
 > SECTION number and left the duplicate ID in place**, which is why the collision
@@ -5677,20 +5678,27 @@ outcomes it is choosing, in terms of packets, for a named deployment topology.
 > itself invalidated by one, which is as direct a demonstration as the register
 > can offer.
 >
-> **A SEPARATE duplicate is already ON `main` and no branch can resolve it.** §29 — the
-> credential-verification-cost sweep, merged 2026-09-11 — is stamped `CHAOS-57`,
-> which §25 has held since 2026-09-04. Both are merged, so the asymmetry that
-> resolved collisions 1–7 does not apply: neither side is free to move, and
-> whichever is renumbered rewrites identifiers that merged PRs already reference.
-> It is also the first collision to reach the CODE: both sweeps name their gates
+> **`CHAOS-57` is now stamped on THREE merged sections, and no branch can resolve
+> any of them.** §25 (the hijacked-tunnel plane, 2026-09-04), §29 (credential
+> verification, 2026-09-11) and §33 (the admin-UI listener, 2026-09-11) all carry
+> it. Every one is merged, so the asymmetry that resolved collisions 1–7 does not
+> apply: no side is free to move, and whichever is renumbered rewrites identifiers
+> that merged PRs already reference.
+>
+> It is also the collision that reached the CODE. All three sweeps name their gates
 > `TestChaos57_*` in the same `package main`, and the tree compiles only because
-> every suffix happens to differ — a future gate named for either sweep can now
-> fail to build for a reason that has nothing to do with its subject. **This
-> section records the fact and renumbers nothing**: choosing which merged sweep
-> moves is exactly the owner decision the header reserves, and doing it from an
-> unrelated branch would edit two other sweeps' merged history. It is stated here
-> because the argument above stops being a prediction at this point — the process
-> has now produced a duplicate that no branch can resolve cheaply.
+> every suffix happens to differ — with two sweeps that was luck, with three it is
+> luck being asked to hold across a widening surface, and a future gate named for
+> any of them can now fail to build for a reason that has nothing to do with its
+> subject. **This section records the fact and renumbers nothing**: choosing which
+> merged sweep moves is exactly the owner decision the header reserves, and doing
+> it from an unrelated branch would edit three other sweeps' merged history.
+>
+> The progression is the argument. When this note first recorded the duplicate it
+> was a pair and the claim was that the process had produced something no branch
+> could resolve cheaply. Within the same day it became a triple — without anyone
+> making a mistake, because each sweep independently picked an id that was free
+> when it looked. **Renaming at merge cannot converge; only allocation can.**
 
 ### 34.1 Reachability
 

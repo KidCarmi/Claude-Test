@@ -48,7 +48,7 @@ var (
 // runtime reload, the reader lifetime must be made safe first: hold the read
 // lock across db.Country, or reference-count the reader, or simply never close
 // the old one (a leaked mapping is strictly cheaper than a crash). Recorded in
-// roadmap/CHAOS-ENGINEERING-REVIEW.md §33.7 rather than fixed here, because
+// roadmap/CHAOS-ENGINEERING-REVIEW.md §34.7 rather than fixed here, because
 // building unreachable lifetime machinery for a path with no caller is the
 // wrong trade — the trap was the claim, and the claim is what is corrected.
 func InitGeoDB(path string) error {
