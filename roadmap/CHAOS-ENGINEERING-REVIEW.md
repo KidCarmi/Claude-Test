@@ -5934,3 +5934,24 @@ them **before** any reload path is added.
 
 **Owner action:** treat "add a GeoIP reload" as blocked on the reader-lifetime
 fix, not as a standalone feature.
+
+---
+
+## 35. CHAOS-65 — The OCSP revocation path (PLACEHOLDER — id claimed, sweep in progress)
+
+**Date:** 2026-09-11 · **Domain:** Certificates / revocation (never previously
+swept) · **Code:** `internal/ocsp/`, `ocsp.go`, `mtls_ocsp_startup.go`,
+`proxy_tunnel.go`, `proxy_tunnel_h2.go`
+
+> **This row exists to CLAIM THE ID BEFORE ANY CODE IS WRITTEN.** The revision
+> log at the head of this file records at least ten id collisions across six
+> concurrent sweeps in seventy-six hours, and reaches the same conclusion twice
+> independently: *"the next sweep to open should claim its id in a committed
+> placeholder row in this file as its FIRST commit, before any code is written —
+> that is the whole remedy, and it costs one line."* This is that commit. It is
+> the first sweep to follow the rule.
+>
+> Scope under investigation: the OCSP revocation-checking engine
+> (`internal/ocsp`) — responder query pipeline, verdict cache, and which TLS
+> handshakes actually consult it. Findings and the shipped change replace this
+> placeholder before merge.
