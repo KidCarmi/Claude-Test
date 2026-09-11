@@ -11,6 +11,7 @@ package ocsp
 // the SSRF guard refuses in production — hence ssrf.AllowLoopbackForTest.
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -120,7 +121,8 @@ func staticResponder(t *testing.T, body func() []byte) (url string, hits *atomic
 // that a per-responder timeout can only bound one responder at a time.
 func blackholeListener(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// (*net.ListenConfig).Listen, not net.Listen — repo lint policy (noctx).
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
