@@ -424,7 +424,8 @@ run_mutation M30 \
   'the pinned identity is re-read from a second inventory lookup (the torn (F1,I2) pair)' \
   'TestReviewedBinding_C16_IdentityAndFingerprintComeFromOneSnapshot' \
   . mcp_canary_preflight.go \
-  's/\t\t\tServerIdentity: ti\.pinnedIdentity,/\t\t\tServerIdentity: string(registry.ServerID("")) + func() string { reg, _ := mcpInventory.sharedInventory(); if reg == nil { return "" }; s, ok := reg.Current().Get(registry.ServerID(serverID)); if !ok { return "" }; return string(s.PinnedIdentity) }(),/'
+  's/\t"github\.com\/KidCarmi\/Culvert\/internal\/mcp\/rollout"/\t"github.com\/KidCarmi\/Culvert\/internal\/mcp\/registry"\n\t"github.com\/KidCarmi\/Culvert\/internal\/mcp\/rollout"/' \
+  's/\t\t\tServerIdentity: ti\.pinnedIdentity,/\t\t\tServerIdentity: func() string \{ reg, _ := mcpInventory.sharedInventory(); if reg == nil \{ return "" \}; s, ok := reg.Current().Get(registry.ServerID(serverID)); if !ok \{ return "" \}; return string(s.PinnedIdentity) \}(),/'
 
 # ── (13) ROUND 26: THE THREE REMAINING TRANSITION-DEPENDENCIES ─────────────
 # The through-line for four rounds: detection kept depending on a request arriving to notice a
