@@ -327,11 +327,17 @@ func assertNoTmpLeak(t *testing.T, dir string) {
 // ── loadEnrollmentConfig Tests ─────────────────────────────────────────────
 
 func TestLoadEnrollmentConfig_RoundTrip(t *testing.T) {
-	// Save original working dir and change to temp dir.
-	origDir, _ := os.Getwd()
+	// t.Chdir restores the working directory via Cleanup and FAILS the test if
+	// it cannot. The hand-rolled form this replaces discarded all three errors
+	// (Getwd, Chdir, and the deferred restore), so a failed Getwd left origDir
+	// empty, the restore silently no-opped, and the process stayed inside a
+	// t.TempDir() that cleanup then deleted. After that every CWD-relative read
+	// in the package failed with ENOENT, and the NEXT chdir test's Getwd failed
+	// too — latching the breakage for the rest of the run. It surfaced as
+	// unrelated tests (scripts/install.sh, .github/workflows/*, testdata/*)
+	// failing at 0.00s under -shuffle, i.e. as a flaky determinism gate.
 	dir := t.TempDir()
-	_ = os.Chdir(dir)
-	defer func() { _ = os.Chdir(origDir) }()
+	t.Chdir(dir)
 
 	ec := &dpEnrollmentConfig{
 		CPAddr:   "10.0.0.1:50051",
@@ -367,10 +373,8 @@ func TestLoadEnrollmentConfig_RoundTrip(t *testing.T) {
 }
 
 func TestLoadEnrollmentConfig_MissingFile(t *testing.T) {
-	origDir, _ := os.Getwd()
 	dir := t.TempDir()
-	_ = os.Chdir(dir)
-	defer func() { _ = os.Chdir(origDir) }()
+	t.Chdir(dir)
 
 	_, err := loadEnrollmentConfig()
 	if err == nil {
@@ -379,10 +383,8 @@ func TestLoadEnrollmentConfig_MissingFile(t *testing.T) {
 }
 
 func TestLoadEnrollmentConfig_InvalidJSON(t *testing.T) {
-	origDir, _ := os.Getwd()
 	dir := t.TempDir()
-	_ = os.Chdir(dir)
-	defer func() { _ = os.Chdir(origDir) }()
+	t.Chdir(dir)
 
 	_ = os.WriteFile(enrollmentConfigFile, []byte("{bad json"), 0o600)
 

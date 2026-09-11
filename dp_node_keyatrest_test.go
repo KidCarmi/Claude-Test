@@ -366,15 +366,8 @@ func TestDPNodeKey_FailedMigrationPreservesReadableBak(t *testing.T) {
 // encrypts the key (and only the key) when enabled. Uses os.Chdir like
 // enroll_util_test.go because persistEnrollCerts writes CWD-relative paths.
 func TestDPNodeKey_PersistEnrollCertsEncryptsKey(t *testing.T) {
-	origDir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
 	dir := t.TempDir()
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(origDir) })
+	t.Chdir(dir) // restores via Cleanup and fails loudly; see enroll_util_test.go
 
 	t.Setenv(dpNodeKeyEncryptEnvVar, "true")
 	t.Setenv(envKEKName, "")
