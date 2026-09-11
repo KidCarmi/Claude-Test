@@ -1629,6 +1629,7 @@ culvert_decrypt_autoexclude_surge_total %d
 	urlcatWritePrometheus(&ruleMetBuf)
 	threatFeedWritePrometheus(&ruleMetBuf) // culvert_threat_feed_* freshness (WK-5 staleness plane)
 	caWritePrometheus(&ruleMetBuf)
+	ocspWritePrometheus(&ruleMetBuf) // culvert_ocsp_* (CHAOS-65 revocation plane; emitted only when enabled)
 	certSignHist.WritePrometheus(&ruleMetBuf)
 	clusterWritePrometheus(&ruleMetBuf)
 	cdrWritePrometheus(&ruleMetBuf)

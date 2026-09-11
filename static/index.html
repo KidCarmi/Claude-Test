@@ -4477,10 +4477,17 @@ Firefox (all platforms):
           </label>
           <span>Cache entries: <strong id="ocsp-cache-len">-</strong></span>
           <span>Confirmed revoked: <strong id="ocsp-revoked-total">-</strong></span>
-          <span id="ocsp-failclosed-wrap">Fail-closed (responder unreachable): <strong id="ocsp-failclosed-total">-</strong></span>
+          <span id="ocsp-failclosed-wrap">Fail-closed (no usable verdict): <strong id="ocsp-failclosed-total">-</strong></span>
+          <span id="ocsp-rejected-wrap">Responses rejected: <strong id="ocsp-rejected-total">-</strong></span>
+        </div>
+        <div id="ocsp-coverage-banner" style="display:none;margin:0 16px 16px;background:rgba(234,179,8,.1);border-left:3px solid var(--yellow);padding:8px 12px;border-radius:6px;font-size:.78rem;color:var(--yellow)">
+          <strong>Coverage:</strong> revocation checking is applied to the shared upstream transport only. Inspected HTTPS origin handshakes (<span id="ocsp-coverage-gaps"></span>) are <strong>not</strong> revocation-checked, so the counters below say nothing about inspected traffic. Bypassed CONNECT tunnels are relayed raw and carry no certificate to check. See <code>docs/operator/ocsp-revocation-checking.md</code>.
+        </div>
+        <div id="ocsp-borrowed-banner" style="display:none;margin:0 16px 16px;background:rgba(220,53,69,.1);border-left:3px solid var(--red,#dc3545);padding:8px 12px;border-radius:6px;font-size:.78rem;color:var(--red,#dc3545)">
+          OCSP responses were received that were signed by the issuer but were <strong>about a different certificate</strong> (<strong id="ocsp-notforcert-total">0</strong>). They were discarded. Sustained growth means something on the path is answering with borrowed responses — investigate before trusting revocation verdicts from the affected upstream.
         </div>
         <div id="ocsp-failclosed-banner" style="display:none;margin:0 16px 16px;background:rgba(234,179,8,.1);border-left:3px solid var(--yellow);padding:8px 12px;border-radius:6px;font-size:.78rem;color:var(--yellow)">
-          OCSP responders were unreachable and Culvert treated affected certificates as revoked (fail-closed), blocking those connections. Last occurrence: <strong id="ocsp-failclosed-last">-</strong>.
+          No OCSP responder returned a usable, affirmative verdict and Culvert treated affected certificates as revoked (fail-closed), blocking those connections. Last occurrence: <strong id="ocsp-failclosed-last">-</strong>.
         </div>
       </div>
       <!-- Upstream mTLS Client Certificate -->
@@ -17482,6 +17489,25 @@ async function loadCAMgmt() {
     document.getElementById('ocsp-cache-len').textContent = ocsp.cacheLen ?? 0;
     document.getElementById('ocsp-revoked-total').textContent = ocsp.revokedTotal ?? 0;
     document.getElementById('ocsp-failclosed-total').textContent = ocsp.failClosedTotal ?? 0;
+    // CHAOS-65: discarded responses, and which handshakes the check reaches.
+    const rejected = (ocsp.notForCertificateTotal ?? 0) + (ocsp.staleResponseTotal ?? 0) +
+      (ocsp.unknownStatusTotal ?? 0) + (ocsp.responderBlockedTotal ?? 0);
+    document.getElementById('ocsp-rejected-total').textContent = rejected;
+    const covBanner = document.getElementById('ocsp-coverage-banner');
+    const gaps = ocsp.uncheckedEnforcingPaths || [];
+    if (ocsp.enabled && gaps.length > 0) {
+      document.getElementById('ocsp-coverage-gaps').textContent = gaps.join(', ');
+      covBanner.style.display = '';
+    } else {
+      covBanner.style.display = 'none';
+    }
+    const borrowed = document.getElementById('ocsp-borrowed-banner');
+    if ((ocsp.notForCertificateTotal ?? 0) > 0) {
+      document.getElementById('ocsp-notforcert-total').textContent = ocsp.notForCertificateTotal;
+      borrowed.style.display = '';
+    } else {
+      borrowed.style.display = 'none';
+    }
     const fcBanner = document.getElementById('ocsp-failclosed-banner');
     if (ocsp.failClosedTotal > 0) {
       fcBanner.style.display = '';
