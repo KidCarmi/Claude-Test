@@ -467,7 +467,20 @@ func (rt *canaryRuntime) latchReviewedDriftUnderActivation(capb rollout.Capabili
 	//
 	// Checked BEFORE the reviewed comparison so the reported first cause is the anchor loss rather
 	// than whatever the target happens to compare as.
-	if !obs.Usable {
+	//
+	// A DIVERGENT REGISTRY PIN is the same class and is charged the same way. Inside the
+	// repin/re-ingest window the registry pins I2 while the catalog record still describes I1, so
+	// obs.Target is internally coherent and compares as ReviewedMatches — the fingerprint and the
+	// identity it was ingested with really are unchanged. But a request would be ROUTED by the
+	// registry's pin, to a workload the reviewed record does not describe.
+	//
+	// mcpLiveTrustPrecheck charges it; this path must too, and for the round-3 reason repeated:
+	// an authenticated request rejected by inspection, policy or rollout scope never reaches the
+	// precheck, so restoring I1 before the next request would let the activation continue with the
+	// observed anchor breach unrecorded. Adding the field to the observation and teaching only ONE
+	// of the two consumers about it is precisely the "two paths, same question, opposite answers"
+	// defect the !obs.Usable branch above exists to close (Codex P1, PR #1360, round 5).
+	if !obs.Usable || obs.RegistryPinDiverged {
 		res := rt.tripLockedForGeneration(cr, capb, "server_identity_drift", gen, now)
 		return canaryDriftLatch{
 			Active: true, Generation: gen, DriftCode: "server_identity_drift",

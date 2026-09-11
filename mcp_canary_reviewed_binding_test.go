@@ -60,6 +60,7 @@ import (
 //	16  identity + fingerprint from ONE snapshot        → structural, no second lookup
 //	17  the reviewed pair reassigned to another tenant → reviewed_target_tenant_drift + latch
 //	18  the repin window (registry I2, catalog I1)     → detected, charged as identity drift
+//	19  that window on the OBSERVATION path            → latched there too, not only in the precheck
 
 // reviewedRig is one armed activation over the REAL inventory, the REAL approval store and the
 // REAL admission gate. Everything the matrix asserts flows through production code.
@@ -1246,4 +1247,46 @@ func TestReviewedBinding_C18_RepinWindowIsDetectedAsDrift(t *testing.T) {
 		t.Fatalf("the live precheck must charge the repin window as server_identity_drift, got %q (eligible=%v)",
 			live.DriftCode, live.Eligible)
 	}
+}
+
+// ── 19 ───────────────────────────────────────────────────────────────────────────────────────
+// The OBSERVATION PATH latches the repin window too — not only the live precheck.
+//
+// C18 proved the window is detected and that mcpLiveTrustPrecheck charges it. It did not prove the
+// scope-independent path does, and it didn't: obs.Target is internally coherent inside the window
+// (the fingerprint and the identity it was ingested with really are unchanged), so Compare returned
+// ReviewedMatches and nothing latched. An authenticated request rejected by inspection, policy or
+// rollout scope never reaches the precheck, so restoring the old pin before the next request would
+// let the activation continue with the observed anchor breach unrecorded (Codex P1, round 5).
+//
+// This is the same defect shape as the round-3 anchor loss — a new fact taught to one of the two
+// consumers of the observation and not the other — which is why the gate is written against the
+// path rather than against the field.
+func TestReviewedBinding_C19_ObservationPathLatchesTheRepinWindow(t *testing.T) {
+	r := newReviewedRig(t)
+	reg, _ := mcpInventory.sharedInventory()
+	if reg == nil {
+		t.Fatal("premise: a shared registry must be published")
+	}
+	if _, err := reg.Repin(registry.ServerID(r.sid), registry.Identity("rotated"), canaryRuntimeTestNow); err != nil {
+		t.Fatalf("repin: %v", err)
+	}
+	cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+	if !cur.Found || !cur.Usable || !cur.RegistryPinDiverged {
+		t.Fatalf("premise: the window must present as found+usable+diverged, got %+v", cur)
+	}
+	// The comparison ALONE sees nothing — the fact that makes this branch necessary.
+	set, ok := r.rt.activeReviewedTargets(r.capb)
+	if !ok {
+		t.Fatal("premise: the activation must carry a reviewed set")
+	}
+	if v := set.Compare(cur.Target); v != canary.ReviewedMatches {
+		t.Fatalf("premise: inside the window the target must still compare as a MATCH (got %q); if "+
+			"it does not, this gate is proving the ordinary drift path instead of the divergence one", v)
+	}
+
+	canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+		Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
+	})
+	r.assertLatched(t, "server_identity_drift")
 }

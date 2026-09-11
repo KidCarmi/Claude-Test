@@ -458,6 +458,17 @@ run_mutation M34 \
   ./internal/mcp/runtime/ internal/mcp/runtime/pipeline.go \
   's/\t\tif reason == mcperr\.ReasonRegistryServerUnavailable \{/\t\tif true \{/'
 
+# ── (14) ROUND 27: ONE FACT, BOTH CONSUMERS ───────────────────────────────
+# RegistryPinDiverged was added to the observation and taught to mcpLiveTrustPrecheck only. The
+# scope-independent path — the one an inspection/policy/scope rejection leaves as the ONLY
+# observer — ignored it, and inside the window the target compares as a genuine match.
+
+run_mutation M35 \
+  'the observation path ignores a divergent registry pin (taught to one consumer only)' \
+  'TestReviewedBinding_C19_ObservationPathLatchesTheRepinWindow' \
+  . "$ADM" \
+  's/\tif !obs\.Usable \|\| obs\.RegistryPinDiverged \{/\tif !obs.Usable \{/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then
