@@ -426,7 +426,7 @@ func (rt *canaryRuntime) latchDriftUnderActivation(capb rollout.Capability, want
 // That is what makes it safe to call for EVERY request: a catalog change to an unrelated tool
 // cannot stop an experiment that never reviewed it (the round-15 rule), and unlike the
 // `canaryScoped` proxy that rule used to be enforced with, the reviewed set decides it exactly.
-func (rt *canaryRuntime) latchReviewedDriftUnderActivation(capb rollout.Capability, wantGen uint64, now time.Time, current func() (canary.ReviewedTarget, bool)) canaryDriftLatch {
+func (rt *canaryRuntime) latchReviewedDriftUnderActivation(capb rollout.Capability, wantGen uint64, now time.Time, current func() mcpAuthoritativeTarget) canaryDriftLatch {
 	if wantGen == 0 {
 		return canaryDriftLatch{}
 	}
@@ -443,15 +443,38 @@ func (rt *canaryRuntime) latchReviewedDriftUnderActivation(capb rollout.Capabili
 	if current == nil {
 		return canaryDriftLatch{Active: true, Generation: gen}
 	}
-	cur, ok := current()
-	if !ok {
+	obs := current()
+	if !obs.Found {
 		// The tool no longer resolves to an authoritative target at all. That is NOT read as drift
 		// here: a tool absent from the catalog is refused per-request upstream of this point, and
 		// a transient inventory gap must not stop the experiment on evidence this path cannot
 		// distinguish from one. Fail-safe in the direction that costs availability, not safety.
 		return canaryDriftLatch{Active: true, Generation: gen}
 	}
-	switch v := cr.reviewed.Compare(cur); v {
+	// An UNUSABLE server is the opposite case, and the distinction is the whole reason the two are
+	// separate fields. "Not found" is an absence this path cannot tell from a transient gap;
+	// "not usable" is an AFFIRMATIVE published state saying the trust anchor the activation was
+	// approved against — an enabled server with a verified identity — is no longer in force.
+	//
+	// mcpLiveTrustPrecheck already charges that as server_identity_drift, with the rationale
+	// recorded at its !ServerUsable branch. This path must agree, and it is now the one that has
+	// to: a server disabled BEFORE a request starts leaves nothing for refuseOnToolDrift to see
+	// (decision and catalog have both settled), and a policy or inspection rejection can stop the
+	// precheck from ever running. Without this branch the reviewed comparison would return
+	// ReviewedMatches — the fingerprint and identity really are unchanged — and the experiment
+	// could be disabled, re-enabled and resumed on the SAME activation with nothing latched
+	// (Codex P1, PR #1360, round 3).
+	//
+	// Checked BEFORE the reviewed comparison so the reported first cause is the anchor loss rather
+	// than whatever the target happens to compare as.
+	if !obs.Usable {
+		res := rt.tripLockedForGeneration(cr, capb, "server_identity_drift", gen, now)
+		return canaryDriftLatch{
+			Active: true, Generation: gen, DriftCode: "server_identity_drift",
+			Latched: res == canary.TripCanaryLatched,
+		}
+	}
+	switch v := cr.reviewed.Compare(obs.Target); v {
 	case canary.ReviewedMatches, canary.ReviewedOutOfScope:
 		return canaryDriftLatch{Active: true, Generation: gen}
 	default:
@@ -475,7 +498,7 @@ func canaryReviewedTargetObserved(capability string, obs mcpruntime.CanaryTarget
 		return
 	}
 	latch := globalCanaryRuntime.latchReviewedDriftUnderActivation(capb, obs.Generation, time.Now(),
-		func() (canary.ReviewedTarget, bool) {
+		func() mcpAuthoritativeTarget {
 			// Read inside the lock, from the same pointer-published inventory every other probe on
 			// this path uses (§5: local control-plane state only, no durable store, no I/O).
 			return mcpCurrentAuthoritativeTarget(obs.ServerID, obs.ToolName)

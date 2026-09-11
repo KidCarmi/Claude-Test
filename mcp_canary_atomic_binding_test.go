@@ -387,7 +387,7 @@ func TestAtomicBinding_TrustProbeMayNotReEnterTheRuntime(t *testing.T) {
 			Current: canary.ReviewedTarget{
 				Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
 				Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
-				ServerIdentity: mcpServerPinnedIdentity(live.Target.ServerID),
+				ServerIdentity: live.ServerIdentity,
 			},
 			Trusted: true,
 		}

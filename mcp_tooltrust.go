@@ -325,6 +325,19 @@ type toolTrustTargetInput struct {
 	fingerprint catalog.Fingerprint // the live record fingerprint (for the catalog CAS)
 	key         catalog.ToolKey
 	found       bool
+	// pinnedIdentity is the server's PINNED, verified identity as read from THE SAME registry
+	// snapshot this struct's other server facts came from.
+	//
+	// It lives here rather than being fetched by a second lookup because the two reads are not
+	// interchangeable. The catalog's composite fingerprint folds the pinned identity in, but a
+	// Registry.Repin and the catalog re-ingest that follows it are SEPARATE publications, so
+	// between them the registry says I2 while the catalog still says F1. A caller that read the
+	// fingerprint here and the identity from a fresh snapshot could therefore compose (F1, I2) —
+	// a pair that was never simultaneously authoritative — and persist it as a reviewed target,
+	// after which an identity rotation compares as reviewed (Codex P1, PR #1360, round 3).
+	//
+	// Empty when the server does not exist in that snapshot, which `found` already reports.
+	pinnedIdentity string
 }
 
 // loadTarget resolves the authoritative current facts for a (server, tool) from the
@@ -342,9 +355,12 @@ func (c *mcpToolTrustCoordinator) loadTarget(serverID, toolName string) toolTrus
 		ServerUsable: sok && srv.Usable(),
 		ToolExists:   ok,
 	}
+	pinned := ""
 	if sok {
 		t.Tenant = string(srv.OwnerScope)
 		t.ServerRevision = srv.Revision
+		// Same snapshot, same record — see the field comment on pinnedIdentity.
+		pinned = string(srv.PinnedIdentity)
 	}
 	if ok {
 		t.Approvable = rec.Eligibility != catalog.ServerDisabled
@@ -358,7 +374,9 @@ func (c *mcpToolTrustCoordinator) loadTarget(serverID, toolName string) toolTrus
 		// tool was unchanged; the per-record revision advances iff THIS tool changed.
 		t.CatalogRevision = rec.Revision
 	}
-	return toolTrustTargetInput{target: t, fingerprint: rec.Fingerprint, key: key, found: ok && sok}
+	return toolTrustTargetInput{
+		target: t, fingerprint: rec.Fingerprint, key: key, found: ok && sok, pinnedIdentity: pinned,
+	}
 }
 
 // toolTrustRequestInput is the coordinator-level request (already RBAC-checked by the

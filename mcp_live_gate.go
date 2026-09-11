@@ -422,7 +422,10 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 			Fingerprint:       ti.target.Fingerprint,
 			FingerprintFormat: ti.target.FingerprintFormatVersion,
 		},
-		ServerIdentity: mcpServerPinnedIdentity(serverID),
+		// From the SAME snapshot loadTarget resolved the fingerprint from, never a second lookup:
+		// a Registry.Repin landing between two reads composes an (F1, I2) pair that was never
+		// simultaneously authoritative. See the pinnedIdentity field comment in mcp_tooltrust.go.
+		ServerIdentity: ti.pinnedIdentity,
 	}
 }
 

@@ -405,8 +405,26 @@ run_mutation M28 \
   'the reviewed-target observation is emitted below the inspection hard-fail return' \
   'TestCanaryReviewedTarget_(ReportedWhenInspectionHardFails|EmissionIsAboveEveryReturnInDispatchPolicy)' \
   ./internal/mcp/runtime/ internal/mcp/runtime/policy.go \
-  's/\tobsServerID, obsToolName := p\.canaryObservedTarget\(req, msg\)\n\tp\.deps\.noteCanaryTargetObserved\(.*?\n\t\}\)\n//s' \
-  's/\td, _, _ := p\.policyEngine\.Evaluate/\tobsServerID, obsToolName := p.canaryObservedTarget(req, msg)\n\tp.deps.noteCanaryTargetObserved(p.capability.String(), CanaryTargetObservation{Generation: p.deps.canaryGenerationAt(p.capability.String()), ServerID: obsServerID, ToolName: obsToolName})\n\td, _, _ := p.policyEngine.Evaluate/'
+  's/\tp\.observeCanaryReviewedTarget\(req, msg\)\n//' \
+  's/\td, _, _ := p\.policyEngine\.Evaluate/\tp.observeCanaryReviewedTarget(req, msg)\n\td, _, _ := p.policyEngine.Evaluate/'
+
+# ── (12) ONE SNAPSHOT, AND AN UNUSABLE ANCHOR IS A BREACH ──────────────────
+# Round 25: the scope-independent observation path runs for EVERY dispatched request, so it is
+# the path that has to carry both verdicts. It carried neither: it re-read the pinned identity
+# from a fresh inventory lookup (tearing (F1,I2) across a Registry.Repin), and it ignored server
+# usability entirely, so a disable that settled before the request latched nothing.
+
+run_mutation M29 \
+  'an unusable reviewed server compares as ReviewedMatches and latches nothing' \
+  'TestReviewedBinding_C1[45]' \
+  . "$ADM" \
+  's/\tif !obs\.Usable \{\n\t\tres := rt\.tripLockedForGeneration\(cr, capb, "server_identity_drift", gen, now\)\n\t\treturn canaryDriftLatch\{\n\t\t\tActive: true, Generation: gen, DriftCode: "server_identity_drift",\n\t\t\tLatched: res == canary\.TripCanaryLatched,\n\t\t\}\n\t\}\n//'
+
+run_mutation M30 \
+  'the pinned identity is re-read from a second inventory lookup (the torn (F1,I2) pair)' \
+  'TestReviewedBinding_C16_IdentityAndFingerprintComeFromOneSnapshot' \
+  . mcp_canary_preflight.go \
+  's/\t\t\tServerIdentity: ti\.pinnedIdentity,/\t\t\tServerIdentity: string(registry.ServerID("")) + func() string { reg, _ := mcpInventory.sharedInventory(); if reg == nil { return "" }; s, ok := reg.Current().Get(registry.ServerID(serverID)); if !ok { return "" }; return string(s.PinnedIdentity) }(),/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"

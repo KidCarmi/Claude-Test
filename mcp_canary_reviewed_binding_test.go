@@ -4,6 +4,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"testing"
 	"time"
@@ -52,6 +55,9 @@ import (
 //	11  server identity change                         → server_identity_drift + latch
 //	12  demote G, activate G+1 against F2              → the old snapshot cannot affect G+1
 //	13  a RESOLVABLE tool never reviewed by this G     → request-scoped denial, NO latch
+//	14  the reviewed SERVER becomes unusable            → server_identity_drift + latch
+//	15  that anchor loss is a verdict, not silence      → reported as drift, latched
+//	16  identity + fingerprint from ONE snapshot        → structural, no second lookup
 
 // reviewedRig is one armed activation over the REAL inventory, the REAL approval store and the
 // REAL admission gate. Everything the matrix asserts flows through production code.
@@ -811,10 +817,10 @@ func TestReviewedBinding_ScopeIndependentPathIgnoresUnreviewedTools(t *testing.T
 	// same server, with the reviewed tool republished UNCHANGED beside it.
 	const otherTool = "sibling"
 	publishTwoToolInventory(t, r.sid, r.tool, otherTool)
-	if _, ok := mcpCurrentAuthoritativeTarget(r.sid, otherTool); !ok {
+	if !mcpCurrentAuthoritativeTarget(r.sid, otherTool).Found {
 		t.Fatal("premise: the sibling tool must resolve to a real authoritative target")
 	}
-	if cur, ok := mcpCurrentAuthoritativeTarget(r.sid, r.tool); !ok || cur.Fingerprint != mustDigest(t, r.fp1) {
+	if cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool); !cur.Found || cur.Target.Fingerprint != mustDigest(t, r.fp1) {
 		t.Fatal("premise: republishing must have left the REVIEWED tool exactly as reviewed")
 	}
 
@@ -827,7 +833,7 @@ func TestReviewedBinding_ScopeIndependentPathIgnoresUnreviewedTools(t *testing.T
 		{"another server", "some-other-server", r.tool, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, ok := mcpCurrentAuthoritativeTarget(tc.sid, tc.tool); ok != tc.resolves {
+			if got := mcpCurrentAuthoritativeTarget(tc.sid, tc.tool).Found; got != tc.resolves {
 				t.Fatalf("premise: resolvability = %v, want %v", !tc.resolves, tc.resolves)
 			}
 			canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
@@ -842,7 +848,7 @@ func TestReviewedBinding_ScopeIndependentPathIgnoresUnreviewedTools(t *testing.T
 			// abortedNow lets this path quietly report drift for a tool nobody reviewed — bounded
 			// evidence an operator would then have to explain. The verdict itself is the contract.
 			latch := r.rt.latchReviewedDriftUnderActivation(r.capb, r.gen, r.now,
-				func() (canary.ReviewedTarget, bool) {
+				func() mcpAuthoritativeTarget {
 					return mcpCurrentAuthoritativeTarget(tc.sid, tc.tool)
 				})
 			if latch.DriftCode != "" || latch.Latched {
@@ -897,16 +903,16 @@ func TestReviewedBinding_C13_UnreviewedTargetIsRequestScopedNotDrift(t *testing.
 
 	const otherTool = "sibling"
 	publishTwoToolInventory(t, r.sid, r.tool, otherTool)
-	cur, ok := mcpCurrentAuthoritativeTarget(r.sid, otherTool)
-	if !ok {
+	cur := mcpCurrentAuthoritativeTarget(r.sid, otherTool)
+	if !cur.Found {
 		t.Fatal("premise: the sibling tool must resolve to a real authoritative target, or the " +
 			"admission probe returns before the reviewed comparison and this proves nothing")
 	}
-	if _, reviewedOK := mcpCurrentAuthoritativeTarget(r.sid, r.tool); !reviewedOK {
+	if !mcpCurrentAuthoritativeTarget(r.sid, r.tool).Found {
 		t.Fatal("premise: republishing must have left the reviewed tool resolvable")
 	}
 
-	d := r.g.AdmitSideEffect(driftGateInput(r.sid, otherTool, hex.EncodeToString(cur.Fingerprint[:]), r.now))
+	d := r.g.AdmitSideEffect(driftGateInput(r.sid, otherTool, hex.EncodeToString(cur.Target.Fingerprint[:]), r.now))
 	if d.Release != nil {
 		d.Release()
 	}
@@ -966,4 +972,154 @@ func TestReviewedBinding_ScopeIndependentPathHonoursGenerationRules(t *testing.T
 				"observation may be charged to")
 		}
 	})
+}
+
+// ── 14 ───────────────────────────────────────────────────────────────────────────────────────
+// A reviewed server that is no longer USABLE latches the whole Canary, even though the reviewed
+// target itself is untouched.
+//
+// This is the case the scope-independent path had to learn (Codex P1, round 3). Disabling a server
+// leaves the fingerprint and the pinned identity exactly as reviewed, so the reviewed comparison
+// alone returns ReviewedMatches and latches nothing. mcpLiveTrustPrecheck already charges an
+// unusable server as server_identity_drift — "the approved anchor is gone" — but it is not
+// guaranteed to run: a disable that SETTLES before a request starts leaves no transition for
+// refuseOnToolDrift to see, and a policy or inspection rejection returns above the precheck
+// entirely. The observation path runs for every dispatched request, so it is the one that has to
+// carry the verdict; otherwise the experiment could be disabled, re-enabled and resumed on the same
+// activation with nothing ever latched.
+func TestReviewedBinding_C14_UnusableReviewedServerLatchesAnchorLoss(t *testing.T) {
+	r := newReviewedRig(t)
+
+	// Disable the server. Nothing about the REVIEWED target changes: same tool, same schema, so the
+	// same fingerprint, and the same pinned identity.
+	before := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+	if !before.Found || !before.Usable {
+		t.Fatalf("premise: the reviewed server must start usable, got %+v", before)
+	}
+	disableSeededServer(t, r.sid, r.tool)
+
+	after := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+	if !after.Found {
+		t.Fatal("premise: a disabled server must still RESOLVE — if it stops resolving this gate is " +
+			"exercising the not-found branch, which is deliberately not drift")
+	}
+	if after.Usable {
+		t.Fatal("premise: the server must now be unusable, or nothing is being tested")
+	}
+	if after.Target != before.Target {
+		t.Fatalf("premise: disabling must leave the REVIEWED target identical (fingerprint and "+
+			"identity), or this gate proves the ordinary drift path instead of the anchor-loss one.\n"+
+			" before: %+v\n after:  %+v", before.Target, after.Target)
+	}
+	canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+		Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
+	})
+	r.assertLatched(t, "server_identity_drift")
+}
+
+// The anchor-loss verdict is reported as drift, not merely as a failure to latch — and it is the
+// FIRST cause, so an operator reads the reason the experiment stopped rather than a later symptom.
+func TestReviewedBinding_C15_AnchorLossIsAVerdictNotSilence(t *testing.T) {
+	r := newReviewedRig(t)
+	disableSeededServer(t, r.sid, r.tool)
+
+	latch := r.rt.latchReviewedDriftUnderActivation(r.capb, r.gen, r.now,
+		func() mcpAuthoritativeTarget { return mcpCurrentAuthoritativeTarget(r.sid, r.tool) })
+	if latch.DriftCode != "server_identity_drift" {
+		t.Fatalf("drift code = %q, want server_identity_drift — the same code "+
+			"mcpLiveTrustPrecheck already assigns to an unusable server, so one fact has one "+
+			"dialect however it is discovered", latch.DriftCode)
+	}
+	if !latch.Latched {
+		t.Fatal("SECURITY: the anchor-loss verdict must stop the whole Canary, not merely be reported")
+	}
+}
+
+// disableSeededServer republishes the controlled inventory with the server DISABLED, leaving the
+// tool and its schema untouched so the reviewed fingerprint and pinned identity do not move.
+func disableSeededServer(t *testing.T, sid, tool string) {
+	t.Helper()
+	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + ttTenant + `","servers":[
+	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"id","enabled":false,
+	   "tools":[{"name":"` + tool + `","input_schema":{"type":"object"}}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("decode inventory: %v", err)
+	}
+	reg, cat, err := seedInventory(doc, limits.DefaultCatalog())
+	if err != nil {
+		t.Fatalf("seed inventory: %v", err)
+	}
+	publishMCPInventory(mcpInvLoaded, "", reg, cat)
+}
+
+// ── 16 ───────────────────────────────────────────────────────────────────────────────────────
+// The fingerprint and the pinned identity come from ONE snapshot read.
+//
+// The catalog's composite fingerprint folds the pinned identity in, but Registry.Repin and the
+// catalog re-ingest that follows it are SEPARATE publications. A caller that reads the fingerprint
+// from loadTarget and the identity from a fresh lookup can therefore compose (F1, I2) — a pair that
+// was never simultaneously authoritative — and persist it as the reviewed target, after which an
+// identity rotation compares as REVIEWED and executes under an approval issued for the old identity
+// (Codex P1, round 3).
+//
+// The fix is structural: nothing on these paths performs a second inventory lookup for the
+// identity. That is what this gate pins, by AST, because the window itself cannot be scheduled
+// deterministically from a test — and a gate that can only sometimes observe a race is a gate that
+// gets muted.
+func TestReviewedBinding_C16_IdentityAndFingerprintComeFromOneSnapshot(t *testing.T) {
+	fset := token.NewFileSet()
+	var offenders []string
+	for _, file := range []string{"mcp_canary_preflight.go", "mcp_live_gate.go", "mcp_canary_admission.go"} {
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			// A registry lookup anywhere on these paths is the shape that reintroduces the tear:
+			// the identity must ride out of loadTarget's snapshot, never be fetched beside it.
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if sel.Sel.Name == "PinnedIdentity" || sel.Sel.Name == "mcpServerPinnedIdentity" {
+				offenders = append(offenders, fset.Position(call.Pos()).String())
+			}
+			if inner, ok := sel.X.(*ast.CallExpr); ok {
+				if isel, ok := inner.Fun.(*ast.SelectorExpr); ok && isel.Sel.Name == "Current" && sel.Sel.Name == "Get" {
+					offenders = append(offenders, fset.Position(call.Pos()).String())
+				}
+			}
+			return true
+		})
+	}
+	if len(offenders) != 0 {
+		t.Fatalf("SECURITY: a second inventory lookup on the reviewed-target paths at %v. The "+
+			"identity and the fingerprint must come from the ONE snapshot loadTarget read, or a "+
+			"Registry.Repin landing between the two composes an (F1, I2) pair that was never "+
+			"authoritative and persists it as reviewed", offenders)
+	}
+}
+
+// CONTROL for C16: the single snapshot really does carry the identity, so the gate above is not
+// passing merely because nothing reads an identity at all.
+func TestReviewedBinding_C16Control_TheSnapshotCarriesTheIdentity(t *testing.T) {
+	r := newReviewedRig(t)
+	cur := mcpCurrentAuthoritativeTarget(r.sid, r.tool)
+	if !cur.Found {
+		t.Fatal("premise: the reviewed tool must resolve")
+	}
+	if cur.Target.ServerIdentity == "" {
+		t.Fatal("the authoritative target must carry the server's pinned identity — an empty one " +
+			"would make the AST gate above vacuous and server_identity_drift undetectable")
+	}
+	live := mcpLiveTrustPrecheck(ttTenant, r.sid, r.tool, r.fp1)
+	if live.ServerIdentity != cur.Target.ServerIdentity {
+		t.Fatalf("the two paths must report the SAME identity, got %q and %q",
+			live.ServerIdentity, cur.Target.ServerIdentity)
+	}
 }

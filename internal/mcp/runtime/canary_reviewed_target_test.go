@@ -377,7 +377,7 @@ func TestCanaryReviewedTarget_EmissionIsAboveEveryReturnInDispatchPolicy(t *test
 			return true
 		}
 		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if ok && sel.Sel.Name == "noteCanaryTargetObserved" {
+		if ok && sel.Sel.Name == "observeCanaryReviewedTarget" {
 			if emit.IsValid() {
 				t.Fatal("dispatchPolicy emits the reviewed-target observation more than once: the " +
 					"root attributes an observation to a generation, and two emissions per request " +
@@ -412,5 +412,26 @@ func TestCanaryReviewedTarget_EmissionIsAboveEveryReturnInDispatchPolicy(t *test
 	if returns < 5 {
 		t.Fatalf("the gate found only %d returns in dispatchPolicy — too few for the function it "+
 			"claims to be checking, so its walk is broken rather than its subject clean", returns)
+	}
+
+	// And the emission cannot be smuggled back inline. dispatchPolicy calls the wrapper, which is
+	// the ONLY place in this file that reaches the seam — so a second, lower call to
+	// noteCanaryTargetObserved cannot be added below a return while this gate still points at the
+	// wrapper above it.
+	var seam int
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "noteCanaryTargetObserved" {
+			seam++
+		}
+		return true
+	})
+	if seam != 1 {
+		t.Fatalf("policy.go reaches noteCanaryTargetObserved %d times, want exactly 1 (inside "+
+			"observeCanaryReviewedTarget). More than one emission point makes the placement gate "+
+			"above prove less than it claims", seam)
 	}
 }
