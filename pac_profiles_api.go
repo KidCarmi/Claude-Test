@@ -306,6 +306,12 @@ func apiPACProfiles(w http.ResponseWriter, r *http.Request) {
 			// the per-pool token every pool PUT/DELETE must echo.
 			"collectionEtag": pac.ConfigETag(cfg),
 			"poolEtags":      pacPoolEtags(cfg),
+			// degraded is keyed by profile ID ("default" for the legacy
+			// profile) and carries only profiles whose most recent serve
+			// compiled with warnings (dropped rule, unresolvable pool
+			// reference, secure-mode conflict) — empty when every profile
+			// last served clean.
+			"degraded": pacDegradedSnapshot(),
 		})
 	case http.MethodPost:
 		if !requireRole(w, r, RoleAdmin) || !pacProfilesMutationAllowed(w) {
@@ -480,6 +486,11 @@ func pacProfileDelete(w http.ResponseWriter, r *http.Request, id string) {
 		logger.Printf("PAC: exception delete for %s: %v", sanitizeLog(id), err)
 	}
 	pacExceptionsMu.Unlock()
+	// Drop this profile's serve-time degradation record too: a profile that no
+	// longer exists must not keep reporting compile warnings, and a later
+	// profile recreated under the SAME id must start from a clean slate rather
+	// than inherit the deleted one's warnings.
+	pacForgetDegraded(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
