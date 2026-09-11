@@ -39,6 +39,13 @@ version is `info.version` in `api/openapi/openapi.yaml` and follows
   Decryption, CDR Integration) and Network (PAC, Upstream Proxies), with the
   backend trust and concurrency corrections recorded in
   `docs/design/FRONTEND-MIGRATION-PLAN.md` §FE-5.
+- Admin UI listener health surfaces (CHAOS-57), all on the **proxy** port so
+  they survive the fault they describe: `admin_ui` on `GET /health`, a
+  report-only `admin_ui` row on `GET /ready`, the `admin_ui_listener`
+  operator-contract row on `GET /api/diagnostics`, the
+  `culvert_admin_ui_{up,unavailable,listen_failures_total,binds_total,listen_backoff_seconds}`
+  series, and the `admin_ui_unavailable` alert. The readiness row never gates
+  the default verdict — a node whose admin UI is down is still proxying.
 - `CULVERT_DATA_DIR` — startup-scoped override of the persisted-state root
   (default `/data`, unchanged when unset). Every persisted-state path —
   including the config-version store, registry settings, the CDR
@@ -109,6 +116,16 @@ endpoints for credentialed parents.
 
 ### Fixed
 
+- An admin UI listener failure no longer terminates the proxy data plane
+  (CHAOS-57). `startUI`'s listen goroutine called `logFatalf`, so an occupied
+  admin port or an unreadable `-tls-cert`/`-tls-key` pair exited the whole
+  process — under `restart: unless-stopped`, an unattended crash loop with no
+  proxy, no admin UI and no health endpoint. The listener now rebinds with a
+  jittered, interruptible backoff for as long as the process lives, re-reading
+  the certificate on every attempt so a rotation self-heals with no restart,
+  while the proxy keeps enforcing policy throughout. `runProxyUntilShutdown`'s
+  fatal proxy-listener branch is deliberately unchanged. See
+  `docs/operator/admin-ui-listener-recovery.md`.
 - `culvert --prepare-downgrade` now writes its counts-only audit record to
   the durable audit log named by `-audit-log` before exiting.
 - The real-binary browser smoke and the upstream test suites are hermetic
