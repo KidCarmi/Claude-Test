@@ -287,7 +287,7 @@ security control's behaviour and deserves its own review. See rows AU-3/AU-3a/AU
 and `docs/operator/credential-verification-cost.md`.
 **2026-09-08 — CHAOS-61 sweep (the Data Plane's outbound cluster state under a Control
 Plane outage).**
-*(Numbered CHAOS-61/§29 on merge, at the THIRD attempt. This sweep ran as `CHAOS-57`/§25 and
+*(Numbered CHAOS-61/§30 on merge, at the THIRD attempt. This sweep ran as `CHAOS-57`/§25 and
 collided with the hijacked-tunnel sweep, which merged first and kept the id; an intervening
 main-merge moved the SECTION to §27 and left the `CHAOS-` id colliding, so the tree carried TWO
 different sweeps stamped `CHAOS-57` — two `## ` sections here and two Architecture Notes in
@@ -301,7 +301,13 @@ renumber is not a fix, because the next free id is exactly what every other conc
 also taking. Resolved both times by this section's established precedent: the already-merged sweep
 keeps the id and this one moved. The header's standing recommendation — allocate the id at the
 START of a sweep, in a committed placeholder row — would have prevented all six, and this sweep
-having to move twice is the clearest evidence yet that renumbering-on-merge cannot converge.)*
+having to move twice is the clearest evidence yet that renumbering-on-merge cannot converge. A
+FOURTH main-merge then moved this section again, §29→§30, ahead of the credential-verification
+sweep that landed at §29 — this time with no id collision at all, because the id was already
+unique. That is the distinction the six collisions kept obscuring: a SECTION number is positional
+and every concurrent merge can change it, so it is not a handle anything may cite, while the
+`CHAOS-` id is stable the moment it is allocated. Cross-references should name the id; the three
+`§29` references this sweep had to fix on that merge are what a positional handle costs.)*
 Register row **HA-1** records the deliberate posture for a DP that loses its
 Control Plane — it keeps serving its last-known-good CONFIG — and that posture was reasoned about
 carefully. This sweep asked the adjacent question the row does not cover: what happens to the DP's
@@ -330,7 +336,8 @@ the local decision, a disagreement between the enforcement and reporting paths t
 gate caught inside the first version of the fix), a freshness health plane armed only on a
 clustered node, counted audit-push drops, and 17 gates with every defect gate verified failing
 against the pre-fix tree. No new alert event: a stale broadcast is always the CP link, which
-already alerts. See rows CL-20/CL-21, §29, and `docs/operator/cluster-rate-limit-freshness.md`.
+already alerts. See rows CL-20/CL-21, §30 (CHAOS-61), and
+`docs/operator/cluster-rate-limit-freshness.md`.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
