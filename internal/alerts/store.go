@@ -33,6 +33,13 @@ package alerts
 //   "cluster_node_reenrolled" — expired-but-registered node re-enrolled with a fresh token (CHAOS-12)
 //   "ha_sync_panic"         — a standby HA sync round panicked and was contained: state replication
 //                             is stalled and this node's automatic failover is suppressed (CHAOS-25)
+//   "auth_verify_saturated" — the credential-verification cost governor has been refusing
+//                             authentication attempts for a sustained period: proxy auth is
+//                             failing CLOSED and valid credentials may be denied (CHAOS-57).
+//                             bcrypt costs ~80 ms of a core, so verification is bounded on
+//                             purpose; this fires when that bound is being hit, which means
+//                             either a credential flood or a genuinely undersized node.
+//                             Fired once per episode, never per denied request.
 //   "socks5_listener_down"  — the SOCKS5 accept loop has been unable to accept connections for a
 //                             sustained period, or has stopped entirely: SOCKS5 clients cannot
 //                             connect (CHAOS-54). Fired once per episode, never per retry.

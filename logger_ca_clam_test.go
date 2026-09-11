@@ -377,7 +377,7 @@ func TestInitAuditLog_ValidPath(t *testing.T) {
 
 func TestAuthCacheStore_SetAndGet(t *testing.T) {
 	store := &authCacheStore{entries: make(map[string]*authCacheEntry)}
-	store.set("user1", "pass1", true)
+	store.set("10.0.0.1", "user1", "pass1", true)
 	ok, hit := store.get("user1", "pass1")
 	if !hit {
 		t.Error("authCacheStore.get should be a cache hit after set")
@@ -393,10 +393,10 @@ func TestAuthCacheStore_Eviction(t *testing.T) {
 	for i := 0; i < maxAuthCacheSize; i++ {
 		user := strings.Repeat("u", i%50+1)
 		pass := strings.Repeat("p", i%50+1) + string(rune('a'+i%26))
-		store.set(user+string(rune(i)), pass, true)
+		store.set("10.0.0.1", user+string(rune(i)), pass, true)
 	}
 	// Adding one more should trigger eviction
-	store.set("evict-trigger-user", "evict-trigger-pass", false)
+	store.set("10.0.0.1", "evict-trigger-user", "evict-trigger-pass", false)
 	// Verify the store size didn't blow up
 	store.mu.Lock()
 	size := len(store.entries)

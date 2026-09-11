@@ -168,6 +168,7 @@ func buildOperatorContract() OperatorContract {
 		checkSOCKS5Listener(),
 		checkRequestLogPersistence(),
 		checkIdentityBackend(),
+		checkCredentialVerification(),
 		checkInteractiveLoginState(),
 		checkAlertWebhookSigning(),
 		checkUpstreamCredentials(),
@@ -567,6 +568,62 @@ func checkRequestLogPersistence() OperatorContractCheck {
 		Code:    "request_log_persistence",
 		Status:  diagOK,
 		Message: "request log is persisting to the configured log file",
+	}
+}
+
+// checkCredentialVerification reports whether the credential-verification cost
+// governor (CHAOS-57, internal/authcost) is refusing authentication attempts.
+//
+// It exists because a refusal DENIES a request whose credential was never
+// checked, and on every other surface that is indistinguishable from a user
+// typing the wrong password. Without this row the operator-visible symptom of
+// a credential flood is "intermittent 407s" against a healthy directory and a
+// healthy proxy, with nothing anywhere saying why.
+//
+// Read the two states as different incidents:
+//
+//   - refusing/degraded NOW — either a flood is in progress or the ceiling is
+//     genuinely undersized for this deployment's login volume. The reason
+//     breakdown separates them: `per_client` means ONE source is asking for
+//     more concurrent verifications than it should ever need, while
+//     queue_full/timeout means aggregate demand exceeded the whole ceiling.
+//   - refused earlier, fine now — a burst that the queue could not absorb.
+//     Some users saw a 407 and will have retried successfully.
+//
+// Counts and bounds only. The client key that triggered a per-client refusal
+// is deliberately NOT reproduced here: this contract is a VIEWER-role surface
+// with a standing no-sensitive-values guardrail, and a per-client identifier
+// on it would expose who is authenticating from where. It goes to the
+// admin-scoped sinks — the rate-limited log line and the alert.
+func checkCredentialVerification() OperatorContractCheck {
+	s := authCostHealthStatus()
+	if s.Refused == 0 {
+		return OperatorContractCheck{
+			Code:    "credential_verification",
+			Status:  diagOK,
+			Message: fmt.Sprintf("no credential verification refused since startup (ceiling %d concurrent, %d per client; peak %d in flight)", s.MaxConcurrent, s.MaxPerClient, s.PeakInFlight),
+		}
+	}
+	breakdown := fmt.Sprintf("%d per-client, %d queue-full, %d timeout", s.RefusedPerClient, s.RefusedQueueFull, s.RefusedTimeout)
+	if s.Refusing {
+		status := diagWarn
+		if s.Degraded {
+			status = diagFail
+		}
+		return OperatorContractCheck{
+			Code:   "credential_verification",
+			Status: status,
+			Message: fmt.Sprintf("credential verification has been refusing for %s — proxy authentication is failing closed for affected clients (%d refused since boot: %s; ceiling %d concurrent, %d queued now)",
+				s.RefusingFor.Round(time.Second), s.Refused, breakdown, s.MaxConcurrent, s.Queued),
+			OperatorAction: "Valid credentials may be denied while this persists. A high `per-client` share points at ONE source flooding the proxy-auth path — identify it from the access log and block it at the IP filter or the per-IP connection limiter, both of which ship disabled. A high `queue-full`/`timeout` share instead means aggregate login demand exceeds what this node's CPU can verify; add cores or spread load. Verification is bounded on purpose: bcrypt costs ~80 ms of a core, so an unbounded path lets ~13 KB/s of traffic saturate the whole gateway.",
+		}
+	}
+	return OperatorContractCheck{
+		Code:   "credential_verification",
+		Status: diagWarn,
+		Message: fmt.Sprintf("credential verification refused %d authentication attempt(s) earlier in this process and has spare capacity again (%s; %d episode(s), last at %s)",
+			s.Refused, breakdown, s.Episodes, s.Last.UTC().Format(time.RFC3339)),
+		OperatorAction: "Authentication has recovered; affected users saw a 407 and will have retried successfully. Investigate the burst — a synchronised cache expiry across a client fleet is benign, a sustained one from a single source is not.",
 	}
 }
 

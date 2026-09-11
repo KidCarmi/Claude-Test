@@ -390,7 +390,13 @@ func resolveRequestAuth(w http.ResponseWriter, r *http.Request, clientIP, reqID 
 				// capable legacy providers must supply the canonical authorization
 				// subject; the Basic username is never substituted for them.
 				if !authed {
-					id, resolved := cfg.resolveAuthIdentity(u, p)
+					// CHAOS-57: the local-bcrypt fallback is the one credential
+					// check in this chain that costs ~80 ms of CPU, so it is
+					// charged to a client-fairness key. authStateClientKey goes
+					// through realClientIP, so an X-Forwarded-For value counts
+					// only from a configured trusted proxy — a spoofable key
+					// would hand an attacker an unlimited supply of budgets.
+					id, resolved := cfg.resolveAuthIdentityFrom(authStateClientKey(r), u, p)
 					if !resolved || id == nil || strings.TrimSpace(id.Sub) == "" {
 						atomic.AddInt64(&statAuthFail, 1)
 						w.Header().Set("Proxy-Authenticate", `Basic realm="Culvert"`)
