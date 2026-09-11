@@ -365,14 +365,29 @@ func apiClusterRateLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodes, hotIPs := globalRLAggregator.Stats()
-	jsonOK(w, map[string]any{
-		"enabled":        clusterRateLimitEnabled.Load(),
-		"syncing_nodes":  nodes,
-		"hot_ips":        hotIPs,
-		"remote_ips":     clusterCounts.Count(),
-		"rate_limit_rpm": rl.Limit(),
-		"threshold_pct":  hotThresholdPct,
-	})
+	// CHAOS-61: remote_ips is the SIZE of the last applied broadcast, which says
+	// nothing about whether it is still being applied. The freshness fields are
+	// what distinguish "no hot IPs anywhere in the fleet" from "a broadcast this
+	// node stopped consulting because the Control Plane went away" — the second
+	// is the state in which a 429 on this node has nothing to do with the
+	// client's current request rate.
+	crl := clusterRateLimitFreshness()
+	body := map[string]any{
+		"enabled":                      clusterRateLimitEnabled.Load(),
+		"syncing_nodes":                nodes,
+		"hot_ips":                      hotIPs,
+		"remote_ips":                   clusterCounts.Count(),
+		"rate_limit_rpm":               rl.Limit(),
+		"threshold_pct":                hotThresholdPct,
+		"remote_counts_stale":          crl.Stale,
+		"remote_counts_max_age_secs":   crl.MaxAge.Seconds(),
+		"remote_counts_applied":        crl.Applied,
+		"remote_counts_stale_episodes": crl.Episodes,
+	}
+	if crl.Applied {
+		body["remote_counts_age_secs"] = crl.Age.Seconds()
+	}
+	jsonOK(w, body)
 }
 
 // apiClusterAudit returns the centralized audit log from all Data Plane nodes.

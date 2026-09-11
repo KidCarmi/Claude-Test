@@ -837,32 +837,129 @@ type RateLimitBroadcast struct {
 // clusterCounts holds per-IP request totals received from the Control Plane
 // (other nodes' aggregated counts). Protected by its own mutex to avoid
 // contention with the hot-path Allow() sharded locks.
+//
+// CHAOS-61 — a broadcast EXPIRES. RemoteCounts is, by its own definition, "the
+// total from other nodes IN THE CURRENT WINDOW": a broadcast received at T
+// describes request timestamps in [T-W, T], where W is the rate limiter's
+// sliding window. At now > T+W every timestamp it counted has aged out, so its
+// contribution to the current window is exactly zero. That is arithmetic, not a
+// posture choice — and until appliedAtNano existed the store had no way to say
+// it, because Apply is called ONLY from the DP gossip loop's success branch
+// (controlplane_client.go). A failed SyncRateLimits `continue`s, so the last
+// broadcast stayed frozen in this map for the rest of the process lifetime
+// while AllowClusterAware kept adding it to every local count. An IP whose
+// remote total happened to be near the limit when the Control Plane went away
+// was then denied on this node PERMANENTLY — a total blackhole for that client,
+// on a healthy proxy, cleared only by the CP returning or a restart.
+//
+// The Control Plane already applies this exact reasoning in the other
+// direction: rateLimitAggregator.ClusterTotalsExcluding prunes any node that
+// has not reported for two minutes, precisely so a dead DP's frozen counts stop
+// suppressing fleet traffic (controlplane.go). Nothing applied it to a dead CP,
+// which is the side that actually makes the allow/deny call on live traffic.
+//
+// The stamp is an atomic OUTSIDE the mutex so the hot path can rule a broadcast
+// stale with one atomic load and no lock at all — the case that matters is
+// exactly the one where the map is not being replaced and every request would
+// otherwise queue on the RWMutex for a value that cannot apply. Apply stores the
+// stamp AFTER releasing the write lock, so a reader that observes the new stamp
+// necessarily observes the new map.
 type clusterCountStore struct {
 	mu     sync.RWMutex
 	counts map[string]int // IP → remote cluster count in current window
+	// appliedAtNano is the wall-clock instant of the last APPLIED broadcast
+	// (0 = none ever received). Freshness is evaluated at read time against it;
+	// nothing latches, so recovery needs no separate clearing path.
+	appliedAtNano atomic.Int64
 }
 
 var clusterCounts = &clusterCountStore{counts: map[string]int{}}
 
-// Get returns the cluster-remote count for an IP.
-func (c *clusterCountStore) Get(ip string) int {
+// clusterRemoteCountFallbackMaxAge bounds a broadcast's usefulness when the
+// rate limiter reports no window (defensive — Configure always sets one). It
+// matches the only window the product ships, so the fallback can never be more
+// permissive than the real rule.
+const clusterRemoteCountFallbackMaxAge = time.Minute
+
+// clusterRemoteCountMaxAge is how long an applied broadcast can still describe
+// the current window: the window itself. Kept as a function so the rule stays
+// derived from the live limiter rather than duplicated as a second constant
+// that could drift away from it.
+func clusterRemoteCountMaxAge(window time.Duration) time.Duration {
+	if window <= 0 {
+		return clusterRemoteCountFallbackMaxAge
+	}
+	return window
+}
+
+// FreshCount returns the cluster-remote count for an IP, or 0 when the applied
+// broadcast is older than maxAge (or none has ever been applied). It is the ONLY
+// read accessor for enforcement — there is deliberately no unconditional Get, so
+// a future caller cannot reintroduce the frozen-count path by accident.
+// A NEGATIVE age (the clock moved back between the stamp and this read) is
+// stale, not fresh. `age >= maxAge` alone reads a future stamp as brand new and
+// would honour the broadcast for however far back the clock went — and it would
+// disagree with clusterRateLimitFreshness, which reports the same condition as
+// stale. Two answers to one question is the defect; both fail toward the local
+// decision, which is where every other failure on this path lands.
+func (c *clusterCountStore) FreshCount(ip string, now time.Time, maxAge time.Duration) int {
+	applied := c.appliedAtNano.Load()
+	if applied == 0 {
+		return 0
+	}
+	if age := now.Sub(time.Unix(0, applied)); age < 0 || age >= maxAge {
+		return 0
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.counts[ip]
 }
 
-// Apply replaces the cluster-remote counts with a new broadcast.
+// Apply replaces the cluster-remote counts with a new broadcast and stamps the
+// instant it landed. A nil/empty map is a legitimate broadcast (no hot IPs
+// anywhere else in the fleet) and correctly clears the previous one.
 func (c *clusterCountStore) Apply(remote map[string]int) {
 	c.mu.Lock()
 	c.counts = remote
 	c.mu.Unlock()
+	c.appliedAtNano.Store(time.Now().UnixNano())
 }
 
-// Count returns the number of IPs tracked.
+// AppliedAt returns the instant of the last applied broadcast and whether one
+// has ever been applied. Read-only; used by the freshness health surface.
+func (c *clusterCountStore) AppliedAt() (time.Time, bool) {
+	applied := c.appliedAtNano.Load()
+	if applied == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, applied), true
+}
+
+// Count returns the number of IPs tracked. This is the SIZE of the last applied
+// broadcast whether or not it is still fresh — the freshness surface reports
+// that separately, so an operator can tell "no hot IPs in the fleet" from "a
+// map we stopped consulting".
 func (c *clusterCountStore) Count() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.counts)
+}
+
+// resetForTest clears the store and its freshness stamp.
+func (c *clusterCountStore) resetForTest() {
+	c.mu.Lock()
+	c.counts = map[string]int{}
+	c.mu.Unlock()
+	c.appliedAtNano.Store(0)
+}
+
+// applyAtForTest applies a broadcast as if it had landed at ts, so a test can
+// age a broadcast without sleeping.
+func (c *clusterCountStore) applyAtForTest(remote map[string]int, ts time.Time) {
+	c.mu.Lock()
+	c.counts = remote
+	c.mu.Unlock()
+	c.appliedAtNano.Store(ts.UnixNano())
 }
 
 // ExportHotDeltas returns per-IP request count deltas for IPs that have
@@ -946,8 +1043,14 @@ func (r *RateLimiter) AllowClusterAware(ip string) bool {
 	b.expire(cutoff)
 
 	// Check local + remote cluster count against limit.
+	//
+	// CHAOS-61: the remote half is consulted only while the broadcast carrying
+	// it can still describe THIS window. Past that it is not a conservative
+	// estimate, it is a count of timestamps that have all aged out — so a
+	// Control-Plane outage degrades this node to plain local rate limiting
+	// instead of enforcing a frozen snapshot of the past forever.
 	localCount := b.n
-	remoteCount := clusterCounts.Get(ip)
+	remoteCount := clusterCounts.FreshCount(ip, now, clusterRemoteCountMaxAge(window))
 	if localCount+remoteCount >= limit {
 		return false
 	}
