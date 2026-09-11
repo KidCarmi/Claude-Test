@@ -1,6 +1,6 @@
 package logstore
 
-// resilient.go — CHAOS-61: surviving a corrupt request-history store.
+// resilient.go — CHAOS-62: surviving a corrupt request-history store.
 //
 // WHY THIS STORE NEEDED IT SECOND
 //

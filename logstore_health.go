@@ -1,6 +1,6 @@
 package main
 
-// logstore_health.go — CHAOS-61: observability for the request-history store's
+// logstore_health.go — CHAOS-62: observability for the request-history store's
 // open outcome.
 //
 // The history store used to be able to kill this process: badger.Open panics

@@ -36,24 +36,34 @@ everything else is triaged below with a suggested PR and required tests for foll
 > rewriting identifiers three merged PRs already reference, so it is an OWNER
 > decision, not a unilateral edit — recorded here rather than silently "fixed".
 >
-> **The request-history sweep (§29) collided THREE TIMES and renumbered itself
+> **The request-history sweep (§31) collided FOUR TIMES and renumbered itself
 > every time, while still unmerged.** It first took `CHAOS-57` alongside the
 > hijacked-tunnel sweep (§25); §25 merged first, so it kept the id and this one
 > moved to `CHAOS-59` (`CHAOS-58` having gone to §26). Within the same day the
 > intelligence-feed sweep (§27) landed on `CHAOS-59` too, so it moved to
-> `CHAOS-60` — and the next day the GeoIP sweep (§28) merged holding
-> `CHAOS-60`, so it moved once more, to **`CHAOS-61`**. Counting the
-> intelligence-feed sweep's own two collisions (recorded in its revision-log
-> entry below), that is **six occurrences across four sweeps in about
-> twenty-four hours** — the pattern is not bad luck, it is the default, and it
-> is getting more frequent as more sweeps run concurrently.
+> `CHAOS-60` — the next day the GeoIP sweep (§28) merged holding `CHAOS-60`, so
+> it moved to `CHAOS-61` — and the day after that the cluster rate-limit sweep
+> (§30) merged holding `CHAOS-61`, so it moved once more, to **`CHAOS-62`**.
+> Counting the other sweeps' own collisions (the intelligence-feed sweep's two,
+> and §30's, whose revision-log entry records that it was itself numbered "at
+> the THIRD attempt" after running as `CHAOS-57` and then `CHAOS-60`), that is
+> **at least nine occurrences across five sweeps in about seventy-two hours**.
+> The pattern is not bad luck, it is the default, and it is getting more
+> frequent as more sweeps run concurrently.
 >
-> **An id that has to be rewritten three times is itself the evidence.** Each
+> **An id that has to be rewritten four times is itself the evidence.** Each
 > renumber was individually cheap and correct, and the sequence is still pure
 > waste: every one of them touched ~15 files, invalidated the PR description's
 > gate names, and bought nothing a committed placeholder row would not have
 > bought for free on day one. Do not read the convention below as a solution —
 > it is the bandage. The fix is allocation.
+>
+> **Two sweeps have now independently converged on the same fix while colliding
+> with each other**, which is the strongest argument available that the
+> convention is not enough: §30's own entry reaches the identical conclusion
+> from the other side of the same collision. The next sweep to open should
+> claim its id in a committed placeholder row in this file as its FIRST commit,
+> before any code is written — that is the whole remedy, and it costs one line.
 >
 > Both sweeps independently arrived at the same rule, which is the one to
 > follow until the durable fix exists: **an id is rewritable for free right up
@@ -382,7 +392,7 @@ clustered node, counted audit-push drops, and 17 gates with every defect gate ve
 against the pre-fix tree. No new alert event: a stale broadcast is always the CP link, which
 already alerts. See rows CL-20/CL-21, §30 (CHAOS-61), and
 `docs/operator/cluster-rate-limit-freshness.md`.
-**2026-08-29 — CHAOS-61 sweep (the request-history store under a damaged data volume).**
+**2026-08-29 — CHAOS-62 sweep (the request-history store under a damaged data volume).**
 §19.6 opened row **R-E** and marked it *"next sweep candidate"*: `internal/logstore` calls
 `badger.Open` with the same uncatchable-panic exposure CHAOS-50 had just fixed for the category
 store — a corrupt `.sst` panics from a goroutine badger spawns, so no `recover()` at any call site
@@ -2233,7 +2243,7 @@ pinned by `TestCheckCategoryFeedDB_RowCarriesNoRawCause`.
   semantics: quarantining it silently is an evidence decision, not a cache
   decision. **Next sweep candidate.**
 
-  > **CLOSED by CHAOS-61 (2026-08-29) — and both bounding clauses above were
+  > **CLOSED by CHAOS-62 (2026-08-29) — and both bounding clauses above were
   > WRONG.** "Quarantining it silently is an evidence decision" argues FOR the
   > fix: the CHAOS-05/07 contract moves aside and never deletes, so the evidence
   > survives either way; what this deferral preserved was a crash loop whose
@@ -4822,7 +4832,7 @@ to ignore the gauge before the real outage arrives.
 > the question in both directions at once.
 
 Runbook: `docs/operator/cluster-rate-limit-freshness.md`.
-## 31. CHAOS-61 — The request-history store under a damaged data volume
+## 31. CHAOS-62 — The request-history store under a damaged data volume
 
 **Date:** 2026-08-29 · **Domain:** storage / persistence (`internal/logstore`) ·
 **Status:** shipped · **Gates:** `internal/storeguard/storeguard_test.go` (19),
@@ -4855,7 +4865,7 @@ created by github.com/dgraph-io/badger/v4.newLevelsController in goroutine 21
 
 A `recover()` in the frame directly above `OpenTTL` never fires: the panic is
 raised on a goroutine badger spawns. This is kept as a permanent DEFECT PROOF
-(`TestChaos61_BareOpenTTLPanicIsUncatchableAtTheCallSite`) so a future badger
+(`TestChaos62_BareOpenTTLPanicIsUncatchableAtTheCallSite`) so a future badger
 change cannot let the recovery gate quietly prove less than it claims.
 
 The same run also produced the table that forced `storeguard.Policy` to exist —

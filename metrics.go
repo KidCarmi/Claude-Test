@@ -1153,7 +1153,7 @@ culvert_geo_policy_unresolved_total %d
 			gr.Unresolved,
 		)
 	}
-	// CHAOS-61: request-history store health, the same triple for the same
+	// CHAOS-62: request-history store health, the same triple for the same
 	// reasons. `available` is 0 both when history saving is off and when the
 	// store failed to open — the `request_history` diagnostics row distinguishes
 	// them, while an alerting rule that only cares "is history being saved?"
