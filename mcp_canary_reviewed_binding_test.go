@@ -1760,90 +1760,115 @@ func publishVariant(t *testing.T, sid, tool, tenant, identity, schema string, en
 // path observed it — an operator reads the code without knowing which path produced it, so a
 // disagreement makes the evidence for an irreversible stop a property of the request rather than
 // of the state. The known causes stay pinned by C14-C24, which are about specific verdicts.
-func TestReviewedBinding_C25_BothPathsAgreeOnEveryPublishedState(t *testing.T) {
+// c25State is one point in the published-state space: which of the five facts the latch paths read
+// deviate from what the activation reviewed.
+type c25State struct {
+	otherTenant bool
+	rotatedID   bool
+	movedFP     bool
+	disabled    bool
+	repinned    bool
+}
+
+func c25StateFromMask(mask int) c25State {
+	return c25State{
+		otherTenant: mask&1 != 0,
+		rotatedID:   mask&2 != 0,
+		movedFP:     mask&4 != 0,
+		disabled:    mask&8 != 0,
+		repinned:    mask&16 != 0,
+	}
+}
+
+func (st c25State) deviates() bool {
+	return st.otherTenant || st.rotatedID || st.movedFP || st.disabled || st.repinned
+}
+
+func (st c25State) name() string {
+	parts := []string{}
+	for _, d := range []struct {
+		name string
+		on   bool
+	}{
+		{"tenant", st.otherTenant}, {"identity", st.rotatedID}, {"fingerprint", st.movedFP},
+		{"disabled", st.disabled}, {"repin", st.repinned},
+	} {
+		if d.on {
+			parts = append(parts, d.name)
+		}
+	}
+	if len(parts) == 0 {
+		return "baseline"
+	}
+	return strings.Join(parts, "+")
+}
+
+// apply publishes the state. The baseline is left exactly as the rig seeded it, so a "no
+// deviation" run really is the untouched reviewed target rather than a re-publish of it.
+func (st c25State) apply(t *testing.T, r *reviewedRig) {
+	t.Helper()
 	const (
 		baseSchema  = `{"type":"object"}`
 		movedSchema = `{"type":"object","properties":{"moved":{"type":"string"}}}`
 	)
-	type dim struct {
-		name string
-		on   bool
+	if st.deviates() {
+		tenant, identity, schema := ttTenant, "id", baseSchema
+		if st.otherTenant {
+			tenant = "other-tenant"
+		}
+		if st.rotatedID {
+			identity = "rotated"
+		}
+		if st.movedFP {
+			schema = movedSchema
+		}
+		publishVariant(t, r.sid, r.tool, tenant, identity, schema, !st.disabled)
 	}
-	// Each state is five booleans: deviate-or-not on each dimension.
+	if !st.repinned {
+		return
+	}
+	reg, _ := mcpInventory.sharedInventory()
+	if reg == nil {
+		t.Fatal("premise: a shared registry must be published")
+	}
+	// A pin the catalog record was NOT built against, whatever the record now carries.
+	if _, err := reg.Repin(registry.ServerID(r.sid), registry.Identity("registry-only"), canaryRuntimeTestNow); err != nil {
+		t.Fatalf("repin: %v", err)
+	}
+}
+
+// c25Cause applies the state to a fresh activation, drives ONE latch path, and reports the cause
+// that path recorded ("" when it latched nothing).
+func c25Cause(t *testing.T, st c25State, viaAdmission bool) string {
+	t.Helper()
+	r := newReviewedRig(t)
+	st.apply(t, r)
+	if viaAdmission {
+		if r.request(r.fp1, r.now) && st.deviates() {
+			t.Fatal("SECURITY: a deviating published state must not be admitted")
+		}
+	} else {
+		canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+			Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
+		})
+	}
+	if !r.rt.abortedNow(r.capb) {
+		return ""
+	}
+	return r.rt.abortCodeNow(r.capb)
+}
+
+func TestReviewedBinding_C25_BothPathsAgreeOnEveryPublishedState(t *testing.T) {
 	for mask := 0; mask < 32; mask++ {
-		otherTenant := mask&1 != 0
-		rotatedID := mask&2 != 0
-		movedFP := mask&4 != 0
-		disabled := mask&8 != 0
-		repinned := mask&16 != 0
-
-		name := "baseline"
-		if mask != 0 {
-			parts := []string{}
-			for _, d := range []dim{
-				{"tenant", otherTenant}, {"identity", rotatedID}, {"fingerprint", movedFP},
-				{"disabled", disabled}, {"repin", repinned},
-			} {
-				if d.on {
-					parts = append(parts, d.name)
-				}
-			}
-			name = strings.Join(parts, "+")
-		}
-
-		apply := func(t *testing.T, r *reviewedRig) {
-			t.Helper()
-			tenant, identity, schema := ttTenant, "id", baseSchema
-			if otherTenant {
-				tenant = "other-tenant"
-			}
-			if rotatedID {
-				identity = "rotated"
-			}
-			if movedFP {
-				schema = movedSchema
-			}
-			if mask != 0 {
-				publishVariant(t, r.sid, r.tool, tenant, identity, schema, !disabled)
-			}
-			if repinned {
-				reg, _ := mcpInventory.sharedInventory()
-				if reg == nil {
-					t.Fatal("premise: a shared registry must be published")
-				}
-				// A pin the catalog record was NOT built against, whatever the record now carries.
-				pin := registry.Identity("registry-only")
-				if _, err := reg.Repin(registry.ServerID(r.sid), pin, canaryRuntimeTestNow); err != nil {
-					t.Fatalf("repin: %v", err)
-				}
-			}
-		}
-
-		t.Run(name, func(t *testing.T) {
-			var viaAdmission, viaObservation string
-
-			r := newReviewedRig(t)
-			apply(t, r)
-			if r.request(r.fp1, r.now) && mask != 0 {
-				t.Fatal("SECURITY: a deviating published state must not be admitted")
-			}
-			if r.rt.abortedNow(r.capb) {
-				viaAdmission = r.rt.abortCodeNow(r.capb)
-			}
-
-			r2 := newReviewedRig(t)
-			apply(t, r2)
-			canaryReviewedTargetObserved(r2.capb.String(), mcpruntime.CanaryTargetObservation{
-				Generation: r2.gen, ServerID: r2.sid, ToolName: r2.tool,
-			})
-			if r2.rt.abortedNow(r2.capb) {
-				viaObservation = r2.rt.abortCodeNow(r2.capb)
-			}
+		st := c25StateFromMask(mask)
+		t.Run(st.name(), func(t *testing.T) {
+			viaAdmission := c25Cause(t, st, true)
+			viaObservation := c25Cause(t, st, false)
 
 			// Non-vacuity: parity alone would be satisfied by two paths that both stayed silent.
-			// Every mask here deviates the reviewed record in at least one dimension the review
-			// bound, so every one of them must stop the experiment.
-			if mask != 0 && viaAdmission == "" {
+			// Every deviating state here moves the reviewed record in at least one dimension the
+			// review bound, so every one of them must stop the experiment.
+			if st.deviates() && viaAdmission == "" {
 				t.Fatal("SECURITY: a published state that deviates from the reviewed record did not " +
 					"stop the experiment on EITHER path — parity held only because both were silent")
 			}
