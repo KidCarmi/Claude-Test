@@ -158,16 +158,16 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		Server:    in.ServerID,
 	}, func() canaryTrustObservation {
 		live := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
-		if live.DriftCode != "" {
-			// A probe-established code, plus the authoritative target when one resolved, so the
-			// transaction can charge the cause the reviewed record establishes rather than only the
-			// one this request could see. It never softens the verdict — a drift stays a drift.
-			if live.Resolved {
-				return canaryTrustObservation{
-					DriftCode: live.DriftCode, Found: true, Current: live.Authoritative,
-				}
+		if !live.Eligible && live.Resolved {
+			// RESOLVED BUT NOT AUTHORIZED, in one shape for all three reasons — the anchor is
+			// gone, the target changed hands, or this request's decision fingerprint is not the
+			// one in force. Every fact the transaction needs is carried and none of them is
+			// pre-classified: canaryDriftCause decides scope first and cause second, and Trusted
+			// stays false so nothing here authorizes anything.
+			return canaryTrustObservation{
+				DriftCode: live.DriftCode, Found: true,
+				Current: live.Authoritative, AnchorLost: live.AnchorLost,
 			}
-			return canaryTrustObservation{DriftCode: live.DriftCode}
 		}
 		if !live.Eligible {
 			// Ineligible splits in two, and collapsing them loses a breach.
@@ -379,6 +379,12 @@ type liveTrustPrecheck struct {
 	// never compare, and reassigning back to A would resume the activation with nothing latched
 	// (Codex P1, PR #1360, round 6).
 	Resolved bool
+	// AnchorLost reports that the trust anchor is no longer in force — the server is not usable,
+	// or the registry pins an identity the catalog record was not built against. It is a FACT, not
+	// a verdict: whether it may stop the activation depends on the reviewed set, which only the
+	// admission transaction can consult (canaryDriftCause). Pre-classifying it here as a drift
+	// code is what let an unreviewed target's disabled server abort a healthy Canary.
+	AnchorLost bool
 	// Authoritative is the CURRENT authoritative target, from the SAME loadTarget snapshot as
 	// every other field here — never a second read. Meaningful only when Resolved.
 	Authoritative canary.ReviewedTarget
@@ -456,7 +462,7 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 	// causes was benign. An operator disable or a lost identity verification after runExecute
 	// snapshotted in.Server fails closed here (P1b).
 	if !ti.target.ServerUsable {
-		return liveTrustPrecheck{DriftCode: "server_identity_drift"}
+		return liveTrustPrecheck{Resolved: true, Authoritative: authoritative, AnchorLost: true}
 	}
 	// The registry currently pins an identity the catalog record was NOT built against — the
 	// repin/re-ingest window. A request would be routed to the registry's pin while every approval
@@ -464,7 +470,7 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 	// one that was reviewed. Same code, same reason as an unusable anchor: the approved anchor is
 	// not the one in force (Codex P1, PR #1360, round 4).
 	if ti.registryPinDiverged {
-		return liveTrustPrecheck{DriftCode: "server_identity_drift"}
+		return liveTrustPrecheck{Resolved: true, Authoritative: authoritative, AnchorLost: true}
 	}
 	// The anchor is sound; only now does ownership decide. Request-scoped for AUTHORIZATION — this
 	// request is not the owner — but the target is carried out so the reviewed comparison can still

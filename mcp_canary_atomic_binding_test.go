@@ -68,9 +68,19 @@ func (r *atomicRig) admit(trust canaryTrustProbe) canaryAdmission {
 	}, trust)
 }
 
-// probeDrift returns a probe reporting an authoritative drift.
+// probeDrift returns a probe reporting an authoritative drift ON A RESOLVED TARGET.
+//
+// The target is carried because a code without one is not a shape production can produce: every
+// return in mcpLiveTrustPrecheck that sets DriftCode also sets Resolved, which
+// TestReviewedBinding_C28 pins structurally. It matters because round 31 made the reviewed set
+// decide WHETHER a cause may stop the activation — an observation with nothing to compare against
+// latches nothing, since scope cannot be established for it. Carrying the canonical reviewed
+// target keeps these cases exercising the drift path they are about rather than the
+// nothing-resolved path.
 func probeDrift(code string) canaryTrustProbe {
-	return func() canaryTrustObservation { return canaryTrustObservation{DriftCode: code} }
+	return func() canaryTrustObservation {
+		return canaryTrustObservation{DriftCode: code, Found: true, Current: testReviewedTarget()}
+	}
 }
 
 // probeTrusted returns a probe reporting healthy trust.
@@ -132,9 +142,10 @@ func TestAtomicBinding_B_DemotionRacingTheObservationNeverLatchesTheReplacement(
 		_ = r.rt.demoteCanary(r.capb)
 	}()
 
+	drift := probeDrift("tool_fingerprint_drift")
 	adm := r.admit(func() canaryTrustObservation {
 		close(released) // the demotion is now runnable and MUST be unable to proceed
-		return canaryTrustObservation{DriftCode: "tool_fingerprint_drift"}
+		return drift()  // production-shaped: a code always carries the target it drifted from
 	})
 	wg.Wait()
 

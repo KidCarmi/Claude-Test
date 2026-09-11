@@ -536,6 +536,37 @@ run_mutation M43 \
   . mcp_live_gate.go \
   's/\tif ti\.target\.Tenant == "" \|\| ti\.target\.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{Resolved: true, Authoritative: authoritative\}\n\t\}/\tif ti.target.Tenant == "" || ti.target.Tenant != tenant \{\n\t\treturn liveTrustPrecheck\{DriftCode: "server_identity_drift"\}\n\t\}/'
 
+# ── (18) ROUND 31: SCOPE DECIDES WHETHER, ANCHOR DECIDES WHICH ─────────────
+# Both paths checked the anchor facts before the reviewed comparison could return OutOfScope, so a
+# resolvable tool on ANY disabled or repinned server aborted the Canary — the round-15 rule
+# inverted, made reachable by round 26's server-unavailable pipeline hook. And the pre-admission
+# evidence counter recorded the pre-lock observation, so the admin surface and auto_stop reported
+# different causes for one event.
+
+run_mutation M44 \
+  'anchor state is charged before scope, so an unreviewed target stops the experiment' \
+  'TestReviewedBinding_C26_AnchorLossOnAnUnreviewedTargetLatchesNothing' \
+  . "$ADM" \
+  's/\tcase v == canary\.ReviewedOutOfScope:\n\t\treturn ""\n\tcase obs\.AnchorLost:/\tcase obs.AnchorLost:/'
+
+run_mutation M45 \
+  'anchor loss stops being a cause at all (the round-3 defect restored)' \
+  'TestReviewedBinding_C26Control_TheReviewedTargetStillLatchesAnchorLoss' \
+  . "$ADM" \
+  's/\tcase obs\.AnchorLost:\n\t\treturn "server_identity_drift"\n//'
+
+run_mutation M46 \
+  'the evidence counter records the pre-lock observation, not the cause that was latched' \
+  'TestReviewedBinding_C27_EvidenceCounterRecordsTheLatchedCause' \
+  . "$ADM" \
+  's/\tif latch\.DriftCode != "" \{\n\t\tnoteCanaryPreAdmissionDrift\(capability, latch\.DriftCode\)\n\t\treturn\n\t\}\n\tnoteCanaryPreAdmissionDrift\(capability, obs\.Code\)/\t_ = latch\n\tnoteCanaryPreAdmissionDrift(capability, obs.Code)/'
+
+run_mutation M47 \
+  'a drift code is emitted with no target, so scope cannot be established and it is dropped' \
+  'TestReviewedBinding_C28_ADriftCodeAlwaysCarriesItsTarget' \
+  . mcp_live_gate.go \
+  's/\t\t\tDriftCode: "tool_fingerprint_drift", Resolved: true, Authoritative: authoritative,/\t\t\tDriftCode: "tool_fingerprint_drift", Authoritative: authoritative,/'
+
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
 if [ "$SKIPPED" -gt 0 ]; then

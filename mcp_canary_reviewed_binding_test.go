@@ -1246,10 +1246,19 @@ func TestReviewedBinding_C18_RepinWindowIsDetectedAsDrift(t *testing.T) {
 			"registry's new pin — mixing the two is the hybrid pair this whole fix exists to prevent")
 	}
 
-	// And the live precheck charges it, so the request path refuses rather than executing.
-	if live := mcpLiveTrustPrecheck(ttTenant, r.sid, r.tool, r.fp1); live.DriftCode != "server_identity_drift" {
-		t.Fatalf("the live precheck must charge the repin window as server_identity_drift, got %q (eligible=%v)",
-			live.DriftCode, live.Eligible)
+	// And the live precheck reports it, so the request path refuses rather than executing.
+	//
+	// It reports the FACT (AnchorLost) rather than a pre-classified drift code: round 31 moved the
+	// classification into canaryDriftCause, because whether a lost anchor may stop the activation
+	// depends on the reviewed set, and pre-classifying it here let an UNREVIEWED target's disabled
+	// server abort a healthy Canary. The window is still charged as server_identity_drift for the
+	// reviewed target — C19 and C26Control pin that end to end.
+	live := mcpLiveTrustPrecheck(ttTenant, r.sid, r.tool, r.fp1)
+	if !live.AnchorLost {
+		t.Fatalf("the live precheck must report the repin window as anchor loss, got %+v", live)
+	}
+	if live.Eligible {
+		t.Fatal("SECURITY: a target inside the repin window must never be eligible to execute")
 	}
 }
 
@@ -1854,4 +1863,202 @@ func nameOrSilent(code string) string {
 		return "(no latch)"
 	}
 	return code
+}
+
+// publishTwoToolsDisabled republishes the reviewed server carrying BOTH the reviewed tool and an
+// unrelated sibling, with the server DISABLED — the anchor-loss state, reached by a request that
+// names the sibling.
+func publishTwoToolsDisabled(t *testing.T, sid, reviewedTool, otherTool string) {
+	t.Helper()
+	doc, err := decodeInventory([]byte(`{"schema_version":1,"tenant":"` + ttTenant + `","servers":[
+	  {"server_id":"` + sid + `","endpoint":"e","pinned_identity":"id","enabled":false,
+	   "tools":[{"name":"` + reviewedTool + `","input_schema":{"type":"object"}},
+	            {"name":"` + otherTool + `","input_schema":{"type":"object","properties":{"z":{"type":"string"}}}}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("decode inventory: %v", err)
+	}
+	reg, cat, err := seedInventory(doc, limits.DefaultCatalog())
+	if err != nil {
+		t.Fatalf("seed inventory: %v", err)
+	}
+	publishMCPInventory(mcpInvLoaded, "", reg, cat)
+}
+
+// ── 26 ───────────────────────────────────────────────────────────────────────────────────────
+// SCOPE DECIDES WHETHER TO LATCH; ANCHOR STATE DECIDES WHICH CAUSE.
+//
+// Both latch paths checked the anchor facts BEFORE the reviewed comparison, so a resolvable tool
+// the activation was never reviewed for, on a server that is merely disabled or repinned, aborted
+// the whole Canary before Compare could return ReviewedOutOfScope. That is the round-15 rule
+// inverted — "a catalog change to a tool the experiment never reviewed must not abort it" — and
+// round 26's server-unavailable pipeline hook is what made it reachable: an authenticated request
+// for ANY disabled server with retained catalog records reaches the observation sink even when the
+// server is outside the rollout scope entirely (Codex P1, PR #1360, round 31).
+//
+// The ordering rounds 3/4/30 established is still right, but it was stated one step too early. The
+// reviewed set decides WHETHER this activation may be stopped at all; only then does anchor state
+// outrank whatever the target compares as.
+func TestReviewedBinding_C26_AnchorLossOnAnUnreviewedTargetLatchesNothing(t *testing.T) {
+	const sibling = "sibling"
+
+	t.Run("observation", func(t *testing.T) {
+		r := newReviewedRig(t)
+		publishTwoToolsDisabled(t, r.sid, r.tool, sibling)
+		cur := mcpCurrentAuthoritativeTarget(r.sid, sibling)
+		if !cur.Found || cur.Usable {
+			t.Fatalf("premise: the sibling must resolve on a disabled server, got %+v", cur)
+		}
+		canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+			Generation: r.gen, ServerID: r.sid, ToolName: sibling,
+		})
+		if r.rt.abortedNow(r.capb) {
+			t.Fatalf("SECURITY: a tool this activation never reviewed stopped the experiment (%q). "+
+				"Traffic to any disabled server with retained catalog records could halt an "+
+				"otherwise healthy Canary", r.rt.abortCodeNow(r.capb))
+		}
+	})
+
+	t.Run("admission", func(t *testing.T) {
+		r := newReviewedRig(t)
+		publishTwoToolsDisabled(t, r.sid, r.tool, sibling)
+		d := r.g.AdmitSideEffect(driftGateInput(r.sid, sibling, r.fp1, r.now))
+		if d.Release != nil {
+			d.Release()
+		}
+		if d.Admit {
+			t.Fatal("a request for an unreviewed tool on a disabled server must not be admitted")
+		}
+		if r.rt.abortedNow(r.capb) {
+			t.Fatalf("SECURITY: admission latched on an unreviewed target (%q)", r.rt.abortCodeNow(r.capb))
+		}
+	})
+}
+
+// CONTROL for C26: the REVIEWED target on that same disabled server still latches, and still as
+// anchor loss. Without it, "filter unreviewed targets first" could be satisfied by a form that
+// stopped latching anchor loss altogether — which is the round-3 defect restored.
+func TestReviewedBinding_C26Control_TheReviewedTargetStillLatchesAnchorLoss(t *testing.T) {
+	const sibling = "sibling"
+	for _, tc := range []struct{ name, via string }{{"observation", "obs"}, {"admission", "adm"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReviewedRig(t)
+			publishTwoToolsDisabled(t, r.sid, r.tool, sibling)
+			if tc.via == "obs" {
+				canaryReviewedTargetObserved(r.capb.String(), mcpruntime.CanaryTargetObservation{
+					Generation: r.gen, ServerID: r.sid, ToolName: r.tool,
+				})
+			} else if r.request(r.fp1, r.now) {
+				t.Fatal("the reviewed target on a disabled server must not be admitted")
+			}
+			if !r.rt.abortedNow(r.capb) {
+				t.Fatal("SECURITY: the REVIEWED target lost its trust anchor — the experiment must stop")
+			}
+			if code := r.rt.abortCodeNow(r.capb); code != "server_identity_drift" {
+				t.Fatalf("first cause = %q, want \"server_identity_drift\"", code)
+			}
+		})
+	}
+}
+
+// ── 27 ───────────────────────────────────────────────────────────────────────────────────────
+// THE EVIDENCE COUNTER RECORDS THE CAUSE THAT WAS ACTUALLY LATCHED.
+//
+// canaryPreAdmissionDrift counted the runtime's own pre-lock observation and then ignored what the
+// re-derivation under the lock decided. Once reviewedFirstCause could sharpen a stale-fingerprint
+// observation into server_identity_drift, the admin evidence surface reported tool-fingerprint
+// drift for an event auto_stop recorded as server-identity drift — the two surfaces disagreeing
+// about one event, which is the shape of this entire PR (Codex P2, PR #1360, round 31).
+func TestReviewedBinding_C27_EvidenceCounterRecordsTheLatchedCause(t *testing.T) {
+	r := newReviewedRig(t)
+	before := canaryPreAdmissionDriftCounts(r.capb.String())
+
+	// Identity rotation with re-ingest: the probe sees only the stale decision fingerprint, the
+	// reviewed record says the anchor moved.
+	republishWithIdentity(t, r.sid, r.tool, "rotated", `{"type":"object"}`)
+	canaryPreAdmissionDrift(r.capb.String(), mcpruntime.CanaryDriftTarget{
+		Generation: r.gen, Tenant: ttTenant, ServerID: r.sid, ToolName: r.tool,
+		DecisionFP: r.fp1, Code: "tool_fingerprint_drift",
+	})
+
+	latched := r.rt.abortCodeNow(r.capb)
+	if latched != "server_identity_drift" {
+		t.Fatalf("premise: the re-derivation must sharpen the cause, got %q", latched)
+	}
+	after := canaryPreAdmissionDriftCounts(r.capb.String())
+	if after[latched] <= before[latched] {
+		t.Fatalf("the evidence counter did not record the cause that was latched (%q): before=%v after=%v. "+
+			"An operator reading the rollout surface would see a different reason than auto_stop recorded",
+			latched, before, after)
+	}
+	if after["tool_fingerprint_drift"] > before["tool_fingerprint_drift"] {
+		t.Fatalf("the counter recorded the pre-lock observation as well, so one event appears twice "+
+			"under two causes: before=%v after=%v", before, after)
+	}
+}
+
+// ── 28 ───────────────────────────────────────────────────────────────────────────────────────
+// A PROBE-ESTABLISHED DRIFT CODE ALWAYS CARRIES THE TARGET IT DRIFTED FROM.
+//
+// Round 31 made the reviewed set decide whether a cause may stop the activation at all, so an
+// observation with no resolved target latches nothing — there is no way to establish scope for it,
+// and latching anyway is the round-15 rule inverted. That is only safe if production never
+// produces a drift code WITHOUT a target, because such an observation would now be silently
+// dropped rather than refused loudly.
+//
+// This is checked structurally rather than by behaviour, because the property is about every
+// return statement in the function — including ones no test drives today and ones added later. A
+// behavioural gate can only cover the shapes someone thought to construct, which is precisely how
+// the three defects this matrix was built for survived.
+func TestReviewedBinding_C28_ADriftCodeAlwaysCarriesItsTarget(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "mcp_live_gate.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse mcp_live_gate.go: %v", err)
+	}
+	checked := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		id, ok := lit.Type.(*ast.Ident)
+		if !ok || id.Name != "liveTrustPrecheck" {
+			return true
+		}
+		var hasCode, hasResolved bool
+		for _, e := range lit.Elts {
+			kv, ok := e.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := kv.Key.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			switch key.Name {
+			case "DriftCode":
+				hasCode = true
+			case "Resolved":
+				if b, ok := kv.Value.(*ast.Ident); ok && b.Name == "true" {
+					hasResolved = true
+				}
+			}
+		}
+		if hasCode {
+			checked++
+			if !hasResolved {
+				t.Errorf("%s: a liveTrustPrecheck carrying DriftCode must also carry Resolved:true. "+
+					"Since round 31 an observation with no resolved target latches NOTHING (scope "+
+					"cannot be established for it), so a code without a target would be dropped "+
+					"silently instead of stopping the experiment",
+					fset.Position(lit.Pos()))
+			}
+		}
+		return true
+	})
+	if checked == 0 {
+		t.Fatal("the wall matched no liveTrustPrecheck literal carrying a DriftCode — the selector " +
+			"has gone stale and this test now proves nothing")
+	}
 }
