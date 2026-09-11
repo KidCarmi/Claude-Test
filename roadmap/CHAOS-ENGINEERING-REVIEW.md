@@ -285,6 +285,52 @@ PRE-EXISTING username-enumeration oracle reached by repetition (wrong-username n
 cached, correct-username ones are), is recorded and deliberately NOT fixed here: closing it changes a
 security control's behaviour and deserves its own review. See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, §25,
 and `docs/operator/credential-verification-cost.md`.
+**2026-09-08 — CHAOS-61 sweep (the Data Plane's outbound cluster state under a Control
+Plane outage).**
+*(Numbered CHAOS-61/§29 on merge, at the THIRD attempt. This sweep ran as `CHAOS-57`/§25 and
+collided with the hijacked-tunnel sweep, which merged first and kept the id; an intervening
+main-merge moved the SECTION to §27 and left the `CHAOS-` id colliding, so the tree carried TWO
+different sweeps stamped `CHAOS-57` — two `## ` sections here and two Architecture Notes in
+`CLAUDE.md`. Renumbered to `CHAOS-60`/§28 — and within a day collided AGAIN, with the GeoIP
+resolution sweep that took `CHAOS-60` concurrently and merged first; that merge once more moved
+the SECTION (§28→§29) and left the id colliding, so two sweeps shared `CHAOS-60` and, in the same
+package, a `TestChaos60_` test-name prefix. Those are the FIFTH and SIXTH occurrences of the
+collision this section's header warns about, the second and third time a section-only renumber let
+the id survive its own remedy, and the second time it happened to THIS sweep specifically — a
+renumber is not a fix, because the next free id is exactly what every other concurrent sweep is
+also taking. Resolved both times by this section's established precedent: the already-merged sweep
+keeps the id and this one moved. The header's standing recommendation — allocate the id at the
+START of a sweep, in a committed placeholder row — would have prevented all six, and this sweep
+having to move twice is the clearest evidence yet that renumbering-on-merge cannot converge.)*
+Register row **HA-1** records the deliberate posture for a DP that loses its
+Control Plane — it keeps serving its last-known-good CONFIG — and that posture was reasoned about
+carefully. This sweep asked the adjacent question the row does not cover: what happens to the DP's
+other outbound cluster state, the per-tick loops that are not config sync at all. The same posture
+had been applied to data where it is not correct. **CL-20:** `clusterCounts.Apply` is reached from
+exactly one place, the gossip loop's SUCCESS branch, so a failed `SyncRateLimits` left the Control
+Plane's last per-IP broadcast FROZEN in memory and `AllowClusterAware` kept adding it to every
+local count for the rest of the process lifetime. An IP whose cluster-wide total happened to be at
+the limit when the CP went away — an ordinary NAT or corporate egress address, exactly the kind
+that gets hot — was thereafter denied on that node with a local count of ZERO: a total blackhole
+for that client, on a healthy proxy, cleared only by the CP returning or a restart, and
+indistinguishable in the log from a client genuinely sending too fast. The fix is arithmetic
+rather than posture — `RemoteCounts` means "the total in the CURRENT window", so past one window
+every timestamp it counted has aged out and its correct contribution is zero — and **the Control
+Plane had been applying that exact reasoning in the other direction all along**
+(`ClusterTotalsExcluding` prunes a node that has not reported for two minutes, so a dead DP's
+counts stop suppressing fleet traffic). The rule existed on one side of the link and not the
+other, and the side that lacked it is the one that decides allow/deny on live traffic.
+**CL-21:** the DP→CP audit push queue is correctly bounded at 1000 and correctly keeps the newest —
+but dropped with no counter, no metric and no log line, three hundred lines below this same
+package's documented contract for the durable path ("count EVERY failure, log only the FIRST"),
+and because `Requeue` prepends the events that just failed to send, the first thing discarded is
+the OLDEST unsent history: the beginning of whatever happened during the outage. Shipped: broadcast
+expiry derived from the live limiter window (with a negative age — clock rollback — failing toward
+the local decision, a disagreement between the enforcement and reporting paths that the sweep's own
+gate caught inside the first version of the fix), a freshness health plane armed only on a
+clustered node, counted audit-push drops, and 17 gates with every defect gate verified failing
+against the pre-fix tree. No new alert event: a stale broadcast is always the CP link, which
+already alerts. See rows CL-20/CL-21, §29, and `docs/operator/cluster-rate-limit-freshness.md`.
 
 **2026-08-24 — CHAOS-55 sweep (the fencing lease's recovery paths).** ADR-0005 built the
 fence to answer *may this node write?* and answers it correctly in every direction. What it never
@@ -3375,7 +3421,7 @@ ACKs StartTLS and then never negotiates TLS hangs with `SetTimeout` armed.
 
 This was verified directly against the library, not assumed, and the check is
 kept as a permanent **defect proof**
-(`TestChaos57_SetTimeoutDoesNotBoundStartTLSHandshake`): it asserts that go-ldap
+(`TestChaos58_SetTimeoutDoesNotBoundStartTLSHandshake`): it asserts that go-ldap
 still behaves this way, so a future library release that fixes it fails the
 build rather than leaving a backstop silently guarding nothing — the role
 `BareGracefulStopIsUnboundedOnAWedgedStream` plays for CHAOS-56.
@@ -4492,3 +4538,194 @@ verification on an unauthenticated path.
 
 See rows AU-3/AU-3a/AU-3c/AU-3d/AU-3e, `internal/authcost` (package comment),
 `auth_cost_health.go`, and `docs/operator/credential-verification-cost.md`.
+
+## 30. CHAOS-61 — The Data Plane's outbound cluster state under a Control Plane outage
+
+**Date:** 2026-09-08 · **Domain:** DP→CP gossip (`controlplane_client.go`), the
+distributed rate limiter (`security.go`), the DP→CP audit push queue
+(`internal/audit`).
+
+### 30.1 Why this domain
+
+Register row **HA-1** records the deliberate posture for a DP that loses its
+Control Plane: it keeps serving its last-known-good *config*. That posture was
+reasoned about for configuration and reasoned about carefully. This sweep asked
+the adjacent question the row does not cover — what happens to the DP's other
+outbound cluster state, the per-tick loops that are not config sync at all
+(`rateLimitGossipLoop`, `revocationSyncLoop`, `auditPushLoop`, `metricsLoop`) —
+and found the same posture applied to data where it is **not** correct, in one
+case with a customer-visible, permanently self-sustaining denial.
+
+### 30.2 CL-20 — a rate-limit broadcast that never expired
+
+Cluster rate limiting is gossip: each DP reports hot IPs, the CP aggregates the
+fleet, and the DP adds the returned per-IP remote total to its own local count:
+
+```go
+localCount := len(b.timestamps)
+remoteCount := clusterCounts.Get(ip)
+if localCount+remoteCount >= limit { return false }
+```
+
+`clusterCounts.Apply` is reached from exactly one place — the gossip loop's
+SUCCESS branch. A failed `SyncRateLimits` logs and `continue`s. So the moment
+the CP became unreachable the last broadcast **froze in the map and was
+enforced for the rest of the process lifetime**.
+
+The reachable worst case needs no attacker and no unusual configuration: an IP
+whose cluster-wide total was at or above `limit` at the instant of the outage —
+an ordinary NAT or corporate egress address, which is exactly the kind of IP
+that gets hot — is thereafter denied on this node with `localCount = 0`. **A
+total blackhole for that client, on a healthy proxy, cleared only by the CP
+returning or a process restart.** The quieter half is worse to diagnose: any
+non-zero frozen remote count permanently shrinks the node's local allowance for
+that IP.
+
+It was also unfalsifiable from the outside. `RATE_LIMITED <ip>` is logged per
+request and names only the IP; nothing distinguished "this client is sending
+too fast" from "this node is enforcing an hour-old number from a Control Plane
+that has been gone since Tuesday".
+
+**The fix is arithmetic, not posture, and that matters.** `RemoteCounts` is
+defined as the total *in the current window*: a broadcast received at `T`
+describes timestamps in `[T-W, T]`, so at `now > T+W` every timestamp it
+counted has aged out and its contribution to the current window is exactly
+zero. Serving the frozen value is not a conservative choice — it is a wrong
+answer. `clusterCountStore` therefore stamps every applied broadcast and
+`FreshCount(ip, now, maxAge)` returns 0 past the window; there is deliberately
+no unconditional `Get` left, so the frozen-count path cannot be reintroduced by
+a future caller.
+
+**The Control Plane already applied this exact reasoning in the other
+direction.** `rateLimitAggregator.ClusterTotalsExcluding` prunes any node that
+has not reported for two minutes, precisely so a dead DP's counts stop
+suppressing fleet traffic. The rule existed on one side of the link and not the
+other — and the side that lacked it is the one that makes the allow/deny call
+on live traffic. That asymmetry, not the missing expiry itself, is the finding:
+**a staleness rule that is only half-applied is a staleness rule nobody
+reviewed as a pair.**
+
+Two implementation details are load-bearing:
+
+1. **The max-age is DERIVED from the live limiter** (`clusterRemoteCountMaxAge(rl.Window())`),
+   not a second constant. A hardcoded minute would silently disagree with any
+   operator who configured a different window, in the permissive direction.
+2. **A NEGATIVE age is stale, not fresh.** `age >= maxAge` alone reads a
+   future stamp (clock rollback between the stamp and the read) as brand new
+   and honours the broadcast for however far back the clock went. This was
+   caught by the sweep's own gate, against the first version of the fix: the
+   enforcement path and the reporting path had reached opposite verdicts on the
+   same condition. Two answers to one question is the defect; both now fail
+   toward the local decision, where every other failure on this path lands.
+
+Freshness is **evaluated, never latched** (`clusterRateLimitFreshness()` derives
+it from the stamp on every read), so recovery needs no clearing path and a
+gossip loop that wedges entirely still reports the truth to `/metrics` — the
+`ca_health.go` `Usable()` discipline.
+
+### 30.3 CL-21 — the DP→CP audit push queue dropped silently
+
+`internal/audit` bounds the DP push queue at 1000 entries and trims to the
+newest. The bound is correct — a DP that cannot reach its CP must not grow it
+without limit. The silence was not: there was **no counter, no metric and no
+log line**, three hundred lines below this package's own documented contract
+for the durable JSONL path ("count EVERY failure, log only the FIRST").
+
+Which entries are lost makes it worse rather than better. `Requeue` prepends
+the events that just failed to send, and the trim keeps the newest — so the
+first thing discarded is the **oldest unsent history**, the beginning of
+whatever happened during the outage. That is the half an investigation needs
+most, and losing it with no marker is CWE-778 in the same shape the
+durable-write counter exists to prevent. The local JSONL file on the node is
+unaffected; what acquires a hole is the CENTRALIZED trail, which is the surface
+an operator actually watches in a cluster.
+
+Both writers now go through one `trimPendingLocked` chokepoint so neither can
+drop without charging `PendingDrops()`; surfaced as
+`culvert_audit_cluster_push_drops_total` and, when non-zero,
+`auditClusterPushDrops` on `/healthz`.
+
+### 30.4 What shipped
+
+* Broadcast expiry at the rate-limit window, derived from the live limiter,
+  with the negative-age case failing toward local.
+* A freshness health plane: `culvert_cluster_ratelimit_{remote_stale,broadcast_age_seconds,stale_episodes_total}`
+  (emitted ONLY on a node where cluster rate limiting is armed — CHAOS-54's
+  rule), five read-only fields on `GET /api/cluster/rate-limits`, a Cluster-panel
+  banner, and one log line per TRANSITION in each direction (the gossip loop
+  ticks every 5s; a per-tick line would report an hour-long outage 720 times).
+* Counted audit push-queue drops with the package's first-failure-only log.
+* 17 gates in `cluster_ratelimit_freshness_chaos_test.go`. Every DEFECT gate was
+  verified failing against the pre-fix shape.
+
+**No new alert event.** A stale broadcast is always caused by the CP link,
+which already alerts and already carries a `cp_poll` row on `/ready`. A second
+event name for one root cause is two pages for one action.
+
+**The control gates are the point.** The cheapest way to pass every defect gate
+is to stop consulting remote counts at all — which would silently delete the
+distributed rate limiter. `TestChaos61_FreshBroadcastStillSuppresses` and
+`TestChaos61_BroadcastAppliesForTheWholeWindow` pin the healthy path from both
+sides, so a fix that passes by deleting the feature fails.
+
+### 30.4b Review follow-up — a defect in the fix itself (Codex, PR #1346)
+
+The freshness plane's emission rule is stated in its own header — a 0/1 gauge on
+a node that never had the feature is indistinguishable from a broken one, so
+emit only when ARMED — and the first version broke it in the same file. `Armed`
+checked only `clusterRateLimitEnabled`, but `rateLimitGossipLoop` sets that flag
+UNCONDITIONALLY when it starts and then skips every RPC while `rl.Enabled()` is
+false. That is the DEFAULT posture: `Configure` enables the limiter only for a
+limit > 0, so on a Data Plane with no rate limit configured no broadcast can
+ever be applied — and every freshness surface reported a permanent,
+un-clearable degradation on a node that is not rate limiting at all: gauge
+pinned at 1, an episode counted, a warning logged, the panel banner shown.
+
+The condition was applied to *"is gossip running"* but not to *"is anything
+being decided"*. `Armed` now requires BOTH halves of what the request path
+itself requires — the gossip loop running (so `AllowAuto` dispatches to the
+cluster-aware path) AND `rl.Enabled()` (`AllowClusterAware` returns true
+immediately when the limiter is off, before `FreshCount` is ever reached) — and
+an un-armed node is never `Stale`, because staleness is a statement about
+ENFORCEMENT, not about the age of a value nobody reads. `Applied` and `Age`
+stay honest there, so suppressing the ALARM does not blank the FACTS.
+
+Three gates, each verified failing against the pre-fix condition:
+`LimiterOffIsNeverReportedStale`, `LimiterOffStillReportsWhatArrived`, and
+`ArmedNeedsBothHalves` — the last being the control that suppressing the false
+alarm did not also silence the real one.
+
+The lesson is narrower than the finding: **a health surface's armed condition
+must be the same predicate as the code path it reports on.** The request path
+needs two facts to consult a remote count; the reporter checked one, and a
+false alarm on the default posture is the kind of noise that trains operators
+to ignore the gauge before the real outage arrives.
+
+### 30.5 What is deliberately left
+
+* **HA-1 itself is unchanged.** Config staleness is a posture decision with a
+  recorded owner; this sweep touched only data whose own definition makes it
+  expire.
+* **None of the four auxiliary DP loops back off** (`revocationSyncLoop` 3s,
+  `rateLimitGossipLoop` 5s, `auditPushLoop` 10s, `metricsLoop`). Against a
+  down CP each retries at a fixed cadence with a fixed log line, and none
+  jitters — WK-13/HA-11's herd shape, registered P2, and now with a second
+  instance recorded here. Only the config poll (`pollConfig`) backs off.
+* **`pollConfig` double-counts a failure.** It increments `failCount` and then
+  calls `backoff`, which increments it again — so the delay reaches its ceiling
+  in three failures rather than six, and the "3 consecutive failures" failover
+  threshold fires after two. Cosmetic; recorded rather than changed inside a
+  sweep about something else.
+* **A partitioned fleet still under-counts.** Nodes that reach the CP see totals
+  excluding those that cannot. Inherent to gossip aggregation.
+
+### 30.6 The process lesson
+
+> A staleness rule applied on one side of a link and not the other is not half
+> a rule — it is an unreviewed asymmetry. The Control Plane pruned dead Data
+> Planes for exactly the reason the Data Plane needed to expire a dead Control
+> Plane's broadcast, and the code that did it sits in the same repository, two
+> files away, with a comment explaining why. What was missing was ever asking
+> the question in both directions at once.
+
+Runbook: `docs/operator/cluster-rate-limit-freshness.md`.
