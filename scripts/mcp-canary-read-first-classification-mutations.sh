@@ -364,7 +364,7 @@ run_mutation M13 \
   'TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass' \
   . "$LGATE" \
   's/\tif !g\.readFirst\(in\.Operation\) \{/\tif false \&\& !g.readFirst(in.Operation) {/' \
-  's/\t\tadmitUnderActivation: func\(now time\.Time, opClass policy\.OperationClass, ident canary\.ExecutionIdentity, trust canaryTrustProbe\) canaryAdmission \{\n\t\t\treturn globalCanaryRuntime\.admitLiveExecution\(capb, now, opClass, ident, trust\)/\t\tadmitUnderActivation: func(now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission \{\n\t\t\t_ = opClass\n\t\t\treturn globalCanaryRuntime.admitLiveExecution(capb, now, policy.OpRead, ident, trust)/'
+  's/\t\t\treturn globalCanaryRuntime\.admitLiveExecution\(capb, now, opClass, resolvedScope, scopeNow, ident, trust\)/\t\t\t_ = opClass\n\t\t\treturn globalCanaryRuntime.admitLiveExecution(capb, now, policy.OpRead, resolvedScope, scopeNow, ident, trust)/'
 
 # M14 — THE PROMOTION IS DROPPED ON THE FLOOR. `in.Operation = op` moves ABOVE the call that may
 # promote it, so the classification is computed correctly and then never reaches the decision tuple.
@@ -408,7 +408,7 @@ EXECUTOR=internal/mcp/execution/executor.go
 # one that notices.
 run_mutation M17 \
   'the scope hash is never captured at resolution' \
-  'TestScopeInForce_UnchangedEnvelopeStillProceeds' \
+  'TestScopeInForce_EnvelopeIsCarriedFromResolutionToTheBoundary' \
   . "$RESOLVE" \
   's/\tr\.ScopeHash = a\.scope\.Hash\(\)\n//'
 

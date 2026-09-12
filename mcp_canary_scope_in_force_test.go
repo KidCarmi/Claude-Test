@@ -353,3 +353,51 @@ func TestScopeInForce_EmergencyKillStillOutranksAGrantedAdmission(t *testing.T) 
 		t.Fatal("the kill generation must advance so the boundary re-read can see it")
 	}
 }
+
+// ── THE CARRY, END TO END ─────────────────────────────────────────────────────────────────────
+//
+// Every case above hands the boundary an envelope directly, which proves the COMPARISON but says
+// nothing about whether the envelope ever gets there on its own. This one drives the real
+// resolution: Executor.Resolve stamps the hash onto its Resolution from the scope it decided
+// against, Execute carries it onto the ExecInput, liveGateInput hands it to the gate, and the
+// admission transaction compares it against the installed scope.
+//
+// It is written as a POSITIVE control — the upstream is reached — because that is the direction a
+// broken carry fails in: a hash that never arrives is "", the boundary correctly refuses "", and
+// the only visible symptom is that a healthy request stops executing. A negative test would pass
+// against a carry that was silently dropped, which is precisely the mutation this gate exists to
+// catch (M17).
+func TestScopeInForce_EnvelopeIsCarriedFromResolutionToTheBoundary(t *testing.T) {
+	up := &recordingUpstream{}
+	cfg := armCanaryLiveTier(t, up, true, 5)
+	ex := cfg.Deps.Executor
+
+	in := liveExecInput(policy.OpRead, "t1", "p1")
+	in.ToolStillCurrent = func() bool { return true }
+
+	// The resolution must itself carry the envelope it decided under. Asserted separately from
+	// the execution below so a failure names WHICH link broke rather than only that the upstream
+	// went unreached.
+	res := ex.Resolve(in)
+	if res.ScopeHash == "" {
+		t.Fatal("SECURITY: the resolution carries no authorization envelope — nothing downstream " +
+			"can revalidate a fact that was never captured")
+	}
+	if want := getMCPRollout().stateFor(rollout.CapabilityGateway).ScopeHash(); res.ScopeHash != want {
+		t.Fatalf("the resolution must carry the scope it decided against: got %q want %q", res.ScopeHash, want)
+	}
+	// And the request must NOT already carry it — proving the carry below is the executor's doing
+	// and not something the fixture supplied.
+	if in.ResolvedScopeHash != "" {
+		t.Fatal("fixture drifted: the input must arrive with no envelope so the carry is attributable")
+	}
+
+	if out := ex.Execute(t.Context(), in, res); out.Executed != true && up.callCount() == 0 {
+		t.Fatalf("the carried envelope must let a healthy request reach upstream, out=%+v", out)
+	}
+	if up.callCount() != 1 {
+		t.Fatalf("SECURITY: the envelope did not survive resolution → ExecInput → LiveGateInput → "+
+			"admission; a healthy request was refused as though the scope had changed, calls=%d",
+			up.callCount())
+	}
+}
