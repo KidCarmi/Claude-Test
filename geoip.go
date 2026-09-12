@@ -521,8 +521,12 @@ func lookupPublicHostIP(host string) net.IP {
 		if noteDNSResolveFailure(reason, time.Now()) {
 			// The full error goes here and nowhere else — it embeds the queried
 			// hostname, which is attacker-chosen, so it must not reach the alert
-			// dedup key or the viewer-role contract row.
-			logger.Printf("DNS resolution failed for %q (reason: %s): %v", sanitizeLog(host), reason, err)
+			// dedup key or the viewer-role contract row. Being attacker-chosen is
+			// also why it is SANITISED rather than merely confined: a *net.DNSError
+			// carries the name verbatim, so printing the error raw would re-emit
+			// through `err` exactly the bytes the `host` argument beside it already
+			// sanitises (CWE-117).
+			logger.Printf("DNS resolution failed for %q (reason: %s): %q", sanitizeLog(host), reason, sanitizeLog(err.Error()))
 		}
 		return nil
 	}
