@@ -620,7 +620,7 @@ func TestAPIAuthUsers_List(t *testing.T) {
 
 func TestAPIAuthUsers_Create(t *testing.T) {
 	w := httptest.NewRecorder()
-	apiAuthUsers(w, jsonReq(http.MethodPost, "/api/auth/users", map[string]string{
+	apiAuthUsers(w, jsonReq(http.MethodPost, fencedUsersPath(), map[string]string{
 		"username": "testoperator",
 		"password": "Operator1pass",
 		"role":     "operator",
@@ -717,7 +717,7 @@ func TestAPIAuthLockouts_Unlock_ClearsLockout(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	apiAuthLockouts(w, jsonReq(http.MethodPost, "/api/auth/lockouts", map[string]string{"username": "lockoutunlocktest"}))
+	apiAuthLockouts(w, jsonReq(http.MethodPost, fencedLockoutsPath(), map[string]string{"username": "lockoutunlocktest"}))
 	assertStatus(t, w, http.StatusOK)
 
 	if locked, _ := loginLimiter.Check("198.51.100.51", "lockoutunlocktest"); locked {

@@ -112,18 +112,14 @@ type RevocationList struct {
 	mu     sync.Mutex
 	tokens map[string]time.Time // b64 payload → session expiry
 	users  map[string]time.Time // username → revocation expiry (all sessions for this user)
-	// usersBefore: username → cutoff; sessions issued at or before the
-	// cutoff are revoked, later logins are honoured (role/credential change).
-	usersBefore map[string]time.Time
 }
 
 // NewRevocationList returns an empty list (used by tests to swap the
 // package singleton, mirroring the bl pointer-swap idiom).
 func NewRevocationList() *RevocationList {
 	return &RevocationList{
-		tokens:      map[string]time.Time{},
-		users:       map[string]time.Time{},
-		usersBefore: map[string]time.Time{},
+		tokens: map[string]time.Time{},
+		users:  map[string]time.Time{},
 	}
 }
 
@@ -160,34 +156,6 @@ func (r *RevocationList) RevokeUser(username string) {
 	r.mu.Lock()
 	r.users[username] = time.Now().Add(TTL())
 	r.mu.Unlock()
-}
-
-// RevokeUserIssuedBefore invalidates every session of username issued at or
-// before cutoff (a role or credential change): the user must log in again,
-// and a login AFTER the cutoff is honoured immediately. The cutoff is kept
-// for one TTL (no earlier session can outlive it).
-func (r *RevocationList) RevokeUserIssuedBefore(username string, cutoff time.Time) {
-	r.mu.Lock()
-	if prev, ok := r.usersBefore[username]; !ok || cutoff.After(prev) {
-		r.usersBefore[username] = cutoff
-	}
-	r.mu.Unlock()
-}
-
-// IsSessionSuperseded reports whether a session of username issued at
-// issuedAt falls under a RevokeUserIssuedBefore cutoff.
-func (r *RevocationList) IsSessionSuperseded(username string, issuedAt time.Time) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	cutoff, ok := r.usersBefore[username]
-	if !ok {
-		return false
-	}
-	if time.Now().After(cutoff.Add(TTL())) {
-		delete(r.usersBefore, username) // lazy eviction: nothing issued before it can still be valid
-		return false
-	}
-	return !issuedAt.After(cutoff)
 }
 
 // IsUserRevoked returns true if all sessions for the given username are revoked.
@@ -259,16 +227,14 @@ func (r *RevocationList) Count() int {
 // tests that touch shared revocation state.
 func (r *RevocationList) SwapForTest() (restore func()) {
 	r.mu.Lock()
-	prevTokens, prevUsers, prevBefore := r.tokens, r.users, r.usersBefore
+	prevTokens, prevUsers := r.tokens, r.users
 	r.tokens = map[string]time.Time{}
 	r.users = map[string]time.Time{}
-	r.usersBefore = map[string]time.Time{}
 	r.mu.Unlock()
 	return func() {
 		r.mu.Lock()
 		r.tokens = prevTokens
 		r.users = prevUsers
-		r.usersBefore = prevBefore
 		r.mu.Unlock()
 	}
 }
@@ -394,22 +360,15 @@ type Session struct {
 	// decoding cleanly: their Jti unmarshals to "" and the field is
 	// simply absent on the wire.
 	Jti string `json:"jti,omitempty"`
-	// Iat is the issue instant in Unix NANOSECONDS (FE-6A.0 R11): a role or
-	// credential change revokes every session of that user issued at or
-	// before the change (RevokeUserIssuedBefore) while a login AFTER it is
-	// honoured — unlike RevokeUser (account deletion), which blocks the user
-	// for a full TTL. omitempty keeps legacy cookies decoding; they carry no
-	// Iat and are treated as issued at Exp − TTL.
+	// Iat is the issue instant in Unix nanoseconds (informational).
 	Iat int64 `json:"iat,omitempty"`
-}
-
-// IssuedAt returns the session's issue instant (Exp − TTL for a legacy
-// cookie without Iat).
-func (s *Session) IssuedAt() time.Time {
-	if s.Iat > 0 {
-		return time.Unix(0, s.Iat)
-	}
-	return time.Unix(s.Exp, 0).Add(-TTL())
+	// Gen is the DURABLE per-user security generation the session was
+	// issued under (FE-6A.0 correction, Blocker 2). Package main validates
+	// it against the user's current durable record on every authenticated
+	// request: a role or credential change advances the record, so every
+	// earlier session is invalid — across restarts — while a login after the
+	// change is honoured. A legacy cookie without Gen fails closed.
+	Gen int64 `json:"gen,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -462,11 +421,6 @@ func Decode(raw string) (*Session, error) {
 	// User-level revocation (account deleted while session was active).
 	if s.Sub != "" && Revoked.IsUserRevoked(s.Sub) {
 		return nil, fmt.Errorf("session: user revoked")
-	}
-	// Role/credential change (FE-6A.0 R11): sessions issued before the
-	// change are superseded; a later login is honoured.
-	if s.Sub != "" && Revoked.IsSessionSuperseded(s.Sub, s.IssuedAt()) {
-		return nil, fmt.Errorf("session: superseded by an account change")
 	}
 	return &s, nil
 }

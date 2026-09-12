@@ -18,6 +18,14 @@ func isSecureRequest(r *http.Request) bool {
 }
 
 func setUISessionCookie(w http.ResponseWriter, r *http.Request, username string, role UIRole) error {
+	// The session carries the user's CURRENT durable security generation
+	// (Blocker 2); uiAuthMiddleware re-validates it against the roster on
+	// every request. A legacy-only identity (mirror, no roster entry) is
+	// generation 1 by definition.
+	gen, ok := cfg.UserSecurityGeneration(username)
+	if !ok {
+		gen = 1
+	}
 	s := &Session{
 		Sub:      username,
 		Provider: "local",
@@ -25,6 +33,7 @@ func setUISessionCookie(w http.ResponseWriter, r *http.Request, username string,
 		Exp:      time.Now().Add(getSessionTTL()).Unix(),
 		Jti:      newSessionJti(),
 		Iat:      time.Now().UnixNano(),
+		Gen:      gen,
 	}
 	value, err := encodeSession(s)
 	if err != nil {

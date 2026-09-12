@@ -44,6 +44,12 @@ func setupProxyTest(t *testing.T) {
 	bl = blocklist.New()
 	ipf = &IPFilter{single: map[string]bool{}}
 	rl = newRateLimiter()
+	// Restore the package-global admin Config afterwards: TestMain binds it
+	// to a durable roster file (FE-6A.0 correction, Blocker 7), and a leaked
+	// in-memory replacement would make every later admin-roster handler test
+	// answer 503 persistence_not_configured.
+	prevCfg := cfg
+	t.Cleanup(func() { cfg = prevCfg })
 	cfg = &Config{cache: authCacheStore{entries: map[string]*authCacheEntry{}}}
 	pluginReplace(nil)
 	// Also reset policy state — callers like TestHandleRequest_DefaultDeny_NoRules

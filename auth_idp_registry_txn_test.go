@@ -154,7 +154,7 @@ func TestIdPRegistryTxn_APIMutationsReport500AndAuditNothing(t *testing.T) {
 
 	// POST create → 500.
 	w = httptest.NewRecorder()
-	apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", ldapProfileBodyForPut("Another AD", nil)))
+	apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath(), ldapProfileBodyForPut("Another AD", nil)))
 	assertStatus(t, w, http.StatusInternalServerError)
 
 	// DELETE → 500 (NOT 404 — the profile exists; the appliance failed).
@@ -178,7 +178,7 @@ func TestIdPRegistryTxn_APIMutationsReport500AndAuditNothing(t *testing.T) {
 	w = httptest.NewRecorder()
 	bad := ldapProfileBodyForPut("Bad AD", nil)
 	bad["ldap"].(map[string]any)["url"] = "https://not-ldap"
-	apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", bad))
+	apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath(), bad))
 	assertStatus(t, w, http.StatusBadRequest)
 }
 

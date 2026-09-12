@@ -12,6 +12,7 @@ package main
 // logged, cached, or audited.
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -64,9 +65,10 @@ func apiIdPLegacyLDAP(w http.ResponseWriter, r *http.Request) {
 	}
 	c := legacyLDAPYAMLConfig()
 	if c == nil {
-		out := map[string]any{"present": false, "retired": legacyLDAPRetired(), "scope": "node-local"}
+		out := map[string]any{"present": false, "retired": legacyLDAPRetired(), "scope": "node-local",
+			"cutoverDurability": legacyLDAPCutoverDurability()}
 		if rec := legacyLDAPCutover(); rec != nil {
-			out["cutover"] = rec
+			out["cutover"] = legacyLDAPCutoverReadModel(rec)
 		}
 		jsonOK(w, out)
 		return
@@ -91,10 +93,14 @@ func apiIdPLegacyLDAP(w http.ResponseWriter, r *http.Request) {
 		"tlsSkipVerify":            c.TLSSkipVerify,
 		"cacheTtlSeconds":          int(c.CacheTTL / time.Second),
 	}
-	// FE-6A.0 R7: the DURABLE, operation-identified cutover record (actor,
-	// operationId, the enabling profile + registry revision it was bound to).
+	// FE-6A.0 R7: the operation-identified cutover record (actor,
+	// operationId, the enabling profile + registry revision it was bound to)
+	// with its DURABILITY truth (correction, Blocker 9): an observed cutover
+	// whose sentinel save failed is active at runtime but reported
+	// pending_reconciliation, never claimed durable.
+	out["cutoverDurability"] = legacyLDAPCutoverDurability()
 	if rec := legacyLDAPCutover(); rec != nil {
-		out["cutover"] = rec
+		out["cutover"] = legacyLDAPCutoverReadModel(rec)
 	}
 	jsonOK(w, out)
 }
@@ -119,6 +125,9 @@ func apiIdPLegacyLDAPImport(w http.ResponseWriter, r *http.Request) {
 		writeRefusal(w, http.StatusNotFound, refusalNotFound, "no legacy YAML ldap configuration is present", nil)
 		return
 	}
+	if !requireDurableIdP(w) {
+		return
+	}
 	p := &IdPProfile{
 		Name:    "Imported legacy LDAP",
 		Type:    IdPTypeLDAP,
@@ -129,12 +138,10 @@ func apiIdPLegacyLDAPImport(w http.ResponseWriter, r *http.Request) {
 		writeIdPRefusal(w, err)
 		return
 	}
-	if err := publishCurrentConfigSnapshot(); err != nil {
-		logger.Printf("UI: legacy LDAP import published locally but the cluster snapshot was refused: %v", err)
-	}
-	auditEventDiff(r, "idp.import", p.ID, "imported legacy YAML LDAP configuration", nil, auditIdPProfile(p))
+	fleet := idpPublishFleet("legacy LDAP import")
+	auditEventDiff(r, "idp.import", p.ID, "imported legacy YAML LDAP configuration"+fleet.auditSuffix(), nil, auditIdPProfile(p))
 	logger.Printf("UI: legacy YAML LDAP imported as IdP profile id=%q (disabled; test-then-enable)", sanitizeLog(p.ID))
-	jsonOK(w, publicIdPProfile(p))
+	jsonOK(w, idpWithFleet(publicIdPProfile(p), fleet))
 }
 
 // legacyLDAPToProfileConfig maps the YAML LDAPConfig into the profile shape,
@@ -304,17 +311,36 @@ func resolveTestBindCredential(p *IdPProfile) {
 	}
 }
 
-// ldapTestErrText sanitizes server-controlled error text (CWE-117) and bounds
-// its length so a hostile directory can't stuff the response.
+// ldapTestErrText reduces a directory/transport error to a BOUNDED class
+// (FE-6A.0 correction, Blocker 6). The raw text embeds the directory's
+// hostname, TLS diagnostics and transport detail, and the admin diagnostic
+// report is an API response: only the class crosses the boundary, with the
+// Action hint carrying the operator guidance. The raw error is never logged
+// or audited either.
 func ldapTestErrText(err error) string {
 	if err == nil {
 		return ""
 	}
-	s := sanitizeLog(err.Error())
-	if len(s) > ldapTestMaxErrLen {
-		s = s[:ldapTestMaxErrLen] + "…"
+	msg := err.Error()
+	var ne net.Error
+	switch {
+	case errors.As(err, &ne) && ne.Timeout(), strings.Contains(msg, "i/o timeout"), strings.Contains(msg, "deadline exceeded"):
+		return "timeout"
+	case strings.Contains(msg, "x509:"), strings.Contains(msg, "tls:"), strings.Contains(msg, "TLS"):
+		return "tls_failed"
+	case strings.Contains(msg, "connection refused"), strings.Contains(msg, "no such host"), strings.Contains(msg, "network is unreachable"), strings.Contains(msg, "dial"):
+		return "unreachable"
+	case strings.Contains(msg, "Invalid Credentials"), strings.Contains(msg, "Result Code 49"):
+		return "invalid_credentials"
+	case strings.Contains(msg, "Result Code 32"), strings.Contains(msg, "No Such Object"):
+		return "no_such_object"
+	case strings.Contains(msg, "Result Code 50"), strings.Contains(msg, "Insufficient Access"):
+		return "insufficient_access"
+	case strings.Contains(msg, "Result Code"):
+		return "directory_error"
+	default:
+		return "directory_error"
 	}
-	return s
 }
 
 // ldapDialErrorAction maps a dial/TLS failure to an actionable operator hint.

@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+
+	"github.com/crewjam/saml/samlsp"
 )
 
 // ---------------------------------------------------------------------------
@@ -179,6 +181,21 @@ type IdPRegistry struct {
 	// quarantine evidence through the fenced repair (or a CP snapshot
 	// rebuilds the DP's copy).
 	degraded *idpRegistryDegradation
+
+	// ops is the durable operation-intent ring (Blocker 9), a sibling of the
+	// registry file; nil until first use on a registry built without Load.
+	ops *idpOperationStore
+}
+
+// operations returns the registry's intent store (lazily in-memory for a
+// registry that was never loaded from a path).
+func (r *IdPRegistry) operations() *idpOperationStore {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ops == nil {
+		r.ops = newIdPOperationStore(r.path)
+	}
+	return r.ops
 }
 
 // idpRegistryDegradation is the read-only degraded posture (R8).
@@ -227,6 +244,46 @@ func (e *idpStaleError) Error() string {
 	return fmt.Sprintf("idp: stale revision (current %d)", e.Current)
 }
 
+// idpDocStaleError is the document-level twin (Blocker 4): a CREATE is
+// fenced on the registry DOCUMENT revision — the only identity that exists
+// before the profile does — and carries the authoritative value.
+type idpDocStaleError struct{ Current string }
+
+func (e *idpDocStaleError) Error() string {
+	return "idp: stale document revision (current " + e.Current + ")"
+}
+
+// idpValidationError is an INTRINSIC write-input defect (400 invalid_input):
+// the message is Culvert's own wording about the caller's input and carries
+// no dependency detail (Blocker 6).
+type idpValidationError struct{ msg string }
+
+func (e *idpValidationError) Error() string { return e.msg }
+
+// idpCompileError is a DEPENDENCY / provider-construction failure (502
+// provider_compile_failed): the profile validated, but the live provider
+// could not be built — OIDC discovery, SAML metadata fetch/parse, LDAP
+// provider construction. Only the bounded reason class crosses the trust
+// boundary; the underlying error (which embeds hostnames, TLS and transport
+// text) is dropped at this seam and never logged, audited or returned.
+type idpCompileError struct{ reason string }
+
+func (e *idpCompileError) Error() string { return "idp: provider compile failed (" + e.reason + ")" }
+
+// idpCompileReason maps a profile type to its bounded compile-failure class.
+func idpCompileReason(t IdPType) string {
+	switch t {
+	case IdPTypeOIDC:
+		return "oidc_discovery"
+	case IdPTypeSAML:
+		return "saml_metadata"
+	case IdPTypeLDAP:
+		return "ldap_provider"
+	default:
+		return "unsupported"
+	}
+}
+
 // Load reads IdP profiles from the JSON file.  Silent no-op when path is
 // empty. A CORRUPT file never fails the boot (R8): it is quarantined beside
 // the store (CHAOS-05 convention, `<path>.corrupt.<unixnano>`), the registry
@@ -241,6 +298,10 @@ func (r *IdPRegistry) Load(path string) error {
 	noteResidualQuarantine("idp_profiles", path)
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
+		r.mu.Lock()
+		r.ops = newIdPOperationStore(path)
+		r.mu.Unlock()
+		r.reconcileOperations()
 		return nil // first run — empty registry
 	}
 	if err != nil {
@@ -259,6 +320,7 @@ func (r *IdPRegistry) Load(path string) error {
 		r.profiles = nil
 		r.live = make(map[string]IdentityProvider)
 		r.degraded = d
+		r.ops = newIdPOperationStore(path)
 		r.mu.Unlock()
 		logger.Printf("IdP: registry DEGRADED — %s", sanitizeLog(d.Detail))
 		return nil
@@ -297,8 +359,21 @@ func (r *IdPRegistry) Load(path string) error {
 	r.profiles = profiles
 	r.live = live
 	r.degraded = nil
+	r.ops = newIdPOperationStore(path)
 	r.mu.Unlock()
+	r.reconcileOperations()
 	return nil
+}
+
+// reconcileOperations settles every non-terminal durable intent against the
+// registry content just loaded (Blocker 9: a process that died between the
+// intent and the outcome leaves a truth the file can decide).
+func (r *IdPRegistry) reconcileOperations() {
+	ops := r.operations()
+	n := ops.Reconcile(func(id string) bool { return r.Get(id) != nil }, r.DocumentRevision())
+	if n > 0 {
+		logger.Printf("IdP: reconciled %d unsettled operation intent(s) from the registry file", n)
+	}
 }
 
 // Degraded returns a copy of the degraded posture, or nil when healthy.
@@ -504,6 +579,17 @@ func validateUpsertProfile(p *IdPProfile) error {
 		if err := validateExternalURL(p.OIDC.Issuer); err != nil {
 			return fmt.Errorf("idp oidc issuer: %w", err)
 		}
+		if p.Enabled && p.OIDC.ClientID == "" {
+			// Intrinsic (the constructor would refuse it before any
+			// discovery): keep it a 400, never a dependency failure.
+			return fmt.Errorf("idp oidc: client_id is required")
+		}
+	}
+	if p.Type == IdPTypeOIDC && p.OIDC == nil && p.Enabled {
+		return fmt.Errorf("idp oidc: config is required")
+	}
+	if p.Type == IdPTypeLDAP && p.LDAP == nil {
+		return fmt.Errorf("idp ldap: config is required")
 	}
 	if p.Type == IdPTypeSAML {
 		if err := validateSAMLProfileConfig(p.SAML); err != nil {
@@ -545,14 +631,27 @@ func normalizeIdPProfileWriteInput(p *IdPProfile) {
 func prepareProfile(p *IdPProfile) (IdentityProvider, error) {
 	normalizeIdPProfileWriteInput(p)
 	if err := validateUpsertProfile(p); err != nil {
-		return nil, err
+		return nil, &idpValidationError{msg: err.Error()}
 	}
 	if !p.Enabled {
 		return nil, nil
 	}
 	prov, err := compileIdPProfile(p)
 	if err != nil {
-		return nil, fmt.Errorf("idp compile error: %w", err)
+		// A SAML profile carrying INLINE metadata XML that does not parse is
+		// the caller's own input, not a dependency: report it as validation
+		// (bounded wording — the blob is never echoed).
+		if p.Type == IdPTypeSAML && p.SAML != nil && p.SAML.MetadataXML != "" {
+			if _, perr := samlsp.ParseMetadata([]byte(p.SAML.MetadataXML)); perr != nil {
+				return nil, &idpValidationError{msg: "idp saml: metadata_xml is not valid SAML metadata"}
+			}
+		}
+		// Blocker 6: the cause embeds the dependency's hostname / TLS /
+		// transport text. It is dropped HERE — only the bounded class
+		// survives; the process log carries the class too (never the cause).
+		reason := idpCompileReason(p.Type)
+		logger.Printf("IdP: provider compile failed id=%q type=%q reason=%s", sanitizeLog(p.ID), sanitizeLog(string(p.Type)), reason)
+		return nil, &idpCompileError{reason: reason}
 	}
 	return prov, nil
 }
@@ -562,9 +661,7 @@ func prepareProfile(p *IdPProfile) (IdentityProvider, error) {
 // Update. A created profile gets revision 1; a replaced one advances.
 func (r *IdPRegistry) Upsert(p *IdPProfile) error {
 	if p.ID == "" {
-		b := make([]byte, 6)
-		rand.Read(b) //nolint:errcheck // crypto/rand.Read never returns an error on supported platforms
-		p.ID = hex.EncodeToString(b)
+		p.ID = mintIdPID()
 	}
 	compiled, err := prepareProfile(p)
 	if err != nil {
@@ -575,18 +672,38 @@ func (r *IdPRegistry) Upsert(p *IdPProfile) error {
 	}, nil)
 }
 
-// Create adds a NEW profile (id minted by the registry) and runs
-// beforePublish between the durable write and the publication (the
-// legacy-LDAP cutover hook of an enabling create).
-func (r *IdPRegistry) Create(p *IdPProfile, beforePublish func(next []*IdPProfile) error) error {
+// mintIdPID mints a fresh registry profile id.
+func mintIdPID() string {
 	b := make([]byte, 6)
 	rand.Read(b) //nolint:errcheck // crypto/rand.Read never returns an error on supported platforms
-	p.ID = hex.EncodeToString(b)
+	return hex.EncodeToString(b)
+}
+
+// Create adds a NEW profile and runs beforePublish between the durable write
+// and the publication (the legacy-LDAP cutover hook of an enabling create).
+// p.ID may be PRE-MINTED by the caller (the operation-identified admin path
+// records it in the durable intent before this call); empty mints one here.
+// expectedDocRev is the registry DOCUMENT revision fence (Blocker 4),
+// decided INSIDE the transaction against the current profile set: "" skips
+// the fence (internal callers), a mismatch is *idpDocStaleError, and an id
+// collision is refused rather than silently replacing.
+func (r *IdPRegistry) Create(p *IdPProfile, expectedDocRev string, beforePublish func(next []*IdPProfile) error) error {
+	if p.ID == "" {
+		p.ID = mintIdPID()
+	}
 	compiled, err := prepareProfile(p)
 	if err != nil {
 		return err
 	}
 	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+		if expectedDocRev != "" {
+			if cur := idpDocumentRevisionOf(cur); cur != expectedDocRev {
+				return idpCandidate{}, &idpDocStaleError{Current: cur}
+			}
+		}
+		if findIdPProfile(cur, p.ID) != nil {
+			return idpCandidate{}, &idpValidationError{msg: "idp: profile id already exists"}
+		}
 		return applyProfileCandidate(cur, live, p, compiled), nil
 	}, beforePublish)
 }

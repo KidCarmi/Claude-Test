@@ -267,13 +267,23 @@ func uiAuthMiddleware(next http.Handler) http.Handler {
 		// Check session cookie (browser login via login overlay).
 		sess, err := readUISessionCookie(r)
 		if err == nil && sess != nil {
-			// Reject sessions for deleted users (Finding 5.2).
-			if sess.Provider == "local" && !cfg.UIUserExists(sess.Sub) {
-				clearUISessionCookie(w, r)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
 			role := UIRole(sess.Role)
+			if sess.Provider == "local" {
+				// The DURABLE user record is the authority (FE-6A.0
+				// correction, Blocker 2): the user must still exist, the
+				// session's security generation must equal the record's
+				// (a role/credential change advances it, so every earlier
+				// session — across restarts — is refused; a legacy cookie
+				// without a generation fails closed), and the role is the
+				// record's, never the cookie's.
+				curRole, curGen, ok := cfg.UserRoleAndGeneration(sess.Sub)
+				if !ok || sess.Gen <= 0 || sess.Gen != curGen {
+					clearUISessionCookie(w, r)
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+					return
+				}
+				role = curRole
+			}
 			if !role.HasRole(RoleViewer) {
 				role = RoleAdmin // backwards compat: sessions without role = admin
 			}

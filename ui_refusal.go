@@ -34,17 +34,28 @@ const (
 	refusalVanished             = "vanished"
 	refusalStale                = "stale"
 	refusalPreconditionRequired = "precondition_required"
-	refusalPersistFailed        = "persist_failed"
-	refusalOutcomeUnknown       = "outcome_unknown"
-	refusalLastAdmin            = "last_admin"
-	refusalUserExists           = "user_exists"
-	refusalReferenced           = "referenced"
-	refusalConfirmMismatch      = "confirm_mismatch"
-	refusalNotDegraded          = "not_degraded"
-	refusalRepairUnavailable    = "repair_unavailable"
-	refusalRegistryDegraded     = "registry_degraded"
-	refusalUpstreamError        = "upstream_error"
-	refusalMethodNotAllowed     = "method_not_allowed"
+	// refusalPersistenceNotConfigured: the store has no persistence path, so an
+	// administrative mutation is refused before any runtime state changes
+	// (FE-6A.0 correction, Blocker 7).
+	refusalPersistenceNotConfigured = "persistence_not_configured"
+	// FE-6A.0 correction, Blocker 6/9 (IdP):
+	refusalProviderCompileFailed = "provider_compile_failed"   // 502: dependency / provider construction (bounded reason)
+	refusalOperationIDRequired   = "operation_id_required"     // 428: a cutover-bearing write needs a client operationId
+	refusalOperationMismatch     = "operation_mismatch"        // 409: operationId reused for a different candidate
+	refusalOperationInProgress   = "operation_in_progress"     // 409: the same operation is still being decided
+	refusalOperationAborted      = "operation_aborted"         // 409: replay of an operation that aborted
+	refusalOperationUnknown      = "operation_outcome_unknown" // 409: replay of a split outcome awaiting reconciliation
+	refusalPersistFailed         = "persist_failed"
+	refusalOutcomeUnknown        = "outcome_unknown"
+	refusalLastAdmin             = "last_admin"
+	refusalUserExists            = "user_exists"
+	refusalReferenced            = "referenced"
+	refusalConfirmMismatch       = "confirm_mismatch"
+	refusalNotDegraded           = "not_degraded"
+	refusalRepairUnavailable     = "repair_unavailable"
+	refusalRegistryDegraded      = "registry_degraded"
+	refusalUpstreamError         = "upstream_error"
+	refusalMethodNotAllowed      = "method_not_allowed"
 )
 
 // writeRefusal renders one typed refusal. current carries the authoritative

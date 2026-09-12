@@ -246,7 +246,7 @@ func TestAPIAuthUsers_Get(t *testing.T) {
 func TestAPIAuthUsers_Post_Create(t *testing.T) {
 	defer cfg.DeleteUIUser("newuser-test") //nolint:errcheck // test teardown; cleanup errors are non-actionable
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPost, "/api/auth/users", map[string]any{
+	r := jsonReq(http.MethodPost, fencedUsersPath(), map[string]any{
 		"username": "newuser-test",
 		"password": "StrongPass1",
 		"role":     "viewer",

@@ -260,7 +260,7 @@ func fe6aRosterRevision(t *testing.T) int64 {
 func fe6aIdPCreate(t *testing.T, body map[string]any) string {
 	t.Helper()
 	w := httptest.NewRecorder()
-	apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", body))
+	apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath(), body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("POST /api/idp = %d: %s", w.Code, w.Body.String())
 	}
@@ -292,7 +292,7 @@ func fe6aProbeIdP(t *testing.T, reg *IdPRegistry, path string) fe6aStateProbe {
 		fileBytes:      fe6aReadFile(t, path),
 		storeVersion:   globalConfigStore.Version(),
 		configVersions: len(configVersions.List()),
-		auditSince:     time.Now().UnixMilli(),
+		auditSince:     fe6aSince(),
 	}
 }
 
@@ -672,7 +672,7 @@ func TestFE6A0_R7_CutoverSentinelPersistFailureRefusesTheEnable(t *testing.T) {
 	body := ldapProfileBodyForPut("Registry AD", map[string]any{"bindPassword": "s"})
 	body["enabled"] = true
 	w := httptest.NewRecorder()
-	apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", body))
+	apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath("operationId="+testOperationID()), body))
 	fe6aAssertRefusal(t, w, http.StatusInternalServerError, "persist_failed")
 
 	if legacyLDAPRetired() {
@@ -693,12 +693,12 @@ func TestFE6A0_R7_CutoverSentinelPersistFailureRefusesTheEnable(t *testing.T) {
 func TestFE6A0_R7_CutoverIsOperationIdentifiedAndAtMostOnce(t *testing.T) {
 	settings := filepath.Join(t.TempDir(), "admin_settings.json")
 	_, _ = fe6aLegacyLDAPFixture(t, settings)
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 
 	body := ldapProfileBodyForPut("Registry AD", map[string]any{"bindPassword": "s"})
 	body["enabled"] = true
 	w := httptest.NewRecorder()
-	apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", body))
+	apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath("operationId="+testOperationID()), body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("enable = %d: %s", w.Code, w.Body.String())
 	}
@@ -771,9 +771,9 @@ func TestFE6A0_R8_CorruptRegistryDegradesAndRepairsUnderFence(t *testing.T) {
 	if deg, _ := fe6aJSON(t, w)["degraded"].(bool); !deg {
 		t.Fatalf("read model must report degraded:true; body=%s", w.Body.String())
 	}
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 	w = httptest.NewRecorder()
-	apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", ldapProfileBodyForPut("While degraded", nil)))
+	apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath(), ldapProfileBodyForPut("While degraded", nil)))
 	fe6aAssertRefusal(t, w, http.StatusServiceUnavailable, "registry_degraded")
 	if n := len(reg.All()); n != 0 {
 		t.Fatalf("degraded registry accepted a write (%d profiles)", n)
@@ -799,7 +799,7 @@ func TestFE6A0_R8_CorruptRegistryDegradesAndRepairsUnderFence(t *testing.T) {
 		t.Fatal("registry still degraded after the acknowledged repair")
 	}
 	w = httptest.NewRecorder()
-	apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", ldapProfileBodyForPut("After repair", nil)))
+	apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath(), ldapProfileBodyForPut("After repair", nil)))
 	if w.Code != http.StatusOK {
 		t.Fatalf("write after repair = %d: %s", w.Code, w.Body.String())
 	}
@@ -844,7 +844,7 @@ func TestFE6A0_R9_SelfServicePasswordChangePreservesTOTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	fe6aEnrollTOTP(t, c, "alice")
-	r := jsonReq(http.MethodPost, "/api/auth/change-password", map[string]string{
+	r := jsonReq(http.MethodPost, fencedChangePasswordPath("alice"), map[string]string{
 		"current_password": "AlicePass1", "new_password": "AliceNew2",
 	})
 	r = withRoleCtx(r, RoleOperator)
@@ -891,11 +891,11 @@ func TestFE6A0_R10_UserMutationsRefuseOnPersistFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	rev := fe6aRosterRevision(t)
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 
 	// Create.
 	w := httptest.NewRecorder()
-	apiAuthUsers(w, jsonReq(http.MethodPost, "/api/auth/users", map[string]any{
+	apiAuthUsers(w, jsonReq(http.MethodPost, fencedUsersPath(), map[string]any{
 		"username": "carol", "password": "CarolPass1", "role": "operator",
 	}))
 	fe6aAssertRefusal(t, w, http.StatusInternalServerError, "persist_failed")
@@ -922,7 +922,7 @@ func TestFE6A0_R10_UserMutationsRefuseOnPersistFailure(t *testing.T) {
 		t.Fatal("failed delete revoked bob's sessions — revocation must follow the durable commit")
 	}
 	// Self-service password change.
-	r := jsonReq(http.MethodPost, "/api/auth/change-password", map[string]string{
+	r := jsonReq(http.MethodPost, fencedChangePasswordPath("bob"), map[string]string{
 		"current_password": "BobPass123", "new_password": "BobNewPass2",
 	})
 	r = withRoleCtx(r, RoleViewer)
@@ -1056,7 +1056,7 @@ func TestFE6A0_R12_LastAdminCannotBeDemoted(t *testing.T) {
 	}
 	rev := fe6aRosterRevision(t)
 	before := fe6aReadFile(t, path)
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 	w := httptest.NewRecorder()
 	apiAuthUsers(w, jsonReq(http.MethodPut, "/api/auth/users?revision="+strconv.FormatInt(rev, 10), map[string]any{
 		"username": "root", "role": "viewer",
@@ -1089,10 +1089,10 @@ func TestFE6A0_R13_CreateExistingUserIsConflict(t *testing.T) {
 	}
 	before := fe6aReadFile(t, path)
 	rev := fe6aRosterRevision(t)
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 
 	w := httptest.NewRecorder()
-	apiAuthUsers(w, jsonReq(http.MethodPost, "/api/auth/users", map[string]any{
+	apiAuthUsers(w, jsonReq(http.MethodPost, fencedUsersPath(), map[string]any{
 		"username": "alice", "password": "Hijacked99", "role": "viewer",
 	}))
 	fe6aAssertRefusal(t, w, http.StatusConflict, "user_exists")
@@ -1158,7 +1158,7 @@ func TestFE6A0_R14_RefusalsAreTypedJSON(t *testing.T) {
 		{"idp POST invalid profile", func(w *httptest.ResponseRecorder) {
 			bad := ldapProfileBodyForPut("Bad", nil)
 			bad["ldap"].(map[string]any)["url"] = "https://not-ldap"
-			apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", bad))
+			apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath(), bad))
 		}, 400, "invalid_input"},
 		{"idp POST viewer", func(w *httptest.ResponseRecorder) {
 			apiIdPList(w, viewer(jsonReq(http.MethodPost, "/api/idp", ldapProfileBodyForPut("V", nil))))

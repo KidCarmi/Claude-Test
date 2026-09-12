@@ -200,7 +200,7 @@ func TestAPIIdPList_Post_BadJSON(t *testing.T) {
 
 func TestAPIIdPList_Post_Create(t *testing.T) {
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPost, "/api/idp", map[string]any{
+	r := jsonReq(http.MethodPost, fencedIdPCreatePath(), map[string]any{
 		"name":    "test-saml-idp",
 		"type":    "saml",
 		"enabled": false,

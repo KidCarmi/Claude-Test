@@ -767,13 +767,22 @@ type uiAdminUser struct {
 	totpSecret      string   // base32 TOTP secret; empty = TOTP not enrolled
 	backupCodes     []string // bcrypt-hashed backup codes
 	totpLastCounter int64    // last successfully-used TOTP time-step; prevents replay
+	// securityGen is the DURABLE per-user authentication generation
+	// (FE-6A.0 correction, Blocker 2): minted from the roster-wide monotonic
+	// counter on create and advanced atomically with every role or
+	// credential change. Every local session embeds the generation it was
+	// issued under and is validated against this value on every
+	// authenticated request, so a session issued before a change stays
+	// invalid across restarts while a login after the change is honoured.
+	securityGen int64
 }
 
 // UIUserInfo is the public (no hash) view of a UI admin user.
 type UIUserInfo struct {
-	Username    string `json:"username"`
-	Role        UIRole `json:"role"`
-	TOTPEnabled bool   `json:"totpEnabled"`
+	Username           string `json:"username"`
+	Role               UIRole `json:"role"`
+	TOTPEnabled        bool   `json:"totpEnabled"`
+	SecurityGeneration int64  `json:"securityGeneration"`
 }
 
 // ─── Config (live-editable) ───────────────────────────────────────────────────
@@ -816,6 +825,11 @@ type Config struct {
 	// echoed by every fenced PUT/DELETE on /api/auth/users. 0 = never
 	// committed (read as 1 on the wire so a fence can always be echoed).
 	rosterRevision int64
+
+	// securityCounter is the roster-wide monotonic source of per-user
+	// security generations (never reused, so a re-created user never
+	// inherits a deleted user's generation). Persisted in the envelope.
+	securityCounter int64
 
 	// saveUIUsersMu serializes SaveUIUsersFile's snapshot+write sequence
 	// end-to-end. mu alone is not enough: SaveUIUsersFile only holds mu
@@ -879,8 +893,9 @@ func (c *Config) SetAuth(user, pass string) error {
 	}
 	if existing := c.uiUsers[user]; existing != nil {
 		existing.passHash, existing.role = hash, RoleAdmin // TOTP enrollment preserved
+		existing.securityGen = c.nextSecurityGenLocked()   // credential change ⇒ new generation
 	} else {
-		c.uiUsers[user] = &uiAdminUser{passHash: hash, role: RoleAdmin}
+		c.uiUsers[user] = &uiAdminUser{passHash: hash, role: RoleAdmin, securityGen: c.nextSecurityGenLocked()}
 	}
 	c.cache.clear()
 	c.mu.Unlock()
@@ -1272,28 +1287,41 @@ func (c *Config) SetUIUser(username, password string, role UIRole) error {
 	if c.uiUsers == nil {
 		c.uiUsers = map[string]*uiAdminUser{}
 	}
-	return applyRosterSet(c.uiUsers, username, hash, role)
+	return applyRosterSet(c.uiUsers, username, hash, role, c.nextSecurityGenLocked)
+}
+
+// nextSecurityGenLocked mints the next roster-wide security generation.
+// Caller holds c.mu.
+func (c *Config) nextSecurityGenLocked() int64 {
+	c.securityCounter++
+	return c.securityCounter
 }
 
 // applyRosterSet is the shared create-or-update step over a roster map
 // (the live map under c.mu, or commitRoster's candidate copy). hash == nil
 // means "keep the password" (role-only update; refused for a new user).
-func applyRosterSet(users map[string]*uiAdminUser, username string, hash []byte, role UIRole) error {
+// nextGen mints a fresh security generation: a created user gets one, and
+// a role or credential change advances the existing user's (Blocker 2).
+func applyRosterSet(users map[string]*uiAdminUser, username string, hash []byte, role UIRole, nextGen func() int64) error {
 	existing := users[username]
 	switch {
 	case existing == nil && hash == nil:
 		return fmt.Errorf("password is required to create a new user")
 	case existing == nil:
-		users[username] = &uiAdminUser{passHash: hash, role: role}
+		users[username] = &uiAdminUser{passHash: hash, role: role, securityGen: nextGen()}
 		return nil
 	}
 	if existing.role == RoleAdmin && role != RoleAdmin && rosterAdminCount(users) <= 1 {
 		return errRosterLastAdmin
 	}
+	changed := hash != nil || existing.role != role
 	if hash != nil {
 		existing.passHash = hash // TOTP enrollment untouched (R9)
 	}
 	existing.role = role
+	if changed {
+		existing.securityGen = nextGen()
+	}
 	return nil
 }
 
@@ -1365,7 +1393,7 @@ func (c *Config) ListUIUsers() []UIUserInfo {
 	defer c.mu.RUnlock()
 	out := make([]UIUserInfo, 0, len(c.uiUsers))
 	for name, u := range c.uiUsers {
-		out = append(out, UIUserInfo{Username: name, Role: u.role, TOTPEnabled: u.totpSecret != ""})
+		out = append(out, UIUserInfo{Username: name, Role: u.role, TOTPEnabled: u.totpSecret != "", SecurityGeneration: userSecurityGen(u)})
 	}
 	return out
 }
@@ -1386,6 +1414,9 @@ type uiUserRecord struct {
 	TOTPSecret      string   `json:"totp_secret,omitempty"`       // base32 TOTP secret
 	BackupCodes     []string `json:"backup_codes,omitempty"`      // bcrypt-hashed one-time codes
 	TOTPLastCounter int64    `json:"totp_last_counter,omitempty"` // last successfully-used TOTP step (replay protection)
+	// SecurityGeneration is the durable per-user authentication generation
+	// (FE-6A.0 correction); absent on a pre-correction file (read as 1).
+	SecurityGeneration int64 `json:"security_generation,omitempty"`
 }
 
 // uiUsersFileEnvelope is the on-disk JSON structure that wraps the user
@@ -1408,6 +1439,10 @@ type uiUsersFileEnvelope struct {
 	// RosterRevision is the durable roster fencing token (FE-6A.0); absent
 	// on a pre-FE-6A file (read as 0 → floor 1). Older binaries ignore it.
 	RosterRevision int64 `json:"roster_revision,omitempty"`
+	// SecurityCounter is the durable source of per-user security
+	// generations (FE-6A.0 correction); absent on older files (recomputed
+	// as the highest generation present).
+	SecurityCounter int64 `json:"security_counter,omitempty"`
 }
 
 // LoadUIUsersFile reads persisted UI users from disk and populates the roster.
@@ -1455,6 +1490,9 @@ func (c *Config) LoadUIUsersFile() error {
 	if env.RosterRevision > c.rosterRevision {
 		c.rosterRevision = env.RosterRevision
 	}
+	if env.SecurityCounter > c.securityCounter {
+		c.securityCounter = env.SecurityCounter
+	}
 	if c.uiUsers == nil {
 		c.uiUsers = map[string]*uiAdminUser{}
 	}
@@ -1463,12 +1501,20 @@ func (c *Config) LoadUIUsersFile() error {
 		if err != nil {
 			continue
 		}
+		gen := rec.SecurityGeneration
+		if gen <= 0 {
+			gen = 1 // pre-correction file: every record starts at generation 1
+		}
+		if gen > c.securityCounter {
+			c.securityCounter = gen
+		}
 		c.uiUsers[rec.Username] = &uiAdminUser{
 			passHash:        hash,
 			role:            rec.Role,
 			totpSecret:      rec.TOTPSecret,
 			backupCodes:     rec.BackupCodes,
 			totpLastCounter: rec.TOTPLastCounter,
+			securityGen:     gen,
 		}
 		// Keep legacy single-user in sync with the first admin found.
 		if rec.Role == RoleAdmin && c.user == "" {
@@ -1501,7 +1547,7 @@ func (c *Config) SaveUIUsersFile() error {
 		outcome = OutcomeDefault
 	}
 	authoritative := string(outcome)
-	env := rosterEnvelope(c.uiUsers, authoritative, c.rosterRevision)
+	env := rosterEnvelope(c.uiUsers, authoritative, c.rosterRevision, c.securityCounter)
 	c.mu.RUnlock()
 	if path == "" {
 		return nil
@@ -1510,20 +1556,26 @@ func (c *Config) SaveUIUsersFile() error {
 }
 
 // rosterEnvelope serialises a roster map (live or candidate) for disk.
-func rosterEnvelope(users map[string]*uiAdminUser, outcome string, revision int64) uiUsersFileEnvelope {
+func rosterEnvelope(users map[string]*uiAdminUser, outcome string, revision, securityCounter int64) uiUsersFileEnvelope {
 	env := uiUsersFileEnvelope{
 		DefaultAuthOutcome: &outcome,
 		Users:              make([]uiUserRecord, 0, len(users)),
 		RosterRevision:     revision,
+		SecurityCounter:    securityCounter,
 	}
 	for name, u := range users {
+		gen := u.securityGen
+		if gen <= 0 {
+			gen = 1
+		}
 		env.Users = append(env.Users, uiUserRecord{
-			Username:        name,
-			PassHash:        hex.EncodeToString(u.passHash),
-			Role:            u.role,
-			TOTPSecret:      u.totpSecret,
-			BackupCodes:     u.backupCodes,
-			TOTPLastCounter: u.totpLastCounter,
+			Username:           name,
+			PassHash:           hex.EncodeToString(u.passHash),
+			Role:               u.role,
+			TOTPSecret:         u.totpSecret,
+			BackupCodes:        u.backupCodes,
+			TOTPLastCounter:    u.totpLastCounter,
+			SecurityGeneration: gen,
 		})
 	}
 	return env

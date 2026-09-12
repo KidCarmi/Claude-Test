@@ -70,6 +70,7 @@ func swapIdPRegistry(t *testing.T, profiles ...*IdPProfile) *IdPRegistry {
 	orig := idpRegistry
 	t.Cleanup(func() { idpRegistry = orig })
 	reg := &IdPRegistry{live: map[string]IdentityProvider{}}
+	makeIdPRegistryDurable(t, reg)
 	if err := reg.ReplaceAll(profiles); err != nil {
 		t.Fatalf("ReplaceAll: %v", err)
 	}

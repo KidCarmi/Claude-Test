@@ -321,6 +321,48 @@ func validateLDAPAttrName(attr string) error {
 // legacyLDAPRetiredFlag is the in-memory view of the durable sentinel.
 var legacyLDAPRetiredFlag atomic.Bool
 
+// legacyLDAPCutoverDurableFlag records whether the RUNTIME cutover is known
+// to be on disk (FE-6A.0 correction, Blocker 9): the admin path flips it
+// only inside a durable save's applyOnSuccess and the settings load sets it
+// from the file; the OBSERVED path (boot reconciliation / CP→DP sync) marks
+// the runtime first — safety first — and reports `durable:false` /
+// `pending_reconciliation` until a save lands. A best-effort sentinel save
+// never silently claims durability.
+var legacyLDAPCutoverDurableFlag atomic.Bool
+
+// legacyLDAPCutoverDurable reports whether the active cutover is durable.
+func legacyLDAPCutoverDurable() bool { return legacyLDAPCutoverDurableFlag.Load() }
+
+// legacyLDAPCutoverReadModel projects the cutover record + its durability
+// truth for the admin read model.
+func legacyLDAPCutoverReadModel(rec *LegacyLDAPCutover) map[string]any {
+	if rec == nil {
+		return nil
+	}
+	return map[string]any{
+		"operationId":      rec.OperationID,
+		"profileId":        rec.ProfileID,
+		"profileName":      rec.ProfileName,
+		"registryRevision": rec.RegistryRevision,
+		"actor":            rec.Actor,
+		"trigger":          rec.Trigger,
+		"at":               rec.At,
+		"durable":          legacyLDAPCutoverDurable(),
+	}
+}
+
+// legacyLDAPCutoverDurability is the bounded posture word for the read model.
+func legacyLDAPCutoverDurability() string {
+	switch {
+	case !legacyLDAPRetired():
+		return "not_retired"
+	case legacyLDAPCutoverDurable():
+		return "durable"
+	default:
+		return "pending_reconciliation"
+	}
+}
+
 // legacyLDAPShadowWarnOnce dedupes the cutover warning: one clear line, no
 // per-sync log spam (ReplaceAll runs on every CP→DP config poll).
 var legacyLDAPShadowWarnOnce sync.Once
@@ -392,9 +434,15 @@ func markLegacyLDAPRetired(reason string) {
 	}
 	// Synchronous persist: cutover is a once-ever authority transition, so the
 	// one bounded disk write on this path is worth durable-before-return
-	// semantics (error is logged inside SaveAdminSettings; a lost write is
-	// re-recorded by any later save and re-observed from the registry at boot).
-	_ = SaveAdminSettings()
+	// semantics. The OUTCOME is recorded, never assumed (Blocker 9): a failed
+	// save leaves the runtime cutover active (safety first) and the read model
+	// reporting pending_reconciliation until a later save lands.
+	legacyLDAPCutoverDurableFlag.Store(false)
+	if err := SaveAdminSettings(); err != nil {
+		logger.Printf("IdP: observed legacy-LDAP cutover is active at runtime but NOT yet durable — pending reconciliation")
+		return
+	}
+	legacyLDAPCutoverDurableFlag.Store(true)
 }
 
 // markLegacyLDAPRetiredWith flips the in-memory sentinel ONCE and records

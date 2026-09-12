@@ -6516,7 +6516,9 @@ async function saveUser() {
     if (password) body.password = password;
     // FE-6A.0: create is POST (409 when the name is taken); an edit is a
     // fenced PUT echoing the roster revision the list was loaded with.
-    const path = isEdit ? '/api/auth/users?revision=' + encodeURIComponent(_usersRevision) : '/api/auth/users';
+    // FE-6A.0 correction (Blocker 4): the CREATE is fenced on the roster
+    // revision too — the only identity that exists before the user does.
+    const path = '/api/auth/users?revision=' + encodeURIComponent(_usersRevision);
     const res = await api(path, {
       method: isEdit ? 'PUT' : 'POST',
       headers: {'Content-Type':'application/json'},
@@ -6558,9 +6560,11 @@ function fmtLockoutRemaining(secs) {
   return secs + 's';
 }
 
+let _lockoutsGeneration = 0; // FE-6A.0 correction: the lock-set generation the listing was loaded with
 async function fetchLockouts() {
   try {
     const d = await api('/api/auth/lockouts');
+    _lockoutsGeneration = d.generation || 0;
     renderLockoutsTable(d.lockouts || []);
   } catch (_) {}
 }
@@ -6584,14 +6588,17 @@ function renderLockoutsTable(lockouts) {
 async function unlockUser(username) {
   if (!await confirmAction('Unlock Account', `Clear all active lockouts for "${username}"? They will be able to log in immediately.`)) return;
   try {
-    await api('/api/auth/lockouts', {
+    // FE-6A.0 correction (Blocker 4): the reset asserts the generation of the
+    // lock set the operator looked at (409 stale when it moved since).
+    await api('/api/auth/lockouts?generation=' + encodeURIComponent(_lockoutsGeneration), {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({username})
     });
     fetchLockouts();
   } catch (err) {
-    toast('Unlock failed: ' + err.message, 'error');
+    toast('Unlock failed: ' + err.message + ' — the list has been reloaded', 'error');
+    fetchLockouts();
   }
 }
 
@@ -13593,11 +13600,13 @@ function idpProviderMeta(p) {
   return { label: p.type === 'saml' ? 'SAML 2.0' : 'OIDC',  color: '#14b8a6' };
 }
 
+let _idpDocumentRevision = ''; // FE-6A.0 correction: the registry document revision the list was loaded with (create fence)
 async function loadIdPList() {
   loadLegacyLDAPBanner();
   const res = await apiFetch('/api/idp');
   if (!res.ok) return;
   const data = await res.json();
+  _idpDocumentRevision = (data && data.revision) || '';
   const list = Array.isArray(data) ? data : (data.profiles || []);
   const persistWarn = document.getElementById('idp-persist-warning');
   if (persistWarn) persistWarn.style.display = (data && data.persisted === false) ? '' : 'none';
@@ -14199,6 +14208,17 @@ async function discoverOIDC() {
   ].filter(Boolean).join('<br>');
 }
 
+// newOperationId mints a client UUID v4 for an operation-identified write.
+function newOperationId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+}
+
 async function saveIdP() {
   const id   = document.getElementById('idp-edit-id').value;
   const type = document.getElementById('idp-type').value;
@@ -14258,6 +14278,13 @@ async function saveIdP() {
   // FE-6A.0 fence: a PUT must echo the entry revision it was loaded with
   // (428 without it, 409 stale when another admin changed the profile).
   if (id) q.push('revision=' + encodeURIComponent(_idpEditRevision));
+  // FE-6A.0 correction (Blocker 4/9): a CREATE is fenced on the registry
+  // document revision, and carries a client-minted operationId so a lost
+  // response can be re-sent and REPLAYED (never a second create/cutover).
+  if (!id) {
+    q.push('documentRevision=' + encodeURIComponent(_idpDocumentRevision));
+    q.push('operationId=' + encodeURIComponent(newOperationId()));
+  }
   // Safe activation (ADR-0027): enabling an LDAP provider runs a live
   // connection preflight server-side BEFORE anything persists — a broken
   // candidate can never replace a working enabled provider.

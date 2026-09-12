@@ -124,7 +124,7 @@ func TestAPIAuthChangePassword_DoesNotCreateConfigVersion(t *testing.T) {
 	// by calling the handler directly).
 	ctx := context.WithValue(context.Background(), uiRoleKey{}, RoleAdmin)
 	body := strings.NewReader(`{"current_password":"` + testOldPass + `","new_password":"` + testNewPass + `"}`)
-	r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/auth/change-password", body)
+	r := httptest.NewRequestWithContext(ctx, http.MethodPost, fencedChangePasswordPath(testUser), body)
 	r.Header.Set("Content-Type", "application/json")
 	// Cookie attributes are inert here — request never crosses the
 	// network; the handler just calls r.Cookie(name) which returns the

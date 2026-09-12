@@ -30,7 +30,7 @@ func TestAPIIdPList_PostRejectsInvalidSAMLMetadataSources(t *testing.T) {
 			withTestIdPRegistry(t)
 
 			w := httptest.NewRecorder()
-			r := jsonReq(http.MethodPost, "/api/idp", map[string]any{
+			r := jsonReq(http.MethodPost, fencedIdPCreatePath(), map[string]any{
 				"name":    "bad-saml",
 				"type":    "saml",
 				"enabled": false,
@@ -275,6 +275,7 @@ func withTestIdPRegistry(t *testing.T) {
 	t.Helper()
 	orig := idpRegistry
 	idpRegistry = &IdPRegistry{live: make(map[string]IdentityProvider)}
+	makeIdPRegistryDurable(t, idpRegistry)
 	t.Cleanup(func() {
 		idpRegistry = orig
 	})

@@ -585,6 +585,7 @@ func applyBlocklistFeeds(s *AdminSettings) {
 func applyLegacyLDAPRetirement(s *AdminSettings) {
 	if s.LegacyLDAPRetired {
 		legacyLDAPRetiredFlag.Store(true)
+		legacyLDAPCutoverDurableFlag.Store(true) // read from the file: durable by definition
 		if s.LegacyLDAPCutover != nil {
 			rec := *s.LegacyLDAPCutover
 			legacyLDAPCutoverRec.Store(&rec)
@@ -593,6 +594,10 @@ func applyLegacyLDAPRetirement(s *AdminSettings) {
 	enforceLegacyLDAPShadowing()
 	if legacyLDAPRetired() && !s.LegacyLDAPRetired {
 		// In-memory cutover predates the settings load — make it durable.
+		// Until that save lands the read model reports pending_reconciliation
+		// (the save's success path marks durability; see
+		// saveAdminSettingsWithOverrides).
+		legacyLDAPCutoverDurableFlag.Store(false)
 		adminSettingsSave()
 	}
 }
@@ -1148,6 +1153,11 @@ func saveAdminSettingsWithOverrides(ov adminSaveOverrides) error {
 	if ov.applyOnSuccess != nil {
 		ov.applyOnSuccess()
 	}
+	// The file just written carries LegacyLDAPRetired == legacyLDAPRetired()
+	// (or the override that set it), so a runtime cutover is now durable.
+	if legacyLDAPRetired() {
+		legacyLDAPCutoverDurableFlag.Store(true)
+	}
 	return nil
 }
 
@@ -1167,6 +1177,11 @@ func applyAdminSettingsOverridesUnpersisted(ov adminSaveOverrides, rewriteApply 
 	}
 	if ov.applyOnSuccess != nil {
 		ov.applyOnSuccess()
+	}
+	// The file just written carries LegacyLDAPRetired == legacyLDAPRetired()
+	// (or the override that set it), so a runtime cutover is now durable.
+	if legacyLDAPRetired() {
+		legacyLDAPCutoverDurableFlag.Store(true)
 	}
 	return nil
 }

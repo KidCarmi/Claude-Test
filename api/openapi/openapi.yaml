@@ -153,7 +153,12 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/AuthRefusal' }
     AuthRefusalPreconditionRequired:
-      description: FE-6A.0 fence — the fenced write carried no `revision` (query or body). `current.revision` is the token to echo. Nothing was changed.
+      description: >-
+        FE-6A.0 fence — the fenced write carried no fencing identity (`code: precondition_required`): `revision` on a
+        roster/entry write (`current.revision`), `documentRevision` on an IdP create (`current.documentRevision`),
+        `generation` on a self-service password change or a lockout reset (`current.generation`); or, on an IdP
+        write that would retire the legacy YAML ldap authenticator, no client `operationId`
+        (`code: operation_id_required`). Nothing was changed.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/AuthRefusal' }
@@ -168,7 +173,21 @@ components:
           schema: { $ref: '#/components/schemas/AuthRefusal' }
     AuthRefusalDegraded:
       description: >-
-        FE-6A.0 — the identity-provider registry is degraded (corrupt file quarantined at boot; `code: registry_degraded`). Acknowledge the repair (POST /api/idp/repair) or restore the file and restart.
+        FE-6A.0 — the store cannot accept the administrative mutation: the identity-provider registry is degraded
+        (corrupt file quarantined at boot; `code: registry_degraded` — acknowledge the repair via POST /api/idp/repair
+        or restore the file and restart), or the store has NO persistence path (`code: persistence_not_configured`
+        — no idp_profiles_file / no -ui-users-file; the mutation is refused BEFORE any runtime change, there is no
+        `persisted:false` success). Nothing was changed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AuthRefusal' }
+    AuthRefusalProviderCompileFailed:
+      description: >-
+        FE-6A.0 correction — the profile validated but the live identity provider could not be constructed from it
+        (`code: provider_compile_failed`): OIDC discovery, SAML metadata fetch/parse or LDAP provider construction
+        failed. `current.reason` is a BOUNDED class (oidc_discovery, saml_metadata, ldap_provider, unsupported);
+        the dependency's own error text (hostnames, TLS, transport) never crosses this boundary — not in the
+        response, the process log or the audit trail. Nothing was changed.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/AuthRefusal' }
@@ -288,6 +307,7 @@ components:
         loggedIn: { type: boolean }
         user: { type: string }
         role: { $ref: '#/components/schemas/Role' }
+        securityGeneration: { type: integer, format: int64, description: "FE-6A.0 correction — the caller's current per-user security generation (advances on every role/credential change; every session is bound to the generation it was issued under). Echo it as `generation` on POST /api/auth/change-password." }
         ui_tls_fallback: { type: boolean, description: "True when self-signed TLS setup failed at startup and the admin UI fell back to plain HTTP. Exposed pre-authentication so the login overlay can warn before credentials are submitted. The FLAG only - this route is unauthenticated, so the underlying self-sign error (which can quote an operator-configured SAN or hostname) is NOT returned here; it is on the viewer-gated GET /api/settings/network and in the server log." }
     Role:
       type: string
@@ -299,6 +319,7 @@ components:
         username: { type: string }
         role: { $ref: '#/components/schemas/Role' }
         totpEnabled: { type: boolean, description: "TOTP enrollment present (secret never exposed)." }
+        securityGeneration: { type: integer, format: int64, description: "FE-6A.0 correction — durable per-user security generation; a role/credential change advances it inside the roster commit and invalidates every session issued under the previous value (across restarts)." }
     UserList:
       type: object
       required: [users, revision]
@@ -314,11 +335,13 @@ components:
       description: >-
         FE-6A.0 typed refusal shared by the Identity Providers and Administrators surfaces. `code` is
         bounded: invalid_input (400), forbidden / invalid_credentials (403), not_found / vanished (404),
-        stale / last_admin / user_exists / referenced / confirm_mismatch / not_degraded / repair_unavailable
-        (409), precondition_required (428), persist_failed / outcome_unknown (500), registry_degraded (503),
-        upstream_error (502), method_not_allowed (405). `current` carries typed facts for the retry
-        (revision, references, confirmValue, detail). A refusal mutates nothing, audits no success and
-        publishes no cluster snapshot.
+        stale / last_admin / user_exists / referenced / confirm_mismatch / not_degraded / repair_unavailable /
+        operation_mismatch / operation_in_progress / operation_aborted / operation_outcome_unknown (409),
+        precondition_required / operation_id_required (428), persist_failed / outcome_unknown (500),
+        provider_compile_failed (502), registry_degraded / persistence_not_configured (503),
+        method_not_allowed (405). `current` carries typed facts for the retry (revision, documentRevision,
+        generation, references, confirmValue, detail, reason, operationId, state, code). A refusal mutates
+        nothing, audits no success and publishes no cluster snapshot.
       required: [error, code]
       additionalProperties: false
       properties:
@@ -327,6 +350,7 @@ components:
         current: { type: object, additionalProperties: true }
     CreateUserRequest:
       type: object
+      description: FE-6A.0 correction — a create is fenced on the ROSTER revision (`revision`, or the `revision` query parameter) — the only identity that exists before the user does.
       required: [username, password, role]
       additionalProperties: false
       x-culvert-sensitive: true
@@ -334,6 +358,7 @@ components:
         username: { type: string, minLength: 1, maxLength: 64 }
         password: { type: string, format: password, minLength: 8 }
         role: { $ref: '#/components/schemas/Role' }
+        revision: { type: integer, format: int64, description: "The loaded roster revision (UserList.revision)." }
     UpdateUserRequest:
       type: object
       description: FE-6A.0 fenced update — at least one of role/password; `revision` (or the `revision` query parameter) must equal the loaded roster revision.
@@ -355,8 +380,9 @@ components:
         user: { $ref: '#/components/schemas/User' }
         revision: { type: integer, format: int64 }
         persisted: { type: boolean, description: "false only on an in-memory roster (no -ui-users-file)." }
-        sessionsRevoked: { type: boolean, description: "Update only — every session of the user issued before the change is invalidated." }
+        sessionsRevoked: { type: boolean, description: "Update only — every session of the user issued under the previous security generation is invalidated (durably, across restarts)." }
         selfAffected: { type: boolean, description: "Update only — the actor changed their own account (their session is revoked too)." }
+        securityGeneration: { type: integer, format: int64, description: "The user's security generation after the commit." }
     UserDeleteResult:
       type: object
       required: [ok, deleted, username, revision, persisted, sessionsRevoked]
@@ -371,12 +397,26 @@ components:
         selfAffected: { type: boolean }
     ChangePasswordRequest:
       type: object
+      description: FE-6A.0 correction — bound to the caller's security generation (`generation`, or the `generation` query parameter; AuthStatus.securityGeneration) observed together with the verified credential.
       required: [current_password, new_password]
       additionalProperties: false
       x-culvert-sensitive: true
       properties:
         current_password: { type: string, format: password }
         new_password: { type: string, format: password, minLength: 8 }
+        generation: { type: integer, format: int64 }
+    ChangePasswordResult:
+      type: object
+      description: Action-bound success of a self-service password change — roster revision, durability, session impact and the new security generation.
+      required: [ok, revision, persisted, sessionsRevoked, selfAffected, securityGeneration]
+      additionalProperties: false
+      properties:
+        ok: { type: boolean }
+        revision: { type: integer, format: int64 }
+        persisted: { type: boolean }
+        sessionsRevoked: { type: boolean, description: "Every session issued under the previous generation is invalid; the caller's own UI session was re-issued at the new generation (Set-Cookie)." }
+        selfAffected: { type: boolean }
+        securityGeneration: { type: integer, format: int64 }
 
     # ── Dashboard ────────────────────────────────────────────────────────────────
     StatsSummary:
@@ -2376,9 +2416,59 @@ components:
         degradedReason: { type: string, enum: [corrupt_quarantined, corrupt_not_quarantined] }
         degradedDetail: { type: string }
         quarantineEvidence: { type: string, description: "Base name of the quarantined file — the exact confirm word POST /api/idp/repair expects." }
-        revision: { type: string, description: "Content-derived registry document revision (every id + entry revision)." }
+        revision: { type: string, description: "Content-derived registry document revision (every id + entry revision). Echo it as `documentRevision` on POST /api/idp." }
         scope: { type: string, enum: [cluster-synced] }
         profiles: { type: array, items: { $ref: '#/components/schemas/IdPProfileRead' }, nullable: true }
+        cluster: { $ref: '#/components/schemas/IdPClusterState' }
+    IdPClusterState:
+      type: object
+      description: FE-6A.0 correction (Blocker 8) — the FLEET state of the registry, derived by comparing the last published snapshot's registry document with the authoritative local one.
+      required: [state, publishedVersion]
+      additionalProperties: false
+      properties:
+        state: { type: string, enum: [published, pending], description: "published = the fleet snapshot carries exactly the current registry document; pending = the local commit is authoritative but not (yet) published — see lastRejection." }
+        publishedVersion: { type: integer, format: int64, description: "Version of the last published config snapshot." }
+        lastRejection:
+          type: object
+          additionalProperties: false
+          properties:
+            reason: { type: string, enum: [identity_degraded, snapshot_invalid, marshal_failed, wire_size_exceeded] }
+            at: { type: string, format: date-time }
+    IdPClusterPublication:
+      type: object
+      description: FE-6A.0 correction (Blocker 8) — the fleet publication outcome of ONE mutation, reported beside the local durable commit (never the raw rejection text).
+      required: [publication]
+      additionalProperties: false
+      properties:
+        publication: { type: string, enum: [published, rejected] }
+        version: { type: integer, format: int64, description: "published only — the snapshot version." }
+        reason: { type: string, enum: [identity_degraded, snapshot_invalid, marshal_failed, wire_size_exceeded], description: "rejected only — bounded class." }
+    IdPMutationResult:
+      allOf:
+        - $ref: '#/components/schemas/IdPProfileRead'
+        - type: object
+          properties:
+            cluster: { $ref: '#/components/schemas/IdPClusterPublication' }
+            operationId: { type: string, format: uuid, description: "Echoed when the write carried one." }
+            replayed: { type: boolean, description: "true when this response is the recorded result of an earlier dispatch of the same operationId — nothing was written again." }
+    IdPOperation:
+      type: object
+      description: Durable, non-secret record of an operation-identified IdP write (FE-6A.0 correction, Blocker 9).
+      required: [operationId, state, action, actor, profileId, registryRevision, cutover, startedAt]
+      additionalProperties: false
+      properties:
+        operationId: { type: string, format: uuid }
+        state: { type: string, enum: [pending, committed, aborted, outcome_unknown] }
+        action: { type: string, enum: [idp.create] }
+        actor: { type: string }
+        profileId: { type: string, description: "The candidate's pre-minted profile id." }
+        registryRevision: { type: string, description: "The registry document revision the write was fenced on." }
+        cutover: { type: boolean, description: "The write carried the legacy-LDAP authority cutover." }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        code: { type: string, description: "aborted/outcome_unknown — the refusal code; reconciled_committed / reconciled_absent after a boot reconciliation." }
+        committedRevision: { type: string, description: "committed — the registry document revision after the commit." }
+        result: { type: object, additionalProperties: true, description: "committed — the response the client received." }
     IdPProfileRead:
       type: object
       description: >-
@@ -2401,7 +2491,7 @@ components:
         ldap: { type: object, additionalProperties: true, nullable: true }
     IdPDeleteResult:
       type: object
-      required: [ok, deleted, id, revision, persisted]
+      required: [ok, deleted, id, revision, persisted, cluster]
       additionalProperties: false
       properties:
         ok: { type: boolean }
@@ -2409,6 +2499,7 @@ components:
         id: { type: string }
         revision: { type: string, description: "Registry document revision after the delete." }
         persisted: { type: boolean }
+        cluster: { $ref: '#/components/schemas/IdPClusterPublication' }
     IdPRepairRequest:
       type: object
       required: [confirm]
@@ -2463,10 +2554,11 @@ components:
         html: { type: string }
     LockoutsList:
       type: object
-      required: [lockouts]
+      required: [lockouts, generation]
       additionalProperties: false
       properties:
         lockouts: { type: array, items: { type: object, additionalProperties: true }, nullable: true }
+        generation: { type: integer, format: int64, description: "FE-6A.0 correction — server-owned generation of the lock SET (advances on every failure/success/reset/cleanup); echo it on POST so a reset clears the state you looked at." }
         scope: { type: string, enum: [node-local], description: "Login lockouts are node-local (never cluster-synced)." }
     ClearLockoutBody:
       type: object
@@ -2474,6 +2566,16 @@ components:
       additionalProperties: false
       properties:
         username: { type: string }
+        generation: { type: integer, format: int64, description: "The generation from GET /api/auth/lockouts (or the `generation` query parameter)." }
+    ClearLockoutResult:
+      type: object
+      required: [ok, username, generation, scope]
+      additionalProperties: false
+      properties:
+        ok: { type: boolean }
+        username: { type: string }
+        generation: { type: integer, format: int64, description: "The lock-set generation after the reset." }
+        scope: { type: string, enum: [node-local] }
     URLCategoryLookup:
       type: object
       required: [host, category]
@@ -3170,8 +3272,10 @@ paths:
       summary: Create an admin user
       description: >-
         Creates a NEW admin user (FE-6A.0 R13: never an upsert — 409 user_exists when the name is taken).
-        Commits persist-before-publish: a failed roster write is 500 persist_failed with nothing changed.
-        Admin-only and audited.
+        Fenced on the ROSTER revision (`revision` body or query; 428 precondition_required when absent, 409 stale
+        when it moved). Commits persist-before-publish: a failed roster write is 500 persist_failed with nothing
+        changed; a roster with no persistence path refuses the create before any runtime change (503
+        persistence_not_configured). Admin-only and audited.
       security:
         - sessionCookie: []
         - basicAuth: []
@@ -3183,6 +3287,12 @@ paths:
       x-culvert-introduced-version: 1.0.0
       x-culvert-danger-level: high
       x-culvert-audit-event: auth.users.create
+      parameters:
+        - name: revision
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+          description: The loaded roster revision (wins over the body value).
       requestBody:
         required: true
         content:
@@ -3197,11 +3307,13 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UserMutationResult' }
-              example: { ok: true, user: { username: alice, role: operator, totpEnabled: false }, revision: 4, persisted: true }
+              example: { ok: true, user: { username: alice, role: operator, totpEnabled: false, securityGeneration: 5 }, revision: 4, persisted: true }
         '400': { $ref: '#/components/responses/AuthRefusalBadRequest' }
         '403': { $ref: '#/components/responses/AuthRefusalForbidden' }
         '409': { $ref: '#/components/responses/AuthRefusalConflict' }
+        '428': { $ref: '#/components/responses/AuthRefusalPreconditionRequired' }
         '500': { $ref: '#/components/responses/AuthRefusalPersistFailed' }
+        '503': { $ref: '#/components/responses/AuthRefusalDegraded' }
     put:
       operationId: updateUser
       tags: [auth]
@@ -3247,6 +3359,7 @@ paths:
         '409': { $ref: '#/components/responses/AuthRefusalConflict' }
         '428': { $ref: '#/components/responses/AuthRefusalPreconditionRequired' }
         '500': { $ref: '#/components/responses/AuthRefusalPersistFailed' }
+        '503': { $ref: '#/components/responses/AuthRefusalDegraded' }
     delete:
       operationId: deleteUser
       tags: [auth]
@@ -3290,13 +3403,23 @@ paths:
         '409': { $ref: '#/components/responses/AuthRefusalConflict' }
         '428': { $ref: '#/components/responses/AuthRefusalPreconditionRequired' }
         '500': { $ref: '#/components/responses/AuthRefusalPersistFailed' }
+        '503': { $ref: '#/components/responses/AuthRefusalDegraded' }
 
   /api/auth/change-password:
     post:
       operationId: changePassword
       tags: [auth]
       summary: Change the current user's password
-      description: Changes the authenticated user's own password after verifying the current one. Audited.
+      description: >-
+        Changes the authenticated user's own password after verifying the current one (FE-6A.0 correction).
+        The change is bound to the caller's SECURITY GENERATION (`generation` body or query — read it from
+        GET /api/auth/status together with the credential you verify): 428 precondition_required when absent,
+        409 stale (current.generation) when an administrator's update landed first, 404 not_found when the
+        account was deleted — zero mutation in every refusal. ONE roster transaction revalidates the generation
+        under the roster lock and commits persist-before-publish (500 persist_failed keeps the old credential
+        usable and the new one unusable; a legacy single-user identity is migrated by the same transaction).
+        After the durable commit every session issued under the previous generation is invalid (across
+        restarts) and the caller's own UI session is re-issued at the new generation. TOTP is preserved. Audited.
       security:
         - sessionCookie: []
         - basicAuth: []
@@ -3308,6 +3431,12 @@ paths:
       x-culvert-introduced-version: 1.0.0
       x-culvert-danger-level: medium
       x-culvert-audit-event: auth.password_change
+      parameters:
+        - name: generation
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+          description: The caller's security generation from GET /api/auth/status (wins over the body value).
       requestBody:
         required: true
         content:
@@ -3317,11 +3446,11 @@ paths:
             # example (Gate 10); the schema documents the required shape.
       responses:
         '200':
-          description: Password changed (persist-before-publish; TOTP enrollment preserved). Carries the roster revision now in force.
+          description: Password changed (persist-before-publish; TOTP enrollment preserved). Carries the roster revision, durability, session impact and the new security generation; the caller's UI session cookie is re-issued.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
-              example: { ok: true, revision: 7, persisted: true }
+              schema: { $ref: '#/components/schemas/ChangePasswordResult' }
+              example: { ok: true, revision: 7, persisted: true, sessionsRevoked: true, selfAffected: true, securityGeneration: 9 }
         '400': { $ref: '#/components/responses/AuthRefusalBadRequest' }
         '401':
           description: >-
@@ -3330,7 +3459,11 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AuthRefusal' }
         '403': { $ref: '#/components/responses/AuthRefusalForbidden' }
+        '404': { $ref: '#/components/responses/AuthRefusalNotFound' }
+        '409': { $ref: '#/components/responses/AuthRefusalConflict' }
+        '428': { $ref: '#/components/responses/AuthRefusalPreconditionRequired' }
         '500': { $ref: '#/components/responses/AuthRefusalPersistFailed' }
+        '503': { $ref: '#/components/responses/AuthRefusalDegraded' }
 
   /api/stats:
     get:
@@ -11424,7 +11557,11 @@ paths:
       operationId: clearLockout
       tags: [auth]
       summary: Clear auth lockout
-      description: Clear auth lockout.
+      description: >-
+        Clears every tier-1/tier-2 lock for the username (node-local). FE-6A.0 correction: fenced on the
+        lock-set `generation` from the listing (428 precondition_required when absent, 409 stale with
+        current.generation when the set changed since — checked and cleared under one limiter lock);
+        404 not_found when the username holds no lock or failure state (nothing cleared).
       security:
         - sessionCookie: []
         - basicAuth: []
@@ -11441,14 +11578,24 @@ paths:
         content:
           application/json:
             schema: { $ref: '#/components/schemas/ClearLockoutBody' }
+      parameters:
+        - name: generation
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+          description: The listing's lock-set generation (wins over the body value).
       responses:
         '200':
-          description: Clear auth lockout (node-local).
+          description: Lock state cleared (node-local); carries the advanced generation.
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: '#/components/schemas/ClearLockoutResult' }
+              example: { ok: true, username: alice, generation: 12, scope: node-local }
         '400': { $ref: '#/components/responses/AuthRefusalBadRequest' }
         '403': { $ref: '#/components/responses/AuthRefusalForbidden' }
+        '404': { $ref: '#/components/responses/AuthRefusalNotFound' }
+        '409': { $ref: '#/components/responses/AuthRefusalConflict' }
+        '428': { $ref: '#/components/responses/AuthRefusalPreconditionRequired' }
   /api/idp:
     get:
       operationId: getIdPList
@@ -11475,7 +11622,20 @@ paths:
       operationId: createIdP
       tags: [auth]
       summary: Create IdP profile
-      description: Create IdP profile.
+      description: >-
+        Creates a profile (FE-6A.0 correction). Fenced on the registry DOCUMENT revision (`documentRevision`
+        query = IdPList.revision; 428 precondition_required / 409 stale with current.documentRevision, decided
+        again inside the transaction). Optional client UUID `operationId`: REQUIRED (428 operation_id_required)
+        when the write would retire the legacy YAML ldap authenticator; the non-secret intent (actor, candidate
+        identity + spec digest, fenced revision) is persisted BEFORE the first irreversible write, a duplicate
+        operationId REPLAYS the recorded result (`replayed:true`, never a second create/cutover; a different
+        candidate under the same id is 409 operation_mismatch; an aborted/pending/unknown outcome is 409
+        operation_aborted / operation_in_progress / operation_outcome_unknown), and GET
+        /api/idp/operations/{operationId} is the authoritative lookup. A profile that validates but whose
+        provider cannot be constructed is 502 provider_compile_failed with a bounded `current.reason`. A registry
+        without a persistence path refuses before any runtime change (503 persistence_not_configured). The
+        local durable commit and the FLEET publication are reported separately: `cluster.publication`
+        (published|rejected, bounded `cluster.reason`), and the audit detail carries `fleet=…`.
       security:
         - sessionCookie: []
         - basicAuth: []
@@ -11487,6 +11647,22 @@ paths:
       x-culvert-introduced-version: 1.0.0
       x-culvert-danger-level: high
       x-culvert-audit-event: idp.create
+      parameters:
+        - name: documentRevision
+          in: query
+          required: false
+          schema: { type: string }
+          description: The loaded registry document revision (IdPList.revision). Absent ⇒ 428.
+        - name: operationId
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: Client-generated UUID identifying this write intent (required for a cutover-bearing write).
+        - name: preflight
+          in: query
+          required: false
+          schema: { type: string, enum: [connection] }
+          description: LDAP only — run a live connection test before anything persists (422 on failure).
       requestBody:
         required: true
         content:
@@ -11494,19 +11670,58 @@ paths:
             schema: { $ref: '#/components/schemas/IdPProfileInput' }
       responses:
         '200':
-          description: The created profile (secret-free read model with its entry `revision`). An enabling LDAP create on a node with a legacy YAML ldap block records the cutover DURABLY before the registry publishes.
+          description: The created profile (secret-free read model with its entry `revision`) plus the fleet publication fact (`cluster`), the echoed `operationId` and `replayed:true` on a replay. An enabling LDAP create on a node with a legacy YAML ldap block records the cutover DURABLY before the registry publishes.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/IdPProfileRead' }
+              schema: { $ref: '#/components/schemas/IdPMutationResult' }
         '400': { $ref: '#/components/responses/AuthRefusalBadRequest' }
         '403': { $ref: '#/components/responses/AuthRefusalForbidden' }
+        '409': { $ref: '#/components/responses/AuthRefusalConflict' }
         '422':
           description: LDAP activation preflight failed (?preflight=connection); the current configuration remains active and unchanged.
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+        '428': { $ref: '#/components/responses/AuthRefusalPreconditionRequired' }
         '500': { $ref: '#/components/responses/AuthRefusalPersistFailed' }
+        '502': { $ref: '#/components/responses/AuthRefusalProviderCompileFailed' }
         '503': { $ref: '#/components/responses/AuthRefusalDegraded' }
+  /api/idp/operations/{operationId}:
+    parameters:
+      - name: operationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: getIdPOperation
+      tags: [auth]
+      summary: Look up a durable IdP write intent
+      description: >-
+        FE-6A.0 correction (Blocker 9): the authoritative record of an operation-identified IdP write —
+        `state` is pending (dispatched, not yet decided), committed (the profile exists; `result` is the
+        response the client received, `committedRevision` the registry document revision after the commit),
+        aborted (refused; `code` names the refusal) or outcome_unknown (split durable state, reconciled at the
+        next restart). A process that died mid-operation leaves a pending record that boot reconciles against
+        the registry file. Admin-only: the record names the actor. Never carries a secret.
+      security:
+        - sessionCookie: []
+        - basicAuth: []
+      x-culvert-visibility: admin-supported
+      x-culvert-permission: admin
+      x-culvert-tenant-scope: appliance
+      x-culvert-stability: stable
+      x-culvert-idempotency: safe
+      x-culvert-introduced-version: 1.3.0
+      responses:
+        '200':
+          description: The recorded operation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IdPOperation' }
+              example: { operationId: 3f0e0d3a-5b7f-4f2b-9a8f-1c2d3e4f5a6b, state: committed, action: idp.create, actor: admin@127.0.0.1, profileId: d81fbbe5df51, registryRevision: "sha256:0", cutover: true, startedAt: "2026-09-12T06:44:32Z" }
+        '400': { $ref: '#/components/responses/AuthRefusalBadRequest' }
+        '403': { $ref: '#/components/responses/AuthRefusalForbidden' }
+        '404': { $ref: '#/components/responses/AuthRefusalNotFound' }
   /api/idp/{id}:
     parameters:
       - name: id
@@ -11575,10 +11790,10 @@ paths:
             schema: { $ref: '#/components/schemas/IdPProfileInput' }
       responses:
         '200':
-          description: The updated profile with its new entry `revision`.
+          description: The updated profile with its new entry `revision` plus the fleet publication fact (`cluster`).
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/IdPProfileRead' }
+              schema: { $ref: '#/components/schemas/IdPMutationResult' }
         '400': { $ref: '#/components/responses/AuthRefusalBadRequest' }
         '403': { $ref: '#/components/responses/AuthRefusalForbidden' }
         '404': { $ref: '#/components/responses/AuthRefusalNotFound' }
@@ -11590,6 +11805,7 @@ paths:
               schema: { type: object, additionalProperties: true }
         '428': { $ref: '#/components/responses/AuthRefusalPreconditionRequired' }
         '500': { $ref: '#/components/responses/AuthRefusalPersistFailed' }
+        '502': { $ref: '#/components/responses/AuthRefusalProviderCompileFailed' }
         '503': { $ref: '#/components/responses/AuthRefusalDegraded' }
     delete:
       operationId: deleteIdP

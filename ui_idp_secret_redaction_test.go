@@ -51,6 +51,7 @@ func TestAPIIdPItemGet_RedactsClientSecret(t *testing.T) {
 	}
 	orig := idpRegistry
 	idpRegistry = &IdPRegistry{profiles: []*IdPProfile{p}, live: make(map[string]IdentityProvider)}
+	makeIdPRegistryDurable(t, idpRegistry)
 	t.Cleanup(func() { idpRegistry = orig })
 
 	w := httptest.NewRecorder()
@@ -119,10 +120,11 @@ func TestAPIIdPListGet_RedactsClientSecret(t *testing.T) {
 func TestAPIIdPListPost_StoresAndRedactsClientSecret(t *testing.T) {
 	orig := idpRegistry
 	idpRegistry = &IdPRegistry{live: make(map[string]IdentityProvider)}
+	makeIdPRegistryDurable(t, idpRegistry)
 	t.Cleanup(func() { idpRegistry = orig })
 
 	w := httptest.NewRecorder()
-	r := jsonReq(http.MethodPost, "/api/idp", map[string]any{
+	r := jsonReq(http.MethodPost, fencedIdPCreatePath(), map[string]any{
 		"name":    "OIDC Create",
 		"type":    "oidc",
 		"enabled": false,
@@ -165,13 +167,14 @@ func TestAPIIdPAudit_RedactsWriteOnlyFields(t *testing.T) {
 	origRegistry := idpRegistry
 	restoreAudit := audit.SwapRingForTest()
 	idpRegistry = &IdPRegistry{live: make(map[string]IdentityProvider)}
+	makeIdPRegistryDurable(t, idpRegistry)
 	t.Cleanup(func() {
 		idpRegistry = origRegistry
 		restoreAudit()
 	})
 
 	createW := httptest.NewRecorder()
-	createR := jsonReq(http.MethodPost, "/api/idp", map[string]any{
+	createR := jsonReq(http.MethodPost, fencedIdPCreatePath(), map[string]any{
 		"name":    "OIDC Audit Create",
 		"type":    "oidc",
 		"enabled": false,
@@ -246,6 +249,7 @@ func TestAPIIdPItemPut_PreservesOIDCClientSecretWhenRedactedFromForm(t *testing.
 	}
 	orig := idpRegistry
 	idpRegistry = &IdPRegistry{profiles: []*IdPProfile{p}, live: make(map[string]IdentityProvider)}
+	makeIdPRegistryDurable(t, idpRegistry)
 	t.Cleanup(func() { idpRegistry = orig })
 
 	w := httptest.NewRecorder()
@@ -291,6 +295,7 @@ func TestAPIIdPItemPut_PreservesOIDCDiscoveryEndpointsWhenIssuerUnchanged(t *tes
 	p := oidcDiscoveryCacheProfile()
 	orig := idpRegistry
 	idpRegistry = &IdPRegistry{profiles: []*IdPProfile{p}, live: make(map[string]IdentityProvider)}
+	makeIdPRegistryDurable(t, idpRegistry)
 	t.Cleanup(func() { idpRegistry = orig })
 
 	w := httptest.NewRecorder()
@@ -356,6 +361,7 @@ func TestAPIIdPItemPut_MutatesOIDCClientSecretWhenProvided(t *testing.T) {
 			}
 			orig := idpRegistry
 			idpRegistry = &IdPRegistry{profiles: []*IdPProfile{p}, live: make(map[string]IdentityProvider)}
+			makeIdPRegistryDurable(t, idpRegistry)
 			t.Cleanup(func() { idpRegistry = orig })
 
 			w := httptest.NewRecorder()
@@ -601,6 +607,7 @@ func TestAPIIdPGetAndList_RedactSAMLMetadataXML(t *testing.T) {
 	}
 	orig := idpRegistry
 	idpRegistry = &IdPRegistry{profiles: []*IdPProfile{p}, live: make(map[string]IdentityProvider)}
+	makeIdPRegistryDurable(t, idpRegistry)
 	t.Cleanup(func() { idpRegistry = orig })
 
 	getW := httptest.NewRecorder()

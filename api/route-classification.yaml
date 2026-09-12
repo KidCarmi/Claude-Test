@@ -1681,6 +1681,17 @@ routes:
     audit_expected: true
     danger_level: medium
     documented: true
+  - route: "/api/idp/operations/"
+    method: "GET"
+    handler: "apiIdPOperations"
+    domain: "auth"
+    visibility: admin-supported
+    min_role: "admin"
+    mutating: false
+    audit_expected: false
+    danger_level: medium
+    documented: true
+    openapi_path: "/api/idp/operations/{operationId}"
   - route: "/api/idp/repair"
     method: "POST"
     handler: "apiIdPRepair"

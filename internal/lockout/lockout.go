@@ -189,15 +189,41 @@ type LoginLimiter struct {
 	pairs    map[string]*lockoutEntry        // key: ip\x00username
 	accounts map[string]*lockoutEntry        // key: username
 	trusted  map[string]map[string]time.Time // username -> ip -> last success
+	// generation is the server-owned fencing identity of the LOCK SET: it
+	// advances under mu on every mutation of pairs/accounts (a recorded
+	// failure, a success, a reset, a cleanup that removed something), so an
+	// administrator's reset can assert "clear the state I looked at" and be
+	// refused when the set moved underneath them. Floor 1 so a caller can
+	// always echo a positive value. Node-local like the rest of the state.
+	generation int64
 }
 
 // NewLoginLimiter returns a ready-to-use LoginLimiter.
 func NewLoginLimiter() *LoginLimiter {
 	return &LoginLimiter{
-		pairs:    map[string]*lockoutEntry{},
-		accounts: map[string]*lockoutEntry{},
-		trusted:  map[string]map[string]time.Time{},
+		pairs:      map[string]*lockoutEntry{},
+		accounts:   map[string]*lockoutEntry{},
+		trusted:    map[string]map[string]time.Time{},
+		generation: 1,
 	}
+}
+
+// bumpLocked advances the lock-set generation. Caller holds l.mu.
+func (l *LoginLimiter) bumpLocked() {
+	if l.generation <= 0 {
+		l.generation = 1
+	}
+	l.generation++
+}
+
+// Generation returns the current lock-set fencing identity (floor 1).
+func (l *LoginLimiter) Generation() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.generation <= 0 {
+		return 1
+	}
+	return l.generation
 }
 
 // isTrustedLocked reports whether ip has a live TrustTTL grant for username.
@@ -297,6 +323,7 @@ func (l *LoginLimiter) RecordPairFailure(ip, username string) bool {
 		pe = &lockoutEntry{}
 		l.pairs[pk] = pe
 	}
+	l.bumpLocked()
 	return pe.recordFailureLocked(time.Now(), MaxAttempts)
 }
 
@@ -323,6 +350,7 @@ func (l *LoginLimiter) RecordFailure(ip, username string) bool {
 		l.accounts[username] = ae
 	}
 	acctTripped := ae.recordFailureLocked(now, AccountMaxAttempts)
+	l.bumpLocked()
 
 	return pairTripped || acctTripped
 }
@@ -336,7 +364,10 @@ func (l *LoginLimiter) RecordSuccess(ip, username string) {
 	username = boundUsername(username)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.pairs, pairKey(ip, username))
+	if _, had := l.pairs[pairKey(ip, username)]; had {
+		delete(l.pairs, pairKey(ip, username))
+		l.bumpLocked()
+	}
 
 	set := l.trusted[username]
 	if set == nil {
@@ -371,18 +402,24 @@ func (l *LoginLimiter) Cleanup() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
+	removed := false
 	for _, entries := range []map[string]*lockoutEntry{l.pairs, l.accounts} {
 		for key, e := range entries {
 			if !e.lockedUntil.IsZero() {
 				if e.lockedUntil.Before(now) {
 					delete(entries, key) // lock expired
+					removed = true
 				}
 				continue
 			}
 			if !e.firstFail.IsZero() && now.Sub(e.firstFail) > Window {
 				delete(entries, key) // accumulating-failures window elapsed
+				removed = true
 			}
 		}
+	}
+	if removed {
+		l.bumpLocked()
 	}
 	for username, set := range l.trusted {
 		for ip, ts := range set {
@@ -423,13 +460,66 @@ func (l *LoginLimiter) ResetUser(username string) {
 	username = boundUsername(username)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.accounts, username)
+	l.resetUserLocked(username)
+}
+
+// resetUserLocked removes every tier-1/tier-2 entry for username and reports
+// whether anything existed. Caller holds l.mu.
+func (l *LoginLimiter) resetUserLocked(username string) bool {
+	found := false
+	if _, ok := l.accounts[username]; ok {
+		delete(l.accounts, username)
+		found = true
+	}
 	suffix := "\x00" + username
 	for key := range l.pairs {
 		if len(key) >= len(suffix) && key[len(key)-len(suffix):] == suffix {
 			delete(l.pairs, key)
+			found = true
 		}
 	}
+	if found {
+		l.bumpLocked()
+	}
+	return found
+}
+
+// ResetStatus is the verdict of a fenced reset.
+type ResetStatus int
+
+const (
+	// ResetOK means the target had state and it was cleared.
+	ResetOK ResetStatus = iota
+	// ResetStale means the caller's generation is not the current one;
+	// nothing was cleared.
+	ResetStale
+	// ResetNotFound means the generation matched but the target holds no
+	// lock or failure state; nothing was cleared and the generation did not
+	// move.
+	ResetNotFound
+)
+
+// ResetUserIfGeneration is the FENCED unlock primitive (FE-6A.0 correction,
+// Blocker 4): the check against the observed generation and the clear run
+// under ONE acquisition of l.mu, so a concurrent failure/success/cleanup that
+// changed the lock set between the administrator's listing and their reset
+// is refused as stale (zero mutation) rather than silently clearing a set
+// they never saw. The returned generation is the current one after the call
+// (advanced on ResetOK, unchanged otherwise).
+func (l *LoginLimiter) ResetUserIfGeneration(username string, expected int64) (status ResetStatus, current int64) {
+	username = boundUsername(username)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.generation <= 0 {
+		l.generation = 1
+	}
+	if expected != l.generation {
+		return ResetStale, l.generation
+	}
+	if !l.resetUserLocked(username) {
+		return ResetNotFound, l.generation
+	}
+	return ResetOK, l.generation
 }
 
 // LockedEntry describes one currently-active lockout, for admin visibility.
@@ -501,15 +591,23 @@ func (l *LoginLimiter) SnapshotAndClear() func() {
 		}
 		savedTrusted[u] = cpSet
 	}
+	savedGen := l.generation
 	l.pairs = map[string]*lockoutEntry{}
 	l.accounts = map[string]*lockoutEntry{}
 	l.trusted = map[string]map[string]time.Time{}
+	l.bumpLocked()
 	l.mu.Unlock()
 	return func() {
 		l.mu.Lock()
 		l.pairs = savedPairs
 		l.accounts = savedAccounts
 		l.trusted = savedTrusted
+		// Never rewind: a fence observed against the cleared state must not
+		// validate against the restored one.
+		if l.generation < savedGen {
+			l.generation = savedGen
+		}
+		l.bumpLocked()
 		l.mu.Unlock()
 	}
 }

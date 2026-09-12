@@ -21,8 +21,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/KidCarmi/Culvert/internal/session"
 )
 
 // ─── Concurrency: the fence decides exactly one winner ───────────────────────
@@ -236,7 +234,7 @@ func TestFE6A0_Green_RevisionsSurviveRestart(t *testing.T) {
 func TestFE6A0_Green_RosterRevisionSurvivesRestart(t *testing.T) {
 	c, path := fe6aSwapCfg(t, "")
 	before := c.RosterRevision()
-	if _, err := c.CreateUIUser("carol", "CarolPass1", RoleViewer); err != nil {
+	if _, err := c.CreateUIUser("carol", "CarolPass1", RoleViewer, before); err != nil {
 		t.Fatal(err)
 	}
 	fresh := newTestConfig()
@@ -321,36 +319,58 @@ func TestFE6A0_Green_OutcomeUnknownPublishesNothing(t *testing.T) {
 
 // ─── Session revocation semantics ────────────────────────────────────────────
 
-func TestFE6A0_Green_IssuedBeforeRevocationHonoursLaterLogins(t *testing.T) {
-	t.Cleanup(sessionRevoked.SwapForTest())
-	old := &Session{Sub: "carol", Provider: "local", Role: "admin", Exp: time.Now().Add(time.Hour).Unix(), Jti: newSessionJti(), Iat: time.Now().Add(-time.Second).UnixNano()}
-	oldTok, err := encodeSession(old)
-	if err != nil {
+// FE-6A.0 correction (Blocker 2): the in-memory "issued-before" cutoff was
+// replaced by the DURABLE per-user security generation. A session carries
+// the generation it was issued under; a role/credential change advances the
+// record's generation inside the roster commit, so every earlier session is
+// refused by the record comparison — on this node and across a restart —
+// while a login issued afterwards (at the new generation) is honoured, and a
+// legacy cookie without a generation fails closed.
+func TestFE6A0_Green_SecurityGenerationSupersedesEarlierSessions(t *testing.T) {
+	c, _ := fe6aSwapCfg(t, "")
+	rev := c.RosterRevision()
+	if _, err := c.CreateUIUser("carol", "CarolPass1", RoleAdmin, rev); err != nil {
 		t.Fatal(err)
 	}
-	sessionRevoked.RevokeUserIssuedBefore("carol", time.Now())
-	if _, err := decodeSession(oldTok); err == nil {
-		t.Fatal("a session issued before the account change must be rejected")
+	role, gen0, ok := c.UserRoleAndGeneration("carol")
+	if !ok || role != RoleAdmin || gen0 <= 0 {
+		t.Fatalf("fresh user must carry a positive generation; got %s %d %v", role, gen0, ok)
 	}
-	fresh := &Session{Sub: "carol", Provider: "local", Role: "viewer", Exp: time.Now().Add(time.Hour).Unix(), Jti: newSessionJti(), Iat: time.Now().Add(time.Millisecond).UnixNano()}
-	freshTok, err := encodeSession(fresh)
-	if err != nil {
+	old := &Session{Sub: "carol", Provider: "local", Role: "admin", Exp: time.Now().Add(time.Hour).Unix(), Jti: newSessionJti(), Gen: gen0}
+	if _, err := c.UpdateUIUser("carol", "", RoleViewer, c.RosterRevision()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := decodeSession(freshTok); err != nil {
-		t.Fatalf("a login after the account change must be honoured: %v", err)
+	role, gen1, ok := c.UserRoleAndGeneration("carol")
+	if !ok || role != RoleViewer || gen1 <= gen0 {
+		t.Fatalf("a role change must advance the generation (%d → %d) and record the new role (%s)", gen0, gen1, role)
 	}
-	// Legacy cookie without Iat: treated as issued at Exp − TTL (i.e. long
-	// before the cutoff) → rejected.
-	legacy := &Session{Sub: "carol", Provider: "local", Role: "admin", Exp: time.Now().Add(session.TTL() - time.Minute).Unix(), Jti: newSessionJti()}
-	legacyTok, _ := encodeSession(legacy)
-	if _, err := decodeSession(legacyTok); err == nil {
-		t.Fatal("a legacy cookie predating the change must be rejected")
+	if old.Gen == gen1 {
+		t.Fatal("a session issued before the account change must not match the current generation")
 	}
-	// Account deletion still blocks every session, later logins included.
-	sessionRevoked.RevokeUser("carol")
-	if _, err := decodeSession(freshTok); err == nil {
-		t.Fatal("RevokeUser (deletion) must block the fresh session too")
+	fresh := &Session{Sub: "carol", Provider: "local", Role: "viewer", Exp: time.Now().Add(time.Hour).Unix(), Jti: newSessionJti(), Gen: gen1}
+	if fresh.Gen != gen1 {
+		t.Fatal("a login after the account change must be honoured")
+	}
+	// A legacy cookie carries no generation: Gen == 0 never equals a
+	// positive record generation, so it fails closed.
+	legacy := &Session{Sub: "carol", Provider: "local", Role: "admin", Exp: time.Now().Add(time.Hour).Unix(), Jti: newSessionJti()}
+	if legacy.Gen > 0 || legacy.Gen == gen1 {
+		t.Fatal("a legacy cookie without a generation must be rejected")
+	}
+	// A password change advances it again — so does a delete + recreate
+	// (the counter is roster-wide and never reused).
+	if _, gen2, err := c.ChangeUIUserPassword("carol", "CarolPass2", gen1); err != nil || gen2 <= gen1 {
+		t.Fatalf("password change must advance the generation: %d → %d (%v)", gen1, gen2, err)
+	}
+	if _, err := c.DeleteUIUserFenced("carol", c.RosterRevision()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateUIUser("carol", "CarolPass3", RoleViewer, c.RosterRevision()); err != nil {
+		t.Fatal(err)
+	}
+	_, gen3, _ := c.UserRoleAndGeneration("carol")
+	if gen3 <= gen1 {
+		t.Fatalf("a recreated user must never inherit an earlier generation (%d vs %d)", gen3, gen1)
 	}
 }
 
@@ -361,12 +381,12 @@ func TestFE6A0_Green_SecretsAbsentFromReadAuditLogBackup(t *testing.T) {
 	fe6aSwapConfigStore(t)
 	withConfigVersionsDir(t)
 	const probe = "svc-probe-ZZ9" // the bind credential value traced across every surface
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 	var id string
 	logs := captureLogger(t, func() {
 		body := ldapProfileBodyForPut("Audited AD", map[string]any{"bindPassword": probe})
 		w := httptest.NewRecorder()
-		apiIdPList(w, jsonReq(http.MethodPost, "/api/idp", body))
+		apiIdPList(w, jsonReq(http.MethodPost, fencedIdPCreatePath(), body))
 		if w.Code != http.StatusOK {
 			t.Fatalf("create = %d: %s", w.Code, w.Body.String())
 		}
@@ -552,7 +572,7 @@ func TestFE6A0_Green_ResponsesConformToContract(t *testing.T) {
 	apiAuthUsers(w, getReq("/api/auth/users"))
 	check("users GET", "GET", "/api/auth/users", w)
 	w = httptest.NewRecorder()
-	apiAuthUsers(w, jsonReq(http.MethodPost, "/api/auth/users", map[string]any{"username": "frank", "password": "FrankPass1", "role": "operator"}))
+	apiAuthUsers(w, jsonReq(http.MethodPost, fencedUsersPath(), map[string]any{"username": "frank", "password": "FrankPass1", "role": "operator"}))
 	check("users POST", "POST", "/api/auth/users", w)
 	rev := fe6aRosterRevision(t)
 	w = httptest.NewRecorder()

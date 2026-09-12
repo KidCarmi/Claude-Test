@@ -9,14 +9,17 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/KidCarmi/Culvert/internal/lockout"
 	"github.com/KidCarmi/Culvert/internal/totp"
 	"github.com/crewjam/saml"
 )
@@ -217,17 +220,31 @@ func apiAuthStatus(w http.ResponseWriter, r *http.Request) {
 	sess, err := readUISessionCookie(r)
 	if err == nil && sess != nil {
 		role := UIRole(sess.Role)
+		var gen int64
+		if sess.Provider == "local" {
+			// Same authority as uiAuthMiddleware (Blocker 2): the durable
+			// record decides, so a session issued under a previous security
+			// generation reads as logged out here too — this route is
+			// public, so the middleware never sees it.
+			curRole, curGen, ok := cfg.UserRoleAndGeneration(sess.Sub)
+			if !ok || sess.Gen <= 0 || sess.Gen != curGen {
+				jsonOKAuthStatus(w, map[string]any{"loggedIn": false})
+				return
+			}
+			role, gen = curRole, curGen
+		}
 		if !role.HasRole(RoleViewer) {
 			role = RoleAdmin
 		}
-		jsonOKAuthStatus(w, map[string]any{"loggedIn": true, "user": sess.Sub, "role": role})
+		jsonOKAuthStatus(w, map[string]any{"loggedIn": true, "user": sess.Sub, "role": role, "securityGeneration": gen})
 		return
 	}
 	// Accept Basic Auth header for CLI/API callers.
 	user, pass, ok := r.BasicAuth()
 	if ok {
 		if role, valid := cfg.VerifyUIUser(user, pass); valid {
-			jsonOKAuthStatus(w, map[string]any{"loggedIn": true, "user": user, "role": role})
+			gen, _ := cfg.UserSecurityGeneration(user)
+			jsonOKAuthStatus(w, map[string]any{"loggedIn": true, "user": user, "role": role, "securityGeneration": gen})
 			return
 		}
 	}
@@ -324,11 +341,19 @@ func decodeAuthUsersBody(w http.ResponseWriter, r *http.Request) (authUsersBody,
 // writeRosterRefusal maps a roster transaction error to its typed refusal.
 func writeRosterRefusal(w http.ResponseWriter, err error) {
 	var stale *rosterStaleError
+	var genStale *rosterGenStaleError
 	switch {
 	case errors.As(err, &stale):
 		writeRefusal(w, http.StatusConflict, refusalStale,
 			"stale revision: the roster changed since you loaded it — reload and retry",
 			map[string]any{"revision": stale.Current})
+	case errors.As(err, &genStale):
+		writeRefusal(w, http.StatusConflict, refusalStale,
+			"stale generation: the account's security generation changed since you verified your credential — reload and retry",
+			map[string]any{"generation": genStale.Current})
+	case errors.Is(err, errRosterNotDurable):
+		writeRefusal(w, http.StatusServiceUnavailable, refusalPersistenceNotConfigured,
+			"the admin roster has no persistence path; administrative mutations are refused", nil)
 	case errors.Is(err, errRosterNotFound):
 		writeRefusal(w, http.StatusNotFound, refusalNotFound, "user not found", nil)
 	case errors.Is(err, errRosterUserExists):
@@ -355,15 +380,25 @@ func apiAuthUsersCreate(w http.ResponseWriter, r *http.Request) {
 		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "password and role are required to create a user", nil)
 		return
 	}
-	rev, err := cfg.CreateUIUser(body.Username, body.Password, UIRole(body.Role))
+	if !requireDurableRoster(w) {
+		return
+	}
+	// Blocker 4: a create is fenced on the ROSTER DOCUMENT revision — the
+	// only identity that exists before the user does.
+	token := revisionFence(r, body.Revision)
+	if !checkRevisionFence(w, token, cfg.RosterRevision()) {
+		return
+	}
+	rev, err := cfg.CreateUIUser(body.Username, body.Password, UIRole(body.Role), token)
 	if err != nil {
 		writeRosterRefusal(w, err)
 		return
 	}
+	gen, _ := cfg.UserSecurityGeneration(body.Username)
 	auditEvent(r, "auth.users.create", body.Username, fmt.Sprintf("role=%s", body.Role))
 	jsonOK(w, map[string]any{
 		"ok":        true,
-		"user":      UIUserInfo{Username: body.Username, Role: UIRole(body.Role)},
+		"user":      UIUserInfo{Username: body.Username, Role: UIRole(body.Role), SecurityGeneration: gen},
 		"revision":  rev,
 		"persisted": cfg.uiUsersFilePath() != "",
 	})
@@ -385,6 +420,9 @@ func apiAuthUsersUpdate(w http.ResponseWriter, r *http.Request) {
 		writeRefusal(w, http.StatusNotFound, refusalNotFound, "user not found", nil)
 		return
 	}
+	if !requireDurableRoster(w) {
+		return
+	}
 	token := revisionFence(r, body.Revision)
 	if !checkRevisionFence(w, token, cfg.RosterRevision()) {
 		return
@@ -394,13 +432,15 @@ func apiAuthUsersUpdate(w http.ResponseWriter, r *http.Request) {
 		writeRosterRefusal(w, err)
 		return
 	}
-	// Session impact ONLY after the durable commit: a changed role or
-	// credential invalidates every live session of that user, so a demoted
-	// admin loses authority now — not at cookie TTL (R11).
+	// Session impact is a consequence of the DURABLE commit, not a separate
+	// in-memory step: a changed role or credential advanced the user's
+	// security generation inside the roster transaction, and every session
+	// carries the generation it was issued under, so each earlier session —
+	// on this node, on a restarted node, on any node loading this roster —
+	// is refused by uiAuthMiddleware. A demoted admin loses authority now,
+	// not at cookie TTL (R11), and the invalidation survives a restart
+	// (Blocker 2).
 	revoked := res.RoleChanged || res.PasswordChanged
-	if revoked {
-		sessionRevoked.RevokeUserIssuedBefore(body.Username, time.Now())
-	}
 	self := sessionAdmin(r) == body.Username
 	role := res.PreviousRole
 	if body.Role != "" {
@@ -409,12 +449,13 @@ func apiAuthUsersUpdate(w http.ResponseWriter, r *http.Request) {
 	auditEvent(r, "auth.users.update", body.Username,
 		fmt.Sprintf("role=%s roleChanged=%t passwordChanged=%t sessionsRevoked=%t", role, res.RoleChanged, res.PasswordChanged, revoked))
 	jsonOK(w, map[string]any{
-		"ok":              true,
-		"user":            UIUserInfo{Username: body.Username, Role: role, TOTPEnabled: cfg.UserHasTOTP(body.Username)},
-		"revision":        res.Revision,
-		"persisted":       cfg.uiUsersFilePath() != "",
-		"sessionsRevoked": revoked,
-		"selfAffected":    self,
+		"ok":                 true,
+		"user":               UIUserInfo{Username: body.Username, Role: role, TOTPEnabled: cfg.UserHasTOTP(body.Username), SecurityGeneration: res.Generation},
+		"revision":           res.Revision,
+		"persisted":          cfg.uiUsersFilePath() != "",
+		"sessionsRevoked":    revoked,
+		"selfAffected":       self,
+		"securityGeneration": res.Generation,
 	})
 }
 
@@ -429,6 +470,9 @@ func apiAuthUsersDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if !cfg.UIUserExists(username) {
 		writeRefusal(w, http.StatusNotFound, refusalNotFound, "user not found", nil)
+		return
+	}
+	if !requireDurableRoster(w) {
 		return
 	}
 	token := revisionFence(r, 0)
@@ -472,14 +516,18 @@ func apiAuthLockouts(w http.ResponseWriter, r *http.Request) {
 		if !requireRoleJSON(w, r, RoleAdmin) {
 			return
 		}
-		jsonOK(w, map[string]any{"lockouts": loginLimiter.Snapshot(), "scope": "node-local"})
+		// The generation is read in the same call as the listing so a
+		// caller echoes the identity of the set they actually saw.
+		entries, gen := loginLimiter.Snapshot(), loginLimiter.Generation()
+		jsonOK(w, map[string]any{"lockouts": entries, "generation": gen, "scope": "node-local"})
 
 	case http.MethodPost:
 		if !requireRoleJSON(w, r, RoleAdmin) {
 			return
 		}
 		var body struct {
-			Username string `json:"username"`
+			Username   string `json:"username"`
+			Generation int64  `json:"generation"`
 		}
 		if err := decodeJSON(r, &body); err != nil {
 			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
@@ -490,9 +538,29 @@ func apiAuthLockouts(w http.ResponseWriter, r *http.Request) {
 			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "missing username", nil)
 			return
 		}
-		loginLimiter.ResetUser(body.Username)
-		auditEvent(r, "auth.lockout.clear", body.Username, "")
-		jsonOK(w, map[string]any{"ok": true, "username": body.Username, "scope": "node-local"})
+		// Blocker 4: the reset asserts the server-owned lock-set generation
+		// (428 absent / 409 stale / 404 no such lock), checked and cleared
+		// under one limiter lock so no failure can land between the two.
+		token := generationFence(r, body.Generation)
+		if token == 0 {
+			writeRefusal(w, http.StatusPreconditionRequired, refusalPreconditionRequired,
+				"precondition required: echo the generation from the lockout listing",
+				map[string]any{"generation": loginLimiter.Generation()})
+			return
+		}
+		status, cur := loginLimiter.ResetUserIfGeneration(body.Username, token)
+		switch status {
+		case lockout.ResetStale:
+			writeRefusal(w, http.StatusConflict, refusalStale,
+				"stale generation: the lockout set changed since you listed it — reload and retry",
+				map[string]any{"generation": cur})
+			return
+		case lockout.ResetNotFound:
+			writeRefusal(w, http.StatusNotFound, refusalNotFound, "no lockout state for that username", nil)
+			return
+		}
+		auditEvent(r, "auth.lockout.clear", body.Username, fmt.Sprintf("generation=%d", cur))
+		jsonOK(w, map[string]any{"ok": true, "username": body.Username, "generation": cur, "scope": "node-local"})
 
 	default:
 		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
@@ -500,10 +568,26 @@ func apiAuthLockouts(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/auth/change-password — self-service password change for any authenticated user.
-// Body: {"current_password": "...", "new_password": "..."}
-// Verifies the current password before accepting the change. Commits
-// persist-before-publish (500 persist_failed keeps the old credential) and
-// preserves TOTP enrollment (FE-6A.0 R9/R10).
+// Body: {"current_password": "...", "new_password": "...", "generation": N}
+// (`?generation=` wins when present).
+//
+// FE-6A.0 correction (Blocker 1/3): the change is bound to the caller's
+// SECURITY GENERATION — the per-user identity that advances on every
+// role/credential change — observed together with the verified credential
+// (GET /api/auth/status exposes it). Order: decode → verify the current
+// password (403 invalid_credentials) → fence (428 precondition_required /
+// 409 stale, current.generation) → ONE roster transaction, which
+// revalidates the generation under the roster lock (a competing
+// administrator update ⇒ 409 stale; a competing delete ⇒ 404 not_found;
+// zero mutation either way) and commits persist-before-publish (500
+// persist_failed keeps the old credential usable and the new one unusable).
+// A legacy single-user identity (mirror only, no roster entry) is migrated
+// by the SAME transaction — never by a separate SetAuth that would publish
+// the new credential before the durable outcome is known. TOTP enrollment
+// is preserved (R9/R10). After the commit every session issued under the
+// previous generation is invalid (durably, across restart); the caller's
+// own UI session is re-issued at the new generation so the ceremony does
+// not log them out.
 func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
@@ -520,6 +604,7 @@ func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		CurrentPass string `json:"current_password"`
 		NewPass     string `json:"new_password"`
+		Generation  int64  `json:"generation"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
@@ -527,6 +612,14 @@ func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.CurrentPass == "" || body.NewPass == "" {
 		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "current_password and new_password are required", nil)
+		return
+	}
+	// The caller IS this account (authenticated), so telling them it no
+	// longer exists leaks nothing — and it must be 404, not 403: a deleted
+	// account has no credential to be "incorrect" about.
+	curGen, known := cfg.UserSecurityGeneration(username)
+	if !known {
+		writeRefusal(w, http.StatusNotFound, refusalNotFound, "user not found", nil)
 		return
 	}
 	// Verify current password.
@@ -538,20 +631,33 @@ func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, err.Error(), nil)
 		return
 	}
-	if !cfg.UIUserExists(username) {
-		// Legacy single-user deployment (pre-RBAC): the roster carries no
-		// entry, so the credential lives in the legacy mirror only.
-		if err := cfg.SetAuth(username, body.NewPass); err != nil {
-			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, err.Error(), nil)
-			return
-		}
+	if !requireDurableRoster(w) {
+		return
 	}
-	rev, err := cfg.ChangeUIUserPassword(username, body.NewPass)
+	token := generationFence(r, body.Generation)
+	if !checkGenerationFence(w, token, curGen) {
+		return
+	}
+	rev, gen, err := cfg.ChangeUIUserPassword(username, body.NewPass, token)
 	if err != nil {
 		writeRosterRefusal(w, err)
 		return
 	}
-	auditEvent(r, "auth.password_change", username, "self-service password change")
+	// The caller keeps working: re-issue THEIR session at the new
+	// generation when the request rode a UI session cookie (a Basic-auth
+	// caller has no cookie to re-issue). Every other session of this user
+	// was issued under the previous generation and is now refused.
+	if sess, cerr := readUISessionCookie(r); cerr == nil && sess != nil && sess.Sub == username {
+		role, _, ok := cfg.UserRoleAndGeneration(username)
+		if !ok {
+			role = RoleAdmin
+		}
+		if err := setUISessionCookie(w, r, username, role); err != nil {
+			logger.Printf("change-password: session re-issue failed for %q: %v", sanitizeLog(username), err)
+		}
+	}
+	auditEvent(r, "auth.password_change", username,
+		fmt.Sprintf("self-service password change generation=%d sessionsRevoked=true", gen))
 	// Intentionally NOT calling saveConfigVersion: password hashes are
 	// excluded from the rollback surface (captureConfigBackup does NOT
 	// capture ui_users.json). Even if they were captured, rolling back
@@ -561,7 +667,62 @@ func apiAuthChangePassword(w http.ResponseWriter, r *http.Request) {
 	// audit trail above is the appropriate observability tier; rollback
 	// is deliberately not. Category D-sec finding from
 	// roadmap/CONFIG-VERSIONING-TRIAGE.md.
-	jsonOK(w, map[string]any{"ok": true, "revision": rev, "persisted": cfg.uiUsersFilePath() != ""})
+	jsonOK(w, map[string]any{
+		"ok":                 true,
+		"revision":           rev,
+		"persisted":          cfg.uiUsersFilePath() != "",
+		"sessionsRevoked":    true,
+		"selfAffected":       true,
+		"securityGeneration": gen,
+	})
+}
+
+// generationFence returns the caller's `generation` precondition: the query
+// parameter wins when present (malformed reads as 0 ⇒ 428), else the body
+// value.
+func generationFence(r *http.Request, body int64) int64 {
+	if q := r.URL.Query().Get("generation"); q != "" {
+		v, err := strconv.ParseInt(q, 10, 64)
+		if err != nil {
+			return 0
+		}
+		return v
+	}
+	return body
+}
+
+// checkGenerationFence is the per-user twin of checkRevisionFence: the
+// fenced identity is the target account's security generation, and the
+// refusal carries current.generation.
+func checkGenerationFence(w http.ResponseWriter, token, current int64) bool {
+	if token == 0 {
+		writeRefusal(w, http.StatusPreconditionRequired, refusalPreconditionRequired,
+			"precondition required: echo the security generation you observed with your verified credential",
+			map[string]any{"generation": current})
+		return false
+	}
+	if token != current {
+		writeRefusal(w, http.StatusConflict, refusalStale,
+			"stale generation: the account changed since you loaded it — reload and retry",
+			map[string]any{"generation": current})
+		return false
+	}
+	return true
+}
+
+// requireDurableRoster refuses an administrative roster mutation BEFORE any
+// runtime state changes when the roster has no persistence path (Blocker 7):
+// a `2xx persisted:false` answer would let an in-memory change masquerade as
+// an administrative fact that a restart silently reverts. Reads keep
+// reporting the posture (`persisted`). Bootstrap paths (setup, the
+// reset-password one-shot) keep their own contract.
+func requireDurableRoster(w http.ResponseWriter) bool {
+	if cfg.RosterDurable() {
+		return true
+	}
+	writeRefusal(w, http.StatusServiceUnavailable, refusalPersistenceNotConfigured,
+		"the admin roster has no persistence path; administrative mutations are refused", nil)
+	return false
 }
 
 // GET /api/setup/status — reports whether first-time setup is still needed.
@@ -717,6 +878,7 @@ func idpListReadModel() map[string]any {
 		"revision":  idpRegistry.DocumentRevision(),
 		"profiles":  publicIdPProfiles(idpRegistry.All()),
 		"scope":     "cluster-synced",
+		"cluster":   idpClusterReadModel(),
 	}
 	if d := idpRegistry.Degraded(); d != nil {
 		out["degraded"] = true
@@ -732,11 +894,29 @@ func idpListReadModel() map[string]any {
 // writeIdPRefusal maps a registry mutation error to its typed refusal.
 func writeIdPRefusal(w http.ResponseWriter, err error) {
 	var stale *idpStaleError
+	var docStale *idpDocStaleError
+	var invalid *idpValidationError
+	var compile *idpCompileError
 	switch {
 	case errors.As(err, &stale):
 		writeRefusal(w, http.StatusConflict, refusalStale,
 			"stale revision: the profile changed since you loaded it — reload and retry",
 			map[string]any{"revision": stale.Current})
+	case errors.As(err, &docStale):
+		writeRefusal(w, http.StatusConflict, refusalStale,
+			"stale document revision: the registry changed since you loaded it — reload and retry",
+			map[string]any{"documentRevision": docStale.Current})
+	case errors.As(err, &invalid):
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, invalid.msg, nil)
+	case errors.As(err, &compile):
+		// Blocker 6: a dependency failure is a 502 with a BOUNDED reason
+		// class — never the provider's error text.
+		writeRefusal(w, http.StatusBadGateway, refusalProviderCompileFailed,
+			"the identity provider could not be constructed from this profile (dependency failure); nothing was changed",
+			map[string]any{"reason": compile.reason})
+	case errors.Is(err, errIdPOperationPersist):
+		writeRefusal(w, http.StatusInternalServerError, refusalPersistFailed,
+			"the operation intent could not be persisted; nothing was changed", nil)
 	case errors.Is(err, errIdPVanished):
 		writeRefusal(w, http.StatusNotFound, refusalVanished, "profile vanished: it was deleted since you loaded it", nil)
 	case errors.Is(err, errIdPRegistryDegraded):
@@ -750,8 +930,117 @@ func writeIdPRefusal(w http.ResponseWriter, err error) {
 		writeRefusal(w, http.StatusInternalServerError, refusalPersistFailed,
 			"the identity-provider registry could not be persisted; nothing was changed", nil)
 	default:
-		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, err.Error(), nil)
+		// Every error the registry returns is typed above; an unclassified
+		// one is reported as a FIXED message so no dependency text can ride
+		// the default branch (Blocker 6).
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid identity-provider profile", nil)
 	}
+}
+
+// refusalCodeOf maps a registry error to the bounded refusal code it would
+// be reported as (recorded on an aborted operation intent).
+func refusalCodeOf(err error) string {
+	w := httptest.NewRecorder()
+	writeIdPRefusal(w, err)
+	var m struct {
+		Code string `json:"code"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &m)
+	return m.Code
+}
+
+// requireDurableIdP refuses an administrative registry mutation BEFORE any
+// runtime state changes when the registry has no persistence path (Blocker
+// 7). Reads keep reporting `persisted:false`; the CP→DP sync and the boot
+// loaders are not administrative mutations and keep their own contract.
+func requireDurableIdP(w http.ResponseWriter) bool {
+	if idpRegistry.Persisted() {
+		return true
+	}
+	writeRefusal(w, http.StatusServiceUnavailable, refusalPersistenceNotConfigured,
+		"the identity-provider registry has no persistence path (no idp_profiles_file); administrative mutations are refused", nil)
+	return false
+}
+
+// ── Fleet publication facts (Blocker 8) ──────────────────────────────────
+
+// idpFleetResult is the bounded, structured outcome of publishing the
+// registry to the fleet after a LOCAL durable commit.
+type idpFleetResult struct {
+	Publication string // published | rejected
+	Version     int64  // the published snapshot version (published only)
+	Reason      string // bounded rejection class (rejected only)
+}
+
+func (f idpFleetResult) readModel() map[string]any {
+	out := map[string]any{"publication": f.Publication}
+	if f.Publication == "published" {
+		out["version"] = f.Version
+	} else {
+		out["reason"] = f.Reason
+	}
+	return out
+}
+
+// auditSuffix distinguishes the local durable commit from the fleet outcome
+// in the audit detail.
+func (f idpFleetResult) auditSuffix() string {
+	if f.Publication == "published" {
+		return fmt.Sprintf(" fleet=published v%d", f.Version)
+	}
+	return " fleet=rejected:" + f.Reason
+}
+
+// idpLastFleetRejection remembers the most recent rejected registry
+// publication (bounded class + time) for the read model; cleared by the next
+// successful publish.
+var idpLastFleetRejection atomic.Pointer[idpFleetRejection]
+
+type idpFleetRejection struct {
+	Reason string `json:"reason"`
+	At     string `json:"at"`
+}
+
+// idpPublishFleet publishes the current config to the fleet after a local
+// registry commit and returns the structured fact. The raw rejection stays
+// in the log; the action result carries the class only.
+func idpPublishFleet(what string) idpFleetResult {
+	if err := publishCurrentConfigSnapshot(); err != nil {
+		reason := publishRejectionClass(err)
+		idpLastFleetRejection.Store(&idpFleetRejection{Reason: reason, At: time.Now().UTC().Format(time.RFC3339)})
+		logger.Printf("UI: %s committed locally but the cluster publication was rejected (%s): %v", what, reason, err)
+		return idpFleetResult{Publication: "rejected", Reason: reason}
+	}
+	idpLastFleetRejection.Store(nil)
+	return idpFleetResult{Publication: "published", Version: globalConfigStore.Version()}
+}
+
+// idpClusterReadModel derives the fleet state of the registry: `published`
+// when the last published snapshot carries exactly the current registry
+// document, else `pending` (a rejected or not-yet-run publication).
+func idpClusterReadModel() map[string]any {
+	snap := globalConfigStore.Get()
+	state := "pending"
+	if idpDocumentRevisionOf(snap.IdPProfiles) == idpRegistry.DocumentRevision() {
+		state = "published"
+	}
+	out := map[string]any{"state": state, "publishedVersion": snap.Version}
+	if rej := idpLastFleetRejection.Load(); rej != nil && state == "pending" {
+		out["lastRejection"] = *rej
+	}
+	return out
+}
+
+// idpWithFleet decorates a profile response with the fleet facts.
+func idpWithFleet(p *IdPProfile, fleet idpFleetResult) map[string]any {
+	b, _ := json.Marshal(p)
+	var m map[string]any
+	_ = json.Unmarshal(b, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	m["cluster"] = fleet.readModel()
+	return m
 }
 
 // errAdminSettingsPersist wraps a failed durable cutover-sentinel write so the
@@ -808,39 +1097,218 @@ func apiIdPList(w http.ResponseWriter, r *http.Request) {
 		// is in-memory only and profiles would be lost on restart.
 		jsonOK(w, idpListReadModel())
 	case http.MethodPost:
-		if !requireRoleJSON(w, r, RoleAdmin) {
-			return
-		}
-		var p IdPProfile
-		if err := decodeJSON(r, &p); err != nil {
-			writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
-			return
-		}
-		p.ID = "" // force generation of new ID
-		if idpRegistry.Degraded() != nil {
-			writeIdPRefusal(w, errIdPRegistryDegraded)
-			return
-		}
-		// Optional safe-activation preflight (?preflight=connection): a live
-		// connection test must pass BEFORE anything persists (LDAP only).
-		if rep := ldapActivationPreflight(r, &p); rep != nil && !rep.OK {
-			writeLDAPPreflightFailure(w, rep)
-			return
-		}
-		if err := idpRegistry.Create(&p, idpLegacyCutoverHook(r, &p)); err != nil {
-			writeIdPRefusal(w, err)
-			return
-		}
-		enforceLegacyLDAPShadowing()
-		if err := publishCurrentConfigSnapshot(); err != nil {
-			logger.Printf("UI: IdP create published locally but the cluster snapshot was refused: %v", err)
-		}
-		auditEventDiff(r, "idp.create", p.ID, p.Name, nil, auditIdPProfile(&p))
-		logger.Printf("UI: IdP profile created id=%q name=%q type=%q", sanitizeLog(p.ID), sanitizeLog(p.Name), sanitizeLog(string(p.Type)))
-		jsonOK(w, publicIdPProfile(&p))
+		apiIdPCreate(w, r)
 	default:
 		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
 	}
+}
+
+// apiIdPCreate is POST /api/idp (FE-6A.0 correction). Order, and why:
+//
+//  1. decode; 2. durability (Blocker 7: refused before ANY runtime change);
+//  3. operationId (Blocker 9: a cutover-bearing write REQUIRES a client
+//     UUID — 428 operation_id_required; a known id REPLAYS the recorded
+//     outcome: committed ⇒ the same response with replayed:true, aborted ⇒
+//     409 operation_aborted, pending ⇒ 409 operation_in_progress, unknown ⇒
+//     409 operation_outcome_unknown; a different candidate under a known id
+//     ⇒ 409 operation_mismatch — never a second write);
+//  4. document-revision fence pre-check (Blocker 4: 428/409 with
+//     current.documentRevision; decided again INSIDE the transaction);
+//  5. preflight; 6. durable INTENT (pre-minted id, actor, spec digest,
+//     fenced revision) BEFORE the first irreversible write; 7. the registry
+//     transaction (compile outside locks; a dependency failure is 502
+//     provider_compile_failed with a bounded reason — Blocker 6); 8. the
+//     terminal intent state; 9. fleet publication as a STRUCTURED fact
+//     (Blocker 8: `cluster.publication`, audit `fleet=…`, never the raw
+//     rejection).
+func apiIdPCreate(w http.ResponseWriter, r *http.Request) {
+	if !requireRoleJSON(w, r, RoleAdmin) {
+		return
+	}
+	var p IdPProfile
+	if err := decodeJSON(r, &p); err != nil {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "invalid JSON", nil)
+		return
+	}
+	p.ID = "" // the registry (or the durable intent) mints the id
+	if !requireDurableIdP(w) {
+		return
+	}
+	if idpRegistry.Degraded() != nil {
+		writeIdPRefusal(w, errIdPRegistryDegraded)
+		return
+	}
+	cutover := idpLegacyCutoverHook(r, &p)
+	opID, ok := idpCreateOperationID(w, r, cutover != nil)
+	if !ok {
+		return
+	}
+	// Normalise the candidate the same way the registry will (write-only
+	// echo fields stripped) so the intent digest is the registry's view.
+	normalizeIdPProfileWriteInput(&p)
+	specDigest := idpSpecDigest(&p)
+	ops := idpRegistry.operations()
+	if opID != "" {
+		if prev := ops.Get(opID); prev != nil {
+			apiIdPReplayOperation(w, prev, specDigest)
+			return
+		}
+	}
+	docRev, ok := idpCreateDocumentFence(w, r)
+	if !ok {
+		return
+	}
+	// Optional safe-activation preflight (?preflight=connection): a live
+	// connection test must pass BEFORE anything persists (LDAP only).
+	if rep := ldapActivationPreflight(r, &p); rep != nil && !rep.OK {
+		writeLDAPPreflightFailure(w, rep)
+		return
+	}
+	p.ID = mintIdPID()
+	if !idpBeginCreateIntent(w, ops, idpOperation{
+		OperationID: opID, Action: "idp.create", Actor: auditActor(r),
+		ProfileID: p.ID, SpecDigest: specDigest, RegistryRevision: docRev, Cutover: cutover != nil,
+	}) {
+		return
+	}
+	if err := idpRegistry.Create(&p, docRev, cutover); err != nil {
+		idpFinishFailedOperation(ops, opID, err)
+		writeIdPRefusal(w, err)
+		return
+	}
+	enforceLegacyLDAPShadowing()
+	fleet := idpPublishFleet("IdP create")
+	result := idpWithFleet(publicIdPProfile(&p), fleet)
+	detail := p.Name + fleet.auditSuffix()
+	if opID != "" {
+		result["operationId"] = opID
+		ops.Finish(opID, idpOpCommitted, "", idpRegistry.DocumentRevision(), result)
+		detail += " operationId=" + opID
+	}
+	auditEventDiff(r, "idp.create", p.ID, detail, nil, auditIdPProfile(&p))
+	logger.Printf("UI: IdP profile created id=%q name=%q type=%q fleet=%s", sanitizeLog(p.ID), sanitizeLog(p.Name), sanitizeLog(string(p.Type)), fleet.Publication)
+	jsonOK(w, result)
+}
+
+// idpCreateOperationID resolves the optional client operationId: malformed
+// ⇒ 400, absent on a cutover-bearing write ⇒ 428 operation_id_required.
+func idpCreateOperationID(w http.ResponseWriter, r *http.Request, cutover bool) (string, bool) {
+	opID := strings.TrimSpace(r.URL.Query().Get("operationId"))
+	if opID != "" && !validIdPOperationID(opID) {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "operationId must be a UUID", nil)
+		return "", false
+	}
+	if opID == "" && cutover {
+		writeRefusal(w, http.StatusPreconditionRequired, refusalOperationIDRequired,
+			"this write retires the legacy YAML ldap authenticator: supply a client-generated UUID operationId so a lost response can be recovered without a second cutover", nil)
+		return "", false
+	}
+	return opID, true
+}
+
+// idpCreateDocumentFence applies the document-revision pre-check (428 absent,
+// 409 stale with current.documentRevision); the transaction re-decides it.
+func idpCreateDocumentFence(w http.ResponseWriter, r *http.Request) (string, bool) {
+	docRev := strings.TrimSpace(r.URL.Query().Get("documentRevision"))
+	if docRev == "" {
+		writeRefusal(w, http.StatusPreconditionRequired, refusalPreconditionRequired,
+			"precondition required: echo the registry documentRevision you loaded",
+			map[string]any{"documentRevision": idpRegistry.DocumentRevision()})
+		return "", false
+	}
+	if cur := idpRegistry.DocumentRevision(); docRev != cur {
+		writeIdPRefusal(w, &idpDocStaleError{Current: cur})
+		return "", false
+	}
+	return docRev, true
+}
+
+// idpBeginCreateIntent persists the durable intent BEFORE the first
+// irreversible write (no-op without an operationId). A concurrent dispatch
+// of the same id that won the race is answered from its record.
+func idpBeginCreateIntent(w http.ResponseWriter, ops *idpOperationStore, op idpOperation) bool {
+	if op.OperationID == "" {
+		return true
+	}
+	prev, created, err := ops.Begin(op)
+	if err != nil {
+		writeIdPRefusal(w, err)
+		return false
+	}
+	if !created {
+		apiIdPReplayOperation(w, prev, op.SpecDigest)
+		return false
+	}
+	return true
+}
+
+// idpFinishFailedOperation records the terminal state of a refused write.
+func idpFinishFailedOperation(ops *idpOperationStore, opID string, err error) {
+	if opID == "" {
+		return
+	}
+	state := idpOpAborted
+	if errors.Is(err, errIdPOutcomeUnknown) {
+		state = idpOpOutcomeUnknown
+	}
+	ops.Finish(opID, state, refusalCodeOf(err), "", nil)
+}
+
+// apiIdPReplayOperation answers a re-dispatched operationId from the durable
+// record — never by performing the write again.
+func apiIdPReplayOperation(w http.ResponseWriter, prev *idpOperation, specDigest string) {
+	if prev.SpecDigest != specDigest {
+		writeRefusal(w, http.StatusConflict, refusalOperationMismatch,
+			"this operationId was already used for a different candidate; generate a new operationId for a new write",
+			map[string]any{"operationId": prev.OperationID, "state": prev.State})
+		return
+	}
+	switch prev.State {
+	case idpOpCommitted:
+		var m map[string]any
+		_ = json.Unmarshal(prev.Result, &m)
+		if m == nil {
+			m = map[string]any{"id": prev.ProfileID}
+		}
+		m["operationId"] = prev.OperationID
+		m["replayed"] = true
+		jsonOK(w, m)
+	case idpOpAborted:
+		writeRefusal(w, http.StatusConflict, refusalOperationAborted,
+			"this operation was refused when it was first dispatched; nothing was written — generate a new operationId to try again",
+			map[string]any{"operationId": prev.OperationID, "state": prev.State, "code": prev.Code})
+	case idpOpOutcomeUnknown:
+		writeRefusal(w, http.StatusConflict, refusalOperationUnknown,
+			"the outcome of this operation is not yet known (split durable state); the next restart reconciles it — look it up, do not retry",
+			map[string]any{"operationId": prev.OperationID, "state": prev.State})
+	default:
+		writeRefusal(w, http.StatusConflict, refusalOperationInProgress,
+			"this operation is still being decided; look it up rather than re-sending",
+			map[string]any{"operationId": prev.OperationID, "state": prev.State})
+	}
+}
+
+// GET /api/idp/operations/{operationId} — authoritative lookup of a durable
+// operation intent (Blocker 9). Admin-only: the record names the actor.
+func apiIdPOperations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeRefusal(w, http.StatusMethodNotAllowed, refusalMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	if !requireRoleJSON(w, r, RoleAdmin) {
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/idp/operations/")
+	if !validIdPOperationID(id) {
+		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "operationId must be a UUID", nil)
+		return
+	}
+	op := idpRegistry.operations().Get(id)
+	if op == nil {
+		writeRefusal(w, http.StatusNotFound, refusalNotFound, "no such operation", nil)
+		return
+	}
+	jsonOK(w, op.lookupReadModel())
 }
 
 // GET /api/idp/{id}     — get profile
@@ -903,6 +1371,9 @@ func apiIdPUpdate(w http.ResponseWriter, r *http.Request, id string) {
 		writeRefusal(w, http.StatusNotFound, refusalVanished, "profile not found", nil)
 		return
 	}
+	if !requireDurableIdP(w) {
+		return
+	}
 	// Fast pre-check against the value read now; the authoritative fence is
 	// decided again INSIDE the registry transaction (Update).
 	token := revisionFence(r, p.Revision)
@@ -931,13 +1402,17 @@ func apiIdPUpdate(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	enforceLegacyLDAPShadowing()
-	if err := publishCurrentConfigSnapshot(); err != nil {
-		logger.Printf("UI: IdP update published locally but the cluster snapshot was refused: %v", err)
-	}
-	auditEventDiff(r, "idp.update", id, p.Name, auditIdPProfile(before), auditIdPProfile(&p))
-	logger.Printf("UI: IdP profile updated id=%q name=%q", sanitizeLog(id), sanitizeLog(p.Name))
-	jsonOK(w, publicIdPProfile(&p))
+	fleet := idpPublishFleet("IdP update")
+	auditEventDiff(r, "idp.update", id, p.Name+fleet.auditSuffix(), auditIdPProfile(before), auditIdPProfile(&p))
+	logger.Printf("UI: IdP profile updated id=%q name=%q fleet=%s", sanitizeLog(id), sanitizeLog(p.Name), fleet.Publication)
+	jsonOK(w, idpWithFleet(publicIdPProfile(&p), fleet))
 }
+
+// idpDeletePauseHook is a TEST SEAM: when non-nil it runs inside the
+// exclusive reference gate, between the reference scan and the durable
+// delete — the window the gate exists to close (Blocker 5 interleaving
+// proofs). Production never sets it.
+var idpDeletePauseHook func()
 
 func apiIdPDelete(w http.ResponseWriter, r *http.Request, id string) {
 	if !requireRoleJSON(w, r, RoleAdmin) {
@@ -948,6 +1423,9 @@ func apiIdPDelete(w http.ResponseWriter, r *http.Request, id string) {
 		writeRefusal(w, http.StatusNotFound, refusalVanished, "profile not found", nil)
 		return
 	}
+	if !requireDurableIdP(w) {
+		return
+	}
 	token := revisionFence(r, 0)
 	if !checkRevisionFence(w, token, idpEntryRevision(p)) {
 		return
@@ -956,29 +1434,39 @@ func apiIdPDelete(w http.ResponseWriter, r *http.Request, id string) {
 		writeIdPRefusal(w, errIdPRegistryDegraded)
 		return
 	}
-	// Reference integrity (R4): an SSORequired rule naming this provider
-	// blocks the delete with the referencing rules as typed facts.
+	// Blocker 5: the reference scan and the durable delete are ONE decision
+	// under the exclusive side of the shared reference-integrity gate. Every
+	// SSORequired providerRefs writer holds the shared side across its own
+	// validate→commit window, so neither interleaving can commit a dangling
+	// reference: a writer that lands first blocks this scan until it commits
+	// (the scan then sees the reference ⇒ 409 referenced); a writer that
+	// arrives while this delete holds the gate waits, then revalidates its
+	// target against the post-delete registry and refuses.
+	refScanDeleteLock()
+	defer refScanDeleteUnlock()
 	if _, refs := objectReferences("idp", id); len(refs) > 0 {
 		writeRefusal(w, http.StatusConflict, refusalReferenced,
 			"the provider is referenced by authentication rules; remove or retarget them first",
 			map[string]any{"revision": idpEntryRevision(p), "references": refs})
 		return
 	}
+	if idpDeletePauseHook != nil {
+		idpDeletePauseHook()
+	}
 	if err := idpRegistry.DeleteFenced(id, token); err != nil {
 		writeIdPRefusal(w, err)
 		return
 	}
-	if err := publishCurrentConfigSnapshot(); err != nil {
-		logger.Printf("UI: IdP delete published locally but the cluster snapshot was refused: %v", err)
-	}
-	auditEventDiff(r, "idp.delete", id, "", auditIdPProfile(p), nil)
-	logger.Printf("UI: IdP profile deleted id=%q", sanitizeLog(id))
+	fleet := idpPublishFleet("IdP delete")
+	auditEventDiff(r, "idp.delete", id, fleet.auditSuffix(), auditIdPProfile(p), nil)
+	logger.Printf("UI: IdP profile deleted id=%q fleet=%s", sanitizeLog(id), fleet.Publication)
 	jsonOK(w, map[string]any{
 		"ok":        true,
 		"deleted":   true,
 		"id":        id,
 		"revision":  idpRegistry.DocumentRevision(),
 		"persisted": idpRegistry.Persisted(),
+		"cluster":   fleet.readModel(),
 	})
 }
 
@@ -1446,6 +1934,7 @@ func registerAuthRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/idp/legacy-ldap", apiIdPLegacyLDAP)              // GET: legacy YAML ldap summary
 	mux.HandleFunc("/api/idp/legacy-ldap/import", apiIdPLegacyLDAPImport) // POST: explicit legacy import
 	mux.HandleFunc("/api/idp/repair", apiIdPRepair)                       // POST: fenced quarantine acknowledgement (FE-6A.0 R8)
+	mux.HandleFunc("/api/idp/operations/", apiIdPOperations)              // GET: authoritative operation-intent lookup (FE-6A.0 correction, Blocker 9)
 	mux.HandleFunc("/api/idp/", apiIdPRouter)                             // GET|PUT|DELETE /api/idp/{id} + /api/idp/{id}/groups
 
 	// ── Auth callbacks (not behind UI auth middleware) ────────────────────

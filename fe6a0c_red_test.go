@@ -80,7 +80,7 @@ func fe6acStatus(t *testing.T, ch *fe6aChain, client *http.Client) map[string]an
 
 // fe6acPost sends a JSON POST through a cookie-jar client and returns the
 // status, decoded body and the response headers.
-func fe6acPost(t *testing.T, ch *fe6aChain, client *http.Client, path string, body any) (int, map[string]any, http.Header) {
+func fe6acPost(t *testing.T, ch *fe6aChain, client *http.Client, path string, body any) (status int, out map[string]any, hdr http.Header) {
 	t.Helper()
 	b, _ := json.Marshal(body)
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, ch.srv.URL+path, strings.NewReader(string(b)))
@@ -105,7 +105,7 @@ func fe6acDocRevision(t *testing.T) string {
 }
 
 // fe6acCreateFenced creates an IdP profile with the current document revision.
-func fe6acCreateFenced(t *testing.T, body map[string]any, extra ...string) (int, map[string]any) {
+func fe6acCreateFenced(t *testing.T, body map[string]any, extra ...string) (status int, out map[string]any) {
 	t.Helper()
 	q := []string{"documentRevision=" + fe6acDocRevision(t)}
 	q = append(q, extra...)
@@ -114,6 +114,42 @@ func fe6acCreateFenced(t *testing.T, body map[string]any, extra ...string) (int,
 	var m map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &m)
 	return w.Code, m
+}
+
+// fe6acAuditSnapshot captures the audit ring by entry identity so a
+// follow-up assertion is exact even when two actions land in the same
+// millisecond (a TS watermark cannot separate them).
+func fe6acAuditSnapshot() map[string]int {
+	seen := map[string]int{}
+	entries := auditGet()
+	for i := range entries {
+		e := &entries[i]
+		seen[fe6acAuditKey(e)]++
+	}
+	return seen
+}
+
+func fe6acAuditKey(e *audit.Entry) string {
+	return strconv.FormatInt(e.TS, 10) + "|" + e.Action + "|" + e.Object + "|" + e.Detail
+}
+
+// fe6acAssertNoNewAudit fails when an entry with one of the actions appeared
+// AFTER the snapshot was taken.
+func fe6acAssertNoNewAudit(t *testing.T, before map[string]int, actions ...string) {
+	t.Helper()
+	after := auditGet()
+	for i := range after {
+		e := &after[i]
+		if before[fe6acAuditKey(e)] > 0 {
+			before[fe6acAuditKey(e)]--
+			continue
+		}
+		for _, a := range actions {
+			if e.Action == a {
+				t.Fatalf("refusal/replay emitted a success audit entry: %+v", e)
+			}
+		}
+	}
 }
 
 func fe6acUserGeneration(t *testing.T, user string) int64 {
@@ -562,7 +598,7 @@ func TestFE6A0C_CR6_DependencyErrorsAreBoundedOnEverySink(t *testing.T) {
 		return nil, errors.New("dial tcp 203.0.113.10:443: " + canary + ": x509: certificate signed by unknown authority")
 	}
 	t.Cleanup(func() { ssrfSafeDialContext = orig })
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 	probe := fe6aProbeIdP(t, reg, path)
 	var w *httptest.ResponseRecorder
 	logs := captureLogger(t, func() {
@@ -599,7 +635,7 @@ func TestFE6A0C_CR7_InMemoryStoresRefuseAdminMutations(t *testing.T) {
 	idpRegistry = &IdPRegistry{live: make(map[string]IdentityProvider)} // no path
 	t.Cleanup(func() { idpRegistry = orig })
 	fe6aSwapConfigStore(t)
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 	w := httptest.NewRecorder()
 	apiIdPList(w, jsonReq(http.MethodPost, "/api/idp?documentRevision="+fe6acDocRevision(t), ldapProfileBodyForPut("Volatile", nil)))
 	fe6aAssertRefusal(t, w, http.StatusServiceUnavailable, "persistence_not_configured")
@@ -636,7 +672,7 @@ func TestFE6A0C_CR8_RejectedPublicationIsAStructuredFact(t *testing.T) {
 	withConfigVersionsDir(t)
 	setRewriteIdentityDegraded("cr8-injected")
 	t.Cleanup(clearRewriteIdentityDegraded)
-	since := time.Now().UnixMilli()
+	since := fe6aSince()
 	code, m := fe6acCreateFenced(t, ldapProfileBodyForPut("Fleet", nil))
 	if code != http.StatusOK {
 		t.Fatalf("local commit must succeed: %d %v", code, m)
@@ -710,7 +746,7 @@ func TestFE6A0C_CR9_CutoverWriteRequiresAndReplaysTheOperationId(t *testing.T) {
 	if first["operationId"] != opID {
 		t.Fatalf("success must echo the operationId; got %v", first)
 	}
-	since := time.Now().UnixMilli()
+	before := fe6acAuditSnapshot()
 	// The lost-response retry: same operationId, same candidate → REPLAY.
 	code, again := fe6acCreateFenced(t, body, "operationId="+opID)
 	if code != http.StatusOK {
@@ -722,7 +758,7 @@ func TestFE6A0C_CR9_CutoverWriteRequiresAndReplaysTheOperationId(t *testing.T) {
 	if n := len(reg.All()); n != 1 {
 		t.Fatalf("duplicate operationId created a second profile (%d)", n)
 	}
-	fe6aAssertNoAudit(t, since, "idp.create", "idp.legacy_ldap.retired")
+	fe6acAssertNoNewAudit(t, before, "idp.create", "idp.legacy_ldap.retired")
 	// Authoritative lookup.
 	mux := d0WireMux(t)
 	w := httptest.NewRecorder()

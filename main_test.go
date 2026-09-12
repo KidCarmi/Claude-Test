@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/KidCarmi/Culvert/internal/obs"
@@ -24,6 +25,19 @@ func TestMain(m *testing.M) {
 	// dataDir still override it via withTempDataDir (which saves/restores this value).
 	if td, err := os.MkdirTemp("", "culvert-test-datadir-"); err == nil {
 		dataDir = td
+		// FE-6A.0 correction (Blocker 10): the defaults that were bound to
+		// the literal "/data" root at init time (the config-version store,
+		// registry settings, CDR paths, the alert retry queue) must follow
+		// the test root too — otherwise the suite rotates and rewrites the
+		// operator's /data/config_versions on the host it runs on.
+		rebindDataDirPaths()
+		// Blocker 7: administrative mutations are refused on a store with no
+		// persistence path, so the package-global roster and IdP registry
+		// the handler tests mutate are bound to the test data dir.
+		cfg.SetUIUsersFile(filepath.Join(td, "ui_users.json"))
+		if err := idpRegistry.Load(filepath.Join(td, "idp_profiles.json")); err != nil {
+			panic(err)
+		}
 		code := m.Run()
 		os.RemoveAll(td)
 		os.Exit(code)

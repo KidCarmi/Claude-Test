@@ -149,6 +149,9 @@ var uiRoutes = []uiRouteMetadata{
 	{Path: "/api/idp/repair", Handler: "apiIdPRepair", Domain: "auth", Public: false,
 		Methods: []uiRouteMethod{{Method: "POST", MinRole: RoleAdmin, Mutating: true, AuditExpected: true,
 			Note: "FE-6A.0 R8: fenced acknowledgement of a quarantined (corrupt) registry file"}}},
+	{Path: "/api/idp/operations/", Handler: "apiIdPOperations", Domain: "auth", Public: false,
+		Methods: []uiRouteMethod{{Method: "GET", MinRole: RoleAdmin,
+			Note: "FE-6A.0 correction (Blocker 9): authoritative lookup of a durable, operation-identified IdP write intent (pending/committed/aborted/outcome_unknown); admin-only because the record names the actor"}}},
 	{Path: "/api/idp/", Handler: "apiIdPRouter", Domain: "auth", Public: false,
 		Methods: []uiRouteMethod{
 			{Method: "GET", MinRole: RoleViewer, Note: "delegates to apiIdPItem/apiIdPGroups (requireRoleJSON viewer inside; /{id} and /{id}/groups)"},

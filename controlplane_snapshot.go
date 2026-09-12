@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -586,21 +587,23 @@ func (s *ConfigStore) Update(snap ConfigSnapshot) error {
 	// alerted, LastPublishError; the fleet stays on the last valid snapshot —
 	// rather than silently omitting or re-minting the rewrite slice.
 	if d := rewriteIdentityDegraded(); d != nil {
-		return s.rejectPublish(fmt.Errorf("rewrite management identity degraded (%s): refusing to publish ephemeral rewrite StableIDs as authoritative fleet identity", d.reason))
+		return s.rejectPublish(&publishRejectedError{Class: publishRejectIdentityDegraded,
+			Err: fmt.Errorf("rewrite management identity degraded (%s): refusing to publish ephemeral rewrite StableIDs as authoritative fleet identity", d.reason)})
 	}
 	// Gate 1 — entry counts (fast pre-check).
 	if err := validateConfigSnapshot(snap); err != nil {
-		return s.rejectPublish(err)
+		return s.rejectPublish(&publishRejectedError{Class: publishRejectSnapshotInvalid, Err: err})
 	}
 	// Gate 2 — marshaled BYTE budget. Counts can pass while long strings push
 	// the snapshot past the frame; measuring the real wire size here stops a
 	// byte-oversized config from committing and then failing every DP fetch.
 	b, err := json.Marshal(snap)
 	if err != nil {
-		return s.rejectPublish(fmt.Errorf("config snapshot marshal failed: %w", err))
+		return s.rejectPublish(&publishRejectedError{Class: publishRejectMarshalFailed, Err: fmt.Errorf("config snapshot marshal failed: %w", err)})
 	}
 	if len(b) > maxSnapshotWireBytes {
-		return s.rejectPublish(fmt.Errorf("config snapshot wire size=%d bytes exceeds budget %d (too large to sync in one CP↔DP frame)", len(b), maxSnapshotWireBytes))
+		return s.rejectPublish(&publishRejectedError{Class: publishRejectWireSize,
+			Err: fmt.Errorf("config snapshot wire size=%d bytes exceeds budget %d (too large to sync in one CP↔DP frame)", len(b), maxSnapshotWireBytes)})
 	}
 
 	recordPublishedSnapshotSizes(snap) // for the utilization metrics (cheap; no per-scrape rebuild)
@@ -637,6 +640,36 @@ func (s *ConfigStore) Update(snap ConfigSnapshot) error {
 	}
 	logger.Printf("ControlPlane: config v%d published", snap.Version)
 	return nil
+}
+
+// Bounded publication-rejection classes (FE-6A.0 correction, Blocker 8): an
+// admin action result reports WHICH gate refused the fleet publication as a
+// typed fact; the verbose cause stays in the log / LastPublishError.
+const (
+	publishRejectIdentityDegraded = "identity_degraded"
+	publishRejectSnapshotInvalid  = "snapshot_invalid"
+	publishRejectMarshalFailed    = "marshal_failed"
+	publishRejectWireSize         = "wire_size_exceeded"
+)
+
+// publishRejectedError is the typed commit-time rejection; Unwrap keeps the
+// verbose cause reachable for logs.
+type publishRejectedError struct {
+	Class string
+	Err   error
+}
+
+func (e *publishRejectedError) Error() string { return e.Err.Error() }
+func (e *publishRejectedError) Unwrap() error { return e.Err }
+
+// publishRejectionClass returns the bounded class of a publish error
+// ("snapshot_invalid" for an untyped one — never the raw text).
+func publishRejectionClass(err error) string {
+	var rej *publishRejectedError
+	if errors.As(err, &rej) && rej.Class != "" {
+		return rej.Class
+	}
+	return publishRejectSnapshotInvalid
 }
 
 // rejectPublish records a commit-time rejection (count OR byte gate): it does
