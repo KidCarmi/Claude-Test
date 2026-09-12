@@ -6197,6 +6197,8 @@ production instead of a cliff.
 | **OCSP-2b** | Freshness checked at receipt, then discarded: a confirmed verdict cached for the full hour regardless of `NextUpdate`. OCSP-2's replay window reopened in the cache | Medium | High | **CLOSED** (Codex review) |
 | **OCSP-3b** | Every parse failure charged the "borrowed response" accusation, so a broken responder's HTML 502 raised a standing claim of attack | High (any broken responder) | Medium (false positive on a trust surface) | **CLOSED** (Codex review) |
 | **OCSP-7b** | `resolve` opened a flight without re-checking the cache — a late arrival queried again for a verdict already cached | Medium | Low-Medium | **CLOSED** (Codex review) |
+| **OCSP-11** | Bounding the responder loop also made the FIRST Good win, so the peer's own AIA ordering decides the verdict; a later Revoked was never consulted | Medium (replication lag alone reaches it) | **High** — a security posture moved as a side effect of a cost change | **CLOSED** (Codex review) |
+| **OCSP-12** | A dial-time SSRF refusal (DNS rebinding) was charged to nothing, so the guard's own success was invisible on the surface built to expose it | Low-Medium | Medium | **CLOSED** (Codex review) |
 | **OCSP-8** | Revocation not checked on inspected HTTPS; control reports itself healthy | **Certain** (it is the default wiring) | High (security control dark) | **OPEN — owner posture decision, now visible on three surfaces** |
 
 ### Recovery assessment
@@ -6277,6 +6279,28 @@ is `malformed`. Note *why* a second parse is needed rather than a string match:
 the library checks the serial BEFORE it verifies any signature, so its
 serial-mismatch error on its own proves nothing about who signed.
 
+**OCSP-11 — a security posture moved as a side effect of a cost change.
+(High.)** The pre-CHAOS-65 loop walked every responder and returned revoked if
+ANY of them said so. The rewrite added a `case Good: return` to save queries, so
+the FIRST responder decides — and **the peer writes the AIA list and its
+ORDER**, which hands the verdict back to the party being checked. That is this
+sweep's own finding, reintroduced by this sweep, inside the change that bounded
+the loop. It also accepts a certificate during ordinary responder replication
+lag. Restored: a Good is remembered (with the EARLIEST deadline among the Good
+answers, for the cache) and the loop continues; only Revoked short-circuits.
+**A cost change must not quietly move a security posture** — and the way to
+notice is to diff the CONTROL FLOW of the thing being sped up against what it
+replaced, not just its outputs on the happy path.
+
+**OCSP-12 — the guard fired and nothing counted it. (Medium.)** A responder host
+that answers public to the pre-flight `ssrf.PrivateHost` check and private to
+the dial is exactly what `ssrf.SafeDialContext` exists to catch, and it does —
+but its `ErrBlocked` arrived at the generic transport branch, so the
+DNS-rebinding attack moved neither `responderBlockedTotal` nor
+`culvert_ocsp_response_rejected_total{reason="responder_blocked"}`. The
+defence worked and was invisible on the surface built to expose it. Same family
+as OCSP-3b: the counters have to say what actually happened.
+
 **OCSP-7b — the single-flight had a hole on the late arrival. (Low-Medium.)**
 `resolve` opened a flight without re-checking the cache, so a handshake
 descheduled while the leader finished would start a redundant query for a
@@ -6314,9 +6338,9 @@ measures the work or the outcome.**
 
 `internal/ocsp/ocsp_chaos_test.go` — 8 defect gates, **each verified failing
 against the pre-fix tree**, plus 2 gates for the self-review defects above
-(each mutation-checked against the shape it replaces), 5 gates for the Codex
-findings (each verified failing against the tree that shipped the original fix)
-and 5 controls (a checker that refused everything
+(each mutation-checked against the shape it replaces), 7 gates for the two Codex
+rounds (each verified failing against the tree that shipped the original fix)
+and 6 controls (a checker that refused everything
 would pass all eight while being a fleet-wide HTTPS outage: a healthy `good` is
 still accepted and still cached, a genuine revocation still blocks and still
 counts as a revocation rather than a fail-close, and a disabled checker still

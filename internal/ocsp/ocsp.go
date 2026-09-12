@@ -524,6 +524,20 @@ func (oc *Checker) checkResponders(leaf, issuer *x509.Certificate) (revoked, fai
 	ctx, cancel := context.WithTimeout(context.Background(), queryBudget)
 	defer cancel()
 
+	// REVOKED WINS OVER GOOD, so a Good does NOT short-circuit the loop.
+	//
+	// The peer writes the AIA list AND its order, so returning on the first
+	// Good hands the verdict to the party being checked — this sweep's own
+	// finding, reintroduced as a side effect of bounding the loop (Codex
+	// review, PR #1369). It also accepts a certificate during ordinary
+	// responder replication lag. The pre-CHAOS-65 loop continued past every
+	// non-revoked answer and denied if ANY responder reported revocation; that
+	// posture is restored, now inside the bounded list and the one envelope.
+	// A cost change must not quietly move a security posture.
+	var (
+		sawGood        bool
+		goodValidUntil time.Time
+	)
 	for _, responderURL := range responders {
 		status, validUntil, err := oc.queryOCSP(ctx, leaf, issuer, responderURL)
 		if err != nil {
@@ -535,9 +549,14 @@ func (oc *Checker) checkResponders(leaf, issuer *x509.Certificate) (revoked, fai
 		switch status {
 		case cryptoocsp.Revoked:
 			oc.revokedTotal.Add(1)
-			return true, false, validUntil // confirmed revoked
+			return true, false, validUntil // confirmed revoked — nothing outranks it
 		case cryptoocsp.Good:
-			return false, false, validUntil // confirmed good
+			// Remember it, keep asking. The EARLIEST deadline among the Good
+			// answers is the one the cache may rely on.
+			if !sawGood || validUntil.Before(goodValidUntil) {
+				goodValidUntil = validUntil
+			}
+			sawGood = true
 		default:
 			// Unknown: the issuer does not recognise this certificate. Under
 			// the CA/Browser Forum baseline requirements a CA must not answer
@@ -546,6 +565,9 @@ func (oc *Checker) checkResponders(leaf, issuer *x509.Certificate) (revoked, fai
 			// pass; try the next responder, then fail closed.
 			oc.unknownTotal.Add(1)
 		}
+	}
+	if sawGood {
+		return false, false, goodValidUntil
 	}
 
 	obs.Printf("OCSP: no usable verdict from %d responder(s) for cert %s — fail-closed (treating as revoked)",
@@ -594,6 +616,17 @@ func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate
 
 	resp, err := responderClient.Do(httpReq) // #nosec G107 -- scheme + ssrf.PrivateHost guard above, SSRF-controlled dialer below
 	if err != nil {
+		// A dial-time refusal is the SSRF guard doing the job the pre-flight
+		// check cannot: ssrf.SafeDialContext re-checks the resolved address
+		// immediately before connect(2), catching a responder host that
+		// answered public to the pre-check and private to the dial. That is
+		// the DNS-rebinding attack the dialer exists for, and charging it to
+		// the generic transport branch left it invisible on the very surface
+		// built to expose it (Codex review, PR #1369).
+		if errors.Is(err, ssrf.ErrBlocked) {
+			oc.blockedTotal.Add(1)
+			return 0, time.Time{}, fmt.Errorf("ocsp: responder blocked at dial: %w", err)
+		}
 		return 0, time.Time{}, fmt.Errorf("ocsp request failed: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // response body, best-effort close

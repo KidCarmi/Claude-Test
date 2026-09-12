@@ -818,3 +818,107 @@ func TestChaos65_LateArrivalUsesTheCacheNotANewFlight(t *testing.T) {
 			"resolve must re-check the cache before opening a flight", got)
 	}
 }
+
+// TestChaos65_RevokedWinsOverAnEarlierGood — Codex P1, round 2.
+//
+// A SECURITY POSTURE CHANGED AS A SIDE EFFECT OF A COST CHANGE. The pre-CHAOS-65
+// loop continued past every non-revoked answer and returned revoked if ANY
+// responder said so; the rewrite added `case Good: return` to save queries, so
+// the FIRST responder decides. The peer writes the AIA list and its ORDER, so
+// that hands the verdict back to the party being checked — the exact failure
+// this sweep is named for — and it also accepts a certificate during ordinary
+// responder replication lag.
+func TestChaos65_RevokedWinsOverAnEarlierGood(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	var goodBody, revokedBody []byte
+	goodURL, goodHits := staticResponder(t, func() []byte { return goodBody })
+	revokedURL, revokedHits := staticResponder(t, func() []byte { return revokedBody })
+
+	// The peer lists the agreeable responder FIRST.
+	leaf := ca.issueLeaf(t, 81, goodURL, revokedURL)
+	goodBody = ca.sign(t, cryptoocsp.Response{Status: cryptoocsp.Good, SerialNumber: leaf.SerialNumber})
+	revokedBody = ca.sign(t, cryptoocsp.Response{
+		Status:           cryptoocsp.Revoked,
+		SerialNumber:     leaf.SerialNumber,
+		RevokedAt:        time.Now().Add(-time.Hour),
+		RevocationReason: cryptoocsp.KeyCompromise,
+	})
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err == nil {
+		t.Fatal("an earlier responder's GOOD short-circuited a later responder's REVOKED — " +
+			"the peer orders its own AIA list, so first-wins hands it the verdict")
+	}
+	if goodHits.Load() == 0 || revokedHits.Load() == 0 {
+		t.Fatalf("both responders must be consulted (good=%d revoked=%d)",
+			goodHits.Load(), revokedHits.Load())
+	}
+	if oc.RevokedTotal() != 1 {
+		t.Fatalf("RevokedTotal() = %d, want 1", oc.RevokedTotal())
+	}
+}
+
+// TestChaos65_Control_GoodStillAcceptedAcrossSeveralResponders — the control:
+// restoring "revoked wins" must not turn a healthy multi-responder certificate
+// into a refusal.
+func TestChaos65_Control_GoodStillAcceptedAcrossSeveralResponders(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	var body []byte
+	a, _ := staticResponder(t, func() []byte { return body })
+	b, _ := staticResponder(t, func() []byte { return body })
+	leaf := ca.issueLeaf(t, 82, a, b)
+	body = ca.sign(t, cryptoocsp.Response{Status: cryptoocsp.Good, SerialNumber: leaf.SerialNumber})
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err != nil {
+		t.Fatalf("a certificate every responder calls good must be accepted: %v", err)
+	}
+	if oc.FailClosedTotal() != 0 {
+		t.Fatalf("FailClosedTotal() = %d on the healthy path", oc.FailClosedTotal())
+	}
+}
+
+// TestChaos65_DNSRebindingRefusalIsCounted — Codex P2, round 2.
+//
+// ssrf.SafeDialContext re-checks the resolved address immediately before
+// connect(2), which is the whole point of having it under the pre-flight
+// ssrf.PrivateHost check. But its refusal surfaced as an ordinary transport
+// error and was charged to nothing, so the DNS-rebinding attack the dialer
+// exists to catch moved neither the API field nor
+// culvert_ocsp_response_rejected_total{reason="responder_blocked"} — invisible
+// on exactly the surface built to expose it.
+//
+// The rebind is simulated by priming the SSRF package's own DNS verdict cache
+// so the pre-flight check passes, while the dial-time Control still sees a
+// loopback address. That is precisely the public-then-private sequence.
+func TestChaos65_DNSRebindingRefusalIsCounted(t *testing.T) {
+	ssrf.CacheReset()
+	t.Cleanup(ssrf.CacheReset)
+	ca := newTestCA(t, "issuer")
+
+	url, hits := staticResponder(t, func() []byte { return nil })
+	leaf := ca.issueLeaf(t, 83, url)
+
+	// Pre-flight says public (the attacker's first DNS answer)...
+	ssrf.CacheStore("127.0.0.1", false)
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err == nil {
+		t.Fatal("a responder that rebinds to a private address must fail closed")
+	}
+	// ...and the dial must have been refused, not completed.
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("the rebound dial reached the private address %d time(s)", n)
+	}
+	if got := oc.ResponderBlockedTotal(); got != 1 {
+		t.Fatalf("ResponderBlockedTotal() = %d, want 1 — a connect-time SSRF refusal "+
+			"is invisible on the surface built to expose it", got)
+	}
+}
