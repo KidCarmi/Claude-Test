@@ -1833,13 +1833,15 @@ func apiOCSPConfig(w http.ResponseWriter, r *http.Request) {
 			// CHAOS-65: which handshakes actually consult the checker.
 			// "Working perfectly" and "never consulted" otherwise render
 			// identically — both are all-zero counters.
-			"coverage":                 ocspCoverage(),
-			"uncheckedEnforcingPaths":  ocspUncheckedEnforcingPaths(),
-			"notForCertificateTotal":   globalOCSP.NotForCertificateTotal(),
-			"staleResponseTotal":       globalOCSP.StaleTotal(),
-			"unknownStatusTotal":       globalOCSP.UnknownTotal(),
-			"responderBlockedTotal":    globalOCSP.ResponderBlockedTotal(),
-			"respondersTruncatedTotal": globalOCSP.RespondersTruncatedTotal(),
+			"coverage":                   ocspCoverage(),
+			"uncheckedEnforcingPaths":    ocspUncheckedEnforcingPaths(),
+			"notForCertificateTotal":     globalOCSP.NotForCertificateTotal(),
+			"unauthorizedResponderTotal": globalOCSP.UnauthorizedResponderTotal(),
+			"malformedResponseTotal":     globalOCSP.MalformedTotal(),
+			"staleResponseTotal":         globalOCSP.StaleTotal(),
+			"unknownStatusTotal":         globalOCSP.UnknownTotal(),
+			"responderBlockedTotal":      globalOCSP.ResponderBlockedTotal(),
+			"respondersTruncatedTotal":   globalOCSP.RespondersTruncatedTotal(),
 		}
 		// Upstream mTLS client-cert health rides the same admin surface as
 		// OCSP — both are loaded together by loadMTLSAndOCSP — so an admin

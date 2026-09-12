@@ -112,6 +112,8 @@ func TestOCSP8_MetricsAreSilentUntilEnabled(t *testing.T) {
 		"culvert_ocsp_enabled 1",
 		"culvert_ocsp_fail_closed_total",
 		`culvert_ocsp_response_rejected_total{reason="not_for_certificate"}`,
+		`culvert_ocsp_response_rejected_total{reason="unauthorized_responder"}`,
+		`culvert_ocsp_response_rejected_total{reason="malformed"}`,
 		`culvert_ocsp_path_checked{path="ssl_inspect_origin"} 0`,
 	} {
 		if !strings.Contains(on.String(), want) {

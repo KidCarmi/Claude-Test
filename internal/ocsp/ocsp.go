@@ -45,6 +45,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,7 +81,9 @@ type Checker struct {
 	// CHAOS-65 rejection counters. Each names a DIFFERENT cause with a
 	// different operator action, so they are separate rather than one
 	// "bad response" total; main renders them as one labelled series.
-	notForCertTotal   atomic.Int64 // signed response, but about another certificate
+	notForCertTotal   atomic.Int64 // issuer-signed response, but about another certificate
+	malformedTotal    atomic.Int64 // unparseable, badly signed, or otherwise unintelligible
+	unauthorizedTotal atomic.Int64 // signer is not an RFC 6960 authorized responder
 	staleTotal        atomic.Int64 // outside its ThisUpdate/NextUpdate window
 	unknownTotal      atomic.Int64 // issuer does not recognise the certificate
 	blockedTotal      atomic.Int64 // responder URL refused by the SSRF guard
@@ -234,6 +237,16 @@ func (oc *Checker) RevokedTotal() int64 { return oc.revokedTotal.Load() }
 // shape CHAOS-65 closed.
 func (oc *Checker) NotForCertificateTotal() int64 { return oc.notForCertTotal.Load() }
 
+// MalformedTotal counts responses discarded as unintelligible — unparseable
+// DER, a bad signature, an HTML error page. A broken responder, not a hostile
+// one; see NotForCertificateTotal for the accusation.
+func (oc *Checker) MalformedTotal() int64 { return oc.malformedTotal.Load() }
+
+// UnauthorizedResponderTotal counts responses whose signer is not an RFC 6960
+// authorized responder for the issuer — most importantly a certificate signing
+// a verdict about itself.
+func (oc *Checker) UnauthorizedResponderTotal() int64 { return oc.unauthorizedTotal.Load() }
+
 // StaleTotal counts responses discarded as outside their validity window
 // (replay, or a badly skewed clock on either end).
 func (oc *Checker) StaleTotal() int64 { return oc.staleTotal.Load() }
@@ -309,11 +322,22 @@ func (oc *Checker) checkCached(key string) (revoked, failClosed, found bool) {
 	return false, false, false
 }
 
-// cacheResult stores an OCSP result and evicts if needed. The TTL is chosen
-// from failClosed: a fail-closed verdict is cached on the short
-// indeterminateTTL so outage recovery tracks the responder rather than being
-// pinned for the full cacheTTL; confirmed verdicts keep the full cacheTTL.
-func (oc *Checker) cacheResult(key string, revoked, failClosed bool) {
+// cacheResult stores an OCSP result and evicts if needed.
+//
+// The TTL is the EARLIER of the configured maximum and the responder's own
+// authorization deadline (`validUntil`, zero when there is none). Freshness was
+// previously checked only at the moment of receipt and every confirmed verdict
+// then cached for the full cacheTTL, so a "good" whose NextUpdate was a minute
+// away kept admitting the certificate for another 59 minutes after the
+// responder stopped vouching for it — the replay window CHAOS-65 closed on the
+// wire, reopened in the cache (Codex review, PR #1369). A verdict already at or
+// past its deadline is not cached at all: the next handshake re-queries, which
+// is exactly right for a response at its edge.
+//
+// A fail-closed verdict keeps the short indeterminateTTL so outage recovery
+// tracks the responder rather than being pinned for the full cacheTTL
+// (CHAOS-04 outage amplification).
+func (oc *Checker) cacheResult(key string, revoked, failClosed bool, validUntil time.Time) {
 	oc.mu.Lock()
 	if len(oc.cache) >= cacheMaxSize {
 		// Evict expired entries first, then oldest 10% if still over capacity.
@@ -335,8 +359,17 @@ func (oc *Checker) cacheResult(key string, revoked, failClosed bool) {
 		}
 	}
 	ttl := cacheTTL
-	if failClosed {
+	switch {
+	case failClosed:
 		ttl = indeterminateTTL
+	case !validUntil.IsZero():
+		if remaining := time.Until(validUntil); remaining < ttl {
+			ttl = remaining
+		}
+	}
+	if ttl <= 0 {
+		oc.mu.Unlock()
+		return
 	}
 	oc.cache[key] = &cacheEntry{
 		revoked:    revoked,
@@ -408,19 +441,20 @@ func (oc *Checker) resolve(key string, leaf, issuer *x509.Certificate) (revoked,
 		oc.flightMu.Unlock()
 		oc.singleFlightTotal.Add(1)
 		<-f.done
-		if f.revoked && f.failClosed {
-			// A follower's handshake is refused too, so it must be counted
-			// too. failClosedTotal means "handshakes refused for want of a
-			// usable verdict" — the cached-fail-closed path in
-			// VerifyPeerCertificate already charges every hit for exactly this
-			// reason, and collapsing N queries into one must not also collapse
-			// N refusals into one. revokedTotal is deliberately NOT charged
-			// here: it counts responder CONFIRMATIONS, and the cached
-			// confirmed-revocation path does not charge it either.
-			oc.failClosedTotal.Add(1)
-			oc.lastFailClosedUTC.Store(time.Now().Unix())
-		}
+		oc.noteBorrowedFailClosed(f.revoked, f.failClosed)
 		return f.revoked, f.failClosed
+	}
+	// The caller's cache lookup happened before this lock. A handshake that
+	// missed the cache can be descheduled while the leader finishes and removes
+	// its flight, so without this second look it would open a NEW flight and
+	// issue a redundant query for a verdict already cached — defeating the
+	// collapsing precisely during the cold-cache burst it exists for (Codex
+	// review, PR #1369). Lock order is flightMu → mu, the only order this file
+	// ever takes.
+	if cachedRevoked, cachedFailClosed, found := oc.checkCached(key); found {
+		oc.flightMu.Unlock()
+		oc.noteBorrowedFailClosed(cachedRevoked, cachedFailClosed)
+		return cachedRevoked, cachedFailClosed
 	}
 	f := &flight{done: make(chan struct{}), revoked: true, failClosed: true}
 	oc.inflight[key] = f
@@ -437,10 +471,30 @@ func (oc *Checker) resolve(key string, leaf, issuer *x509.Certificate) (revoked,
 		close(f.done)
 	}()
 
-	revoked, failClosed = oc.checkResponders(leaf, issuer)
-	oc.cacheResult(key, revoked, failClosed)
+	var validUntil time.Time
+	revoked, failClosed, validUntil = oc.checkResponders(leaf, issuer)
+	oc.cacheResult(key, revoked, failClosed, validUntil)
 	published = true
 	return revoked, failClosed
+}
+
+// noteBorrowedFailClosed charges the fail-closed accounting for a handshake
+// refused on a verdict somebody else produced — a follower of an in-flight
+// query, or a late arrival that found the leader's verdict already cached.
+//
+// failClosedTotal means "handshakes refused for want of a usable verdict", and
+// the cached-fail-closed path in VerifyPeerCertificate already charges every
+// hit for exactly this reason: collapsing N queries into one must not also
+// collapse N refusals into one, or a fail-closed storm under-reports itself by
+// however many handshakes happened to arrive together — worst exactly when the
+// storm is worst. revokedTotal is deliberately NOT charged here: it counts
+// responder CONFIRMATIONS, and the cached confirmed-revocation path does not
+// charge it either.
+func (oc *Checker) noteBorrowedFailClosed(revoked, failClosed bool) {
+	if revoked && failClosed {
+		oc.failClosedTotal.Add(1)
+		oc.lastFailClosedUTC.Store(time.Now().Unix())
+	}
 }
 
 // checkResponders queries the OCSP responders listed in the leaf certificate,
@@ -453,10 +507,10 @@ func (oc *Checker) resolve(key string, leaf, issuer *x509.Certificate) (revoked,
 // counter. failClosed reports whether the revoked verdict came from that path
 // rather than a confirmed revocation, so the caller can cache the reason on the
 // short indeterminateTTL and keep the fail-closed observability current.
-func (oc *Checker) checkResponders(leaf, issuer *x509.Certificate) (revoked, failClosed bool) {
+func (oc *Checker) checkResponders(leaf, issuer *x509.Certificate) (revoked, failClosed bool, expires time.Time) {
 	responders := leaf.OCSPServer
 	if len(responders) == 0 {
-		return false, false // nothing to check — unchanged
+		return false, false, time.Time{} // nothing to check — unchanged
 	}
 	if len(responders) > maxResponders {
 		oc.truncatedTotal.Add(1)
@@ -471,7 +525,7 @@ func (oc *Checker) checkResponders(leaf, issuer *x509.Certificate) (revoked, fai
 	defer cancel()
 
 	for _, responderURL := range responders {
-		status, err := oc.queryOCSP(ctx, leaf, issuer, responderURL)
+		status, validUntil, err := oc.queryOCSP(ctx, leaf, issuer, responderURL)
 		if err != nil {
 			if ctx.Err() != nil {
 				break // the envelope is spent; the remaining entries get nothing
@@ -481,9 +535,9 @@ func (oc *Checker) checkResponders(leaf, issuer *x509.Certificate) (revoked, fai
 		switch status {
 		case cryptoocsp.Revoked:
 			oc.revokedTotal.Add(1)
-			return true, false // confirmed revoked
+			return true, false, validUntil // confirmed revoked
 		case cryptoocsp.Good:
-			return false, false // confirmed good
+			return false, false, validUntil // confirmed good
 		default:
 			// Unknown: the issuer does not recognise this certificate. Under
 			// the CA/Browser Forum baseline requirements a CA must not answer
@@ -498,12 +552,12 @@ func (oc *Checker) checkResponders(leaf, issuer *x509.Certificate) (revoked, fai
 		len(responders), leaf.SerialNumber.Text(16))
 	oc.failClosedTotal.Add(1)
 	oc.lastFailClosedUTC.Store(time.Now().Unix())
-	return true, true
+	return true, true, time.Time{}
 }
 
 // queryOCSP sends an OCSP request to one responder and returns the status it
 // affirmed for leaf. An error means this responder produced nothing usable.
-func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate, responderURL string) (int, error) {
+func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate, responderURL string) (int, time.Time, error) {
 	// SSRF guard, inline so CodeQL sees it on the path to the request (repo
 	// convention). The URL is read from the PEER's certificate, so any operator
 	// of any destination this gateway reaches can name an address inside the
@@ -511,11 +565,11 @@ func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate
 	u, err := url.Parse(responderURL)
 	if err != nil {
 		oc.blockedTotal.Add(1)
-		return 0, fmt.Errorf("ocsp: unparseable responder URL: %w", err)
+		return 0, time.Time{}, fmt.Errorf("ocsp: unparseable responder URL: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		oc.blockedTotal.Add(1)
-		return 0, fmt.Errorf("ocsp: responder scheme %q not allowed", u.Scheme)
+		return 0, time.Time{}, fmt.Errorf("ocsp: responder scheme %q not allowed", u.Scheme)
 	}
 	// PrivateHostContext, not PrivateHost: the plain form resolves under
 	// context.Background(), so on a wedged resolver the GUARD becomes the
@@ -524,29 +578,29 @@ func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate
 	// The budget it runs under is the same envelope the query itself gets.
 	if err := ssrf.PrivateHostContext(ctx, u.Host); err != nil {
 		oc.blockedTotal.Add(1)
-		return 0, fmt.Errorf("ocsp: responder blocked: %w", err)
+		return 0, time.Time{}, fmt.Errorf("ocsp: responder blocked: %w", err)
 	}
 
 	ocspReq, err := cryptoocsp.CreateRequest(leaf, issuer, nil)
 	if err != nil {
-		return 0, fmt.Errorf("ocsp create request: %w", err)
+		return 0, time.Time{}, fmt.Errorf("ocsp create request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, responderURL, bytes.NewReader(ocspReq))
 	if err != nil {
-		return 0, fmt.Errorf("ocsp http request: %w", err)
+		return 0, time.Time{}, fmt.Errorf("ocsp http request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/ocsp-request")
 
 	resp, err := responderClient.Do(httpReq) // #nosec G107 -- scheme + ssrf.PrivateHost guard above, SSRF-controlled dialer below
 	if err != nil {
-		return 0, fmt.Errorf("ocsp request failed: %w", err)
+		return 0, time.Time{}, fmt.Errorf("ocsp request failed: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // response body, best-effort close
 
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return 0, fmt.Errorf("ocsp read response: %w", err)
+		return 0, time.Time{}, fmt.Errorf("ocsp read response: %w", err)
 	}
 
 	// ParseResponseForCert, never ParseResponse: with a nil certificate the
@@ -557,14 +611,100 @@ func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate
 	// the peer picked the answer.
 	ocspResp, err := cryptoocsp.ParseResponseForCert(respBytes, leaf, issuer)
 	if err != nil {
-		oc.notForCertTotal.Add(1)
-		return 0, fmt.Errorf("ocsp parse response: %w", err)
+		oc.noteUnusableResponse(respBytes, leaf, issuer)
+		return 0, time.Time{}, fmt.Errorf("ocsp parse response: %w", err)
 	}
-	if !responseFresh(ocspResp, time.Now()) {
+	now := time.Now()
+	if err := responderAuthorized(ocspResp, issuer, now); err != nil {
+		oc.unauthorizedTotal.Add(1)
+		return 0, time.Time{}, err
+	}
+	if !responseFresh(ocspResp, now) {
 		oc.staleTotal.Add(1)
-		return 0, fmt.Errorf("ocsp: response for %s is outside its validity window", leaf.SerialNumber.Text(16))
+		return 0, time.Time{}, fmt.Errorf("ocsp: response for %s is outside its validity window", leaf.SerialNumber.Text(16))
 	}
-	return ocspResp.Status, nil
+	return ocspResp.Status, responseValidUntil(ocspResp), nil
+}
+
+// errUnauthorizedResponder is returned for a response whose signer is not an
+// RFC 6960 §4.2.2.2 authorized responder for this issuer.
+var errUnauthorizedResponder = errors.New("ocsp: response signer is not an authorized responder")
+
+// responderAuthorized enforces RFC 6960 §4.2.2.2 on the party that signed the
+// response. It is the other half of binding a response to a certificate, and
+// without it the binding buys nothing.
+//
+// x/crypto verifies an embedded responder certificate by asking only whether
+// the ISSUER signed it — never whether it carries id-kp-OCSPSigning. The peer's
+// own leaf is, by definition, a certificate the issuer signed, and the peer
+// holds its private key. So a peer could sign a fresh "good" response about its
+// OWN serial, embed its own leaf as the responder, serve it from the responder
+// URL in its own AIA, and have a REVOKED certificate accepted — needing no
+// response from anyone else at all. That is strictly easier than the borrowed-
+// response vector CHAOS-65 closed, and it survived it (Codex review, PR #1369).
+//
+// Two signers are authorized and nothing else is: the issuer itself (the
+// library has already verified that signature), and a delegate the issuer
+// signed that carries the OCSP-signing EKU and is inside its own validity
+// window. Delegated responders are ordinary, so refusing every embedded
+// certificate is not an option — pinned by
+// TestChaos65_Control_AuthorizedDelegateIsStillAccepted.
+//
+// The delegate's own revocation status is deliberately NOT checked: that is the
+// infinite regress RFC 6960 §4.2.2.2.1 answers with id-pkix-ocsp-nocheck, and
+// the validity window is the part that is both cheap and sound.
+func responderAuthorized(resp *cryptoocsp.Response, issuer *x509.Certificate, now time.Time) error {
+	if resp.Certificate == nil || resp.Certificate.Equal(issuer) {
+		return nil // signed by the issuer itself
+	}
+	if !slices.Contains(resp.Certificate.ExtKeyUsage, x509.ExtKeyUsageOCSPSigning) {
+		// ExtKeyUsageAny is deliberately NOT accepted: RFC 6960 asks for
+		// id-kp-OCSPSigning specifically, and honouring "any" would re-admit
+		// every ordinary leaf the issuer ever signed.
+		return fmt.Errorf("%w: no id-kp-OCSPSigning extended key usage", errUnauthorizedResponder)
+	}
+	if now.Before(resp.Certificate.NotBefore.Add(-responseClockSkew)) ||
+		now.After(resp.Certificate.NotAfter.Add(responseClockSkew)) {
+		return fmt.Errorf("%w: delegate outside its validity window", errUnauthorizedResponder)
+	}
+	return nil
+}
+
+// noteUnusableResponse attributes a response that would not parse for this
+// certificate, distinguishing a broken responder from a hostile one.
+//
+// `not_for_certificate` is an ACCUSATION — its metric help and the admin
+// panel's red banner both read it as evidence that something is answering with
+// borrowed responses — so it is charged only when that is demonstrably what
+// happened: the response parses, its signature verifies against the issuer, and
+// the serial it carries belongs to someone else. Everything else (an HTML error
+// page, truncated DER, a bad signature) is a broken responder and counts as
+// malformed. Charging every parse failure to the accusation meant an ordinary
+// 502 raised a standing claim of attack, on a surface whose whole job is to be
+// believed (Codex review, PR #1369).
+//
+// The re-parse runs only on the failure path, and it is deliberately the only
+// way to tell the two apart: the library checks the serial BEFORE it verifies
+// any signature, so its serial-mismatch error on its own proves nothing about
+// who signed. A response carrying multiple statuses cannot be re-parsed this
+// way and is counted as malformed — an undercount of the accusation, which is
+// the only direction it may err in.
+func (oc *Checker) noteUnusableResponse(body []byte, leaf, issuer *x509.Certificate) {
+	if resp, err := cryptoocsp.ParseResponseForCert(body, nil, issuer); err == nil &&
+		resp.SerialNumber != nil && resp.SerialNumber.Cmp(leaf.SerialNumber) != 0 {
+		oc.notForCertTotal.Add(1)
+		return
+	}
+	oc.malformedTotal.Add(1)
+}
+
+// responseValidUntil is the instant past which responseFresh would no longer
+// accept resp — the end of the window the responder actually authorized.
+func responseValidUntil(resp *cryptoocsp.Response) time.Time {
+	if !resp.NextUpdate.IsZero() {
+		return resp.NextUpdate.Add(responseClockSkew)
+	}
+	return resp.ThisUpdate.Add(maxResponseAge)
 }
 
 // responseFresh reports whether resp is currently authoritative.

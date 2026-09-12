@@ -573,3 +573,248 @@ func TestChaos65_Control_DisabledCheckerNeverQueries(t *testing.T) {
 		t.Fatalf("a disabled checker queried the responder %d time(s)", hits.Load())
 	}
 }
+
+// ── Codex review gates (PR #1369) ───────────────────────────────────────────
+//
+// Four findings on the CHAOS-65 engine, each verified reachable against the
+// tree that shipped it. The first defeats the CHAOS-65 fix outright.
+
+// issueDelegate mints a leaf under ca, optionally carrying the OCSP-signing EKU,
+// and returns it with its private key so a test can sign a response with it.
+func (ca *testCA) issueDelegate(t *testing.T, serial int64, ocspSigning bool, responders ...string) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("delegate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(serial),
+		Subject:      pkix.Name{CommonName: "delegate"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		OCSPServer:   responders,
+	}
+	if ocspSigning {
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
+	if err != nil {
+		t.Fatalf("delegate cert: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse delegate: %v", err)
+	}
+	return cert, key
+}
+
+// TestChaos65_SelfSignedResponseIsNotAVerdict — Codex P1, and it defeats the
+// CHAOS-65 fix outright.
+//
+// Binding the response to the certificate (ParseResponseForCert) closed the
+// "borrowed response from a sibling" vector and left a strictly EASIER one
+// open. x/crypto verifies an embedded responder certificate only by asking
+// whether the ISSUER signed it — it never checks RFC 6960 §4.2.2.2's
+// id-kp-OCSPSigning EKU. The peer's own leaf is, by definition, a certificate
+// the issuer signed, and the peer holds its private key. So the peer can sign
+// a fresh "good" response for ITS OWN serial, embed its own leaf as the
+// responder certificate, and serve it from the responder URL in its own AIA.
+// A revoked certificate is accepted, with no other response needed from
+// anyone.
+func TestChaos65_SelfSignedResponseIsNotAVerdict(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	var body []byte
+	url, _ := staticResponder(t, func() []byte { return body })
+	// An ORDINARY leaf: no OCSP-signing EKU, exactly what a peer holds.
+	leaf, leafKey := ca.issueDelegate(t, 71, false, url)
+
+	// The peer signs a "good" verdict about itself with its own key and
+	// embeds its own certificate as the responder.
+	selfSigned, err := cryptoocsp.CreateResponse(ca.cert, leaf, cryptoocsp.Response{
+		Status:       cryptoocsp.Good,
+		SerialNumber: leaf.SerialNumber,
+		ThisUpdate:   time.Now().Add(-time.Minute),
+		NextUpdate:   time.Now().Add(time.Hour),
+		Certificate:  leaf,
+	}, leafKey)
+	if err != nil {
+		t.Fatalf("create self-signed response: %v", err)
+	}
+	body = selfSigned
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err == nil {
+		t.Fatal("a certificate signed its OWN 'good' OCSP response and was accepted — " +
+			"the responder was never checked for the id-kp-OCSPSigning EKU, so binding " +
+			"the response to the certificate bought nothing")
+	}
+}
+
+// TestChaos65_Control_AuthorizedDelegateIsStillAccepted — the control for the
+// gate above. Delegated OCSP responders are ordinary and widely deployed;
+// refusing every embedded responder certificate would pass the defect gate
+// while breaking revocation checking against most public CAs.
+func TestChaos65_Control_AuthorizedDelegateIsStillAccepted(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	var body []byte
+	url, _ := staticResponder(t, func() []byte { return body })
+	leaf := ca.issueLeaf(t, 72, url)
+	delegate, delegateKey := ca.issueDelegate(t, 73, true) // carries the EKU
+
+	signed, err := cryptoocsp.CreateResponse(ca.cert, delegate, cryptoocsp.Response{
+		Status:       cryptoocsp.Good,
+		SerialNumber: leaf.SerialNumber,
+		ThisUpdate:   time.Now().Add(-time.Minute),
+		NextUpdate:   time.Now().Add(time.Hour),
+		Certificate:  delegate,
+	}, delegateKey)
+	if err != nil {
+		t.Fatalf("create delegated response: %v", err)
+	}
+	body = signed
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err != nil {
+		t.Fatalf("an RFC 6960 authorized delegated responder must be accepted: %v", err)
+	}
+}
+
+// TestChaos65_CachedVerdictExpiresAtTheResponseDeadline — Codex P1.
+//
+// Freshness was checked only at the moment of receipt, then every confirmed
+// verdict was cached for the fixed one-hour cacheTTL. A "good" whose NextUpdate
+// is a minute away therefore kept admitting the certificate for another 59
+// minutes after the responder stopped vouching for it — the replay window
+// CHAOS-65 closed on the wire, reopened in the cache.
+func TestChaos65_CachedVerdictExpiresAtTheResponseDeadline(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	var body []byte
+	url, _ := staticResponder(t, func() []byte { return body })
+	leaf := ca.issueLeaf(t, 74, url)
+
+	nextUpdate := time.Now().Add(time.Minute)
+	body = ca.sign(t, cryptoocsp.Response{
+		Status:       cryptoocsp.Good,
+		SerialNumber: leaf.SerialNumber,
+		ThisUpdate:   time.Now().Add(-time.Minute),
+		NextUpdate:   nextUpdate,
+	})
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err != nil {
+		t.Fatalf("a fresh GOOD response must be accepted: %v", err)
+	}
+
+	entry, ok := oc.cache[certKey(leaf, ca.cert)]
+	if !ok {
+		t.Fatal("the verdict should be cached")
+	}
+	limit := nextUpdate.Add(responseClockSkew)
+	if entry.expiresAt.After(limit) {
+		t.Fatalf("verdict cached until %v, past the responder's own NextUpdate+skew %v "+
+			"— the cache outlives the authorization it is built on",
+			entry.expiresAt.UTC(), limit.UTC())
+	}
+}
+
+// TestChaos65_MalformedResponseIsNotCountedAsBorrowed — Codex P2.
+//
+// Every ParseResponseForCert error charged notForCertTotal, whose metric help
+// and red panel banner both claim "something is answering with borrowed
+// responses". A responder returning an HTML error page therefore raised a
+// standing accusation of attack. A surface whose job is to be believed must
+// not cry wolf at a broken upstream.
+func TestChaos65_MalformedResponseIsNotCountedAsBorrowed(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	url, _ := staticResponder(t, func() []byte {
+		return []byte("<html><body>502 Bad Gateway</body></html>")
+	})
+	leaf := ca.issueLeaf(t, 75, url)
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err == nil {
+		t.Fatal("an unintelligible response must fail closed")
+	}
+	if got := oc.NotForCertificateTotal(); got != 0 {
+		t.Fatalf("NotForCertificateTotal() = %d after a malformed response — "+
+			"a broken responder must not be reported as an issuer-signed response "+
+			"about another certificate", got)
+	}
+	if got := oc.MalformedTotal(); got == 0 {
+		t.Fatal("a malformed response must still be counted under its own reason")
+	}
+}
+
+// TestChaos65_Control_BorrowedResponseIsStillCountedAsBorrowed — the control
+// for the gate above: narrowing the counter must not silence the real signal.
+func TestChaos65_Control_BorrowedResponseIsStillCountedAsBorrowed(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+	other := ca.issueLeaf(t, 76)
+
+	var body []byte
+	url, _ := staticResponder(t, func() []byte { return body })
+	leaf := ca.issueLeaf(t, 77, url)
+	body = ca.sign(t, cryptoocsp.Response{Status: cryptoocsp.Good, SerialNumber: other.SerialNumber})
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err == nil {
+		t.Fatal("a response about another certificate must fail closed")
+	}
+	if got := oc.NotForCertificateTotal(); got != 1 {
+		t.Fatalf("NotForCertificateTotal() = %d, want 1 — a genuinely borrowed, "+
+			"issuer-signed response is exactly what this counter is for", got)
+	}
+}
+
+// TestChaos65_LateArrivalUsesTheCacheNotANewFlight — Codex P2.
+//
+// The cache was consulted before resolve, and the no-flight branch then created
+// a query without looking again. A handshake that missed the cache, was
+// descheduled while the leader finished and removed its flight, and then woke
+// up would start a SECOND query for a verdict already sitting in the cache —
+// defeating the collapsing precisely during the cold-cache burst it exists for.
+func TestChaos65_LateArrivalUsesTheCacheNotANewFlight(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	var body []byte
+	url, hits := staticResponder(t, func() []byte { return body })
+	leaf := ca.issueLeaf(t, 78, url)
+	body = ca.sign(t, cryptoocsp.Response{Status: cryptoocsp.Good, SerialNumber: leaf.SerialNumber})
+
+	oc := New()
+	oc.Enable()
+	key := certKey(leaf, ca.cert)
+
+	// The leader's round: one query, verdict cached, flight removed.
+	if revoked, _ := oc.resolve(key, leaf, ca.cert); revoked {
+		t.Fatal("the healthy response should not be revoked")
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("responder queried %d times on the first round, want 1", hits.Load())
+	}
+
+	// The late arrival: it already missed the cache in VerifyPeerCertificate
+	// and reaches resolve after the flight is gone.
+	if revoked, _ := oc.resolve(key, leaf, ca.cert); revoked {
+		t.Fatal("the cached verdict should not be revoked")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("a late arrival started a second responder query (%d hits total) — "+
+			"resolve must re-check the cache before opening a flight", got)
+	}
+}

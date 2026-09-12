@@ -484,7 +484,9 @@ components:
             client's behalf and yet does not consult the revocation checker.
             Excludes bypassed CONNECT tunnels, which never terminate TLS.
           items: { type: string }
-        notForCertificateTotal: { type: integer, format: int64, description: "Signed OCSP responses discarded because they were about a different certificate than the one being checked. Sustained growth means something is answering with borrowed responses." }
+        notForCertificateTotal: { type: integer, format: int64, description: "Issuer-signed OCSP responses discarded because they were about a different certificate than the one being checked. An accusation: sustained growth means something is answering with borrowed responses." }
+        unauthorizedResponderTotal: { type: integer, format: int64, description: "OCSP responses discarded because the signer is not an RFC 6960 authorized responder for the issuer — most importantly a certificate signing a verdict about itself. An accusation." }
+        malformedResponseTotal: { type: integer, format: int64, description: "OCSP responses discarded as unintelligible (unparseable DER, bad signature, an HTML error page). An ordinary broken responder, NOT an attack signal." }
         staleResponseTotal: { type: integer, format: int64, description: "OCSP responses discarded as outside their ThisUpdate/NextUpdate window (replay, or clock skew)." }
         unknownStatusTotal: { type: integer, format: int64, description: "Responders that answered \"unknown\" — the issuer does not recognise the certificate. Not treated as a pass." }
         responderBlockedTotal: { type: integer, format: int64, description: "Responder URLs refused before any request was made (disallowed scheme, or an address in a private range). The URL comes from the peer's certificate." }

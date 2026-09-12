@@ -43,14 +43,20 @@ func ocspWritePrometheus(w *strings.Builder) {
 	w.WriteString("# TYPE culvert_ocsp_cache_entries gauge\n")
 	fmt.Fprintf(w, "culvert_ocsp_cache_entries %d\n", globalOCSP.CacheLen())
 
-	// One labelled series rather than four names: every value here is a
+	// One labelled series rather than six names: every value here is a
 	// response that was DISCARDED, and the label is the bounded reason class.
-	// `not_for_certificate` is the one to alert on — it means something is
-	// answering with responses borrowed from other certificates, which is the
-	// revocation-bypass shape CHAOS-65 closed.
+	// Two of them are ACCUSATIONS and are the ones to alert on:
+	// `unauthorized_responder` means something signed a verdict it had no
+	// authority to sign — most importantly a certificate vouching for itself —
+	// and `not_for_certificate` means an issuer-signed response about someone
+	// else was offered as this certificate's verdict. Both are the
+	// revocation-bypass shapes CHAOS-65 closed. `malformed` is an ordinary
+	// broken responder and must not be confused with either.
 	w.WriteString("\n# HELP culvert_ocsp_response_rejected_total OCSP responses discarded without producing a verdict, by reason\n")
 	w.WriteString("# TYPE culvert_ocsp_response_rejected_total counter\n")
 	fmt.Fprintf(w, "culvert_ocsp_response_rejected_total{reason=\"not_for_certificate\"} %d\n", globalOCSP.NotForCertificateTotal())
+	fmt.Fprintf(w, "culvert_ocsp_response_rejected_total{reason=\"unauthorized_responder\"} %d\n", globalOCSP.UnauthorizedResponderTotal())
+	fmt.Fprintf(w, "culvert_ocsp_response_rejected_total{reason=\"malformed\"} %d\n", globalOCSP.MalformedTotal())
 	fmt.Fprintf(w, "culvert_ocsp_response_rejected_total{reason=\"stale\"} %d\n", globalOCSP.StaleTotal())
 	fmt.Fprintf(w, "culvert_ocsp_response_rejected_total{reason=\"unknown_status\"} %d\n", globalOCSP.UnknownTotal())
 	fmt.Fprintf(w, "culvert_ocsp_response_rejected_total{reason=\"responder_blocked\"} %d\n", globalOCSP.ResponderBlockedTotal())

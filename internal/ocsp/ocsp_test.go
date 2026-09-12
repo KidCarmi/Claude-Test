@@ -116,7 +116,7 @@ func TestOCSPChecker_CacheExpired(t *testing.T) {
 
 func TestOCSPChecker_CacheResult(t *testing.T) {
 	oc := New()
-	oc.cacheResult("serial-123", true, false)
+	oc.cacheResult("serial-123", true, false, time.Time{})
 	if len(oc.cache) != 1 {
 		t.Fatal("cache should have 1 entry")
 	}
@@ -237,7 +237,7 @@ func TestOCSPChecker_CacheEviction(t *testing.T) {
 		}
 	}
 	// Adding one more should trigger eviction.
-	oc.cacheResult("new-serial", false, false)
+	oc.cacheResult("new-serial", false, false, time.Time{})
 	if len(oc.cache) > cacheMaxSize {
 		t.Fatalf("cache size = %d, should be <= %d", len(oc.cache), cacheMaxSize)
 	}
@@ -385,7 +385,7 @@ func TestOCSPChecker_CheckRespondersFailClosedIncrementsCounters(t *testing.T) {
 
 	oc := New()
 	before := time.Now()
-	if revoked, _ := oc.checkResponders(leaf, issuer); !revoked {
+	if revoked, _, _ := oc.checkResponders(leaf, issuer); !revoked {
 		t.Fatal("checkResponders should fail-closed (return true) when every responder is unreachable")
 	}
 	if got := oc.FailClosedTotal(); got != 1 {
