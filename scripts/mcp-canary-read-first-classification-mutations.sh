@@ -235,7 +235,7 @@ run_mutation M02 \
   'TestReadFirstRuntime_NonAffirmativeAnswersStayWrite' \
   ./internal/mcp/runtime "$RTPOLICY" \
   's/\tif p\.deps\.canaryReviewedReadFirst\(p\.capability\.String\(\), serverID, toolName\) \{\n\t\top\.Class = policy\.OpRead\n\t\}/\tif strings.HasPrefix(toolName, "x") || strings.HasPrefix(toolName, "get_") {\n\t\top.Class = policy.OpRead\n\t}/' \
-  's/^import \(\n\t"context"/import (\n\t"context"\n\t"strings"/'
+  's/import \(\n\t"context"\n/import (\n\t"context"\n\t"strings"\n/'
 
 # M03 — the MISSING answer becomes the permissive one: an activation arms carrying a target whose
 # class nobody stated, and the unstated class reads as read.
@@ -244,6 +244,7 @@ run_mutation M03 \
   'TestReadFirstClass_C02_ReviewedTargetWithNoClassCannotArm' \
   . "$REVIEWED" \
   's/\t\tcase t\.OperationClass == policy\.OpUnset:\n\t\t\treturn ReviewedTargetSet\{\}, ReviewedNoOperationClass\n//' \
+  's/\treturn \[\]policy\.OperationClass\{policy\.OpRead, policy\.OpWrite, policy\.OpDestructive\}/\treturn []policy.OperationClass{policy.OpUnset, policy.OpRead, policy.OpWrite, policy.OpDestructive}/' \
   's/func OperationClassFromReviewed\(c tooltrust\.ReviewedOperationClass\) \(policy\.OperationClass, bool\) \{\n\tswitch c \{/func OperationClassFromReviewed(c tooltrust.ReviewedOperationClass) (policy.OperationClass, bool) {\n\tswitch c {\n\tcase tooltrust.ReviewedOpUnset:\n\t\treturn policy.OpRead, true/'
 
 # M04 — THE HEADLINE DEFECT. The classification stops being fingerprint-bound: it is looked up by
@@ -275,8 +276,8 @@ run_mutation M06 \
 # a hint, a catalog annotation) can reach the classification decision.
 run_mutation M07 \
   'the classifier seam widens so a per-request value can reach the decision' \
-  'TestReadFirstWall_ClassifierTakesNoServerSuppliedInput' \
-  ./internal/mcp/runtime "$RTDEPS" \
+  'TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead' \
+  --compile-wall . "$RTDEPS" \
   's/\tCanaryOperationClass func\(capability string, serverID, toolName string\) \(policy\.OperationClass, bool\)/\tCanaryOperationClass func(capability string, serverID, toolName, arguments string) (policy.OperationClass, bool)/' \
   's/\tclass, ok := d\.CanaryOperationClass\(capability, serverID, toolName\)/\tclass, ok := d.CanaryOperationClass(capability, serverID, toolName, "")/'
 
@@ -310,7 +311,7 @@ run_mutation M11 \
   'a stale F1 decision reaches upstream after the target became F2' \
   'TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2' \
   . "$LGATE" \
-  's/\tif !g\.readFirst\(in\.Operation\) \{/\tif false \&\& !g.readFirst(in.Operation) {/'
+  's/\tif hex\.EncodeToString\(ti\.target\.Fingerprint\[:\]\) != decisionFP \{/\tif false \&\& hex.EncodeToString(ti.target.Fingerprint[:]) != decisionFP {/'
 
 # M12 — DISCOVERY IS USED AS THE SUBSTITUTE. A tools/call is defaulted to OpDiscovery, so it passes
 # the read-first gate with no review at all — blocker #4 "closed" by pretending a listing is an
@@ -320,6 +321,14 @@ run_mutation M12 \
   'TestReadFirstRuntime_NoClassifierLeavesTheConservativeDefault' \
   ./internal/mcp/runtime "$RTPOLICY" \
   's/\tdefault: \/\/ tools\/call\n\t\t\/\/ Conservative default: a tool call is a write unless a later slice supplies a\n\t\t\/\/ finer class\. Destructive is NEVER assumed\.\n\t\top\.Class = policy\.OpWrite/\tdefault: \/\/ tools\/call\n\t\top.Class = policy.OpDiscovery/'
+
+# M13 — THE READ-FIRST GATE IS DISABLED. Classification without a gate that consumes it is
+# decoration: a write-class operation would cross the First-Canary boundary unremarked.
+run_mutation M13 \
+  'the read-first gate stops refusing a write-class operation' \
+  'TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass' \
+  . "$LGATE" \
+  's/\tif !g\.readFirst\(in\.Operation\) \{/\tif false \&\& !g.readFirst(in.Operation) {/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
