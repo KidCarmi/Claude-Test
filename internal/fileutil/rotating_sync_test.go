@@ -210,9 +210,20 @@ func TestFindAndSync_HoldsTheGenerationAgainstAConcurrentRotation(t *testing.T) 
 	mu.Lock()
 	got := append([]string(nil), order...)
 	mu.Unlock()
-	want := []string{"file:log", "dir:" + filepath.Base(dir), "find-returned", "rotated"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("the rotation must wait for the found generation to be proven: got %v want %v", got, want)
+	// The invariant: BOTH synchronisations of the found generation land
+	// before the rotation. "find-returned" is noted after the mutex is
+	// released, so its position relative to "rotated" is not constrained.
+	idx := func(s string) int {
+		for i, g := range got {
+			if g == s {
+				return i
+			}
+		}
+		return -1
+	}
+	fileAt, dirAt, rotAt := idx("file:log"), idx("dir:"+filepath.Base(dir)), idx("rotated")
+	if fileAt < 0 || dirAt < 0 || rotAt < 0 || fileAt > rotAt || dirAt > rotAt || fileAt > dirAt {
+		t.Fatalf("the rotation must wait for the found generation to be proven (file, then dir, then rotation): got %v", got)
 	}
 	if b, _ := os.ReadFile(path + ".1"); string(b) != "keyed\n" {
 		t.Fatalf("archive = %q", b)
