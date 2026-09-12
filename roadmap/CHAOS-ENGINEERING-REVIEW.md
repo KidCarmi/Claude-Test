@@ -6193,6 +6193,10 @@ production instead of a cliff.
 | **OCSP-5** | Responder URL is an unguarded SSRF sink; redirects followed | Medium | High | **CLOSED** |
 | **OCSP-6** | Unbounded responder fan-out ⇒ ~17 min handshake stall + outbound amplifier | Low-Medium | High | **CLOSED** |
 | **OCSP-7** | No single-flight ⇒ 1:1 amplification onto a failing responder | High whenever it runs | Medium | **CLOSED** |
+| **OCSP-1b** | The response was bound to the certificate; the SIGNER was never bound to an authority. A peer signs a `good` about its own serial with its own leaf key and embeds that leaf as the responder — no `id-kp-OCSPSigning` check. Defeats OCSP-1 and is easier than it | Low-Medium | **Critical** — revocation bypass needing no other party at all | **CLOSED** (Codex review) |
+| **OCSP-2b** | Freshness checked at receipt, then discarded: a confirmed verdict cached for the full hour regardless of `NextUpdate`. OCSP-2's replay window reopened in the cache | Medium | High | **CLOSED** (Codex review) |
+| **OCSP-3b** | Every parse failure charged the "borrowed response" accusation, so a broken responder's HTML 502 raised a standing claim of attack | High (any broken responder) | Medium (false positive on a trust surface) | **CLOSED** (Codex review) |
+| **OCSP-7b** | `resolve` opened a flight without re-checking the cache — a late arrival queried again for a verdict already cached | Medium | Low-Medium | **CLOSED** (Codex review) |
 | **OCSP-8** | Revocation not checked on inspected HTTPS; control reports itself healthy | **Certain** (it is the default wiring) | High (security control dark) | **OPEN — owner posture decision, now visible on three surfaces** |
 
 ### Recovery assessment
@@ -6223,6 +6227,61 @@ audited as `ocsp.toggle`, deliberately off the config-version rollback surface.
   unchanged by this sweep, recorded as **OCSP-10**.
 - **`maxResponders` = 4 is a constant**, like every other bound in this file
   whose only use would be widening an attack window.
+
+### The review round: binding a response is only half of it
+
+Codex reviewed the shipped engine and found four more, each reproduced against
+the tree that had just fixed OCSP-1. **The first defeats that fix outright, and
+it is the more important finding of the two.**
+
+**OCSP-1b — the RESPONSE was bound; the SIGNER was not. (Critical.)**
+`ParseResponseForCert` verifies an embedded responder certificate by asking one
+question — did the ISSUER sign it? — and never asks RFC 6960 §4.2.2.2's: does it
+carry `id-kp-OCSPSigning`? **The peer's own leaf is, by definition, a
+certificate the issuer signed, and the peer holds its private key.** So the peer
+signs a fresh `good` about its OWN serial, embeds its own leaf as the responder
+certificate, and serves it from the responder URL in its own AIA. A revoked
+certificate is accepted — needing no response from anyone else at all, which
+makes it *strictly easier* than the borrowed-response vector OCSP-1 closed.
+
+**The lesson is the one this sweep had already written down and then only half
+applied.** OCSP-1's own reasoning was "the peer picks the responder, so the peer
+picks the answer" — and the fix asked only *which certificate is this response
+about?* while leaving *who was allowed to say so?* unasked. Binding an assertion
+to its subject is worth nothing until the signer is also bound to an authority.
+Now only two signers are authorized: the issuer itself, and a delegate it signed
+that carries the OCSP-signing EKU and is inside its own validity window.
+`ExtKeyUsageAny` is deliberately refused — honouring it would re-admit every
+ordinary leaf the issuer ever signed, which is the whole attack. Delegated
+responders are ordinary, so refusing every embedded certificate is not the fix;
+that shape is pinned as a CONTROL.
+
+**OCSP-2b — freshness was checked at receipt and then thrown away. (High.)**
+Every confirmed verdict was cached for the fixed 1 h `cacheTTL`, so a `good`
+whose `NextUpdate` was a minute out kept admitting the certificate for another
+59 minutes after the responder stopped vouching for it: **the replay window
+OCSP-2 closed on the wire, reopened in the cache.** Same shape as OCSP-1b — a
+rule enforced at one layer and not carried to the next. The TTL is now the
+earlier of `cacheTTL` and the response's own deadline, and a verdict already at
+its deadline is not cached at all.
+
+**OCSP-3b — the accusation counter cried wolf at a 502. (Medium.)** Every
+`ParseResponseForCert` error charged `notForCertTotal`, whose metric help and
+red panel banner both read *"something is answering with borrowed responses"*.
+An HTML error page from a broken responder therefore raised a standing claim of
+attack — on a surface whose whole job is to be believed, and against this
+register's own rule about false positives on such surfaces. The accusation is
+now charged only when it is demonstrable (the response parses, its signature
+verifies against the issuer, and the serial is someone else's); everything else
+is `malformed`. Note *why* a second parse is needed rather than a string match:
+the library checks the serial BEFORE it verifies any signature, so its
+serial-mismatch error on its own proves nothing about who signed.
+
+**OCSP-7b — the single-flight had a hole on the late arrival. (Low-Medium.)**
+`resolve` opened a flight without re-checking the cache, so a handshake
+descheduled while the leader finished would start a redundant query for a
+verdict already cached — defeating the collapsing during exactly the cold-cache
+burst it exists for.
 
 ### Two defects the fix itself introduced
 
@@ -6255,7 +6314,9 @@ measures the work or the outcome.**
 
 `internal/ocsp/ocsp_chaos_test.go` — 8 defect gates, **each verified failing
 against the pre-fix tree**, plus 2 gates for the self-review defects above
-(each mutation-checked against the shape it replaces) and 3 controls (a checker that refused everything
+(each mutation-checked against the shape it replaces), 5 gates for the Codex
+findings (each verified failing against the tree that shipped the original fix)
+and 5 controls (a checker that refused everything
 would pass all eight while being a fleet-wide HTTPS outage: a healthy `good` is
 still accepted and still cached, a genuine revocation still blocks and still
 counts as a revocation rather than a fail-close, and a disabled checker still

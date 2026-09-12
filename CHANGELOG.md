@@ -40,6 +40,19 @@ version is `info.version` in `api/openapi/openapi.yaml` and follows
   outbound requests at hosts it chose. At most four responders are now
   consulted, all inside one 5-second envelope, single-flighted per
   certificate.
+- OCSP: binding a response to a certificate was only half the check — the
+  *signer* was never bound to an authority. Go's OCSP library verifies an
+  embedded responder certificate by asking only whether the issuer signed it,
+  never whether it carries the `id-kp-OCSPSigning` extended key usage RFC 6960
+  requires. A peer's own certificate is, by definition, one the issuer signed,
+  and the peer holds its private key — so it could sign a "good" response about
+  its own serial, embed its own certificate as the responder, and have a revoked
+  certificate accepted with no other party involved. Only the issuer, and
+  delegates it signed that carry the OCSP-signing usage and are within their own
+  validity period, are now accepted as responders. Related: a confirmed verdict
+  was cached for a fixed hour regardless of the response's own `NextUpdate`, so
+  a response a minute from expiry kept admitting the certificate for another 59;
+  cache lifetime is now capped at the responder's own deadline.
 - **Behaviour change for operators running `security.ocsp_check: true`:**
   responder queries are now made directly and no longer honour `HTTP(S)_PROXY`
   from the environment, and a responder on a private address is refused. An
