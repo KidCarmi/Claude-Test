@@ -93,6 +93,18 @@ within tiny first-Canary caps (`MaxCanaryServers=1`, `MaxCanaryTools=2`, `MaxCan
 `MaxCanaryTenants=1` — structurally incapable of fleet-wide), and be **read-first**
 (`Operations ⊆ {read}`, `!HighRisk`).
 
+Those caps bound the Canary ARCHITECTURE, which a later graduation phase may use. The **FIRST**
+experiment is narrower and is gated separately by `canary.ValidateFirstCanaryScope`
+(`internal/mcp/canary/firstcanary_scope.go`), evaluated on the SIGNED activation scope inside the
+authoritative activation preflight (`ScopeExactFirstCanary` /
+`canary_scope_not_exact_first_canary`): exactly one tenant, one server, one fully-pinned tool on
+that server, and one explicitly named `Principals` entry, with every other selector class empty and
+no duplicate or pattern-shaped identifier. It is a SEPARATE predicate on purpose — tightening
+`MaxCanaryTools`/`MaxCanaryPrincipals` to 1 would silently redefine the architecture as exact-only,
+which is a different decision from bounding this one experiment. Identity is counted on `Principals`
+alone; the base contract's `principalCount` aggregate (Principals+Clients+Agents) can never satisfy
+the exact gate, because one client is not one named principal.
+
 The scope must also be **realizable**: `MatchesNothing` detects only ABSENT inclusion selectors,
 not CONTRADICTORY ones (a tool whose server is not in the server dimension, or an inclusion value
 that is also excluded), so `ValidateScope` builds a witness subject from the scope's own inclusion

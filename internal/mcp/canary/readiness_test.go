@@ -13,6 +13,7 @@ func allTrueFacts() Facts {
 		ShadowExitReviewPassed:       true,
 		ScopeBounded:                 true,
 		ScopeReadFirst:               true,
+		ScopeExactFirstCanary:        true,
 		LiveExecutorComposed:         true,
 		UpstreamCallerPresent:        true,
 		CredentialPathReady:          true,
@@ -73,6 +74,7 @@ func TestEvaluate_EachFactIsIndependentlyLoadBearing(t *testing.T) {
 		{"ShadowExitReviewPassed", ReasonShadowExitNotPassed},
 		{"ScopeBounded", ReasonScopeNotBounded},
 		{"ScopeReadFirst", ReasonScopeNotReadFirst},
+		{"ScopeExactFirstCanary", ReasonScopeNotExactFirstCanary},
 		{"LiveExecutorComposed", ReasonLiveExecutorAbsent},
 		{"UpstreamCallerPresent", ReasonUpstreamCallerAbsent},
 		{"CredentialPathReady", ReasonCredentialPathNotReady},
@@ -124,7 +126,8 @@ func TestEvaluate_ReasonVocabularyParity(t *testing.T) {
 	// every single-fact flip
 	fieldReason := map[string]Reason{
 		"ShadowExitReviewPassed": ReasonShadowExitNotPassed, "ScopeBounded": ReasonScopeNotBounded,
-		"ScopeReadFirst": ReasonScopeNotReadFirst, "LiveExecutorComposed": ReasonLiveExecutorAbsent,
+		"ScopeReadFirst": ReasonScopeNotReadFirst, "ScopeExactFirstCanary": ReasonScopeNotExactFirstCanary,
+		"LiveExecutorComposed":  ReasonLiveExecutorAbsent,
 		"UpstreamCallerPresent": ReasonUpstreamCallerAbsent, "CredentialPathReady": ReasonCredentialPathNotReady,
 		"DurableEventsHealthy": ReasonDurableEventsDegraded, "ResponseInspectionReady": ReasonResponseInspectionNotReady,
 		"RegistryHealthy": ReasonRegistryUnhealthy, "CatalogHealthy": ReasonCatalogUnhealthy,
@@ -157,22 +160,24 @@ func TestEvaluate_ReasonVocabularyParity(t *testing.T) {
 // node dry run must never report an activation-input fact (scope/approval/budget/server/
 // fingerprint) as unmet, so node_ready reflects NODE deficiencies alone. With every node fact
 // satisfied but every activation fact false, EvaluateNode must be Ready with an empty Unmet
-// set, while the full Evaluate reports exactly the six activation reasons.
+// set, while the full Evaluate reports exactly the seven activation reasons.
 func TestEvaluateNode_ExcludesActivationInputs(t *testing.T) {
 	activationReasons := map[Reason]bool{
-		ReasonScopeNotBounded: true, ReasonScopeNotReadFirst: true, ReasonLiveApprovalInvalid: true,
-		ReasonServerNotUsable: true, ReasonToolFingerprintStale: true, ReasonBudgetNotConfigured: true,
+		ReasonScopeNotBounded: true, ReasonScopeNotReadFirst: true, ReasonScopeNotExactFirstCanary: true,
+		ReasonLiveApprovalInvalid: true, ReasonServerNotUsable: true, ReasonToolFingerprintStale: true,
+		ReasonBudgetNotConfigured: true,
 	}
-	// Node facts all true; the six activation facts all false.
+	// Node facts all true; the seven activation facts all false.
 	f := allTrueFacts()
-	f.ScopeBounded, f.ScopeReadFirst, f.LiveApprovalValid = false, false, false
-	f.ServerUsable, f.ToolFingerprintCurrent, f.BudgetConfigured = false, false, false
+	f.ScopeBounded, f.ScopeReadFirst, f.ScopeExactFirstCanary = false, false, false
+	f.LiveApprovalValid, f.ServerUsable = false, false
+	f.ToolFingerprintCurrent, f.BudgetConfigured = false, false
 
 	node := EvaluateNode(f)
 	if !node.Ready || len(node.Unmet) != 0 {
 		t.Fatalf("node readiness must be Ready when every NODE fact holds regardless of activation inputs, got ready=%v unmet=%v", node.Ready, node.Unmet)
 	}
-	// The full verdict must surface exactly the six activation reasons (nothing node-level).
+	// The full verdict must surface exactly the seven activation reasons (nothing node-level).
 	full := Evaluate(f)
 	if full.Ready {
 		t.Fatal("full readiness must not be ready with activation inputs unmet")

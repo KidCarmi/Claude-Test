@@ -90,11 +90,7 @@ type IPFilter struct {
 // beyond the atomic load.
 //
 // The membership test is bucketed by prefix length rather than run as a linear
-// scan over the CIDR list: "does any configured prefix contain this address"
-// is answered by masking the address to each DISTINCT prefix length present
-// and probing a set. The number of distinct lengths is bounded by 33 (v4) /
-// 129 (v6) and is 2–5 in any real operator config, so the cost is flat in the
-// number of prefixes instead of proportional to it.
+// scan over the CIDR list — see prefixSet.
 type ipFilterView struct {
 	mode string
 
@@ -102,6 +98,27 @@ type ipFilterView struct {
 	// net.IP.String() so a lookup formats no string and allocates nothing.
 	singles map[netip.Addr]struct{}
 
+	// nets answers the CIDR half of the decision.
+	nets prefixSet
+}
+
+// prefixSet answers ONE question — "does any configured CIDR contain this
+// address?" — in time FLAT in the number of CIDRs.
+//
+// The naive form is a linear scan of net.IPNet.Contains, which makes the
+// length of an operator's list the price of every probe. Instead the set is
+// bucketed by prefix LENGTH: the address is masked to each DISTINCT length
+// present and the result looked up in a map. The number of distinct lengths is
+// bounded by 33 (v4) / 129 (v6) and is 2–5 in any real operator config, so the
+// cost tracks the number of distinct LENGTHS rather than the number of
+// prefixes.
+//
+// Shared by IPFilter's per-request Allowed() gate and RateLimiter's
+// per-request IsExempt() gate. It is deliberately ONE implementation: the
+// family normalisation in prefixFromIPNet mirrors net.networkNumberAndMask in
+// a way that is easy to get wrong in the FAIL-OPEN direction (see that
+// function's comment), and a second copy of it is how that protection rots.
+type prefixSet struct {
 	// prefixes holds every configured CIDR in canonical (masked) form;
 	// v4Lens/v6Lens are the sorted distinct prefix lengths present in it,
 	// split by address family so a v4 probe never tests a v6 prefix (which
@@ -112,11 +129,84 @@ type ipFilterView struct {
 
 	// oddNets carries any *net.IPNet that could not be represented as a
 	// netip.Prefix (a non-contiguous mask). net.ParseCIDR — the only writer
-	// of IPFilter.nets — cannot produce one, so this is unreachable in
-	// practice; it exists so the representation change can never silently
-	// drop an entry from a security filter. Scanned linearly, empty in every
-	// real config.
+	// of either caller's CIDR list — cannot produce one, so this is
+	// unreachable in practice; it exists so the representation change can
+	// never silently drop an entry from a security filter. Scanned linearly,
+	// empty in every real config.
 	oddNets []*net.IPNet
+}
+
+// buildPrefixSet derives the bucketed form from an authoritative CIDR list.
+//
+// The result never ALIASES nets: both callers publish it for lock-free reading
+// while continuing to mutate their own slice under a write lock, and one of
+// those mutators (RemoveExemption / IPFilter.Remove) compacts that slice IN
+// PLACE.
+func buildPrefixSet(nets []*net.IPNet) prefixSet {
+	var s prefixSet
+	if len(nets) == 0 {
+		return s
+	}
+	s.prefixes = make(map[netip.Prefix]struct{}, len(nets))
+	v4 := map[int]struct{}{}
+	v6 := map[int]struct{}{}
+	for _, n := range nets {
+		p, ok := prefixFromIPNet(n)
+		if !ok {
+			s.oddNets = append(s.oddNets, n)
+			continue
+		}
+		s.prefixes[p] = struct{}{}
+		if p.Addr().Is4() {
+			v4[p.Bits()] = struct{}{}
+		} else {
+			v6[p.Bits()] = struct{}{}
+		}
+	}
+	s.v4Lens = sortedPrefixLens(v4)
+	s.v6Lens = sortedPrefixLens(v6)
+	return s
+}
+
+// empty reports whether the set can match nothing, so a caller can skip
+// parsing the probe address entirely.
+func (s *prefixSet) empty() bool {
+	return len(s.prefixes) == 0 && len(s.oddNets) == 0
+}
+
+// contains reports whether any CIDR in the set covers addr, which MUST already
+// be Unmap()ped (see ipFilterView.contains for why). Allocation-free on the
+// reachable path.
+//
+// ipStr is the probe's original textual form and is used ONLY by the
+// unreachable oddNets fallback, which needs a net.IP to call Contains.
+func (s *prefixSet) contains(addr netip.Addr, ipStr string) bool {
+	lens := s.v4Lens
+	if !addr.Is4() {
+		lens = s.v6Lens
+	}
+	for _, n := range lens {
+		p, err := addr.Prefix(n)
+		if err != nil {
+			continue // n > addr.BitLen(); cannot happen, family-split above
+		}
+		if _, ok := s.prefixes[p]; ok {
+			return true
+		}
+	}
+
+	if len(s.oddNets) > 0 {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return false
+		}
+		for _, n := range s.oddNets {
+			if n.Contains(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // emptyIPFilterView is the view of a freshly constructed IPFilter: filter
@@ -154,26 +244,7 @@ func (f *IPFilter) publishView() {
 		}
 	}
 
-	if len(f.nets) > 0 {
-		v.prefixes = make(map[netip.Prefix]struct{}, len(f.nets))
-		v4 := map[int]struct{}{}
-		v6 := map[int]struct{}{}
-		for _, n := range f.nets {
-			p, ok := prefixFromIPNet(n)
-			if !ok {
-				v.oddNets = append(v.oddNets, n)
-				continue
-			}
-			v.prefixes[p] = struct{}{}
-			if p.Addr().Is4() {
-				v4[p.Bits()] = struct{}{}
-			} else {
-				v6[p.Bits()] = struct{}{}
-			}
-		}
-		v.v4Lens = sortedPrefixLens(v4)
-		v.v6Lens = sortedPrefixLens(v6)
-	}
+	v.nets = buildPrefixSet(f.nets)
 
 	f.view.Store(v)
 }
@@ -239,7 +310,7 @@ func prefixFromIPNet(n *net.IPNet) (netip.Prefix, bool) {
 // free: netip.ParseAddr returns a value type and every probe is a comparison
 // or a map lookup on that value.
 func (v *ipFilterView) contains(ipStr string) bool {
-	if len(v.singles) == 0 && len(v.prefixes) == 0 && len(v.oddNets) == 0 {
+	if len(v.singles) == 0 && v.nets.empty() {
 		return false
 	}
 	addr, err := netip.ParseAddr(ipStr)
@@ -261,32 +332,7 @@ func (v *ipFilterView) contains(ipStr string) bool {
 		return true
 	}
 
-	lens := v.v4Lens
-	if !addr.Is4() {
-		lens = v.v6Lens
-	}
-	for _, n := range lens {
-		p, err := addr.Prefix(n)
-		if err != nil {
-			continue // n > addr.BitLen(); cannot happen, family-split above
-		}
-		if _, ok := v.prefixes[p]; ok {
-			return true
-		}
-	}
-
-	if len(v.oddNets) > 0 {
-		ip := net.ParseIP(ipStr)
-		if ip == nil {
-			return false
-		}
-		for _, n := range v.oddNets {
-			if n.Contains(ip) {
-				return true
-			}
-		}
-	}
-	return false
+	return v.nets.contains(addr, ipStr)
 }
 
 // SetMode sets the IP-filter mode. Valid values are "allow" (allowlist),
@@ -477,9 +523,76 @@ type RateLimiter struct {
 	enabled atomic.Bool
 
 	// Exempt list — exempt IPs/CIDRs that bypass rate limiting (e.g. monitoring).
+	//
+	// IsExempt is the FIRST decision inside Allow/AllowClusterAware, so once a
+	// rate limit is configured it runs on every proxied request. Its read path
+	// is therefore LOCK-FREE and FLAT in the CIDR count: it loads an immutable
+	// *rlExemptView through an atomic.Pointer and never touches exemptMu. The
+	// exemptMu-guarded fields below stay the authoritative write-side state —
+	// AddExemption, RemoveExemption, ReplaceExemptions and ListExemptions keep
+	// their exact previous semantics — and every mutator republishes a freshly
+	// derived view before releasing the lock.
+	//
+	// A mutator added WITHOUT a publishExemptViewLocked() call is a silent
+	// SECURITY failure, not a performance one: a revoked exemption that keeps
+	// bypassing the rate limit. Pinned per mutator by
+	// TestRLExemptView_EveryMutatorRepublishes.
 	exemptMu   sync.RWMutex
 	exemptNets []*net.IPNet
 	exemptIPs  map[string]bool
+
+	// exemptView is the derived, immutable read-side snapshot. Written only
+	// under exemptMu (by publishExemptViewLocked); read without any lock by
+	// IsExempt.
+	exemptView atomic.Pointer[rlExemptView]
+}
+
+// rlExemptView is an immutable snapshot of a RateLimiter's exempt list.
+//
+// Nothing reachable from a published view is ever mutated in place — a mutator
+// builds a REPLACEMENT and stores it — so readers need no synchronisation
+// beyond the atomic load.
+type rlExemptView struct {
+	// ips is the exact-address set, keyed by the RAW probe string exactly as
+	// the pre-view map was, and probed with the caller's string verbatim.
+	//
+	// This is DELIBERATELY not canonicalised to a netip.Addr the way
+	// ipFilterView.singles is. AddExemption stores net.ParseIP(entry).String(),
+	// so today an IPv4-MAPPED probe ("::ffff:198.51.100.7") misses a single-IP
+	// exemption stored as "198.51.100.7". Canonicalising both sides would make
+	// it hit — which WIDENS an exemption, i.e. hands a client a rate-limit
+	// bypass it does not have today. This change is a COST change, not a
+	// POLICY change, so the verdict is preserved byte for byte.
+	ips  map[string]bool
+	nets prefixSet
+}
+
+// emptyRLExemptView is the view of a RateLimiter built as a bare composite
+// literal (`&RateLimiter{}`, which the cluster tests do), so IsExempt has a
+// well-defined answer before the first mutator publishes.
+var emptyRLExemptView = rlExemptView{}
+
+// loadExemptView returns the current read-side snapshot, never nil.
+func (r *RateLimiter) loadExemptView() *rlExemptView {
+	if v := r.exemptView.Load(); v != nil {
+		return v
+	}
+	return &emptyRLExemptView
+}
+
+// publishExemptViewLocked rebuilds the read-side snapshot from the
+// authoritative exemptMu-guarded state and stores it. MUST be called by every
+// mutator, with exemptMu held for writing.
+func (r *RateLimiter) publishExemptViewLocked() {
+	v := &rlExemptView{nets: buildPrefixSet(r.exemptNets)}
+	if len(r.exemptIPs) > 0 {
+		// Copied, not aliased: AddExemption mutates r.exemptIPs in place.
+		v.ips = make(map[string]bool, len(r.exemptIPs))
+		for ip := range r.exemptIPs {
+			v.ips[ip] = true
+		}
+	}
+	r.exemptView.Store(v)
 }
 
 // clientBucket is one IP's sliding window of in-window request stamps, held as
@@ -638,33 +751,99 @@ func newRateLimiter() *RateLimiter {
 }
 
 // IsExempt returns true if the IP is in the rate-limit exempt list.
+//
+// Reads ONE atomic pointer and takes no lock: this is the first decision on
+// every proxied request once a rate limit is configured, and an
+// RWMutex.RLock is an atomic read-modify-write on a single shared word, so the
+// previous shape made every request in the process contend on one cache line.
+// The CIDR half is answered by prefixSet, so its cost no longer scales with
+// the length of the operator's exempt list — measured on a 4-core Xeon, the
+// linear scan it replaces cost 3.6 µs per request at 256 exempt CIDRs, which
+// was ~74% of the entire rate-limit gate.
+//
+// An entirely empty exempt list — the common posture for a deployment that
+// rate-limits but exempts nothing — short-circuits before the probe address is
+// parsed at all. The pre-view shape parsed it unconditionally and then ran an
+// empty loop, so the parse was pure waste.
 func (r *RateLimiter) IsExempt(ip string) bool {
-	r.exemptMu.RLock()
-	defer r.exemptMu.RUnlock()
-	if r.exemptIPs[ip] {
-		return true
-	}
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
+	v := r.loadExemptView()
+	if len(v.ips) == 0 && v.nets.empty() {
 		return false
 	}
-	for _, n := range r.exemptNets {
-		if n.Contains(parsed) {
-			return true
-		}
+	if v.ips[ip] {
+		return true
 	}
-	return false
+	if v.nets.empty() {
+		return false
+	}
+	// net.ParseIP — what this path used before — rejects a zoned address
+	// outright, and a rejected parse means "exempt nothing". netip.ParseAddr
+	// accepts zones, so drop them here to keep the previous verdict.
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || addr.Zone() != "" {
+		return false
+	}
+	// An IPv4-mapped IPv6 address is an IPv4 address to net.IPNet.Contains
+	// (which goes through To4). Unmap so it keeps matching v4 CIDRs and keeps
+	// NOT matching v6 ones.
+	return v.nets.contains(addr.Unmap(), ip)
 }
 
 // AddExemption adds an IP or CIDR to the rate-limit exempt list.
+//
+// Use AddExemptions to load a LIST — AddExemption publishes the derived view
+// on every call (it must: a single admin edit has to take effect immediately),
+// and publishing rebuilds that view from the whole entry set, so AddExemption
+// in a loop is quadratic. See AddExemptions.
 func (r *RateLimiter) AddExemption(entry string) error {
 	r.exemptMu.Lock()
 	defer r.exemptMu.Unlock()
+	if err := r.addExemptionLocked(entry); err != nil {
+		// Rejected entry: nothing changed, so the published view is current.
+		return err
+	}
+	r.publishExemptViewLocked()
+	return nil
+}
+
+// AddExemptions appends every valid entry in ONE pass, under ONE lock,
+// publishing the derived view ONCE at the end. Invalid entries are skipped and
+// returned; a nil result means every entry was accepted.
+//
+// This is the bulk-load primitive every list-restoring caller must use — the
+// admin_settings restore at boot and config import. Publishing per entry
+// instead makes a bulk load O(N²) in the entry count, and the ConfigSnapshot
+// cap for this list is maxSnapRateLimitExempt (10,000). Same trap, same shape
+// and same reason as IPFilter.AddAll; pinned by
+// TestBenchGate_RateLimitExemptBulkLoadIsLinear.
+func (r *RateLimiter) AddExemptions(entries []string) []InvalidIPEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	r.exemptMu.Lock()
+	defer r.exemptMu.Unlock()
+	var invalid []InvalidIPEntry
+	for _, entry := range entries {
+		if err := r.addExemptionLocked(entry); err != nil {
+			invalid = append(invalid, InvalidIPEntry{Entry: entry, Err: err})
+		}
+	}
+	r.publishExemptViewLocked()
+	return invalid
+}
+
+// addExemptionLocked inserts entry into the authoritative write-side state
+// WITHOUT publishing. Callers must hold exemptMu for writing and MUST
+// publishExemptViewLocked before releasing it.
+func (r *RateLimiter) addExemptionLocked(entry string) error {
 	if _, cidr, err := net.ParseCIDR(entry); err == nil {
 		r.exemptNets = append(r.exemptNets, cidr)
 		return nil
 	}
 	if ip := net.ParseIP(entry); ip != nil {
+		if r.exemptIPs == nil {
+			r.exemptIPs = map[string]bool{}
+		}
 		r.exemptIPs[ip.String()] = true
 		return nil
 	}
@@ -683,6 +862,7 @@ func (r *RateLimiter) RemoveExemption(entry string) {
 		}
 	}
 	r.exemptNets = filtered
+	r.publishExemptViewLocked()
 }
 
 // ReplaceExemptions atomically replaces the entire rate-limit exempt list.
@@ -706,6 +886,7 @@ func (r *RateLimiter) ReplaceExemptions(entries []string) {
 	r.exemptMu.Lock()
 	r.exemptIPs = ips
 	r.exemptNets = nets
+	r.publishExemptViewLocked()
 	r.exemptMu.Unlock()
 }
 

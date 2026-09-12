@@ -108,8 +108,9 @@ func TestCanaryActivationPreflight_WiresScopeApprovalBudget(t *testing.T) {
 		t.Fatal("SECURITY: no set of activation inputs may make Canary ready while the live tier is unarmed")
 	}
 	for _, notWanted := range []canary.Reason{
-		canary.ReasonScopeNotBounded, canary.ReasonScopeNotReadFirst, canary.ReasonLiveApprovalInvalid,
-		canary.ReasonServerNotUsable, canary.ReasonToolFingerprintStale, canary.ReasonBudgetNotConfigured,
+		canary.ReasonScopeNotBounded, canary.ReasonScopeNotReadFirst, canary.ReasonScopeNotExactFirstCanary,
+		canary.ReasonLiveApprovalInvalid, canary.ReasonServerNotUsable, canary.ReasonToolFingerprintStale,
+		canary.ReasonBudgetNotConfigured,
 	} {
 		if canaryUnmetHas(base, notWanted) {
 			t.Errorf("valid activation input should satisfy %s, but it is unmet", notWanted)
@@ -123,6 +124,9 @@ func TestCanaryActivationPreflight_WiresScopeApprovalBudget(t *testing.T) {
 	}{
 		{"unbounded_scope", func(in *CanaryActivationInput) { in.Scope.Servers = nil }, canary.ReasonScopeNotBounded},
 		{"non_read_first", func(in *CanaryActivationInput) { in.Scope.Operations = []rollout.RiskClass{rollout.RiskWrite} }, canary.ReasonScopeNotReadFirst},
+		{"wider_than_the_one_experiment", func(in *CanaryActivationInput) {
+			in.Scope.Principals = append(in.Scope.Principals, "synthetic-2")
+		}, canary.ReasonScopeNotExactFirstCanary},
 		{"shadow_approval", func(in *CanaryActivationInput) {
 			in.ToolApprovals[0].Approval.Purpose = tooltrust.PurposeShadowEvaluation
 		}, canary.ReasonLiveApprovalInvalid},
