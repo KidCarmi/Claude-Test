@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -569,5 +570,28 @@ func fe6acDecodeInto(t *testing.T, body map[string]any, dst any) {
 	r := jsonReq(http.MethodPost, "/", body)
 	if err := decodeJSON(r, dst); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// ─── Legacy UI carries the corrected fences ─────────────────────────────────
+
+func TestFE6A0C_Green_LegacyUISendsTheCorrectionFences(t *testing.T) {
+	b, err := os.ReadFile(staticIndexHTMLPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	for _, want := range []string{
+		"const path = '/api/auth/users?revision=' + encodeURIComponent(_usersRevision);",
+		"_lockoutsGeneration = d.generation || 0;",
+		"'/api/auth/lockouts?generation=' + encodeURIComponent(_lockoutsGeneration)",
+		"_idpDocumentRevision = (data && data.revision) || '';",
+		"q.push('documentRevision=' + encodeURIComponent(_idpDocumentRevision));",
+		"q.push('operationId=' + encodeURIComponent(newOperationId()));",
+		"function newOperationId() {",
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("legacy UI missing FE-6A.0 correction patch: %q", want)
+		}
 	}
 }
