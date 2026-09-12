@@ -1,6 +1,7 @@
 package fileutil
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -82,6 +83,65 @@ func (r *RotatingFile) WriteSync(p []byte) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// FindAndSync is the sink-owned "find, then prove durable" primitive
+// (round 6). Under the sink's own mutex — so no Write can rotate the
+// generations between the scan and the synchronisation — it scans the
+// CURRENT file and then the rotated archive for a line match accepts, and
+// when one is found it synchronises the file that holds it AND the
+// directory (the rename and the new file's existence are directory
+// entries; a readable file does not prove them) before reporting found.
+// Any synchronisation failure is returned and found is false: the caller
+// must keep the record pending. A scan error is returned, never read as
+// absent.
+func (r *RotatingFile) FindAndSync(match func(line []byte) bool) (found bool, err error) {
+	if err := beforeSync("find", r.path); err != nil {
+		return false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range []string{r.path, r.path + ".1"} {
+		hit, err := scanFile(p, match)
+		if err != nil {
+			return false, err
+		}
+		if !hit {
+			continue
+		}
+		if err := SyncPath(p); err != nil {
+			return false, err
+		}
+		if err := SyncPath(filepath.Dir(r.path)); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// scanFile reports whether any line of path satisfies match; a missing
+// file is simply "no match", any other read failure is an error.
+func scanFile(path string, match func(line []byte) bool) (bool, error) {
+	f, err := os.Open(path) // #nosec G304 -- sink-owned path; read-only handle
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("scan %s: %w", path, err)
+	}
+	defer f.Close() //nolint:errcheck // read-only handle
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), 64<<20)
+	for sc.Scan() {
+		if match(sc.Bytes()) {
+			return true, nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return false, fmt.Errorf("scan %s: %w", path, err)
+	}
+	return false, nil
 }
 
 // SyncPath fsyncs one file or directory and reports it to the test

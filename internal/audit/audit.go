@@ -326,12 +326,22 @@ var ErrOperationIDRequired = errors.New("audit: operation entry requires an oper
 // acknowledgement that cannot be made durable is never given (round 5).
 var ErrSinkNotSyncable = errors.New("audit: durable sink cannot synchronise to stable storage")
 
-// durableAppender is the production append primitive whose success means
-// the COMPLETE record has been synchronised to stable storage (file, and on
-// rotation the archive and the directory). fileutil.RotatingFile implements
-// it.
-type durableAppender interface {
+// durableSink is the production sink contract behind AppendOperation
+// (rounds 5–6); fileutil.RotatingFile implements it.
+//
+//   - WriteSync: the append primitive whose success means the COMPLETE
+//     record has been synchronised to stable storage (file, and on rotation
+//     the archive and the directory).
+//   - FindAndSync: the sink-owned "find, then prove durable" primitive —
+//     under the sink's rotation lock it scans ONE stable generation set for
+//     the keyed line and synchronises the file that holds it AND the
+//     directory before reporting found. Re-opening a pathname after the
+//     scan would race an ordinary rotation and could synchronise a
+//     different generation; the sink owns both steps so that cannot
+//     happen.
+type durableSink interface {
 	WriteSync(p []byte) (int, error)
+	FindAndSync(match func(line []byte) bool) (bool, error)
 }
 
 // opMu serialises the check-then-append of operation-keyed entries so two
@@ -370,19 +380,19 @@ func AppendOperation(e Entry) (durable bool, err error) {
 		}
 		return false, nil
 	}
-	sink, ok := f.(durableAppender)
+	sink, ok := f.(durableSink)
 	if !ok {
 		return false, ErrSinkNotSyncable
 	}
-	holder, present, err := findOperation(path, e.Action, e.OperationID)
+	// Found-then-proven in ONE sink generation (round 6): the sink scans
+	// and synchronises file + directory under its own rotation lock.
+	present, err := sink.FindAndSync(func(line []byte) bool {
+		return lineHasOperation(line, e.Action, e.OperationID)
+	})
 	if err != nil {
 		return false, err
 	}
 	if present {
-		// Found — but only a synchronised containing file makes it durable.
-		if err := fileutil.SyncPath(holder); err != nil {
-			return false, err
-		}
 		return true, nil
 	}
 	if err := persistEntryDurable(sink, path, e); err != nil {
@@ -419,18 +429,28 @@ func ringHasOperationLocked(action, opID string) bool {
 // persistEntryDurable writes one JSONL record through the sink's
 // synchronising append. A failure — write OR fsync — is charged exactly like
 // a best-effort loss (the storage-health plane must see it) and returned.
-func persistEntryDurable(sink durableAppender, path string, e Entry) error {
+func persistEntryDurable(sink durableSink, path string, e Entry) error {
 	b, err := json.Marshal(e)
 	if err != nil {
 		countWriteError(path, fmt.Errorf("marshal audit entry: %w", err))
 		return err
 	}
 	b = append(b, '\n')
-	if needsBoundaryRepair.CompareAndSwap(true, false) {
+	repaired := needsBoundaryRepair.CompareAndSwap(true, false)
+	if repaired {
 		b = append([]byte{'\n'}, b...)
 	}
 	n, werr := sink.WriteSync(b)
-	if n > 0 && n < len(b) {
+	// Re-derive the boundary state from what actually reached the file,
+	// exactly as the best-effort path does (round 6, GR1): a write that
+	// moved ZERO bytes left the fragment exactly as it was, so a repair we
+	// consumed must be handed back or the next record is glued onto it.
+	switch {
+	case n == 0:
+		if repaired {
+			needsBoundaryRepair.Store(true)
+		}
+	case n < len(b):
 		needsBoundaryRepair.Store(true)
 	}
 	if werr != nil {
@@ -472,6 +492,16 @@ func findOperation(path, action, opID string) (holder string, found bool, err er
 	return "", false, nil
 }
 
+// lineHasOperation decides whether one JSONL line is the keyed entry: a
+// cheap substring pre-filter, then the decode is the decision.
+func lineHasOperation(line []byte, action, opID string) bool {
+	if !bytes.Contains(line, []byte(opID)) {
+		return false
+	}
+	var e Entry
+	return json.Unmarshal(line, &e) == nil && e.OperationID == opID && e.Action == action
+}
+
 func fileHasOperation(path, action, opID string) (bool, error) {
 	f, err := os.Open(path) // #nosec G304 -- operator-configured path
 	if err != nil {
@@ -484,12 +514,7 @@ func fileHasOperation(path, action, opID string) (bool, error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64<<10), 64<<20)
 	for sc.Scan() {
-		line := sc.Bytes()
-		if !bytes.Contains(line, []byte(opID)) {
-			continue // cheap pre-filter; the decode below is the decision
-		}
-		var e Entry
-		if json.Unmarshal(line, &e) == nil && e.OperationID == opID && e.Action == action {
+		if lineHasOperation(sc.Bytes(), action, opID) {
 			return true, nil
 		}
 	}
