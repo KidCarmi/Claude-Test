@@ -320,8 +320,8 @@ run_mutation M11 \
   'TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2' \
   . "$LGATE" \
   's/\tif hex\.EncodeToString\(ti\.target\.Fingerprint\[:\]\) != decisionFP \{/\tif false \&\& hex.EncodeToString(ti.target.Fingerprint[:]) != decisionFP {/' \
-  's/\t\t\tFingerprint:       ti\.target\.Fingerprint,/\t\t\tFingerprint:       mustDecodeDecisionFP(decisionFP, ti.target.Fingerprint),/' \
-  's/\/\/ mcpLiveApprovalSatisfied answers the APPROVAL half/\/\/ mustDecodeDecisionFP is mutation scaffolding.\nfunc mustDecodeDecisionFP(fp string, fallback tooltrust.FingerprintDigest) tooltrust.FingerprintDigest \{\n\traw, err := hex.DecodeString(fp)\n\tif err != nil || len(raw) != len(fallback) \{\n\t\treturn fallback\n\t\}\n\tvar out tooltrust.FingerprintDigest\n\tcopy(out[:], raw)\n\treturn out\n\}\n\n\/\/ mcpLiveApprovalSatisfied answers the APPROVAL half/'
+  's/\treturn liveTrustPrecheck\{\n\t\tEligible: true,\n\t\tTarget: canary\.LiveTarget\{/\tclaimed := ti.target.Fingerprint\n\tif raw, derr := hex.DecodeString(decisionFP); derr == nil \&\& len(raw) == len(claimed) \{\n\t\tcopy(claimed[:], raw)\n\t\}\n\treturn liveTrustPrecheck{\n\t\tEligible: true,\n\t\tTarget: canary.LiveTarget{/' \
+  's/\t\t\tFingerprint:       ti\.target\.Fingerprint,/\t\t\tFingerprint:       claimed,/'
 
 # M12 — DISCOVERY IS USED AS THE SUBSTITUTE. A tools/call is defaulted to OpDiscovery, so it passes
 # the read-first gate with no review at all — blocker #4 "closed" by pretending a listing is an
