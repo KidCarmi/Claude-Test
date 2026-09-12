@@ -28,6 +28,15 @@
 #   M15  the classification outlives the activation that made it (Codex P1)
 #   M16  the boundary revalidation reads an unspeakable record as agreement
 #
+# And the STALE-AUTHORIZATION family (Codex P1, round 2) — the same defect one axis over, where
+# the fact decided at resolution is the rollout SCOPE rather than the operation class:
+#
+#   M17  the scope hash is not carried from resolution
+#   M18  admission ignores the scope hash
+#   M19  a missing scope hash is treated as a match
+#   M20  admission compares only the generation, not scope identity
+#   M21  a principal-only recheck misses a tool/server/exclusion scope edit
+#
 # A COMPILE FAILURE IS NOT PROOF unless the mutation targets a structural wall whose stated purpose
 # is compile-time prevention (those declare --compile-wall). Every other mutation here is written to
 # compile and change behaviour, so the failure comes from an assertion.
@@ -388,6 +397,56 @@ run_mutation M16 \
   'TestAtomicBinding_I_ClassNotInForceIsRefused' \
   . "$ADM" \
   's/\tif current, ok := cr\.reviewed\.OperationClassFor\(obs\.Current\); !ok \|\| current != opClass \{/\tif current, ok := cr.reviewed.OperationClassFor(obs.Current); ok \&\& current != opClass \&\& false \{\n\t\t_ = current/'
+
+RESOLVE=internal/mcp/rollout/state.go
+EXECUTOR=internal/mcp/execution/executor.go
+
+# M17 — THE ENVELOPE IS NEVER CAPTURED. State.ResolveFor stops stamping the scope it decided
+# against, so every request reaches the boundary carrying "" — which the boundary refuses, so the
+# visible symptom is the POSITIVE control failing, not a permissive hole. That is the point: a
+# fact that is not captured cannot be revalidated, and the gate that proves the happy path is the
+# one that notices.
+run_mutation M17 \
+  'the scope hash is never captured at resolution' \
+  'TestScopeInForce_UnchangedEnvelopeStillProceeds' \
+  . "$RESOLVE" \
+  's/\tr\.ScopeHash = a\.scope\.Hash\(\)\n//'
+
+# M18 — ADMISSION IGNORES IT. The envelope is captured and carried and then not compared: the
+# defect exactly as it stood before this fix.
+run_mutation M18 \
+  'the admission boundary ignores the scope hash' \
+  'TestScopeInForce_StaleRequestRefusedAfterSameModeScopeUpdate' \
+  . "$ADM" \
+  's/\tif scopeNow == nil \|\| resolvedScope == "" \|\| scopeNow\(\) != resolvedScope \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitScopeNotInForce, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n//'
+
+# M19 — A MISSING ENVELOPE BECOMES A WILDCARD. The comparison keeps working for requests that
+# carry a hash and silently exempts every request that does not — which is exactly the set that
+# skipped the path that stamps it.
+run_mutation M19 \
+  'a missing scope hash is treated as a match' \
+  'TestScopeInForce_MissingEnvelopeFailsClosed' \
+  . "$ADM" \
+  's/\tif scopeNow == nil \|\| resolvedScope == "" \|\| scopeNow\(\) != resolvedScope \{/\tif resolvedScope != "" \&\& (scopeNow == nil \|\| scopeNow() != resolvedScope) \{/'
+
+# M20 — GENERATION INSTEAD OF SCOPE IDENTITY. The plausible wrong fix: assume a scope change
+# always mints a new generation, so comparing generations is enough. It is not — a SAME-MODE
+# scope update deliberately keeps the generation, which is the whole reason the finding exists.
+run_mutation M20 \
+  'admission compares only the activation generation, not scope identity' \
+  'TestScopeInForce_StaleRequestRefusedAfterSameModeScopeUpdate' \
+  . "$ADM" \
+  's/\tif scopeNow == nil \|\| resolvedScope == "" \|\| scopeNow\(\) != resolvedScope \{/\tif gen == 0 \{/'
+
+# M21 — PRINCIPAL-ONLY RECHECK. The other plausible wrong fix, and the reason hash equality was
+# chosen: re-running membership for the principal closes the headline case and leaves every
+# sibling dimension open. Modelled by comparing only the principal-bearing prefix of the two
+# envelopes, so a principal edit is still caught and a tool/server/exclusion edit is not.
+run_mutation M21 \
+  'a principal-only recheck misses a tool/server/exclusion scope edit' \
+  'TestScopeInForce_AnySelectorEditRefusesTheStaleRequest' \
+  . "$ADM" \
+  's/\tif scopeNow == nil \|\| resolvedScope == "" \|\| scopeNow\(\) != resolvedScope \{/\tif cur := scopeNow; cur == nil \|\| resolvedScope == "" \|\| ident.Principal == "" \{/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
