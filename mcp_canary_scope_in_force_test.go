@@ -498,7 +498,7 @@ func TestScopeInForce_UnchangedEnvelopeSurvivesThePostAdmissionWindow(t *testing
 // node that was never approved.
 func liveRealGateTrust(capb rollout.Capability, trust func() bool) *mcpLiveSideEffectGate {
 	g := liveRealGate(capb, true)
-	g.approvalOK = func(canary.LiveTarget, time.Time) (bool, string) { return trust(), "" }
+	g.approvalOK = func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) { return trust(), "" }
 	return g
 }
 
@@ -617,5 +617,122 @@ func TestBoundaryAuthority_ScopeWithdrawnDuringThePoolWaitRefusesBeforeSend(t *t
 	if out.Reason != mcperr.ReasonRolloutOutOfScope {
 		t.Fatalf("a scope withdrawal must be diagnosed as out-of-scope wherever it is caught, got %s",
 			out.Reason.Code())
+	}
+}
+
+// ── THE APPROVAL MUST STATE THE CLASS IN FORCE ────────────────────────────────────────────────
+//
+// An approval carries its own reviewed operation class, and nothing stops a LATER approval for the
+// same exact fingerprint from stating a different one — that is precisely how a reviewer corrects
+// an earlier determination. The activation's immutable record, by design, does not move.
+//
+// So "some live grant satisfies this target" was not a sufficient question: with the read-only
+// approval that armed the activation gone and only a MUTATING one live, both admission and the
+// boundary still permitted execution as read-first, and the correction never landed for the rest
+// of the activation's window (Codex P1, PR #1370, round 5).
+func TestBoundaryAuthority_ApprovalMustStateTheClassInForce(t *testing.T) {
+	r := newReviewedRig(t)
+	_, cat := mcpInventory.sharedInventory()
+	// A genuine, current, four-eyes live approval that states MUTATING for the exact target.
+	requestAndApproveLive(t, r.sid, r.tool, r.fp1, cat.Current().Revision())
+
+	tgt := canary.LiveTarget{
+		Tenant: ttTenant, ServerID: r.sid, ToolName: r.tool,
+		Fingerprint: mustDigest(t, r.fp1), FingerprintFormat: 1,
+	}
+
+	// CONTROL FIRST: the approval is real and satisfies its own class. Without this the refusal
+	// below could be a matcher that has simply stopped matching anything.
+	if ok, _ := mcpLiveApprovalSatisfied(tgt, policy.OpWrite, r.now); !ok {
+		t.Fatal("premise: the MUTATING approval must satisfy a MUTATING request — otherwise this " +
+			"test proves nothing about the class comparison")
+	}
+
+	if ok, _ := mcpLiveApprovalSatisfied(tgt, policy.OpRead, r.now); ok {
+		t.Fatal("SECURITY: an approval stating MUTATING satisfied a read-first request — a " +
+			"reviewer's correction would then be ignored for the rest of the activation's window")
+	}
+}
+
+// AND AN UNSTATED CLASS FAILS CLOSED rather than reading as agreement — the same discipline the
+// activation gate applies at arming time.
+func TestBoundaryAuthority_ApprovalWithNoStatedClassSatisfiesNothing(t *testing.T) {
+	r := newReviewedRig(t)
+	_, cat := mcpInventory.sharedInventory()
+	requestAndApproveLive(t, r.sid, r.tool, r.fp1, cat.Current().Revision())
+
+	tgt := canary.LiveTarget{
+		Tenant: ttTenant, ServerID: r.sid, ToolName: r.tool,
+		Fingerprint: mustDigest(t, r.fp1), FingerprintFormat: 1,
+	}
+	for _, class := range []policy.OperationClass{policy.OpUnset, policy.OpDiscovery, policy.OpControl} {
+		if ok, _ := mcpLiveApprovalSatisfied(tgt, class, r.now); ok {
+			t.Fatalf("SECURITY: a live approval satisfied class %v, which no review can bind to a tool", class)
+		}
+	}
+}
+
+// ── THE ORDER OF THE BOUNDARY PREDICATE ───────────────────────────────────────────────────────
+//
+// A Canary→non-live commit un-arms the tier and publishes the new scope BEFORE demoteCanary
+// invalidates the generation (mcp_rollout.go, the leavingLive arm), so for a window BOTH are
+// withdrawn. A scope-first order reported `rollout_out_of_scope` for an already-admitted request
+// while a fresh request in the identical final state is refused `rollout_mode_invalid` by the
+// unarmed lifecycle gate — the same diagnosis-depends-on-timing defect the reason plumbing exists
+// to remove, one layer in (Codex P2, PR #1370, round 5).
+func TestBoundaryAuthority_GenerationOutranksScopeWhenBothAreWithdrawn(t *testing.T) {
+	capb := rollout.CapabilityGateway
+	g := liveRealGate(capb, true)
+	// Both withdrawn at once, which is exactly what a leaving-live commit produces.
+	g.generationCurrent = func(uint64) bool { return false }
+	g.currentScopeHash = func() string { return "a-different-envelope-entirely" }
+	g.admitUnderActivation = stubAdmitUnderActivation(canary.BudgetGranted, 11)
+	// Gate (1) is the lifecycle admission, which refuses on an unarmed tier; these two cases are
+	// about the ORDER of the final-boundary predicate, so it is stubbed open rather than arming a
+	// whole live tier to reach one closure.
+	g.admit = func() (func(), bool) { return func() {}, true }
+
+	in := execution.LiveGateInput{
+		Capability: 0, Tenant: "t1", Principal: "p1", ServerID: "s1", ToolName: "tool", Fingerprint: "fp",
+		Operation: policy.OpRead, Now: time.Unix(0, 1),
+		ResolvedScopeHash: "the-envelope-this-request-resolved-under",
+	}
+	d := g.AdmitSideEffect(in)
+	if !d.Admit || d.Revalidate == nil {
+		t.Fatalf("premise: the stubbed admission must grant so the boundary predicate is reachable; admit=%v reason=%s",
+			d.Admit, d.Reason.Code())
+	}
+	if got := d.Revalidate(); got != mcperr.ReasonRolloutModeInvalid {
+		t.Fatalf("with BOTH the generation and the scope withdrawn the refusal must name the "+
+			"generation — the same answer a fresh request gets from the unarmed lifecycle gate — got %s",
+			got.Code())
+	}
+}
+
+// The control: with the generation still current, a withdrawn scope is still reported as such.
+// Without it, "generation first" could be implemented as "generation only".
+func TestBoundaryAuthority_ScopeStillNamedWhenTheGenerationIsCurrent(t *testing.T) {
+	capb := rollout.CapabilityGateway
+	g := liveRealGate(capb, true)
+	g.generationCurrent = func(uint64) bool { return true }
+	g.currentScopeHash = func() string { return "a-different-envelope-entirely" }
+	g.admitUnderActivation = stubAdmitUnderActivation(canary.BudgetGranted, 11)
+	// Gate (1) is the lifecycle admission, which refuses on an unarmed tier; these two cases are
+	// about the ORDER of the final-boundary predicate, so it is stubbed open rather than arming a
+	// whole live tier to reach one closure.
+	g.admit = func() (func(), bool) { return func() {}, true }
+
+	in := execution.LiveGateInput{
+		Capability: 0, Tenant: "t1", Principal: "p1", ServerID: "s1", ToolName: "tool", Fingerprint: "fp",
+		Operation: policy.OpRead, Now: time.Unix(0, 1),
+		ResolvedScopeHash: "the-envelope-this-request-resolved-under",
+	}
+	d := g.AdmitSideEffect(in)
+	if !d.Admit || d.Revalidate == nil {
+		t.Fatalf("premise: the stubbed admission must grant; admit=%v", d.Admit)
+	}
+	if got := d.Revalidate(); got != mcperr.ReasonRolloutOutOfScope {
+		t.Fatalf("CONTROL: a withdrawn envelope under a live generation must still be named as "+
+			"out-of-scope, got %s", got.Code())
 	}
 }

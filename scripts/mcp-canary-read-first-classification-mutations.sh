@@ -41,6 +41,8 @@
 #   M24  the executor does not supply the pre-send re-ask
 #   M25  the upstream client never invokes the pre-send re-ask
 #   M26  a boundary withdrawal is diagnosed by a fixed reason, not the gate's
+#   M27  a satisfying approval need not state the class in force
+#   M28  the boundary predicate asks about scope before the generation
 #
 # A COMPILE FAILURE IS NOT PROOF unless the mutation targets a structural wall whose stated purpose
 # is compile-time prevention (those declare --compile-wall). Every other mutation here is written to
@@ -517,6 +519,27 @@ run_mutation M26 \
   'TestBoundaryAuthority_ScopeWithdrawnDuringThePoolWaitRefusesBeforeSend' \
   . "$RUN" \
   's/\t\t\t\tr := cls\.withdrawnReason/\t\t\t\tr := mcperr.ReasonNone\n\t\t\t\t_ = cls.withdrawnReason/'
+
+# M27 — ANY LIVE GRANT SATISFIES. An approval states its own reviewed class, and a later approval
+# for the same exact fingerprint can state a different one — that is how a reviewer corrects an
+# earlier determination. Without the class comparison the activation's older immutable record keeps
+# saying OpRead while the only live approval says MUTATING, and the correction is ignored for the
+# rest of the activation's window.
+run_mutation M27 \
+  'a satisfying approval need not state the class in force' \
+  'TestBoundaryAuthority_ApprovalMustStateTheClassInForce' \
+  . "$GATE" \
+  's/\t\tgot, ok := canary\.OperationClassFromReviewed\(a\.ReviewedOperationClass\)\n\t\tif !ok \|\| got != class \{\n\t\t\tcontinue\n\t\t\}\n//'
+
+# M28 — SCOPE BEFORE GENERATION. Not a bypass: the request is still refused. The defect is that a
+# leaving-live commit publishes the new scope BEFORE invalidating the generation, so in that window
+# an already-admitted request reads rollout_out_of_scope while a fresh request in the identical
+# final state reads rollout_mode_invalid — the diagnosis depending on timing again, one layer in.
+run_mutation M28 \
+  'the boundary predicate asks about scope before the generation' \
+  'TestBoundaryAuthority_GenerationOutranksScopeWhenBothAreWithdrawn' \
+  . "$GATE" \
+  's/\t\t\tif g\.generationCurrent != nil \&\& !g\.generationCurrent\(gen\) \{\n\t\t\t\treturn mcperr\.ReasonRolloutModeInvalid\n\t\t\t\}\n\t\t\tif !canaryScopeInForce\(in\.ResolvedScopeHash, g\.currentScopeHash\) \{\n\t\t\t\treturn mcperr\.ReasonRolloutOutOfScope\n\t\t\t\}\n/\t\t\tif !canaryScopeInForce(in.ResolvedScopeHash, g.currentScopeHash) \{\n\t\t\t\treturn mcperr.ReasonRolloutOutOfScope\n\t\t\t\}\n\t\t\tif g.generationCurrent != nil \&\& !g.generationCurrent(gen) \{\n\t\t\t\treturn mcperr.ReasonRolloutModeInvalid\n\t\t\t\}\n/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"

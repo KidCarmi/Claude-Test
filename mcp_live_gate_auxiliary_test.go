@@ -63,7 +63,7 @@ func newAuxGate(s *auxSeams) *mcpLiveSideEffectGate {
 			s.trustCalls++
 			return liveTrustPrecheck{Eligible: true}
 		},
-		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
+		approvalOK: func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) {
 			s.trustCalls++
 			return true, ""
 		},

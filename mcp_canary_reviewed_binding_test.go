@@ -320,7 +320,7 @@ func TestReviewedBinding_C05_ALaterApprovalForF2DoesNotResurrectG(t *testing.T) 
 	if ok, _ := mcpLiveApprovalSatisfied(canary.LiveTarget{
 		Tenant: ttTenant, ServerID: r.sid, ToolName: r.tool,
 		Fingerprint: mustDigest(t, fp2), FingerprintFormat: 1,
-	}, r.now); !ok {
+	}, policy.OpWrite, r.now); !ok { // requestAndApproveLive states MUTATING
 		t.Fatal("premise: the F2 approval must itself be valid — otherwise this proves nothing")
 	}
 

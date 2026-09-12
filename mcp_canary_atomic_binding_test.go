@@ -786,7 +786,7 @@ func TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction(t *testing.T) {
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckEligible,
-		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
+		approvalOK: func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) {
 			// The store answers DIFFERENTLY either side of the lock, which is the whole point:
 			// a constant answer cannot tell a cached read from a live one. sync.Mutex is not
 			// reentrant, so on this single-threaded path a successful TryLock means we are NOT
@@ -857,7 +857,7 @@ func TestAtomicBinding_RugPullLatchesAtAdmission(t *testing.T) {
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckAt(fpF2),
-		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
+		approvalOK: func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) {
 			return false, "" // unauthorized, and saying nothing about what was reviewed
 		},
 		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
@@ -906,7 +906,7 @@ func TestAtomicBinding_MissingApprovalIsNotDrift(t *testing.T) {
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckEligible,
-		approvalOK:    func(canary.LiveTarget, time.Time) (bool, string) { return false, "" },
+		approvalOK:    func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) { return false, "" },
 		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 			return r.rt.admitLiveExecution(r.capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},

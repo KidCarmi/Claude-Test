@@ -402,7 +402,7 @@ func TestLiveCommit_DemotedGenerationRefusedAtFinalBoundary(t *testing.T) {
 		admit:                mcpLiveTierFor(capb).admitExecution,
 		readFirst:            canary.IsReadFirstOperation,
 		trustPrecheck:        stubTrustPrecheckEligible,
-		approvalOK:           func(canary.LiveTarget, time.Time) (bool, string) { return true, "" },
+		approvalOK:           func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) { return true, "" },
 		admitUnderActivation: stubAdmitUnderActivation(canary.BudgetGranted, 7),
 		releaseBudget:        func(uint64) {},
 		generationCurrent:    func(uint64) bool { return false }, // demoted after reserve

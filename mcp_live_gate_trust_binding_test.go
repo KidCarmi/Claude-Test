@@ -6,6 +6,7 @@ import (
 
 	"github.com/KidCarmi/Culvert/internal/mcp/catalog"
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/registry"
 )
 
@@ -17,6 +18,8 @@ import (
 // halves were split it had no production caller left — a function that only tests reach is not the
 // live path, however faithfully it is written, and keeping it would have let these tests drift away
 // from what the gate actually runs.
+// The class is fixed at OpRead here because that is the ONLY class a First-Canary tool call can
+// carry across the side-effect gate; these tests are about the fingerprint binding, not the class.
 func liveTrustVerdict(tenant, serverID, toolName, decisionFP string, now time.Time) (trusted bool, driftCode string) {
 	live := mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP)
 	if live.DriftCode != "" {
@@ -25,7 +28,7 @@ func liveTrustVerdict(tenant, serverID, toolName, decisionFP string, now time.Ti
 	if !live.Eligible {
 		return false, ""
 	}
-	return mcpLiveApprovalSatisfied(live.Target, now)
+	return mcpLiveApprovalSatisfied(live.Target, policy.OpRead, now)
 }
 
 // P1a: live-trust revalidation binds trust to the decision fingerprint. A valid live approval for the
