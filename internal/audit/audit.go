@@ -15,7 +15,10 @@
 package audit
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -42,6 +45,11 @@ type Entry struct {
 	Detail   string `json:"detail"`             // extra context (never contains credentials)
 	Before   string `json:"before,omitempty"`   // JSON snapshot before the change
 	After    string `json:"after,omitempty"`    // JSON snapshot after the change
+	// OperationID is the STRUCTURED identity of an operation-identified
+	// write (FE-6A.0 round 4): the client operationId whose success this
+	// entry records. It is the exactly-once key of AppendOperation — never
+	// derived from text inside Detail.
+	OperationID string `json:"operationId,omitempty"`
 }
 
 // MaxRing bounds the in-memory ring. Tests MUST NOT assert on len() deltas
@@ -243,14 +251,19 @@ func Close() error {
 // fragment standing alone as its own already-charged invalid line and lets the
 // new record land intact. Blank lines are skipped by every reader, so the
 // repair is harmless when it turns out not to have been needed.
-func persistEntry(f io.Writer, path string, e Entry) {
+func persistEntry(f io.Writer, path string, e Entry) { _ = persistEntryErr(f, path, e) }
+
+// persistEntryErr is persistEntry returning the loss it charged (nil when
+// the whole record reached the sink). AppendOperation needs the outcome; the
+// best-effort Add discards it exactly as before.
+func persistEntryErr(f io.Writer, path string, e Entry) error {
 	b, err := json.Marshal(e)
 	if err != nil {
 		// Defensive: Entry is all scalars today, so this cannot fail in
 		// practice. It was nevertheless a silent-drop branch — the entry never
 		// reaches the file — so it is charged like any other loss.
 		countWriteError(path, fmt.Errorf("marshal audit entry: %w", err))
-		return
+		return err
 	}
 	b = append(b, '\n')
 	// Only one concurrent Add wins the CAS, so the repair newline is written
@@ -281,11 +294,149 @@ func persistEntry(f io.Writer, path string, e Entry) {
 	switch {
 	case werr != nil:
 		countWriteError(path, werr)
+		return werr
 	case n < len(b):
 		countWriteError(path, io.ErrShortWrite)
+		return io.ErrShortWrite
 	default:
 		noteWriteSuccess(path)
+		return nil
 	}
+}
+
+// ─── Operation-keyed, exactly-once audit completion (FE-6A.0 round 4) ────────
+//
+// Add is best-effort by contract: an admin change must not fail because the
+// audit disk is full. An OPERATION-IDENTIFIED write (the IdP operation
+// ledger) carries a stronger promise — its success audit is part of the
+// operation and must exist EXACTLY ONCE in the durable record — so it goes
+// through AppendOperation instead: the append is keyed by (Action,
+// OperationID), a retry that finds the entry already durable appends nothing,
+// and the caller learns whether the entry is durably present. The caller
+// persists its own "audited" marker ONLY after a true durable outcome, so a
+// crash or failure between the append and the marker is retried by re-running
+// this function, which then only re-checks.
+
+// ErrOperationIDRequired: AppendOperation refuses an entry with no key.
+var ErrOperationIDRequired = errors.New("audit: operation entry requires an operationId")
+
+// opMu serialises the check-then-append of operation-keyed entries so two
+// retries of the same operation cannot both observe "absent" and both append.
+var opMu sync.Mutex
+
+// AppendOperation appends e exactly once and reports whether it is DURABLY
+// present afterwards.
+//
+//   - durable=true, err=nil: the entry is in the JSONL file (appended now, or
+//     found already there from an earlier attempt — nothing was re-appended).
+//   - durable=false, err=nil: no durable sink is configured; the in-memory
+//     ring is this appliance's whole audit record and holds the entry once.
+//   - err != nil: the durable write failed or the record could not be
+//     checked; NOTHING was added to the ring, SIEM or DP queue either, so the
+//     entry is absent everywhere and the caller must retry later.
+func AppendOperation(e Entry) (durable bool, err error) {
+	if e.OperationID == "" {
+		return false, ErrOperationIDRequired
+	}
+	opMu.Lock()
+	defer opMu.Unlock()
+	mu.Lock()
+	f, path := persist, persistPath
+	inRing := ringHasOperationLocked(e.Action, e.OperationID)
+	mu.Unlock()
+	if f == nil {
+		if !inRing {
+			Add(e)
+		}
+		return false, nil
+	}
+	present, err := HasOperation(e.Action, e.OperationID)
+	if err != nil {
+		return false, err
+	}
+	if present {
+		return true, nil
+	}
+	if err := persistEntryErr(f, path, e); err != nil {
+		return false, err
+	}
+	// Durable first, then the volatile fan-out (ring, SIEM, DP queue) —
+	// once each.
+	mu.Lock()
+	if !ringHasOperationLocked(e.Action, e.OperationID) {
+		ring = append(ring, e)
+		if len(ring) > MaxRing {
+			ring = ring[len(ring)-MaxRing:]
+		}
+	}
+	mu.Unlock()
+	if siem != nil {
+		siem(e)
+	}
+	if dpMode.Load() {
+		queueForCluster(e)
+	}
+	return true, nil
+}
+
+func ringHasOperationLocked(action, opID string) bool {
+	for i := range ring {
+		if ring[i].OperationID == opID && ring[i].Action == action {
+			return true
+		}
+	}
+	return false
+}
+
+// HasOperation reports whether the DURABLE record (the current JSONL file
+// and its rotated archive) holds an entry keyed to (action, opID). Without a
+// durable sink it answers from the ring. A read failure is returned, never
+// read as "absent" — an unknowable answer must not become a second append.
+func HasOperation(action, opID string) (bool, error) {
+	mu.Lock()
+	path := persistPath
+	inRing := ringHasOperationLocked(action, opID)
+	mu.Unlock()
+	if path == "" {
+		return inRing, nil
+	}
+	for _, p := range []string{path, path + ".1"} {
+		found, err := fileHasOperation(p, action, opID)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func fileHasOperation(path, action, opID string) (bool, error) {
+	f, err := os.Open(path) // #nosec G304 -- operator-configured path
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("audit: read %s: %w", path, err)
+	}
+	defer f.Close() //nolint:errcheck // read-only handle
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), 64<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if !bytes.Contains(line, []byte(opID)) {
+			continue // cheap pre-filter; the decode below is the decision
+		}
+		var e Entry
+		if json.Unmarshal(line, &e) == nil && e.OperationID == opID && e.Action == action {
+			return true, nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return false, fmt.Errorf("audit: scan %s: %w", path, err)
+	}
+	return false, nil
 }
 
 // Add appends an entry to the in-memory ring and, when configured, to the

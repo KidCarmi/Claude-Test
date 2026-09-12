@@ -2484,6 +2484,13 @@
           },
           {
             "properties": {
+              "auditState": {
+                "description": "Round 4 — the write committed durably but its operation-keyed success audit could not yet be made durable (or its marker persisted); it is completed exactly once by GET /api/idp/operations/{operationId}, by a later settlement or at boot. Absent when the audit is durable.",
+                "enum": [
+                  "pending"
+                ],
+                "type": "string"
+              },
               "cluster": {
                 "$ref": "#/components/schemas/IdPClusterPublication"
               },
@@ -2514,8 +2521,15 @@
           "actor": {
             "type": "string"
           },
+          "auditState": {
+            "description": "committed only, when the success audit is still owed (append not durable or marker not persisted) — recoverable; absent once `audited` is true.",
+            "enum": [
+              "pending"
+            ],
+            "type": "string"
+          },
           "audited": {
-            "description": "committed — the success audit has been emitted (exactly once; a crash between the durable terminal record and the audit is completed by settlement/reconciliation).",
+            "description": "committed — the operation-keyed success audit is DURABLY present exactly once in the audit record (round 4: the entry carries `operationId`, the append is idempotent on that key, and this marker is persisted only after the durable append; a crash or failure between them is retried by the lookup, by settlement and at boot, re-running only the missing step).",
             "type": "boolean"
           },
           "code": {
@@ -2583,6 +2597,14 @@
         "additionalProperties": false,
         "description": "FE-6A.0 round-3 correction (Blockers 1–2) — the posture of the durable operation ledger (idp_operations.json). `degraded:true` means the file is corrupt or unreadable: it is left in place as evidence, every operation-identified write, every lookup and every write that would change or remove an existing profile is refused (503 operation_ledger_degraded) until the operator restores or removes the file and restarts. `unresolved` counts pending/outcome_unknown intents, which are never evicted; at `capacity` unresolved intents a new operation is refused (503 operation_ledger_full).",
         "properties": {
+          "auditSink": {
+            "description": "Where an operation's success audit is completed: `file` = the persistent JSONL audit log (audited means durably present once); `memory` = no audit log is configured on this node, the in-memory ring is its whole audit record.",
+            "enum": [
+              "file",
+              "memory"
+            ],
+            "type": "string"
+          },
           "capacity": {
             "type": "integer"
           },
@@ -2610,7 +2632,8 @@
           "degraded",
           "retained",
           "unresolved",
-          "capacity"
+          "capacity",
+          "auditSink"
         ],
         "type": "object"
       },

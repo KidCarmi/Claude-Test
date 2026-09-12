@@ -1194,10 +1194,33 @@ func apiIdPCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	auditEventDiff(r, "idp.create", p.ID, detail, nil, auditIdPProfile(&p))
-	idpMarkOperationAudited(ops, opID)
+	if opID == "" {
+		auditEventDiff(r, "idp.create", p.ID, detail, nil, auditIdPProfile(&p))
+	} else {
+		idpCompleteOperationAudit(r, ops, opID, result)
+	}
 	logger.Printf("UI: IdP profile created id=%q name=%q type=%q fleet=%s", sanitizeLog(p.ID), sanitizeLog(p.Name), sanitizeLog(string(p.Type)), fleet.Publication)
 	jsonOK(w, result)
+}
+
+// idpCompleteOperationAudit runs the exactly-once audit completion boundary
+// for an operation-identified create from its durable record (round 4): the
+// operation-keyed entry is appended only if absent from the durable audit
+// record, and the marker persisted only after it is durably present. A
+// failure leaves the operation committed-but-audit-pending — reported as
+// `auditState: pending` on the response and the lookup, and retried by the
+// lookup, by settlement and at boot. The response stays 2xx: the registry
+// commit and its terminal record ARE durable and provable.
+func idpCompleteOperationAudit(r *http.Request, ops *idpOperationStore, opID string, result map[string]any) {
+	markAuditEmitted(r) // C2c: the audit for this request is owned by the boundary
+	rec, err := ops.Get(opID)
+	if err == nil && rec != nil {
+		err = ops.emitOperationAudit(*rec)
+	}
+	if err != nil {
+		logger.Printf("UI: IdP create operation %s committed; success audit pending (%s)", sanitizeLog(opID), boundedPersistClass(err))
+		result["auditState"] = "pending"
+	}
 }
 
 // idpReplayKnownOperation answers a re-dispatched operationId from its
@@ -1217,18 +1240,6 @@ func idpReplayKnownOperation(w http.ResponseWriter, ops *idpOperationStore, opID
 	}
 	apiIdPReplayOperation(w, prev, specDigest)
 	return true
-}
-
-// idpMarkOperationAudited records durably that the success audit of an
-// operation-identified write was emitted; a failure is logged (the audit
-// happened; a replay of the mark is idempotent at reconciliation).
-func idpMarkOperationAudited(ops *idpOperationStore, opID string) {
-	if opID == "" {
-		return
-	}
-	if err := ops.MarkAudited(opID); err != nil {
-		logger.Printf("UI: IdP create operation %s audit emitted but not marked durable (%s)", sanitizeLog(opID), boundedPersistClass(err))
-	}
 }
 
 // idpRecordCommittedOperation persists the terminal record of a committed
@@ -1377,7 +1388,8 @@ func apiIdPOperations(w http.ResponseWriter, r *http.Request) {
 		writeRefusal(w, http.StatusNotFound, refusalNotFound, "no such operation", nil)
 		return
 	}
-	if op.unresolved() {
+	switch {
+	case op.unresolved():
 		// Round 3: settle from the registry's durable provenance NOW (the
 		// terminal persist may have failed at create time); the verdict is
 		// reported only once it is durable, else the record stays as is.
@@ -1386,6 +1398,15 @@ func apiIdPOperations(w http.ResponseWriter, r *http.Request) {
 		idpMutationMu.Unlock()
 		if serr != nil {
 			logger.Printf("UI: IdP operation %s could not be settled at lookup (%s)", sanitizeLog(id), boundedPersistClass(serr))
+		} else if cur, gerr := ops.Get(id); gerr == nil && cur != nil {
+			op = cur
+		}
+	case op.State == idpOpCommitted && !op.Audited:
+		// Round 4: committed but the success audit is still owed — retry
+		// ONLY the missing step (append if absent from the durable record,
+		// then the marker); exactly-once is the boundary's contract.
+		if aerr := ops.emitOperationAudit(*op); aerr != nil {
+			logger.Printf("UI: IdP operation %s success audit still pending at lookup (%s)", sanitizeLog(id), boundedPersistClass(aerr))
 		} else if cur, gerr := ops.Get(id); gerr == nil && cur != nil {
 			op = cur
 		}

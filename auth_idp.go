@@ -419,6 +419,8 @@ func boundedPersistClass(err error) string {
 		return "ledger_degraded"
 	case errors.Is(err, errIdPOperationPersist):
 		return "ledger_not_durable"
+	case errors.Is(err, errIdPOperationAuditPending):
+		return "audit_pending"
 	default:
 		return "settle_failed"
 	}
@@ -447,10 +449,17 @@ func (r *IdPRegistry) settleOperation(ops *idpOperationStore, op idpOperation, t
 		return err
 	}
 	rec, err := ops.Get(op.OperationID)
-	if err != nil || rec == nil || rec.Audited {
+	if err != nil || rec == nil {
 		return err
 	}
-	return ops.emitOperationAudit(*rec)
+	// The verdict is durable; the success audit is completed through the
+	// exactly-once boundary. A sink that cannot take it now leaves the
+	// operation committed-but-audit-pending (retried by lookup and boot) —
+	// never a reason to refuse the writer that settled it (round 4).
+	if aerr := ops.emitOperationAudit(*rec); aerr != nil {
+		logger.Printf("IdP: operation %s settled committed; success audit pending (%s)", sanitizeLog(op.OperationID), boundedPersistClass(aerr))
+	}
+	return nil
 }
 
 // settleBeforeWrite runs inside every registry transaction, after the

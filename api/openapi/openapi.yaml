@@ -2439,10 +2439,11 @@ components:
         remove an existing profile is refused (503 operation_ledger_degraded) until the operator restores or
         removes the file and restarts. `unresolved` counts pending/outcome_unknown intents, which are never
         evicted; at `capacity` unresolved intents a new operation is refused (503 operation_ledger_full).
-      required: [degraded, retained, unresolved, capacity]
+      required: [degraded, retained, unresolved, capacity, auditSink]
       additionalProperties: false
       properties:
         degraded: { type: boolean }
+        auditSink: { type: string, enum: [file, memory], description: "Where an operation's success audit is completed: `file` = the persistent JSONL audit log (audited means durably present once); `memory` = no audit log is configured on this node, the in-memory ring is its whole audit record." }
         degradedReason: { type: string, enum: [corrupt, unreadable] }
         degradedDetail: { type: string }
         retained: { type: integer }
@@ -2479,6 +2480,7 @@ components:
             cluster: { $ref: '#/components/schemas/IdPClusterPublication' }
             operationId: { type: string, format: uuid, description: "Echoed when the write carried one." }
             replayed: { type: boolean, description: "true when this response is the recorded result of an earlier dispatch of the same operationId — nothing was written again." }
+            auditState: { type: string, enum: [pending], description: "Round 4 — the write committed durably but its operation-keyed success audit could not yet be made durable (or its marker persisted); it is completed exactly once by GET /api/idp/operations/{operationId}, by a later settlement or at boot. Absent when the audit is durable." }
     IdPOperation:
       type: object
       description: Durable, non-secret record of an operation-identified IdP write (FE-6A.0 correction, Blocker 9).
@@ -2487,7 +2489,8 @@ components:
       properties:
         operationId: { type: string, format: uuid }
         state: { type: string, enum: [pending, committed, aborted, outcome_unknown], description: "A terminal state is reported ONLY once its durable record exists (round 3): a create whose terminal record could not be persisted answers 500 outcome_unknown and the record stays pending until the lookup, a later writer on the same profile, or the next boot settles it from the profile's durable provenance." }
-        audited: { type: boolean, description: "committed — the success audit has been emitted (exactly once; a crash between the durable terminal record and the audit is completed by settlement/reconciliation)." }
+        audited: { type: boolean, description: "committed — the operation-keyed success audit is DURABLY present exactly once in the audit record (round 4: the entry carries `operationId`, the append is idempotent on that key, and this marker is persisted only after the durable append; a crash or failure between them is retried by the lookup, by settlement and at boot, re-running only the missing step)." }
+        auditState: { type: string, enum: [pending], description: "committed only, when the success audit is still owed (append not durable or marker not persisted) — recoverable; absent once `audited` is true." }
         action: { type: string, enum: [idp.create] }
         actor: { type: string }
         profileId: { type: string, description: "The candidate's pre-minted profile id." }

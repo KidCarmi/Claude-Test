@@ -145,6 +145,11 @@ var (
 	// errIdPOperationUnsettled: a writer touched a profile whose outstanding
 	// intent could not be settled durably; nothing was written.
 	errIdPOperationUnsettled = errors.New("idp: outstanding operation on the target could not be settled")
+	// errIdPOperationAuditPending: the success audit of a committed operation
+	// could not be made durable (or its marker could not be persisted); the
+	// operation stays committed-but-audit-pending and is retried by every
+	// lookup, settlement and boot until the durable record holds it once.
+	errIdPOperationAuditPending = errors.New("idp: operation success audit is pending durability")
 )
 
 // idpSpecDigest is the non-secret identity of a candidate profile spec: the
@@ -421,19 +426,39 @@ func (s *idpOperationStore) MarkAudited(id string) error {
 }
 
 // emitOperationAudit completes the success audit of a committed operation
-// from its recorded facts (no request context — settlement, reconciliation
-// and the lookup path all reach it) and marks it durably.
+// from its recorded facts (no request context — the handler, settlement,
+// reconciliation and the lookup path all reach it) EXACTLY ONCE and then
+// marks it durably (round 4):
+//
+//  1. audit.AppendOperation appends the operation-KEYED entry only if the
+//     durable record does not already hold it (a retry after a crash between
+//     the append and the marker appends nothing);
+//  2. the marker is persisted ONLY after the entry is durably present (or,
+//     without a durable audit sink, present once in the ring — the whole
+//     record of that appliance);
+//  3. any failure leaves the operation committed-but-audit-pending; the
+//     next retry re-runs only the step that is still missing.
 func (s *idpOperationStore) emitOperationAudit(op idpOperation) error {
-	audit.Add(audit.Entry{
-		TS:     time.Now().UnixMilli(),
-		Time:   time.Now().Format("2006-01-02 15:04:05"),
-		Actor:  op.Actor,
-		Action: op.Action,
-		Object: op.ProfileID,
-		Detail: op.AuditDetail,
-		After:  string(op.AuditAfter),
+	if op.State != idpOpCommitted || op.Audited {
+		return nil
+	}
+	_, err := audit.AppendOperation(audit.Entry{
+		TS:          time.Now().UnixMilli(),
+		Time:        time.Now().Format("2006-01-02 15:04:05"),
+		Actor:       op.Actor,
+		Action:      op.Action,
+		Object:      op.ProfileID,
+		Detail:      op.AuditDetail,
+		After:       string(op.AuditAfter),
+		OperationID: op.OperationID,
 	})
-	return s.MarkAudited(op.OperationID)
+	if err != nil {
+		return fmt.Errorf("%w: append: %v", errIdPOperationAuditPending, err)
+	}
+	if err := s.MarkAudited(op.OperationID); err != nil {
+		return fmt.Errorf("%w: marker: %v", errIdPOperationAuditPending, err)
+	}
+	return nil
 }
 
 // lookupReadModel is the GET /api/idp/operations/{id} projection.
@@ -448,6 +473,9 @@ func (op *idpOperation) lookupReadModel() map[string]any {
 		"cutover":          op.Cutover,
 		"startedAt":        op.StartedAt,
 		"audited":          op.Audited,
+	}
+	if op.State == idpOpCommitted && !op.Audited {
+		out["auditState"] = "pending" // committed; the durable success audit is still owed
 	}
 	if op.FinishedAt != "" {
 		out["finishedAt"] = op.FinishedAt
@@ -467,7 +495,11 @@ func (op *idpOperation) lookupReadModel() map[string]any {
 // readModel is the ledger posture on GET /api/idp.
 func (s *idpOperationStore) readModel() map[string]any {
 	total, unresolved := s.Counts()
-	out := map[string]any{"degraded": false, "retained": total, "unresolved": unresolved, "capacity": idpOperationsMax}
+	sink := "memory"
+	if audit.PersistActive() {
+		sink = "file"
+	}
+	out := map[string]any{"degraded": false, "retained": total, "unresolved": unresolved, "capacity": idpOperationsMax, "auditSink": sink}
 	if d := s.Degraded(); d != nil {
 		out["degraded"] = true
 		out["degradedReason"] = d.Reason

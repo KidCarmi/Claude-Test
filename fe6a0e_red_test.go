@@ -167,7 +167,6 @@ func TestFE6A0E_ER2_AuditAppendFailureNeverClaimsAudited(t *testing.T) {
 	t.Cleanup(restoreErrs)
 	body := ldapProfileBodyForPut("NoDisk", nil)
 	code, m := fe6acCreateFenced(t, body, "operationId="+opID)
-	restoreWriter()
 	if code != http.StatusOK {
 		t.Fatalf("create = %d %v (the registry commit is durable; the audit is the pending step)", code, m)
 	}
@@ -175,6 +174,8 @@ func TestFE6A0E_ER2_AuditAppendFailureNeverClaimsAudited(t *testing.T) {
 	if n, _ := fe6aeJSONLCounts(t, auditPath, "idp.create", id, opID); n != 0 {
 		t.Fatalf("precondition: the injected failure did not stop the durable append (%d)", n)
 	}
+	// While the sink still fails, a lookup (itself a recovery path) must
+	// keep the operation audit-pending and append nothing durable.
 	lcode, lm := fe6adLookup(t, opID)
 	if lcode != http.StatusOK {
 		t.Fatalf("lookup = %d %v", lcode, lm)
@@ -182,6 +183,10 @@ func TestFE6A0E_ER2_AuditAppendFailureNeverClaimsAudited(t *testing.T) {
 	if lm["audited"] == true {
 		t.Fatal("ER2: audited:true was persisted while the durable audit record never received the entry — a false completion claim")
 	}
+	if n, _ := fe6aeJSONLCounts(t, auditPath, "idp.create", id, opID); n != 0 {
+		t.Fatalf("ER2: a retry against a failing sink left %d durable entries", n)
+	}
+	restoreWriter()
 	// The sink recovers: recovery must write EXACTLY one durable entry and
 	// only then mark the operation audited.
 	fe6aeRestart(t, regPath)
