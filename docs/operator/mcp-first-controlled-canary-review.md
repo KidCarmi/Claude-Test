@@ -867,7 +867,7 @@ case stays non-read and fail-closed. The governing invariant, stated once:
 | Durable across restart, immutable within a generation | `canaryRuntimeSchemaVersion` 3; a record that cannot state its class from its own bytes does not restore armed (`TestReadFirstClass_DurableRecordWithoutAClassDoesNotRestoreArmed`), a restart restores the same classification (`C11`), and a same-generation update that changes only the class is refused (`C12`) |
 | The freshness boundary is not weakened | `TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2` — a decision computed under F1 does not reach upstream once the target is F2; the promotion is not the last word |
 | Anti-vacuity (MANDATORY positive controls) | `TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead`, `TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall` and `TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass` — a classifier that answered "no" to everything would satisfy every negative gate while being the feature deleted |
-| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 13 mutations, 13 caught, 0 survived, 0 skipped |
+| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 14 mutations, 14 caught, 0 survived, 0 skipped |
 
 **Two things the campaign taught, recorded because they change how a survivor should be read.**
 A single-edit mutation of the stale-decision boundary SURVIVED, and the reason was not a missing
@@ -877,6 +877,14 @@ alone changes nothing observable. The same held for the unset-class guard, which
 its own named case and by the reviewable-vocabulary membership test. A mutation that never managed
 to break anything is not evidence of a hole — but it is also not evidence of a gate, so both were
 rewritten to remove BOTH guards.
+
+**And one the campaign found rather than confirmed.** `in.Operation = op` sits AFTER the call that
+may promote it, and the ordering is load-bearing in the quietest possible way: reversed, the
+classifier is still consulted and still answers correctly, nothing refuses, nothing fails to
+compile, and every fail-closed gate still passes — the exact reviewed call is simply denied
+read-first forever, with no signal anywhere. Only a gate that reads the class the EXECUTOR received
+can see it, which is why the positive control asserts on the executor's `DecisionInput` rather than
+on the classifier's answer (M14).
 
 **Default posture unchanged.** No activation arms in the shipped build, so the classifier answers
 `false` for every request and every `tools/call` stays `OpWrite` — byte-identical to the behaviour
