@@ -247,7 +247,7 @@ func (c *Client) attempt(ctx context.Context, target Target, method string, para
 	if err != nil {
 		return nil, legFacts{}, err
 	}
-	raw, facts, err := c.roundTrip(ctx, target, body, opts.AuthHeader, opts.AttemptID)
+	raw, facts, err := c.roundTrip(ctx, target, body, opts.AuthHeader, opts.AttemptID, opts.PreSend)
 	if err != nil {
 		return nil, facts, err
 	}

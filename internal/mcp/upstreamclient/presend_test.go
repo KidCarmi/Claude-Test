@@ -18,6 +18,12 @@ import (
 // EVERY leg, and that a refusal reaches the caller as provably-never-sent on the first one
 // (Codex P1, PR #1370, round 4).
 
+// preSendsPerLeg is how many times the caller's predicate is re-asked for ONE physical leg: once
+// at the pool boundary in Call, and once in roundTrip after DNS resolution and immediately before
+// the transport. Pinned as an exact count so removing either site fails a test rather than being
+// absorbed by the other — the guarded-twice trap this PR has hit five times already.
+const preSendsPerLeg = 2
+
 // A PreSend refusal stops the call before ANY request reaches the server, and the caller learns
 // that no bytes were ever sent — the evidence the executor needs to record definitely_not_sent
 // rather than sending a provably-undelivered attempt to witness reconciliation.
@@ -68,8 +74,12 @@ func TestPreSend_PermittingHookDoesNotInterfere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CONTROL: a permitting hook must not block the call: %v", err)
 	}
-	if resp == nil || calls != 1 || hits != 1 {
-		t.Fatalf("CONTROL: expected exactly one hook call and one request, hook=%d server=%d", calls, hits)
+	// TWO re-asks per leg, and the exactness is deliberate: one at the pool boundary (after the
+	// unbounded wait for a slot) and one after DNS resolution, immediately before the transport
+	// takes over. Deleting EITHER site drops this to one and fails here, which is what keeps both
+	// independently pinned — a looser "at least one" would let either be removed silently.
+	if resp == nil || calls != preSendsPerLeg || hits != 1 {
+		t.Fatalf("CONTROL: expected %d hook calls and one request, hook=%d server=%d", preSendsPerLeg, calls, hits)
 	}
 }
 
@@ -169,8 +179,8 @@ func TestPreSend_RunsOnEveryRetryLeg(t *testing.T) {
 	if got := hits.Load(); got < 2 {
 		t.Skipf("premise: the client did not retry in this run (%d leg(s)); nothing to prove", got)
 	}
-	if hooks.Load() != hits.Load() {
-		t.Fatalf("SECURITY: %d physical leg(s) but only %d pre-send re-ask(s) — a retry sent on the "+
-			"strength of a check made before an earlier leg", hits.Load(), hooks.Load())
+	if want := hits.Load() * preSendsPerLeg; hooks.Load() != want {
+		t.Fatalf("SECURITY: %d physical leg(s) should carry %d pre-send re-ask(s), got %d — a retry "+
+			"sent on the strength of a check made before an earlier leg", hits.Load(), want, hooks.Load())
 	}
 }

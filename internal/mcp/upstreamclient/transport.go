@@ -55,7 +55,7 @@ func (p *serverPool) acquire(ctx context.Context) (func(), error) {
 // returns (rawBody, legFacts, error): preResponse is true when the failure
 // happened before any response headers were received (dial/TLS/timeout) so an
 // idempotent read may retry.
-func (c *Client) roundTrip(ctx context.Context, target Target, body []byte, authHeader string, attemptID string) (respBody []byte, facts legFacts, err error) {
+func (c *Client) roundTrip(ctx context.Context, target Target, body []byte, authHeader string, attemptID string, preSend func() error) (respBody []byte, facts legFacts, err error) {
 	canon, class, err := destination.Canonicalize(target.Endpoint, c.cfg.Policy, c.cfg.InspectionLimits)
 	if err != nil {
 		return nil, legFacts{neverSent: true}, mcperr.Wrap(mcperr.ReasonUpstreamEndpointInvalid, "upstreamclient", "endpoint canonicalize", err)
@@ -112,6 +112,29 @@ func (c *Client) roundTrip(ctx context.Context, target Target, body []byte, auth
 	// Culvert-minted; empty for lifecycle/discovery traffic, which carries no attempt.
 	if attemptID != "" {
 		req.Header.Set(AttemptHeader, attemptID)
+	}
+
+	// THE LAST RE-ASK, AND THE STOPPING POINT.
+	//
+	// `preSend` already ran in Call, holding the pool slot. Between there and here sits
+	// `destination.Resolve` — a DNS lookup, the least bounded of the three things that happen
+	// before any request byte exists — so the caller's predicate is re-asked once more, after
+	// resolution and immediately before the transport takes over (Codex P1, PR #1370, round 5).
+	//
+	// WHAT REMAINS AFTER THIS LINE IS DELIBERATE AND IS WHERE RE-ASKING STOPS BUYING ANYTHING.
+	// `client.Do` still has to obtain a connection (TCP connect, then the TLS handshake) before it
+	// writes the request, and `net/http` exposes no hook there that can ABORT cleanly: a
+	// `httptrace` callback can observe but not refuse, and cancelling the request context from
+	// underneath races the write — turning a deterministic refusal into `may_have_been_sent`,
+	// which is strictly worse evidence than the window it would close. Both remaining steps are
+	// bounded by CONFIGURED timeouts (`ConnectTimeout`, `TLSHandshakeTimeout`, and the whole
+	// attempt by `RequestTimeout` on reqCtx) — unlike the pool wait, which was bounded only by
+	// another request finishing. That is the difference that makes this a reasonable stopping
+	// point rather than an arbitrary one.
+	if preSend != nil {
+		if perr := preSend(); perr != nil {
+			return nil, legFacts{neverSent: true}, perr
+		}
 	}
 
 	resp, err := client.Do(req)

@@ -43,6 +43,7 @@
 #   M26  a boundary withdrawal is diagnosed by a fixed reason, not the gate's
 #   M27  a satisfying approval need not state the class in force
 #   M28  the boundary predicate asks about scope before the generation
+#   M29  the pre-transport re-ask (after DNS resolution) is removed
 #
 # A COMPILE FAILURE IS NOT PROOF unless the mutation targets a structural wall whose stated purpose
 # is compile-time prevention (those declare --compile-wall). Every other mutation here is written to
@@ -501,12 +502,14 @@ run_mutation M24 \
   . "$RUN" \
   's/AttemptID: attemptIDOf\(attempt\), PreSend: preSend,/AttemptID: attemptIDOf(attempt), PreSend: func() error \{ _ = preSend; return nil \},/'
 
-# M25 — THE CLIENT NEVER INVOKES IT. The other half of the same contract, and the half the root
-# gates cannot see: the root double calls the hook itself, deliberately, so that the executor's
-# half is proven independently of the client's. Gated inside the client's own package.
+# M25 — THE POOL-BOUNDARY RE-ASK IS REMOVED. The other half of the same contract, and the half the
+# root gates cannot see: the root double calls the hook itself, deliberately, so that the executor's
+# half is proven independently of the client's. Gated on the per-leg COUNT rather than on a refusal,
+# because the pre-transport re-ask (M29) would otherwise absorb this mutation — the guarded-twice
+# trap, self-inflicted in the same round that added the second site.
 run_mutation M25 \
   'the upstream client never invokes the pre-send re-ask' \
-  'TestPreSend_RefusalStopsTheCallWithNothingSent' \
+  'TestPreSend_RunsOnEveryRetryLeg' \
   ./internal/mcp/upstreamclient "$UCLIENT" \
   's/\t\tif opts\.PreSend != nil \{\n\t\t\tif perr := opts\.PreSend\(\); perr != nil \{\n\t\t\t\tif attempt == 0 \{\n\t\t\t\t\treturn nil, markNeverSent\(perr\)\n\t\t\t\t\}\n\t\t\t\treturn nil, markLegFacts\(perr, call\)\n\t\t\t\}\n\t\t\}\n//'
 
@@ -540,6 +543,17 @@ run_mutation M28 \
   'TestBoundaryAuthority_GenerationOutranksScopeWhenBothAreWithdrawn' \
   . "$GATE" \
   's/\t\t\tif g\.generationCurrent != nil \&\& !g\.generationCurrent\(gen\) \{\n\t\t\t\treturn mcperr\.ReasonRolloutModeInvalid\n\t\t\t\}\n\t\t\tif !canaryScopeInForce\(in\.ResolvedScopeHash, g\.currentScopeHash\) \{\n\t\t\t\treturn mcperr\.ReasonRolloutOutOfScope\n\t\t\t\}\n/\t\t\tif !canaryScopeInForce(in.ResolvedScopeHash, g.currentScopeHash) \{\n\t\t\t\treturn mcperr.ReasonRolloutOutOfScope\n\t\t\t\}\n\t\t\tif g.generationCurrent != nil \&\& !g.generationCurrent(gen) \{\n\t\t\t\treturn mcperr.ReasonRolloutModeInvalid\n\t\t\t\}\n/'
+
+UTRANSPORT=internal/mcp/upstreamclient/transport.go
+
+# M29 — THE PRE-TRANSPORT RE-ASK IS REMOVED, reopening the DNS-resolution window between the pool
+# boundary and the transport. Its sibling M25 removes the other site; each is gated on the per-leg
+# count, so neither can hide behind the other.
+run_mutation M29 \
+  'the pre-transport re-ask after DNS resolution is removed' \
+  'TestPreSend_RunsOnEveryRetryLeg' \
+  ./internal/mcp/upstreamclient "$UTRANSPORT" \
+  's/\tif preSend != nil \{\n\t\tif perr := preSend\(\); perr != nil \{\n\t\t\treturn nil, legFacts\{neverSent: true\}, perr\n\t\t\}\n\t\}\n\n//'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
