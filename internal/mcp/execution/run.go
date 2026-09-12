@@ -175,11 +175,15 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 		// Upstream.Call. The kill re-read stays LAST (PREREQ-MCP-KILL-1). A withdrawn-authority refusal —
 		// the reserved generation demoted, or the resolved scope replaced — is mapped to the
 		// gate-refusal classification path with a bounded rollout reason.
-		gerr, driftObserved := e.preCallGuard(in, admKillGen, revalidate)
-		if gerr != nil {
-			// The physical call never began, so this is the ONE case where
-			// definitely_not_sent is mechanically provable rather than inferred.
-			sendState = model.SendDefinitelyNotSent
+		// applyBoundaryRefusal is SHARED by the two places a boundary guard can refuse: here,
+		// and again from inside the upstream client immediately before each physical send (see
+		// CallOptions.PreSend below). One classification, so a refusal cannot be diagnosed one way
+		// when the pre-call guard catches it and another when the pre-send re-ask does.
+		//
+		// It deliberately does NOT touch sendState: it is provable only at the first site, and the
+		// pre-send path gets it from the client's own never-sent evidence, which is correct on a
+		// retry leg where an earlier leg may already have reached the peer.
+		applyBoundaryRefusal := func(gerr error, driftObserved bool) {
 			cls := classifyBoundaryError(gerr)
 			// A DRIFT REFUSAL AT THE BOUNDARY IS THE SAME BREACH THE ADMISSION GATE REPORTS.
 			//
@@ -204,15 +208,51 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 			}
 			bf.stale, bf.killed = cls.stale, cls.killed
 			if cls.withdrawn {
-				bf.gateRefused, bf.gateReason = true, mcperr.ReasonRolloutModeInvalid
+				// The gate's own reason, never a fixed one: a scope withdrawal caught HERE must
+				// read the same as the identical mismatch caught at admission (Codex P2, round 4).
+				r := cls.withdrawnReason
+				if r == mcperr.ReasonNone {
+					r = mcperr.ReasonRolloutModeInvalid // a gate that names nothing still fails closed
+				}
+				bf.gateRefused, bf.gateReason = true, r
 			}
+		}
+
+		gerr, driftObserved := e.preCallGuard(in, admKillGen, revalidate)
+		if gerr != nil {
+			// The physical call never began, so this is the ONE case where
+			// definitely_not_sent is mechanically provable rather than inferred.
+			sendState = model.SendDefinitelyNotSent
+			applyBoundaryRefusal(gerr, driftObserved)
 			return gerr
 		}
+		// THE GUARDS ABOVE ARE RE-ASKED IMMEDIATELY BEFORE EACH PHYSICAL SEND.
+		//
+		// This comment used to say nothing blocking is introduced between the final kill re-read
+		// and the call. That was true of THIS function and false of the one it calls: Client.Call
+		// blocks in `pool.acquire` on a per-server semaphore until a slot frees or the context is
+		// done, so a kill, a demotion, a scope withdrawal or an approval revocation could land and
+		// return successfully while this request waited, and the request would then send anyway
+		// (Codex P1, PR #1370, round 4). The retry loop had the same shape one level in: a second
+		// leg re-sent on the strength of a check made before the first.
+		//
+		// The predicate is therefore handed to the client and re-run per attempt, holding the pool
+		// slot — so "the last authoritative state read before the send" is now literally true.
+		// Refusals are classified through the SAME applyBoundaryRefusal as the guard above.
+		var preSendErr error
+		var preSendDrift bool
+		preSend := func() error {
+			perr, drift := e.preCallGuard(in, admKillGen, revalidate)
+			if perr != nil {
+				preSendErr, preSendDrift = perr, drift
+			}
+			return perr
+		}
+
 		// Once the call BEGINS, request bytes may already be on the wire. Assume the
 		// conservative state up front so any panic, cancellation or transport fault
 		// from here on is recorded as may_have_been_sent rather than silently
-		// defaulting to "not sent" (§6). NOTHING blocking is introduced between the
-		// final kill re-read above and this call.
+		// defaulting to "not sent" (§6).
 		//
 		// The two adjustments below only ever move this state on POSITIVE evidence,
 		// one in each direction: proof the peer answered, or proof no bytes were ever
@@ -220,8 +260,15 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 		sendState = model.SendMayHaveBeenSent
 		r, err := e.cfg.Upstream.Call(ctx, target, in.Method, json.RawMessage(in.RawParams), upstreamclient.CallOptions{
 			Idempotent: idempotent, AuthHeader: authHeader, WireID: "u-" + target.ServerID,
-			AttemptID: attemptIDOf(attempt),
+			AttemptID: attemptIDOf(attempt), PreSend: preSend,
 		})
+		if preSendErr != nil {
+			// A pre-send refusal is a BOUNDARY refusal that happened to be detected inside the
+			// client. Classify it exactly as the pre-call guard's, so the Canary still hears about
+			// a drift observed there and the client still reads the gate's own bounded reason.
+			// sendState is left to the never-sent evidence below, which is correct on a retry leg.
+			applyBoundaryRefusal(preSendErr, preSendDrift)
+		}
 		if upstreamclient.SendNeverStarted(err) {
 			// The call was refused before any request bytes existed — method not
 			// admitted, an invalid target, pool admission refused, an endpoint that
@@ -318,13 +365,16 @@ func (e *Executor) finishUpstreamLeg(ctx context.Context, in runtime.ExecInput, 
 // Folding them together lost the breach exactly when two things went wrong at once — and since a
 // kill can later be CLEARED, the activation would resume unlatched against the new fingerprint
 // (Codex round 15).
-func (e *Executor) preCallGuard(in runtime.ExecInput, admKillGen uint64, liveRevalidate func() bool) (err error, driftObserved bool) {
+func (e *Executor) preCallGuard(in runtime.ExecInput, admKillGen uint64, liveRevalidate func() mcperr.Reason) (err error, driftObserved bool) {
 	drifted := in.ToolStillCurrent != nil && !in.ToolStillCurrent()
 	// The composition-layer live-generation revalidation is evaluated BEFORE the kill re-read (like the
 	// freshness callback), so the kill generation stays the LAST authoritative state read before
 	// Upstream.Call. It NEVER engages the kill, so evaluating it here cannot reopen the F7 TOCTOU. A
 	// nil predicate (no gate, or Shadow) leaves this byte-identical to the pre-gate boundary.
-	authorityWithdrawn := liveRevalidate != nil && !liveRevalidate()
+	withdrawnReason := mcperr.ReasonNone
+	if liveRevalidate != nil {
+		withdrawnReason = liveRevalidate()
+	}
 	if e.cfg.State.KillGeneration() != admKillGen {
 		// Emergency stop is paramount in the REASON reported to the client, even if the tool also
 		// drifted or lost its rollout authority — but the drift is still returned, so the Canary
@@ -334,8 +384,11 @@ func (e *Executor) preCallGuard(in runtime.ExecInput, admKillGen uint64, liveRev
 	if drifted {
 		return errToolDriftedBeforeCall, true
 	}
-	if authorityWithdrawn {
-		return errLiveAuthorityWithdrawnAtBoundary, false // the generation or the scope the reservation rests on changed mid-flight
+	if withdrawnReason != mcperr.ReasonNone {
+		// The generation, the scope or the approval the reservation rests on changed mid-flight.
+		// The gate's own bounded reason rides out with the sentinel so the refusal is diagnosed as
+		// what it was, not as whichever rollout reason happened to be the default.
+		return withdrawnAtBoundary(withdrawnReason), false
 	}
 	return nil, false
 }
@@ -778,6 +831,9 @@ type boundaryRefusal struct {
 	stale     bool
 	killed    bool
 	withdrawn bool
+	// withdrawnReason names WHICH authority the gate reported withdrawn, so the refusal is
+	// diagnosed identically whether admission or the boundary caught it.
+	withdrawnReason mcperr.Reason
 	// gateRefused/gateReason carry a composition-layer gate denial, which reaches the
 	// same classification path as a boundary guard refusal but names its own reason.
 	gateRefused bool
@@ -789,9 +845,10 @@ type boundaryRefusal struct {
 // only fixes which named reason each refusal carries.
 func classifyBoundaryError(err error) boundaryRefusal {
 	return boundaryRefusal{
-		stale:     errors.Is(err, errToolDriftedBeforeCall),
-		killed:    errors.Is(err, errKilledAtBoundary),
-		withdrawn: errors.Is(err, errLiveAuthorityWithdrawnAtBoundary),
+		stale:           errors.Is(err, errToolDriftedBeforeCall),
+		killed:          errors.Is(err, errKilledAtBoundary),
+		withdrawn:       errors.Is(err, errLiveAuthorityWithdrawnAtBoundary),
+		withdrawnReason: withdrawnReasonOf(err),
 	}
 }
 
@@ -853,7 +910,7 @@ func (e *Executor) commitThenCall(ctx context.Context, in runtime.ExecInput, pro
 // revalidate at the boundary, and the identity the physical effect is charged to.
 type sideEffectAdmission struct {
 	release       func()
-	revalidate    func() bool
+	revalidate    func() mcperr.Reason
 	reservationID string
 	activationGen uint64
 	reason        mcperr.Reason

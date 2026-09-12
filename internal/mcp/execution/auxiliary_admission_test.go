@@ -173,11 +173,14 @@ func (g *revalidatingAuxGate) AdmitSideEffect(LiveGateInput) LiveGateDecision {
 func (g *revalidatingAuxGate) AdmitAuxiliary(LiveGateInput) LiveGateDecision {
 	return LiveGateDecision{
 		Admit: true,
-		Revalidate: func() bool {
+		Revalidate: func() mcperr.Reason {
 			if g.beforeRevalidate != nil {
 				g.beforeRevalidate()
 			}
-			return *g.open
+			if !*g.open {
+				return mcperr.ReasonRolloutModeInvalid
+			}
+			return mcperr.ReasonNone
 		},
 		Release: func() { g.released = true },
 	}

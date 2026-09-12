@@ -37,6 +37,10 @@
 #   M20  admission compares only the generation, not scope identity
 #   M21  a principal-only recheck misses a tool/server/exclusion scope edit
 #   M22  the post-admission window is not revalidated for scope
+#   M23  the boundary stops re-asking the live approval
+#   M24  the executor does not supply the pre-send re-ask
+#   M25  the upstream client never invokes the pre-send re-ask
+#   M26  a boundary withdrawal is diagnosed by a fixed reason, not the gate's
 #
 # A COMPILE FAILURE IS NOT PROOF unless the mutation targets a structural wall whose stated purpose
 # is compile-time prevention (those declare --compile-wall). Every other mutation here is written to
@@ -472,6 +476,47 @@ run_mutation M22 \
   'TestScopeInForce_ScopeWithdrawnAfterAdmissionRefusesBeforeUpstream' \
   . "$GATE" \
   's/\t\t\tif !canaryScopeInForce\(in\.ResolvedScopeHash, g\.currentScopeHash\) \{\n\t\t\t\treturn false\n\t\t\t\}\n//'
+
+RUN=internal/mcp/execution/run.go
+UCLIENT=internal/mcp/upstreamclient/client.go
+
+# M23 — THE APPROVAL IS NOT RE-ASKED. Round 22 moved the approval lookup INTO the admission
+# transaction so a revocation racing the lock could not be admitted, and recorded that the final
+# boundary re-reads "tool freshness, generation and kill state, not approval status". This is that
+# residual: a four-eyes grant revoked while the request waited on the durable commit or a pool slot.
+# Neither the scope nor the generation moves when an approval is withdrawn.
+run_mutation M23 \
+  'the boundary stops re-asking the live approval' \
+  'TestBoundaryAuthority_ApprovalRevokedAfterAdmissionRefusesBeforeUpstream' \
+  . "$GATE" \
+  's/\t\t\tif g\.approvalOK != nil \&\& g\.trustPrecheck != nil \{/\t\t\tif false \{/'
+
+# M24 — THE EXECUTOR DOES NOT SUPPLY THE RE-ASK. The hook still exists and the client still honours
+# it; the executor simply hands over one that always permits, so the pool wait is unguarded again.
+run_mutation M24 \
+  'the executor supplies a pre-send re-ask that always permits' \
+  'TestBoundaryAuthority_ScopeWithdrawnDuringThePoolWaitRefusesBeforeSend' \
+  . "$RUN" \
+  's/AttemptID: attemptIDOf\(attempt\), PreSend: preSend,/AttemptID: attemptIDOf(attempt), PreSend: func() error \{ _ = preSend; return nil \},/'
+
+# M25 — THE CLIENT NEVER INVOKES IT. The other half of the same contract, and the half the root
+# gates cannot see: the root double calls the hook itself, deliberately, so that the executor's
+# half is proven independently of the client's. Gated inside the client's own package.
+run_mutation M25 \
+  'the upstream client never invokes the pre-send re-ask' \
+  'TestPreSend_RefusalStopsTheCallWithNothingSent' \
+  ./internal/mcp/upstreamclient "$UCLIENT" \
+  's/\t\tif opts\.PreSend != nil \{\n\t\t\tif perr := opts\.PreSend\(\); perr != nil \{\n\t\t\t\tif attempt == 0 \{\n\t\t\t\t\treturn nil, markNeverSent\(perr\)\n\t\t\t\t\}\n\t\t\t\treturn nil, markLegFacts\(perr, call\)\n\t\t\t\}\n\t\t\}\n//'
+
+# M26 — THE REFUSAL IS DIAGNOSED BY A FIXED REASON. The bug this reintroduces is not a bypass: the
+# request is still refused. It is that the SAME scope mismatch reads rollout_out_of_scope when
+# admission catches it and rollout_mode_invalid when the boundary does — two contradictory answers
+# for one fact, separated only by timing, in the telemetry an operator reads during an incident.
+run_mutation M26 \
+  'a boundary withdrawal is diagnosed by a fixed reason, not the gate own' \
+  'TestBoundaryAuthority_ScopeWithdrawnDuringThePoolWaitRefusesBeforeSend' \
+  . "$RUN" \
+  's/\t\t\t\tr := cls\.withdrawnReason/\t\t\t\tr := mcperr.ReasonNone\n\t\t\t\t_ = cls.withdrawnReason/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"

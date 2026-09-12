@@ -99,16 +99,27 @@ type LiveGateDecision struct {
 	Admit  bool
 	Reason mcperr.Reason
 	// Revalidate (non-nil only when Admit) is a FINAL-BOUNDARY re-check the executor runs inside
-	// preCallGuard, immediately before the emergency-kill re-read. It returns false when the
-	// activation this request was admitted under is no longer current — e.g. a concurrent Canary
-	// demotion invalidated the reserved generation AFTER admission but BEFORE the irreversible call.
-	// Because the admission-time reservation cannot see a later demotion, and preCallGuard's kill
-	// re-read does not consult the Canary generation, WITHOUT this an already-admitted request could
-	// still reach the upstream after a leaving-live transition returned success (Codex P1 round-8,
-	// PR #1290). It is a composition-layer concern (the generation lives in the canary runtime), so it
-	// enters this package only as an injected predicate — the executor stays generic and byte-identical
-	// when the gate (or Revalidate) is nil.
-	Revalidate func() bool
+	// preCallGuard, immediately before the emergency-kill re-read, and again immediately before each
+	// physical send. It returns mcperr.ReasonNone when the request may still proceed, and otherwise
+	// the BOUNDED REASON naming which authority was withdrawn between admission and the irreversible
+	// call — the reserved activation generation demoted, the resolved scope envelope replaced, or the
+	// live approval revoked or expired.
+	//
+	// It RETURNS A REASON RATHER THAN A BOOL, and that is a correctness property, not ergonomics
+	// (Codex P2, PR #1370, round 4). Collapsing every withdrawal onto one rollout reason made the
+	// SAME scope mismatch report `rollout_out_of_scope` when admission caught it and
+	// `rollout_mode_invalid` when the boundary did — two contradictory diagnoses for one fact,
+	// separated only by timing, in the block telemetry an operator reads during an incident. The
+	// mode is still a perfectly valid Canary in both cases.
+	//
+	// Because the admission-time reservation cannot see a later withdrawal, and preCallGuard's kill
+	// re-read consults neither the Canary generation, the scope, nor the approval, WITHOUT this an
+	// already-admitted request could still reach the upstream after a leaving-live transition, a
+	// scope edit or a four-eyes revocation returned success (Codex P1, rounds 8/3/4). It is a
+	// composition-layer concern — generation, scope and approval all live outside this package — so
+	// it enters only as an injected predicate; the executor stays generic and byte-identical when the
+	// gate (or Revalidate) is nil.
+	Revalidate func() mcperr.Reason
 	Release    func()
 	// ReservationID (set only when Admit) names the budget slot this side effect was
 	// authorized against. It binds a physical attempt to the reservation that paid
@@ -139,6 +150,28 @@ var errLiveGateRefused = errors.New("mcp: live side-effect gate refused")
 // callUpstream maps it to a bounded rollout reason via classifyBoundaryRefusal so a client and block
 // telemetry read a fail-closed refusal, never a transport/durability fault or ReasonNone.
 var errLiveAuthorityWithdrawnAtBoundary = errors.New("mcp: live rollout authority withdrawn before upstream call")
+
+// withdrawnErr carries the gate's bounded reason alongside the sentinel. The sentinel stays the
+// thing every `errors.Is` in this package matches on, so the classification chain is unchanged;
+// the reason rides beside it so the refusal can be diagnosed as what it was rather than as a
+// fixed rollout reason (Codex P2, PR #1370, round 4).
+type withdrawnErr struct{ reason mcperr.Reason }
+
+func (e *withdrawnErr) Error() string { return errLiveAuthorityWithdrawnAtBoundary.Error() }
+func (e *withdrawnErr) Unwrap() error { return errLiveAuthorityWithdrawnAtBoundary }
+
+// withdrawnAtBoundary builds the refusal for a gate that named its reason.
+func withdrawnAtBoundary(reason mcperr.Reason) error { return &withdrawnErr{reason: reason} }
+
+// withdrawnReasonOf recovers the gate's reason, or ReasonNone when the error is not a
+// withdrawal (or came from a gate that named nothing).
+func withdrawnReasonOf(err error) mcperr.Reason {
+	var we *withdrawnErr
+	if errors.As(err, &we) {
+		return we.reason
+	}
+	return mcperr.ReasonNone
+}
 
 // liveGateInput builds the gate input from the already-resolved ExecInput at the boundary. It
 // reads ONLY resolved decision facts (principal/tool/server/operation), never a raw request

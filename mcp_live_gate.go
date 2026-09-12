@@ -85,6 +85,13 @@ type mcpLiveSideEffectGate struct {
 	generationCurrent func(gen uint64) bool
 	// note records a bounded denial reason for metrics/telemetry (never a secret). Optional.
 	note func(reason mcperr.Reason)
+	// now is the clock the FINAL-BOUNDARY revalidation reads. It is deliberately separate from
+	// LiveGateInput.Now, which is stamped when the gate input is built: the boundary predicate may
+	// run much later — after the durable commit, after credential materialization, and after an
+	// unbounded wait for an upstream pool slot — and an approval's validity must be judged at the
+	// instant it is about to be spent, not at the instant the request was admitted. Nil ⇒ the
+	// admission instant is reused, which is the pre-existing behaviour and never falsely refuses.
+	now func() time.Time
 }
 
 var _ execution.LiveExecutionGate = (*mcpLiveSideEffectGate)(nil)
@@ -107,6 +114,7 @@ func newMCPLiveSideEffectGate(capb rollout.Capability) *mcpLiveSideEffectGate {
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
 		note:              noteMCPLiveGateDenied,
+		now:               func() time.Time { return canaryNow() },
 	}
 }
 
@@ -310,35 +318,73 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		Admit:                true,
 		ReservationID:        resID,
 		ActivationGeneration: gen,
-		Revalidate: func() bool {
-			// TWO AUTHORITIES, BOTH RE-ASKED AT THE FINAL BOUNDARY.
+		Revalidate: func() mcperr.Reason {
+			// THREE AUTHORITIES, ALL RE-ASKED AT THE FINAL BOUNDARY — and the answer NAMES which
+			// one was withdrawn, because the same withdrawal must be diagnosed identically whether
+			// admission or the boundary caught it (Codex P2, PR #1370, round 4).
 			//
-			// Admission is one atomic transaction under cr.mu, but the scope is published under
-			// rollout.State's OWN lock (swapMu), which this transaction does not hold and must not
-			// (taking a rollout lock inside the activation lock would invert the order every other
-			// caller uses). So admission can only ever prove the envelope was in force AT THAT
-			// INSTANT — and between that instant and Upstream.Call the request still has to get
-			// through credential materialization, the durable decision commit and connection setup.
+			// Admission is one atomic transaction under cr.mu, but none of these three facts is
+			// frozen by it. The scope is published under rollout.State's OWN lock (swapMu), which
+			// this transaction does not hold and must not (taking a rollout lock inside the
+			// activation lock would invert the order every other caller uses). The approval lives
+			// in the durable tooltrust store, which an operator can revoke at any moment. The
+			// generation moves on a demotion. So admission can only ever prove all three were in
+			// force AT THAT INSTANT — and between that instant and Upstream.Call the request still
+			// has to get through credential materialization, the durable decision commit, and an
+			// unbounded wait for an upstream pool slot.
+			//
 			// That window is exactly why the kill state is re-read here (PREREQ-MCP-KILL-1), and a
-			// withdrawn authorization envelope deserves the same treatment (Codex P1, PR #1370,
-			// round 3).
+			// withdrawn envelope, a demoted generation and a revoked four-eyes grant all deserve
+			// the same treatment (Codex P1, PR #1370, rounds 3 and 4).
 			//
-			// Serializing scope publication with this transaction was the other remedy offered and
-			// is deliberately NOT taken: it would make an operator's scope edit block behind every
-			// in-flight admission, and it would still leave the post-admission window open, since
-			// the request continues long after the transaction returns. Re-asking at the boundary
-			// closes the window instead of narrowing it.
+			// Serializing any of these with the admission transaction was the alternative remedy
+			// and is deliberately NOT taken: it would make an operator's scope edit or revocation
+			// block behind every in-flight admission, and it would still leave the post-admission
+			// window open, since the request continues long after the transaction returns.
+			// Re-asking at the boundary closes the window instead of narrowing it.
 			//
-			// No "unwired ⇒ allow" escape hatch is needed here, unlike the generation seam below:
-			// an admitted request has already passed step (5c), which fails closed on a nil probe
-			// and on an empty envelope, so neither degenerate input can reach this closure.
+			// ORDER: scope, then approval, then generation — cheapest local read first, and the
+			// durable store consulted only for a request the other two still authorize.
+			//
+			// No "unwired ⇒ allow" escape hatch is needed on the scope half, unlike the generation
+			// seam: an admitted request has already passed step (5c), which fails closed on a nil
+			// probe and on an empty envelope, so neither degenerate input can reach this closure.
 			if !canaryScopeInForce(in.ResolvedScopeHash, g.currentScopeHash) {
-				return false
+				return mcperr.ReasonRolloutOutOfScope
+			}
+			// THE APPROVAL IS RE-ASKED AT A FRESH INSTANT. Round 22 moved the approval lookup INTO
+			// the admission transaction so a revocation racing the lock could not be admitted, and
+			// recorded in this file that "the final boundary re-reads tool freshness, generation
+			// and kill state, not approval status". That residual is this branch: a grant revoked
+			// or expired after admission — while the request waited on the durable commit or a
+			// pool slot — otherwise still authorized an irreversible call. ToolStillCurrent does
+			// not cover it (it checks catalog freshness), and neither the scope nor the generation
+			// moves when an approval is withdrawn.
+			//
+			// The target is re-resolved from the SAME lock-free pointer-published inventory the
+			// admission probe used, never from a request-supplied claim, and the time is read
+			// NOW rather than at admission — an approval that expired while this request waited
+			// must not be spent on the strength of how fresh it was when the wait began.
+			if g.approvalOK != nil && g.trustPrecheck != nil {
+				live := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
+				if !live.Eligible {
+					return mcperr.ReasonLiveTrustRevalidationFailed
+				}
+				at := in.Now
+				if g.now != nil {
+					at = g.now()
+				}
+				if ok, _ := g.approvalOK(live.Target, at); !ok {
+					return mcperr.ReasonLiveTrustRevalidationFailed
+				}
 			}
 			if g.generationCurrent == nil {
-				return true // no revalidation seam wired ⇒ preserve prior behavior (never falsely refuse)
+				return mcperr.ReasonNone // no revalidation seam wired ⇒ preserve prior behavior
 			}
-			return g.generationCurrent(gen)
+			if !g.generationCurrent(gen) {
+				return mcperr.ReasonRolloutModeInvalid
+			}
+			return mcperr.ReasonNone
 		},
 		Release: func() {
 			g.releaseBudget(gen)
@@ -387,11 +433,14 @@ func (g *mcpLiveSideEffectGate) AdmitAuxiliary(_ execution.LiveGateInput) execut
 	}
 	return execution.LiveGateDecision{
 		Admit: true,
-		Revalidate: func() bool {
+		Revalidate: func() mcperr.Reason {
 			if g.admitOpen == nil {
-				return true // no revalidation seam wired ⇒ preserve the admission decision
+				return mcperr.ReasonNone // no revalidation seam wired ⇒ preserve the admission decision
 			}
-			return g.admitOpen()
+			if !g.admitOpen() {
+				return mcperr.ReasonRolloutModeInvalid
+			}
+			return mcperr.ReasonNone
 		},
 		Release: releaseAdmit,
 	}

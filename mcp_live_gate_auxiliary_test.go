@@ -146,12 +146,12 @@ func TestAdmitAuxiliary_RevalidatesTheLifecycleAtTheBoundary(t *testing.T) {
 	if !d.Admit || d.Revalidate == nil {
 		t.Fatalf("expected an admitted decision carrying a Revalidate; admit=%v", d.Admit)
 	}
-	if !d.Revalidate() {
-		t.Fatal("revalidation refused while admission was still open")
+	if r := d.Revalidate(); r != mcperr.ReasonNone {
+		t.Fatalf("revalidation refused (%s) while admission was still open", r.Code())
 	}
 	// The tier closes admission after the grant.
 	s.admitOpen = false
-	if d.Revalidate() {
+	if d.Revalidate() == mcperr.ReasonNone {
 		t.Fatal("revalidation admitted after the tier closed admission mid-flight")
 	}
 }

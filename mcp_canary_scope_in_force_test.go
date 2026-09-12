@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
+	"github.com/KidCarmi/Culvert/internal/mcp/upstreamclient"
 )
 
 // mcp_canary_scope_in_force_test.go — the deterministic matrix for STALE AUTHORIZATION at the
@@ -482,5 +485,137 @@ func TestScopeInForce_UnchangedEnvelopeSurvivesThePostAdmissionWindow(t *testing
 	if up.callCount() != 1 {
 		t.Fatalf("CONTROL: an unchanged envelope must still reach upstream exactly once, got %d (out=%+v)",
 			up.callCount(), out)
+	}
+}
+
+// ── THE OTHER TWO AUTHORITIES, AND THE POOL WAIT ──────────────────────────────────────────────
+//
+// Round 4 found that the boundary predicate was still too narrow in two ways, and that the window
+// it guards was still too short.
+
+// liveRealGateTrust is liveRealGate with a MUTABLE approval verdict, so a test can revoke a
+// four-eyes grant mid-flight — the thing an operator actually does — rather than starting from a
+// node that was never approved.
+func liveRealGateTrust(capb rollout.Capability, trust func() bool) *mcpLiveSideEffectGate {
+	g := liveRealGate(capb, true)
+	g.approvalOK = func(canary.LiveTarget, time.Time) (bool, string) { return trust(), "" }
+	return g
+}
+
+// preSendUpstream honours CallOptions.PreSend exactly as the real client does — after the point
+// where the real client would be holding a pool slot, and before any request bytes exist. It is
+// the smallest double that can exercise the executor's half of the contract; the client's half
+// (that it calls the hook at all, after acquire, on every leg) is pinned in
+// internal/mcp/upstreamclient.
+type preSendUpstream struct {
+	recordingUpstream
+	// beforeSend runs at the instant the real client would be waiting for a pool slot: after
+	// admission and after every boundary guard, with nothing sent.
+	beforeSend func()
+	ran        bool
+}
+
+func (u *preSendUpstream) Call(ctx context.Context, target upstreamclient.Target, method string, params json.RawMessage, opts upstreamclient.CallOptions) (*upstreamclient.Response, error) {
+	if u.beforeSend != nil {
+		u.beforeSend()
+	}
+	u.ran = true
+	if opts.PreSend != nil {
+		if err := opts.PreSend(); err != nil {
+			return nil, err
+		}
+	}
+	return u.recordingUpstream.Call(ctx, target, method, params, opts)
+}
+
+// A four-eyes live approval revoked after admission must not be spent.
+//
+// Round 22 moved the approval lookup INTO the admission transaction so a revocation racing the
+// lock could not be admitted, and recorded in mcp_live_gate.go that "the final boundary re-reads
+// tool freshness, generation and kill state, not approval status". This is that residual: a grant
+// withdrawn while the request waited on the durable commit or a pool slot. Neither the scope nor
+// the generation moves when an approval is revoked, and ToolStillCurrent only checks catalog
+// freshness — so nothing else could catch it (Codex P1, PR #1370, round 4).
+func TestBoundaryAuthority_ApprovalRevokedAfterAdmissionRefusesBeforeUpstream(t *testing.T) {
+	approved := true
+	up := &preSendUpstream{beforeSend: func() { approved = false }}
+	cfg := armCanaryLiveTierGate(t, up, func() *mcpLiveSideEffectGate {
+		return liveRealGateTrust(rollout.CapabilityGateway, func() bool { return approved })
+	}, 5)
+	ex := cfg.Deps.Executor
+
+	in := liveExecInput(policy.OpRead, "t1", "p1")
+	in.ToolStillCurrent = func() bool { return true }
+	out := ex.Execute(t.Context(), in, ex.Resolve(in))
+
+	if !up.ran {
+		t.Fatal("premise: the revocation never ran, so this proves nothing about the window")
+	}
+	if up.callCount() != 0 {
+		t.Fatalf("SECURITY: a revoked live approval was still spent — %d physical call(s) under a "+
+			"four-eyes grant that no longer exists", up.callCount())
+	}
+	if out.Executed {
+		t.Fatalf("a request refused at the boundary must not report Executed, out=%+v", out)
+	}
+	if out.Reason != mcperr.ReasonLiveTrustRevalidationFailed {
+		t.Fatalf("a withdrawn approval must be diagnosed as a trust-revalidation failure, got %s", out.Reason.Code())
+	}
+}
+
+// The mandatory control: an approval that STAYS valid across the same window still executes.
+func TestBoundaryAuthority_ValidApprovalSurvivesThePreSendReAsk(t *testing.T) {
+	up := &preSendUpstream{}
+	cfg := armCanaryLiveTierGate(t, up, func() *mcpLiveSideEffectGate {
+		return liveRealGateTrust(rollout.CapabilityGateway, func() bool { return true })
+	}, 5)
+	ex := cfg.Deps.Executor
+
+	in := liveExecInput(policy.OpRead, "t1", "p1")
+	in.ToolStillCurrent = func() bool { return true }
+	out := ex.Execute(t.Context(), in, ex.Resolve(in))
+
+	if up.callCount() != 1 {
+		t.Fatalf("CONTROL: an unrevoked approval must still reach upstream exactly once, got %d (out=%+v)",
+			up.callCount(), out)
+	}
+}
+
+// A scope withdrawn during the wait for a pool slot must refuse before the send.
+//
+// preCallGuard runs and passes; the request then enters Client.Call, which blocks in pool.acquire
+// on a per-server semaphore until a slot frees. A scope update landing in THAT wait used to be
+// invisible, because nothing was re-read between the guard and the send (Codex P1, round 4).
+func TestBoundaryAuthority_ScopeWithdrawnDuringThePoolWaitRefusesBeforeSend(t *testing.T) {
+	gw := getMCPRollout().gateway
+	up := &preSendUpstream{beforeSend: func() {
+		installScope(t, gw, 2, rollout.ScopeSpec{
+			Capability: rollout.CapabilityGateway,
+			Servers:    []string{"s1", "s2-added-during-the-pool-wait"},
+		})
+	}}
+	cfg := armCanaryLiveTierGate(t, up, func() *mcpLiveSideEffectGate {
+		return liveRealGate(rollout.CapabilityGateway, true)
+	}, 5)
+	ex := cfg.Deps.Executor
+
+	in := liveExecInput(policy.OpRead, "t1", "p1")
+	in.ToolStillCurrent = func() bool { return true }
+	out := ex.Execute(t.Context(), in, ex.Resolve(in))
+
+	if !up.ran {
+		t.Fatal("premise: the scope swap never ran, so this proves nothing about the pool wait")
+	}
+	if up.callCount() != 0 {
+		t.Fatalf("SECURITY: the envelope was withdrawn while the request waited for a pool slot "+
+			"and it still sent %d time(s)", up.callCount())
+	}
+	// AND IT IS DIAGNOSED AS WHAT IT WAS. The identical mismatch caught at admission reports
+	// rollout_out_of_scope; reporting rollout_mode_invalid here would give an operator two
+	// contradictory answers for one fact, separated only by timing, while the mode is a
+	// perfectly valid Canary throughout (Codex P2, round 4).
+	if out.Reason != mcperr.ReasonRolloutOutOfScope {
+		t.Fatalf("a scope withdrawal must be diagnosed as out-of-scope wherever it is caught, got %s",
+			out.Reason.Code())
 	}
 }
