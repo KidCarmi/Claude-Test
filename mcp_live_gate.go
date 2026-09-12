@@ -71,7 +71,11 @@ type mcpLiveSideEffectGate struct {
 	// the activation it is about to charge — see step (5b) in admitLiveExecution. The class is not
 	// recomputed here; it is the one the decision carries, handed to the only place that knows
 	// which activation is paying.
-	admitUnderActivation func(now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission
+	admitUnderActivation func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission
+	// currentScopeHash reports the rollout scope in force for this capability. It is handed to
+	// the transaction as a PROBE so the read happens inside the activation lock, at the moment
+	// budget authority is decided — a hash read out here could already be stale by then.
+	currentScopeHash func() string
 	// releaseBudget returns the in-flight concurrency slot for a reservation made under gen.
 	releaseBudget func(gen uint64)
 	// generationCurrent is the final-boundary revalidation: it reports whether the activation
@@ -96,9 +100,10 @@ func newMCPLiveSideEffectGate(capb rollout.Capability) *mcpLiveSideEffectGate {
 		readFirst:     canary.IsReadFirstOperation,
 		trustPrecheck: mcpLiveTrustPrecheck,
 		approvalOK:    mcpLiveApprovalSatisfied,
-		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return globalCanaryRuntime.admitLiveExecution(capb, now, opClass, ident, trust)
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return globalCanaryRuntime.admitLiveExecution(capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
+		currentScopeHash:  func() string { return getMCPRollout().stateFor(capb).ScopeHash() },
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
 		note:              noteMCPLiveGateDenied,
@@ -157,7 +162,7 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	// through an atomic pointer), so the §5 hazard is removed rather than relocated, and the
 	// admission transaction can evaluate the whole predicate under one lock exactly as it did
 	// before the split.
-	adm := g.admitUnderActivation(in.Now, in.Operation, canary.ExecutionIdentity{
+	adm := g.admitUnderActivation(in.Now, in.Operation, in.ResolvedScopeHash, g.currentScopeHash, canary.ExecutionIdentity{
 		Principal: in.Principal,
 		Tool:      in.ToolName,
 		Server:    in.ServerID,
@@ -232,6 +237,14 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		// the target it named is not one this experiment is authorized to execute.
 		releaseAdmit()
 		return deny(mcperr.ReasonLiveTrustRevalidationFailed)
+	case canaryAdmitScopeNotInForce:
+		// The authorization envelope this request resolved under is no longer installed — a
+		// scope edit landed between resolution and the boundary. Request-scoped: NOTHING is
+		// latched, because an operator changing a scope is the system working, not evidence
+		// that the reviewed target drifted. Reported as out-of-scope, which is literally what
+		// happened from the caller's side: it is not in the scope that is in force.
+		releaseAdmit()
+		return deny(mcperr.ReasonRolloutOutOfScope)
 	case canaryAdmitClassNotInForce:
 		// The activation that would be charged does not bind this request's operation class to this
 		// target — a read-first decision taken under an activation that has since been replaced by

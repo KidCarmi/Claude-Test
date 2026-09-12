@@ -615,11 +615,23 @@ func realAdmissionGate(t *testing.T, capb rollout.Capability) *mcpLiveSideEffect
 }
 
 // driftGateInput is one admission input against the seeded controlled target.
+//
+// ResolvedScopeHash is the scope CURRENTLY installed, which is what a genuinely resolved request
+// carries: State.ResolveFor stamps the envelope it decided under, and in these fixtures nothing
+// has changed it since. A fixture that left it empty would be modelling a request that never went
+// through resolution at all — fail-closed at the boundary, and every assertion built on it would
+// be proving the wrong refusal.
 func driftGateInput(sid, tool, fp string, now time.Time) execution.LiveGateInput {
 	return execution.LiveGateInput{
 		Capability: 0, Operation: policy.OpRead, Tenant: ttTenant, Principal: liveRequester,
 		ServerID: sid, ToolName: tool, Fingerprint: fp, Now: now,
+		ResolvedScopeHash: installedScopeHash(),
 	}
+}
+
+// installedScopeHash reports the Gateway scope in force, as State.ResolveFor would have stamped it.
+func installedScopeHash() string {
+	return getMCPRollout().stateFor(rollout.CapabilityGateway).ScopeHash()
 }
 
 // armDriftFixture seeds the real inventory + a real four-eyes live approval and begins a real Canary

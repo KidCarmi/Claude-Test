@@ -15,8 +15,8 @@ import (
 //
 // It deliberately reproduces the real transaction's ordering — drift beats untrusted beats budget —
 // so a test using it cannot pass against a gate that reads the result fields in the wrong order.
-func stubAdmitUnderActivation(outcome canary.BudgetOutcome, gen uint64) func(time.Time, policy.OperationClass, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
-	return func(_ time.Time, _ policy.OperationClass, _ canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+func stubAdmitUnderActivation(outcome canary.BudgetOutcome, gen uint64) func(time.Time, policy.OperationClass, string, canaryScopeProbe, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+	return func(_ time.Time, _ policy.OperationClass, _ string, _ canaryScopeProbe, _ canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 		trusted, drift := true, ""
 		if trust != nil {
 			obs := trust()

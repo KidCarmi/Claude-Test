@@ -156,6 +156,20 @@ func (e *Executor) Execute(ctx context.Context, in runtime.ExecInput, res rollou
 	if e.cfg.State.Killed() {
 		return e.blocked(in, mcperr.ReasonRolloutEmergencyActive, false)
 	}
+	// Stamp the authorization envelope from THE RESOLUTION THIS EXECUTION IS ACTING ON.
+	//
+	// Execute is documented as acting on the pre-resolved mode/scope disposition, and the scope
+	// hash is part of that resolution — so `res` is the authoritative source, not whatever a
+	// caller happened to leave on `in`. Doing it here rather than trusting the caller closes the
+	// failure mode that is otherwise invisible: a caller holding both values and forgetting to
+	// copy one produces an empty envelope, which the admission boundary correctly refuses — and
+	// that refusal reads exactly like a scope edit, so the bug would surface as a confusing
+	// denial rather than as a missing assignment. `in` is a value copy; nothing escapes.
+	//
+	// This is the ONLY path to the live gate (both liveGateInput call sites are below this
+	// point), so every request that can reach the boundary carries the envelope it resolved
+	// under, or "" — which is fail-closed, never a wildcard.
+	in.ResolvedScopeHash = res.ScopeHash
 	subj := subjectFor(in)
 	action := mapAction(in.Decision.Action)
 	e.cfg.Metrics.ObserveResolution(in.Capability.String(), res)

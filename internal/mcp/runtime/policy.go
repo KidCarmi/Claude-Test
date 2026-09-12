@@ -122,6 +122,12 @@ func (p *pipeline) dispatchPolicy(ctx context.Context, rb *recBuilder, req Reque
 		// decision was actually made under. See Deps.CanaryGeneration.
 		genAtResolve := p.deps.canaryGenerationAt(p.capability.String())
 		res := p.executor.Resolve(ei)
+		// Bind the request to the authorization envelope it resolved under. The hash comes
+		// from the resolution itself — the same atomic scope snapshot that decided InScope —
+		// so the request carries the envelope that actually authorized it rather than
+		// whichever one happens to be installed later. The admission boundary requires the
+		// two to still agree before it grants budget authority; see canaryAdmitScopeNotInForce.
+		ei.ResolvedScopeHash = res.ScopeHash
 		if res.Disposition != rollout.EffectRecordOnly {
 			return p.dispatchExecute(ctx, rb, ei, res, genAtResolve)
 		}

@@ -33,9 +33,13 @@ func liveRealGate(capb rollout.Capability, trustOK bool) *mcpLiveSideEffectGate 
 		readFirst:     canary.IsReadFirstOperation,
 		trustPrecheck: stubTrustPrecheckEligible,
 		approvalOK:    func(canary.LiveTarget, time.Time) (bool, string) { return trustOK, "" },
-		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return globalCanaryRuntime.admitLiveExecution(capb, now, opClass, ident, trust)
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return globalCanaryRuntime.admitLiveExecution(capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
+		// The SAME state the executor resolves against (getMCPRollout().gateway), exactly as
+		// production composes it — so the envelope comparison is between two reads of one
+		// scope, never two different states that happen to agree.
+		currentScopeHash:  func() string { return getMCPRollout().stateFor(capb).ScopeHash() },
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
 		note:              noteMCPLiveGateDenied,

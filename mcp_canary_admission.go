@@ -73,6 +73,16 @@ import (
 // materialization, no DNS, no upstream call, no unbounded or blocking work.
 type canaryTrustProbe func() canaryTrustObservation
 
+// canaryScopeProbe reports the content hash of the rollout scope CURRENTLY in force for this
+// capability. Like canaryTrustProbe it is evaluated INSIDE the activation lock, and the same
+// narrow contract makes that legitimate: one lock-free atomic load of local control-plane state
+// — no network I/O, no credential materialization, no blocking work.
+//
+// It is a probe rather than a value because the comparison has to happen at the moment budget
+// authority is decided. A hash read before the lock is a hash that may already be stale by the
+// time it matters, which is the defect class this whole boundary exists to close.
+type canaryScopeProbe func() string
+
 // canaryTrustObservation is one probe's report of the CURRENT authoritative state of the target a
 // request names. The transaction, not the probe, decides what it means for the activation: the
 // probe reports observations, the transaction compares them against what the activation was
@@ -124,6 +134,9 @@ const (
 	// canaryAdmitClassNotInForce — request-scoped: the operation class this request was decided
 	// under is not the class the activation that will be charged binds to this target.
 	canaryAdmitClassNotInForce
+	// canaryAdmitScopeNotInForce — request-scoped: the authorization envelope this request
+	// resolved under is not the one in force now. STALE AUTHORIZATION, never target drift.
+	canaryAdmitScopeNotInForce
 )
 
 // canaryAdmission is the bounded result of one atomic admission transaction. The caller receives
@@ -164,6 +177,7 @@ func (a canaryAdmission) Granted() bool { return a.Denial == canaryAdmitGranted 
 //	trust probe                    — evaluated against the activation that will be latched
 //	drift  ⇒ trip(G) + persist     — fail-closed; the request is denied
 //	class in force under G         — the classification the request carries is still the one G binds
+//	scope in force                 — the authorization envelope it resolved under is still installed
 //	untrusted ⇒ deny               — request-scoped; nothing is latched and nothing persisted
 //	reserve(G) + persist           — only a trusted request spends budget
 //
@@ -171,7 +185,7 @@ func (a canaryAdmission) Granted() bool { return a.Denial == canaryAdmitGranted 
 // preserving the gate's prior ordering. The reservation can therefore only ever be made under the
 // SAME generation the trust verdict was computed against: "trust under G, reserve under G+1" is not
 // a race that is unlikely here, it is a state the code cannot express.
-func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 	cr := rt.capRuntime(capb)
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
@@ -262,6 +276,45 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 	// the record cannot speak for the target at all rather than treating silence as agreement.
 	if current, ok := cr.reviewed.OperationClassFor(obs.Current); !ok || current != opClass {
 		return canaryAdmission{Denial: canaryAdmitClassNotInForce, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
+	}
+
+	// (5c) THE AUTHORIZATION ENVELOPE MUST STILL BE THE ONE THAT AUTHORIZED THIS REQUEST.
+	//
+	// Sibling of (5b), and the same defect class one axis over. (5b) asks whether the CLASS the
+	// request carries is still the one this activation binds; this asks whether the SCOPE the
+	// request resolved under is still installed at all. Scope membership is decided once, at
+	// resolution (rollout.Scope.Contains, via the executor's Resolve), and until now nothing
+	// re-read it — so this sequence was admissible and must not be (Codex P1, PR #1370, round 2):
+	//
+	//	T0     G armed. Scope S1 permits principal A. A's request resolves executable under S1.
+	//	T+     the request pauses — a credential path, a durable commit, a scheduler stall.
+	//	T++    a SAME-MODE scope update installs S2: A removed, B added. The reviewed target and
+	//	       the budget are unchanged, so reconcileCanaryRuntimeAfterCommit accepts it and the
+	//	       generation stays G.
+	//	T+++   the request resumes. The target has not moved, so nothing drifts; (5b) agrees,
+	//	       because S2 binds the same target to the same class; and the budget merely COUNTS
+	//	       principals, so A — already counted — passes the blast-radius ceiling too.
+	//
+	// The request then spends authority granted by an envelope that no longer exists.
+	//
+	// WHY EXACT HASH EQUALITY, and not "is the principal still in scope". Re-running membership
+	// would close the principal case and leave every sibling open: a tool removed from the scope,
+	// a server removed, a tenant changed, an exclusion added, a percentage or bucket-salt edit.
+	// The hash covers every selector dimension at once (see rollout.Scope.computeHash), so ONE
+	// comparison closes the whole family — and it fails closed on the dimensions nobody thought
+	// to enumerate, which is the point. A request resolved under one authorization envelope
+	// cannot spend authority under another, full stop.
+	//
+	// AN EMPTY RESOLVED HASH IS A REFUSAL, NOT A WILDCARD. "" is what a request carries when it
+	// never went through State.ResolveFor, and an executing Canary request always does. Treating
+	// it as a match would make the whole check optional for exactly the requests that skipped the
+	// path that stamps it.
+	//
+	// AND IT IS REQUEST-SCOPED: nothing is latched. An operator narrowing a scope is the system
+	// working, not evidence that the reviewed target drifted — latching the whole experiment for
+	// it would let an ordinary scope edit stop a healthy Canary (the round-15/31 rule).
+	if scopeNow == nil || resolvedScope == "" || scopeNow() != resolvedScope {
+		return canaryAdmission{Denial: canaryAdmitScopeNotInForce, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
 	}
 
 	// (6) Untrusted without drift is request-scoped: the target still matches what was reviewed,

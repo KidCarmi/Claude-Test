@@ -716,7 +716,7 @@ func TestReviewedBinding_AnUnrecognisedDenialClassFailsClosed(t *testing.T) {
 	if unknownDenial == canaryAdmitGranted {
 		t.Fatal("premise: the injected class must not be the grant")
 	}
-	g.admitUnderActivation = func(time.Time, policy.OperationClass, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+	g.admitUnderActivation = func(time.Time, policy.OperationClass, string, canaryScopeProbe, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 		return canaryAdmission{Denial: unknownDenial, Active: true, Generation: 7}
 	}
 	d := g.AdmitSideEffect(driftGateInput("s", "t", "fp", canaryRuntimeTestNow))
@@ -734,7 +734,7 @@ func TestReviewedBinding_AnUnrecognisedDenialClassFailsClosed(t *testing.T) {
 
 	// Control: the SAME harness admits an explicit grant, so the assertion above cannot be
 	// satisfied by a gate that refuses everything.
-	g.admitUnderActivation = func(time.Time, policy.OperationClass, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+	g.admitUnderActivation = func(time.Time, policy.OperationClass, string, canaryScopeProbe, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 		return canaryAdmission{Denial: canaryAdmitGranted, Active: true, Generation: 7, Trusted: true, Outcome: canary.BudgetGranted}
 	}
 	ok := g.AdmitSideEffect(driftGateInput("s", "t", "fp", canaryRuntimeTestNow))

@@ -81,10 +81,25 @@ func (r *atomicRig) admit(trust canaryTrustProbe) canaryAdmission {
 // OpRead because that is the class this file's fixtures arm and the only one a tool call can carry
 // through the First-Canary gate; a case ABOUT the class mismatch states the other one explicitly.
 func (r *atomicRig) admitAs(opClass policy.OperationClass, trust canaryTrustProbe) canaryAdmission {
-	return r.rt.admitLiveExecution(r.capb, canaryRuntimeTestNow, opClass, canary.ExecutionIdentity{
+	return r.admitFull(opClass, testScopeHash, scopeProbe(testScopeHash), trust)
+}
+
+// admitFull drives one transaction with every boundary fact stated. Cases ABOUT the scope
+// envelope use it directly; everything else takes the agreeing pair above, since a rig whose
+// scope never matched would make every other assertion in this file unreachable.
+func (r *atomicRig) admitFull(opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, trust canaryTrustProbe) canaryAdmission {
+	return r.rt.admitLiveExecution(r.capb, canaryRuntimeTestNow, opClass, resolvedScope, scopeNow, canary.ExecutionIdentity{
 		Principal: "p1", Tool: "t1", Server: "s1",
 	}, trust)
 }
+
+// testScopeHash is the canonical synthetic authorization envelope: a request resolved under it and
+// it is still installed. Shaped like a real scope hash (hex) so a test cannot pass on a value the
+// production type would never carry.
+const testScopeHash = "5c09e0f2b1d34a7e8f6c2b0a9d1e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e"
+
+// scopeProbe returns a canaryScopeProbe reporting a fixed installed envelope.
+func scopeProbe(h string) canaryScopeProbe { return func() string { return h } }
 
 // probeDrift returns a probe reporting an authoritative drift ON A RESOLVED TARGET.
 //
@@ -783,8 +798,8 @@ func TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction(t *testing.T) {
 			askedInsideLock = true
 			return false, "" // the revocation the transaction must observe
 		},
-		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return r.rt.admitLiveExecution(r.capb, now, opClass, ident, trust)
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
 		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },
@@ -845,8 +860,8 @@ func TestAtomicBinding_RugPullLatchesAtAdmission(t *testing.T) {
 		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
 			return false, "" // unauthorized, and saying nothing about what was reviewed
 		},
-		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return r.rt.admitLiveExecution(r.capb, now, opClass, ident, trust)
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
 		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },
@@ -892,8 +907,8 @@ func TestAtomicBinding_MissingApprovalIsNotDrift(t *testing.T) {
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckEligible,
 		approvalOK:    func(canary.LiveTarget, time.Time) (bool, string) { return false, "" },
-		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return r.rt.admitLiveExecution(r.capb, now, opClass, ident, trust)
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
 		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },

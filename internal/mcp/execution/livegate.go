@@ -87,7 +87,10 @@ type LiveGateInput struct {
 	ServerID    string
 	ToolName    string
 	Fingerprint string
-	Now         time.Time
+	// ResolvedScopeHash is the authorization envelope this request resolved under. The
+	// admission transaction requires it to still be the one in force; "" is fail-closed.
+	ResolvedScopeHash string
+	Now               time.Time
 }
 
 // LiveGateDecision is the gate's verdict. Admit==false fails closed with Reason and Upstream.Call
@@ -162,6 +165,10 @@ func (e *Executor) liveGateInput(in runtime.ExecInput) LiveGateInput {
 		ServerID:    serverID,
 		ToolName:    toolName,
 		Fingerprint: fp,
-		Now:         e.cfg.Clock(), // the boundary instant, not the request-entry in.Now (see doc above)
+		// Carried through verbatim, exactly like the operation class: the gate revalidates
+		// the envelope the request resolved under, it never re-derives one here. Re-reading
+		// the live scope at this point would compare the current envelope against itself.
+		ResolvedScopeHash: in.ResolvedScopeHash,
+		Now:               e.cfg.Clock(), // the boundary instant, not the request-entry in.Now (see doc above)
 	}
 }
