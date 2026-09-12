@@ -57,7 +57,7 @@ func isTextContentType(ct string) bool {
 // signature match is detected in a buffered response body.
 func dpiBlock(br blockResponder, host, pattern string) {
 	atomic.AddInt64(&statDPIBlocked, 1)
-	logger.Printf("DPI_BLOCKED host=%s pattern=%q", host, pattern)
+	logger.Printf("DPI_BLOCKED host=%q pattern=%q", sanitizeLog(host), pattern)
 	const body = "Blocked by content inspection policy\r\n"
 	br.blockBeforeResponse("text/plain; charset=utf-8", body)
 }

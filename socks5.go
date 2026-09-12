@@ -492,7 +492,7 @@ func handleSOCKS5(conn net.Conn) {
 		atomic.AddInt64(&statBlocked, 1)
 		socks5Reply(conn, 0x02)
 		recordRequest(clientIP, "SOCKS5", host, "BLOCKED", "", "", "", "")
-		logger.Printf("SOCKS5 BLOCKED %s -> %s", clientIP, host)
+		logger.Printf("SOCKS5 BLOCKED %s -> %q", clientIP, sanitizeLog(host))
 		return
 	}
 
@@ -507,7 +507,9 @@ func handleSOCKS5(conn net.Conn) {
 	// ── SSRF guard: block private/internal destinations ───────────────────────
 	if err := isPrivateHost(target); err != nil {
 		socks5Reply(conn, 0x02) // Connection not allowed by ruleset
-		logger.Printf("SOCKS5 SSRF block %s -> %s: %v", clientIP, target, err)
+		// The error embeds the destination, so it carries the same client-chosen
+		// bytes the target does and is sanitised for the same reason.
+		logger.Printf("SOCKS5 SSRF block %s -> %q: %q", clientIP, sanitizeLog(target), sanitizeLog(err.Error()))
 		recordRequest(clientIP, "SOCKS5", host, "BLOCKED", "", "", "", "")
 		return
 	}
@@ -518,7 +520,7 @@ func handleSOCKS5(conn net.Conn) {
 	destConn, err := (&net.Dialer{Timeout: 10 * time.Second, Control: ssrfControl}).DialContext(context.Background(), "tcp", target)
 	if err != nil {
 		socks5Reply(conn, 0x05)
-		logger.Printf("SOCKS5 dial error %s: %v", target, err)
+		logger.Printf("SOCKS5 dial error %q: %q", sanitizeLog(target), sanitizeLog(err.Error()))
 		return
 	}
 	defer destConn.Close()
@@ -546,7 +548,7 @@ func handleSOCKS5(conn net.Conn) {
 
 	atomic.AddInt64(&statTotal, 1)
 	recordRequest(clientIP, "SOCKS5", host, "OK", "", "", "", "")
-	logger.Printf("SOCKS5 OK %s -> %s", clientIP, target)
+	logger.Printf("SOCKS5 OK %s -> %q", clientIP, sanitizeLog(target))
 
 	socks5Relay(conn, destConn, clientIP, host)
 }

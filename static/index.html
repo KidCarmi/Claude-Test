@@ -2969,6 +2969,10 @@ Firefox (all platforms):
             Accounts or IP/username pairs currently blocked from logging in after too many failed attempts.
             A lockout clears itself when the timer expires, or you can unlock it now.
           </p>
+          <p class="hint" id="oversize-login-hint" style="display:none;color:var(--warn,#b8860b)">
+            <svg class="ico" aria-hidden="true"><use href="#i-alert-triangle"/></svg>
+            <span id="oversize-login-text"></span>
+          </p>
           <table>
             <thead><tr>
               <th>Username</th>
@@ -8332,6 +8336,23 @@ async function fetchStats() {
       const pbp = s.processLogBackpressure || 0;
       splbp.textContent = pbp > 0 ? fmt(pbp) + ' lines delayed' : 'None';
       splbp.style.color = pbp > 0 ? 'var(--warn,#b8860b)' : '';
+    }
+    // Oversized-username login attempts (CHAOS-63): each one is refused with a
+    // plain 400 and otherwise leaves no trace an admin would see without a
+    // metrics scraper or shell access to the process log. Surfacing the count
+    // next to Active Login Lockouts puts it where an admin already looks when
+    // investigating login abuse.
+    const oversizeHint = document.getElementById('oversize-login-hint');
+    if (oversizeHint) {
+      const rej = s.loginOversizeRejected || 0;
+      if (rej > 0) {
+        document.getElementById('oversize-login-text').textContent =
+          fmt(rej) + ' login attempt' + (rej === 1 ? '' : 's') +
+          ' refused for an oversized username since the last restart — likely automated probing of the login endpoint.';
+        oversizeHint.style.display = '';
+      } else {
+        oversizeHint.style.display = 'none';
+      }
     }
     // nav badge
     const nb = document.getElementById('nav-blocked-count');

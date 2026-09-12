@@ -6,6 +6,7 @@
 package plugin
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/KidCarmi/Culvert/internal/obs"
@@ -50,7 +51,7 @@ var chain []Middleware
 // Call this from init() or before the proxy starts.
 func Register(m Middleware) {
 	chain = append(chain, m)
-	obs.Printf("Plugin registered: %s", m.Name())
+	obs.Printf("Plugin registered: %q", obs.Sanitize(m.Name()))
 }
 
 // Replace swaps the entire plugin chain and returns the previous one.
@@ -76,7 +77,8 @@ func Decide(clientIP, method, host string) Decision {
 		decision := func() (d Decision) {
 			defer func() {
 				if r := recover(); r != nil {
-					obs.Printf("Plugin[%s] panicked: %v — treated as Allow", p.Name(), r)
+					obs.Printf("Plugin[%s] panicked: %q — treated as Allow",
+						obs.Sanitize(p.Name()), obs.Sanitize(fmt.Sprint(r)))
 					obs.ReportPanic("plugin:"+p.Name(), r)
 					d = DecisionAllow
 				}
@@ -84,7 +86,15 @@ func Decide(clientIP, method, host string) Decision {
 			return p.OnRequest(clientIP, method, host)
 		}()
 		if decision == DecisionBlock {
-			obs.Printf("Plugin[%s] blocked %s -> %s %s", p.Name(), clientIP, method, host)
+			// host is the CLIENT'S chosen destination and reaches here unvalidated
+			// from the SOCKS5 DOMAINNAME (RFC 1928 §4 is a raw byte string), so it
+			// may carry a line terminator. obs.Printf is a plain fmt.Sprintf into
+			// the process logger — it does NOT sanitize — so without this the
+			// plugin-block branch forges log records exactly as the handler's own
+			// destination log sites did before SEC-SOCKS5-LOG-1 (CWE-117).
+			// The plugin name is author-supplied and sanitized for the same reason.
+			obs.Printf("Plugin[%s] blocked %s -> %s %q",
+				obs.Sanitize(p.Name()), clientIP, method, obs.Sanitize(host))
 			return DecisionBlock
 		}
 	}
@@ -97,7 +107,8 @@ func OnResponse(resp *http.Response) {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					obs.Printf("Plugin[%s] panicked in OnResponse: %v", p.Name(), r)
+					obs.Printf("Plugin[%s] panicked in OnResponse: %q",
+						obs.Sanitize(p.Name()), obs.Sanitize(fmt.Sprint(r)))
 					obs.ReportPanic("plugin:"+p.Name(), r)
 				}
 			}()
