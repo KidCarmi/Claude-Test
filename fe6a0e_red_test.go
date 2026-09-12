@@ -91,6 +91,26 @@ func fe6aeJSONLCounts(t *testing.T, path, action, object, opID string) (byObject
 	return byObject, byOperation
 }
 
+// fe6aeJSONLCountsIn counts the keyed entries in ONE file (no archive).
+func fe6aeJSONLCountsIn(t *testing.T, path, opID string) (lines, byOperation int) {
+	t.Helper()
+	f, err := os.Open(path) // #nosec G304 -- test temp path
+	if err != nil {
+		return 0, 0
+	}
+	defer f.Close() //nolint:errcheck // test
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
+	for sc.Scan() {
+		lines++
+		var m map[string]any
+		if json.Unmarshal(sc.Bytes(), &m) == nil && m["operationId"] == opID {
+			byOperation++
+		}
+	}
+	return lines, byOperation
+}
+
 func fe6aeRestart(t *testing.T, regPath string) *IdPRegistry {
 	t.Helper()
 	fresh := &IdPRegistry{live: make(map[string]IdentityProvider)}

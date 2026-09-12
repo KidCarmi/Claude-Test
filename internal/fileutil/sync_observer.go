@@ -27,3 +27,32 @@ func noteSync(kind, path string) {
 		(*p)(kind, path)
 	}
 }
+
+// syncHook is a TEST-ONLY scheduling + fault seam consulted BEFORE a
+// synchronisation step runs (round 6): it lets a test park a goroutine at
+// the exact point between "the record was found" and "it is synchronised",
+// or make one synchronisation kind fail (a directory fsync error after a
+// rotation, say). A non-nil error aborts that synchronisation with the
+// error. Behaviour-neutral when unset — nil means the step runs untouched.
+var syncHook atomic.Pointer[func(kind, path string) error]
+
+// SetSyncHookForTest installs fn and returns a restore func. kind is the
+// synchronisation about to run: "file", "dir", or "path" (SyncPath, before
+// the path is examined).
+func SetSyncHookForTest(fn func(kind, path string) error) (restore func()) {
+	var old *func(kind, path string) error
+	if fn == nil {
+		old = syncHook.Swap(nil)
+	} else {
+		old = syncHook.Swap(&fn)
+	}
+	return func() { syncHook.Store(old) }
+}
+
+// beforeSync consults the hook; nil when unset.
+func beforeSync(kind, path string) error {
+	if p := syncHook.Load(); p != nil {
+		return (*p)(kind, path)
+	}
+	return nil
+}

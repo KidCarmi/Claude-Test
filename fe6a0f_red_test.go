@@ -30,6 +30,7 @@ package main
 // read. No sleeps.
 
 import (
+	"bufio"
 	"errors"
 	"net/http"
 	"os"
@@ -72,6 +73,30 @@ func (w *fe6afSyncWriter) WriteSync(p []byte) (int, error) {
 		return n, errors.New("fsync: input/output error (injected)")
 	}
 	return n, w.f.Sync()
+}
+
+// FindAndSync is the sink-owned find + synchronise primitive (round 6): the
+// generation is stable for the whole scan + sync (this sink never rotates),
+// and both the file and its directory are synchronised before "found".
+func (w *fe6afSyncWriter) FindAndSync(match func(line []byte) bool) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	f, err := os.Open(w.f.Name()) // #nosec G304 -- test temp path
+	if err != nil {
+		return false, err
+	}
+	defer f.Close() //nolint:errcheck // test
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), 64<<20)
+	for sc.Scan() {
+		if match(sc.Bytes()) {
+			if err := fileutil.SyncPath(w.f.Name()); err != nil {
+				return false, err
+			}
+			return true, fileutil.SyncPath(filepath.Dir(w.f.Name()))
+		}
+	}
+	return false, sc.Err()
 }
 
 func fe6afOpenSyncWriter(t *testing.T, path string) *fe6afSyncWriter {

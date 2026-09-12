@@ -66,6 +66,9 @@ func (r *RotatingFile) WriteSync(p []byte) (int, error) {
 	if n < len(p) {
 		return n, fmt.Errorf("rotating file %s: short write (%d of %d)", r.path, n, len(p))
 	}
+	if err := beforeSync("file", r.path); err != nil {
+		return n, fmt.Errorf("rotating file %s: fsync: %w", r.path, err)
+	}
 	if err := r.file.Sync(); err != nil {
 		return n, fmt.Errorf("rotating file %s: fsync: %w", r.path, err)
 	}
@@ -86,6 +89,9 @@ func (r *RotatingFile) WriteSync(p []byte) (int, error) {
 // retry needs when the record is already readable but its synchronisation
 // is uncertain.
 func SyncPath(path string) error {
+	if err := beforeSync("path", path); err != nil {
+		return fmt.Errorf("sync %s: %w", path, err)
+	}
 	f, err := os.Open(path) // #nosec G304 -- caller-owned path; read-only handle
 	if err != nil {
 		return fmt.Errorf("sync %s: open: %w", path, err)
@@ -93,6 +99,10 @@ func SyncPath(path string) error {
 	kind := "file"
 	if st, serr := f.Stat(); serr == nil && st.IsDir() {
 		kind = "dir"
+	}
+	if err := beforeSync(kind, path); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync %s: %w", path, err)
 	}
 	syncErr := f.Sync()
 	closeErr := f.Close()
