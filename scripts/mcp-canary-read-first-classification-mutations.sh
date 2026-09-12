@@ -389,14 +389,24 @@ run_mutation M15 \
   . "$ADM" \
   's/\tif !canaryClassInForce\(cr\.reviewed, obs\.Current, opClass\) \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitClassNotInForce, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n//'
 
-# M16 — the revalidation treats "the record cannot speak for this target" as agreement. The !ok half
-# is what makes an absent determination a refusal rather than a pass, and dropping it is the
-# permissive-default failure this whole PR exists to prevent, one layer down.
+# M16 — THE BOUNDARY CLASS REVALIDATION IS DISABLED. The predicate answers "still in force" for
+# every request, so step (5b) stops refusing anything: the round-1 P1 is reintroduced at the
+# transaction level, where M15 reintroduces it end to end. Two gates for one defect is deliberate —
+# M15 drives the full G1→G2 sequence through the real gate, M16 pins the transaction itself.
+#
+# It is NOT written as "drop the !ok half", which is what the predicate's most interesting clause
+# would suggest, because that mutation SURVIVES — the fourth instance of this campaign's recurring
+# pattern. `!ok` means `Compare` did not return ReviewedMatches, and every request that can reach
+# (5b) in that state has already been refused by step (5)'s ReviewedOutOfScope branch or, failing
+# that, by the trust probe at (6), which has no live approval for a target nobody reviewed.
+# Removing all three to make it reachable would no longer be a mutation of THIS invariant. So the
+# !ok half stays what it is: defense in depth with no independently reachable case today, kept
+# because the reachability argument depends on two guards that live elsewhere and could move.
 run_mutation M16 \
-  'the boundary revalidation reads an unspeakable record as agreement' \
+  'the boundary class revalidation admits every class' \
   'TestAtomicBinding_I_ClassNotInForceIsRefused' \
   . "$ADM" \
-  's/\tgot, ok := reviewed\.OperationClassFor\(current\)\n\treturn ok \&\& got == opClass/\tgot, ok := reviewed.OperationClassFor(current)\n\treturn !ok \|\| got == opClass/'
+  's/\tgot, ok := reviewed\.OperationClassFor\(current\)\n\treturn ok \&\& got == opClass/\tgot, ok := reviewed.OperationClassFor(current)\n\t_, _ = got, ok\n\treturn true/'
 
 RESOLVE=internal/mcp/rollout/state.go
 EXECUTOR=internal/mcp/execution/executor.go
