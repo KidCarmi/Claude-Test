@@ -953,8 +953,9 @@ code:
   The shape settled at **TWO re-ask sites**, each covering a different unbounded wait and neither
   able to stand in for the other: `roundTrip` before `client.Do` (after the pool wait, which ends
   only when another request finishes, and after DNS resolution), and `pinnedDialTLS` after the TCP
-  connect and the TLS handshake. A connection reused across retry legs never reaches the dialer; a
-  fresh connection spends its connect and handshake time after the first site. The **pool-boundary
+  connect and the TLS handshake. They BRACKET DIFFERENT PHASES — the two waits are already behind
+  the first site and the dialer never sees them, while the connect and the handshake are still
+  ahead of it and only the dialer can sit after them. The **pool-boundary
   site added in round 4 was REMOVED as redundant** — `roundTrip`'s re-ask is strictly later on the
   same path with nothing between them that can have an effect — because a site that can only ever be
   absorbed by another is a liability in a mutation campaign, not defence in depth.
@@ -992,6 +993,23 @@ code:
   than silently passing — the check that exists for exactly this. The lesson recorded last round
   ("a refactor that moves a guard is a reason to re-read the mutation that targeted it") is now
   itself load-bearing: it happened again, in the same file, one round later.
+
+  **ROUND 7 RETURNED NO FINDINGS**, on the head carrying all six remedies. That is the closure
+  evidence for this whole sub-section: six consecutive rounds each found the next place the previous
+  fix did not reach, and the seventh found none. It is evidence and not proof — a clean round bounds
+  what one reviewer found, not what is there — which is why the standing claim below remains what
+  the gates and the campaign establish, not what the review failed to object to.
+
+  Self-audit on that same head corrected a SEVENTH instance of the stale-comment class, found here
+  rather than by review: the two-site rationale claimed the dialer site was needed because "a
+  connection reused across retry legs never reaches the dialer". That reuse cannot occur —
+  `roundTrip` builds its own `http.Transport` per leg and releases its idle connections when the leg
+  ends, so every leg dials. The real reason the sites are independent is that they bracket different
+  phases, which is what both comments and this paragraph now say. The per-leg transport is the
+  stronger fact and is recorded in its place: no leg can inherit a connection another leg opened,
+  which is why the dialer site reaches every leg. Checking it also re-confirmed that a redirect
+  follow-up cannot become a second unguarded physical send on this path, since `RetryFreeLimits`
+  forces `MaxRedirects = 0` — closed in an earlier round for exactly that reason.
 - **P2 — credential conditional (§4):** `CredentialProfile` is a policy obligation, so no-credential
   status is unverifiable until the exact tool + rule are fixed. Corrected.
 - **P1 — durable outcome evidence (§15/§18):** every event is a `PhaseDecision` with no
