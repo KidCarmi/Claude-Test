@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,6 +85,12 @@ func newScopeRig(t *testing.T) *scopeRig {
 	return &scopeRig{rt: rt, capb: capb, g: realAdmissionGate(t, capb), gw: gw, sid: sid, tool: tool, fp: fpHex, gen: gen}
 }
 
+// scopeInstallSeq is the apply timestamp handed to SetConfig. The rollout layer uses it only to
+// stamp a mode-change event, and these installs are all same-mode, so the only property that
+// matters is that it is monotonic — deriving it from the scope revision would be a uint64→int64
+// conversion for no benefit.
+var scopeInstallSeq atomic.Int64
+
 // installScope replaces the Gateway's live scope WITHOUT changing the mode. This is the
 // same-mode update the finding turns on: the rollout layer accepts it (budget and reviewed target
 // are untouched) and the activation generation is deliberately NOT re-begun.
@@ -93,7 +100,7 @@ func installScope(t *testing.T, gw *rollout.State, rev uint64, spec rollout.Scop
 		SelectorSchema: 1, Capability: rollout.CapabilityGateway, Mode: rollout.ModeCanary,
 		ScopeRevision: rev, Scope: spec, ConnectorMode: rollout.ConnectorLocalClient,
 	}
-	if err := gw.SetConfig(cfg, "scope-test", time.Unix(0, int64(rev)).UnixNano()); err != nil {
+	if err := gw.SetConfig(cfg, "scope-test", scopeInstallSeq.Add(1)); err != nil {
 		t.Fatalf("install scope rev %d: %v", rev, err)
 	}
 }

@@ -387,7 +387,7 @@ run_mutation M15 \
   'a read-first decision crosses under an activation whose review says mutating' \
   'TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating' \
   . "$ADM" \
-  's/\tif current, ok := cr\.reviewed\.OperationClassFor\(obs\.Current\); !ok \|\| current != opClass \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitClassNotInForce, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n//'
+  's/\tif !canaryClassInForce\(cr\.reviewed, obs\.Current, opClass\) \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitClassNotInForce, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n//'
 
 # M16 — the revalidation treats "the record cannot speak for this target" as agreement. The !ok half
 # is what makes an absent determination a refusal rather than a pass, and dropping it is the
@@ -396,7 +396,7 @@ run_mutation M16 \
   'the boundary revalidation reads an unspeakable record as agreement' \
   'TestAtomicBinding_I_ClassNotInForceIsRefused' \
   . "$ADM" \
-  's/\tif current, ok := cr\.reviewed\.OperationClassFor\(obs\.Current\); !ok \|\| current != opClass \{/\tif current, ok := cr.reviewed.OperationClassFor(obs.Current); ok \&\& current != opClass \&\& false \{\n\t\t_ = current/'
+  's/\tgot, ok := reviewed\.OperationClassFor\(current\)\n\treturn ok \&\& got == opClass/\tgot, ok := reviewed.OperationClassFor(current)\n\treturn !ok \|\| got == opClass/'
 
 RESOLVE=internal/mcp/rollout/state.go
 EXECUTOR=internal/mcp/execution/executor.go
@@ -418,7 +418,7 @@ run_mutation M18 \
   'the admission boundary ignores the scope hash' \
   'TestScopeInForce_StaleRequestRefusedAfterSameModeScopeUpdate' \
   . "$ADM" \
-  's/\tif scopeNow == nil \|\| resolvedScope == "" \|\| scopeNow\(\) != resolvedScope \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitScopeNotInForce, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n//'
+  's/\tif !canaryScopeInForce\(resolvedScope, scopeNow\) \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitScopeNotInForce, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n//'
 
 # M19 — A MISSING ENVELOPE BECOMES A WILDCARD. The comparison keeps working for requests that
 # carry a hash and silently exempts every request that does not — which is exactly the set that
@@ -427,7 +427,7 @@ run_mutation M19 \
   'a missing scope hash is treated as a match' \
   'TestScopeInForce_MissingEnvelopeFailsClosed' \
   . "$ADM" \
-  's/\tif scopeNow == nil \|\| resolvedScope == "" \|\| scopeNow\(\) != resolvedScope \{/\tif resolvedScope != "" \&\& (scopeNow == nil \|\| scopeNow() != resolvedScope) \{/'
+  's/\tif scopeNow == nil \|\| resolvedScope == "" \{\n\t\treturn false\n\t\}/\tif scopeNow == nil \|\| resolvedScope == "" \{\n\t\treturn true\n\t\}/'
 
 # M20 — GENERATION INSTEAD OF SCOPE IDENTITY. The plausible wrong fix: assume a scope change
 # always mints a new generation, so comparing generations is enough. It is not — a SAME-MODE
@@ -436,7 +436,7 @@ run_mutation M20 \
   'admission compares only the activation generation, not scope identity' \
   'TestScopeInForce_StaleRequestRefusedAfterSameModeScopeUpdate' \
   . "$ADM" \
-  's/\tif scopeNow == nil \|\| resolvedScope == "" \|\| scopeNow\(\) != resolvedScope \{/\tif gen == 0 \{/'
+  's/\tif !canaryScopeInForce\(resolvedScope, scopeNow\) \{/\tif gen == 0 \{/'
 
 # M21 — PRINCIPAL-ONLY RECHECK. The other plausible wrong fix, and the reason hash equality was
 # chosen: re-running membership for the principal closes the headline case and leaves every
@@ -446,7 +446,7 @@ run_mutation M21 \
   'a principal-only recheck misses a tool/server/exclusion scope edit' \
   'TestScopeInForce_AnySelectorEditRefusesTheStaleRequest' \
   . "$ADM" \
-  's/\tif scopeNow == nil \|\| resolvedScope == "" \|\| scopeNow\(\) != resolvedScope \{/\tif cur := scopeNow; cur == nil \|\| resolvedScope == "" \|\| ident.Principal == "" \{/'
+  's/\tif !canaryScopeInForce\(resolvedScope, scopeNow\) \{/\tif cur := scopeNow; cur == nil \|\| resolvedScope == "" \|\| ident.Principal == "" \{/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"

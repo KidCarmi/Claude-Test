@@ -274,7 +274,7 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 	// other class for a tool call), so the two are the same predicate; equality is chosen because
 	// it stays correct if a later phase admits a non-read class, and because it fails closed when
 	// the record cannot speak for the target at all rather than treating silence as agreement.
-	if current, ok := cr.reviewed.OperationClassFor(obs.Current); !ok || current != opClass {
+	if !canaryClassInForce(cr.reviewed, obs.Current, opClass) {
 		return canaryAdmission{Denial: canaryAdmitClassNotInForce, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
 	}
 
@@ -313,7 +313,7 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 	// AND IT IS REQUEST-SCOPED: nothing is latched. An operator narrowing a scope is the system
 	// working, not evidence that the reviewed target drifted — latching the whole experiment for
 	// it would let an ordinary scope edit stop a healthy Canary (the round-15/31 rule).
-	if scopeNow == nil || resolvedScope == "" || scopeNow() != resolvedScope {
+	if !canaryScopeInForce(resolvedScope, scopeNow) {
 		return canaryAdmission{Denial: canaryAdmitScopeNotInForce, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
 	}
 
@@ -334,6 +334,30 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 		Denial: denial, Active: true, Generation: gen, Trusted: true, Outcome: outcome,
 		Latched: !cr.aborter.ExecutionEligible(gen),
 	}
+}
+
+// canaryClassInForce decides step (5b): is the operation class this request carries still the one
+// the activation that will be charged binds to the target in front of it?
+//
+// Pure, and deliberately EQUALITY rather than "read is still read" — see the call site for why.
+// A record that cannot speak for the target at all (!ok) is a refusal, never silent agreement.
+func canaryClassInForce(reviewed canary.ReviewedTargetSet, current canary.ReviewedTarget, opClass policy.OperationClass) bool {
+	got, ok := reviewed.OperationClassFor(current)
+	return ok && got == opClass
+}
+
+// canaryScopeInForce decides step (5c): is the authorization envelope this request resolved under
+// still the one installed?
+//
+// Pure apart from the probe, which reads local control-plane state only (§5). Both degenerate
+// inputs fail CLOSED and neither is a wildcard: a nil probe means this boundary cannot see the
+// scope in force, and an empty resolvedScope means the request never went through the path that
+// stamps one — which is exactly the set that must not be exempted from the comparison.
+func canaryScopeInForce(resolvedScope string, scopeNow canaryScopeProbe) bool {
+	if scopeNow == nil || resolvedScope == "" {
+		return false
+	}
+	return scopeNow() == resolvedScope
 }
 
 // canaryDriftCause is THE ordering rule for what stopped the experiment, shared by every latch
