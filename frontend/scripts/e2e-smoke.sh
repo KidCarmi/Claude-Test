@@ -23,6 +23,14 @@ PROXY_PORT="${CULVERT_E2E_PROXY_PORT:-19080}"
 # change the data-plane premise of every other journey on the AUTH
 # instance. Nobody proxies traffic through it.
 YAML_PORT="${CULVERT_E2E_YAML_PORT:-19093}"
+# FE-6A.1: a FIFTH appliance whose IdP registry file is CORRUPT — quarantined
+# at boot (auth_idp.go Load, R8) — and whose config.yaml carries a legacy
+# `ldap:` block that stays present, active and NOT retired (its registry
+# refuses writes, so no cutover can ever land on it). It exists because the
+# corrupt/quarantined posture is a BOOT-TIME truth: no supported API can put
+# a running appliance into it, and no other instance may carry it (a
+# quarantined registry refuses every IdP write the other journeys need).
+IDPQ_PORT="${CULVERT_E2E_IDPQ_PORT:-19094}"
 WORK="$(mktemp -d)"
 BIN="$WORK/culvert"
 
@@ -32,6 +40,7 @@ cleanup() {
   [ -n "${FRESH_PID:-}" ] && kill "$FRESH_PID" 2>/dev/null || true
   [ -n "${FAIL_PID:-}" ] && kill "$FAIL_PID" 2>/dev/null || true
   [ -n "${YAMLUP_PID:-}" ] && kill "$YAMLUP_PID" 2>/dev/null || true
+  [ -n "${IDPQ_PID:-}" ] && kill "$IDPQ_PID" 2>/dev/null || true
   wait 2>/dev/null || true
   rm -rf "$WORK" 2>/dev/null || true
 }
@@ -204,21 +213,52 @@ EOF2
 # ever dialled. Its only role in the suite is the read-only `yaml` row.
 mkdir -p "$WORK/yamlup"
 cp "$WORK/auth/ui_users.json" "$WORK/yamlup/ui_users.json"
+# FE-6A.1: YAMLUP also carries a legacy YAML `ldap:` block (a `.invalid`
+# directory — never dialled: Stage-1 is Exempt on every seeded roster) and an
+# armed registry file, so fe6a1.spec.ts can commit the ONE operation-
+# identified legacy-LDAP authority cutover through the supported admin API
+# and the read surface can report the durable record. The bind_password is
+# a canary the browser must never receive (bindCredentialConfigured only).
 cat > "$WORK/yamlup/config.yaml" <<EOF2
 log_store_path: $WORK/yamlup/logstore
 upstream:
   proxies:
     - url: http://yaml-parent.invalid:3128
+ldap:
+  url: ldaps://legacy-dc.invalid:636
+  base_dn: dc=legacy,dc=invalid
+  bind_dn: cn=svc,dc=legacy,dc=invalid
+  bind_password: YAMLBINDCANARY-legacy-ldap-never-in-browser
 EOF2
+
+# FE-6A.1 IDPQ: same roster (private copy), a legacy `ldap:` block that stays
+# present/active/not-retired, and a registry file that is NOT valid JSON —
+# quarantined at boot, registry EMPTY + degraded, writes refused.
+mkdir -p "$WORK/idpq"
+cp "$WORK/auth/ui_users.json" "$WORK/idpq/ui_users.json"
+cat > "$WORK/idpq/config.yaml" <<EOF2
+log_store_path: $WORK/idpq/logstore
+ldap:
+  url: ldaps://legacy-dc.invalid:636
+  base_dn: dc=legacy,dc=invalid
+  bind_dn: cn=svc,dc=legacy,dc=invalid
+  bind_password: YAMLBINDCANARY-legacy-ldap-never-in-browser
+EOF2
+printf '[{"id":"torn","name":"torn"' > "$WORK/idpq/idp_profiles.json"
 
 # 2E-A premise: a per-run LOCAL YARA rules directory so the Content Security
 # YARA journey exercises the real engine deterministically (no external
 # service; the dir starts empty and the spec cleans up what it creates).
 mkdir -p "$WORK/auth/yara"
-start_instance AUTH "$UI_PORT" "$PROXY_PORT" -ui-users-file "$WORK/auth/ui_users.json" -config "$WORK/auth/config.yaml" -policy "$WORK/auth/policy.json" -yara-rules-dir "$WORK/auth/yara"
+# FE-6A.1: AUTH and YAMLUP arm a per-run IdP registry file (the supported
+# -idp-profiles-file mechanism) so the registry is PERSISTED and the fe6a1
+# spec can seed profiles through the admin API; the file starts absent
+# (first run — empty registry).
+start_instance AUTH "$UI_PORT" "$PROXY_PORT" -ui-users-file "$WORK/auth/ui_users.json" -config "$WORK/auth/config.yaml" -policy "$WORK/auth/policy.json" -yara-rules-dir "$WORK/auth/yara" -idp-profiles-file "$WORK/auth/idp_profiles.json"
 start_instance FRESH "$FRESH_PORT" "$((PROXY_PORT + 1))" -ui-users-file "$WORK/fresh/ui_users.json" -config "$WORK/fresh/config.yaml"
 start_instance FAIL "$FAIL_PORT" "$((PROXY_PORT + 2))" -ui-users-file "$WORK/failparent/blocker/ui_users.json" -config "$WORK/failcfg.yaml"
-start_instance YAMLUP "$YAML_PORT" "$((PROXY_PORT + 3))" -ui-users-file "$WORK/yamlup/ui_users.json" -config "$WORK/yamlup/config.yaml"
+start_instance YAMLUP "$YAML_PORT" "$((PROXY_PORT + 3))" -ui-users-file "$WORK/yamlup/ui_users.json" -config "$WORK/yamlup/config.yaml" -idp-profiles-file "$WORK/yamlup/idp_profiles.json"
+start_instance IDPQ "$IDPQ_PORT" "$((PROXY_PORT + 4))" -ui-users-file "$WORK/idpq/ui_users.json" -config "$WORK/idpq/config.yaml" -idp-profiles-file "$WORK/idpq/idp_profiles.json"
 
 wait_ready() {
   port="$1"; name="$2"
@@ -237,7 +277,8 @@ wait_ready "$UI_PORT" AUTH
 wait_ready "$FRESH_PORT" FRESH
 wait_ready "$FAIL_PORT" FAIL
 wait_ready "$YAML_PORT" YAMLUP
-echo "e2e-smoke: all four instances ready"
+wait_ready "$IDPQ_PORT" IDPQ
+echo "e2e-smoke: all five instances ready"
 
 # API-establish the retained-history premise (§19): the AUTH instance boots
 # from a FRESH per-instance data root (PR-C1), so the retained-history store
@@ -321,6 +362,7 @@ CULVERT_E2E_BASE_URL="http://127.0.0.1:$UI_PORT" \
 CULVERT_E2E_FRESH_URL="http://127.0.0.1:$FRESH_PORT" \
 CULVERT_E2E_SETUPFAIL_URL="http://127.0.0.1:$FAIL_PORT" \
 CULVERT_E2E_YAML_URL="http://127.0.0.1:$YAML_PORT" \
+CULVERT_E2E_IDPQ_URL="http://127.0.0.1:$IDPQ_PORT" \
 CULVERT_E2E_AUTH_DATA_DIR="$WORK/run-AUTH" \
 CULVERT_E2E_SLUICE_ADDR="127.0.0.1:$SLUICE_PORT" \
 CULVERT_E2E_SLUICE_FP="$SLUICE_FP" \

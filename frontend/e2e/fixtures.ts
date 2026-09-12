@@ -15,6 +15,11 @@ export const SETUPFAIL_URL =
  * entry (see scripts/e2e-smoke.sh). */
 export const YAML_URL =
   process.env["CULVERT_E2E_YAML_URL"] ?? "http://127.0.0.1:19093";
+/** FE-6A.1: the appliance whose IdP registry file is CORRUPT (quarantined
+ * at boot) and whose config.yaml carries a legacy `ldap:` block that is
+ * present, active and not retired (see scripts/e2e-smoke.sh). */
+export const IDPQ_URL =
+  process.env["CULVERT_E2E_IDPQ_URL"] ?? "http://127.0.0.1:19094";
 /** PR-C1: the AUTH appliance's per-instance data root (CULVERT_DATA_DIR,
  * exported by scripts/e2e-smoke.sh) — where its admin_settings.json lives
  * for the on-disk ciphertext needle checks. Defaults to the appliance's
