@@ -86,10 +86,14 @@ type CallOptions struct {
 	//	pinnedDialTLS, after the TLS handshake — after the TCP connect and the handshake, with the
 	//	                               connection established and nothing written.
 	//
-	// A connection reused across retry legs never reaches the dialer; a fresh connection spends its
-	// connect and handshake time after the first site. Both run PER LEG: a retry is a second
-	// physical send, and re-sending on the strength of a check made before an earlier leg is the
-	// same defect one loop iteration over.
+	// Neither substitutes for the other because they BRACKET DIFFERENT PHASES: the pool wait and
+	// the DNS lookup are already behind the first site and the dialer never sees them, while the
+	// connect and the handshake are still ahead of it and only the dialer can sit after them.
+	//
+	// Both run PER LEG: a retry is a second physical send, and re-sending on the strength of a
+	// check made before an earlier leg is the same defect one loop iteration over. The dialer site
+	// reaches every leg because each leg builds its OWN transport and releases its idle connections
+	// when it ends (see roundTrip), so no leg can inherit a connection another leg opened.
 	//
 	// It is deliberately OPAQUE: this package learns nothing about generations, scopes, approvals
 	// or kill state — it runs a predicate the executor owns and reports the error verbatim.

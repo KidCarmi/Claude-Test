@@ -121,9 +121,9 @@ func (c *Client) roundTrip(ctx context.Context, target Target, body []byte, auth
 	// happen before any request byte exists, so the caller's predicate is asked here.
 	//
 	// The second re-ask is in pinnedDialTLS, after the TCP connect and the TLS handshake. Two sites
-	// rather than one because they cover DIFFERENT blocking phases and one cannot stand in for the
-	// other: a connection reused across retry legs never reaches the dialer, and a fresh connection
-	// spends its connect+handshake time after this point.
+	// rather than one because they BRACKET DIFFERENT PHASES and neither can stand in for the other:
+	// the two waits above are already behind this point and the dialer never sees them, while the
+	// connect and the handshake are still ahead of it and only the dialer can sit after them.
 	if preSend != nil {
 		if perr := preSend(); perr != nil {
 			return nil, legFacts{neverSent: true}, perr
