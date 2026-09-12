@@ -342,11 +342,20 @@ run_mutation M12 \
 
 # M13 — THE READ-FIRST GATE IS DISABLED. Classification without a gate that consumes it is
 # decoration: a write-class operation would cross the First-Canary boundary unremarked.
+#
+# It takes TWO edits, and the second one did not exist when this mutation was written. The
+# boundary revalidation added for the Codex P1 (step 5b) requires the request's class to EQUAL the
+# one the activation binds, so it refuses an OpWrite request on its own — and this mutation, which
+# caught the defect before that guard existed, stopped reintroducing anything the moment the guard
+# landed. That is the third time in this campaign a single-edit mutation was neutralised by an
+# independent twin (see M03 and M11); it is defense-in-depth working, and it is also why a survivor
+# is re-read before it is believed.
 run_mutation M13 \
-  'the read-first gate stops refusing a write-class operation' \
+  'the read-first gate stops refusing a write-class operation (BOTH class gates removed)' \
   'TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass' \
   . "$LGATE" \
-  's/\tif !g\.readFirst\(in\.Operation\) \{/\tif false \&\& !g.readFirst(in.Operation) {/'
+  's/\tif !g\.readFirst\(in\.Operation\) \{/\tif false \&\& !g.readFirst(in.Operation) {/' \
+  's/\t\tadmitUnderActivation: func\(now time\.Time, opClass policy\.OperationClass, ident canary\.ExecutionIdentity, trust canaryTrustProbe\) canaryAdmission \{\n\t\t\treturn globalCanaryRuntime\.admitLiveExecution\(capb, now, opClass, ident, trust\)/\t\tadmitUnderActivation: func(now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission \{\n\t\t\t_ = opClass\n\t\t\treturn globalCanaryRuntime.admitLiveExecution(capb, now, policy.OpRead, ident, trust)/'
 
 # M14 — THE PROMOTION IS DROPPED ON THE FLOOR. `in.Operation = op` moves ABOVE the call that may
 # promote it, so the classification is computed correctly and then never reaches the decision tuple.
