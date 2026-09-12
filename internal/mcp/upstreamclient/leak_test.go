@@ -38,20 +38,19 @@ func pinnedTestServer(t *testing.T, h http.HandlerFunc) (*Client, Target, *atomi
 // asserted `live == 0` to mean "no connection was opened", which is equally true of a connection
 // that was opened and closed — a false pass. A leak test wants the gauge; an evidence test wants
 // the counter.
-func pinnedTestServerCounting(t *testing.T, h http.HandlerFunc) (*Client, Target, *atomic.Int64, *atomic.Int64, func()) {
+func pinnedTestServerCounting(t *testing.T, h http.HandlerFunc) (client *Client, tgt Target, live, accepts *atomic.Int64, stop func()) {
 	t.Helper()
 	restore := ssrf.AllowLoopbackForTest()
 
-	var conns atomic.Int64   // LIVE connections: +1 on accept, -1 on close
-	var accepts atomic.Int64 // CUMULATIVE accepts: +1 on accept, monotonic
+	live, accepts = &atomic.Int64{}, &atomic.Int64{}
 	srv := httptest.NewUnstartedServer(h)
 	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
 		switch s {
 		case http.StateNew:
-			conns.Add(1)
+			live.Add(1)
 			accepts.Add(1)
 		case http.StateClosed, http.StateHijacked:
-			conns.Add(-1)
+			live.Add(-1)
 		}
 	}
 	srv.StartTLS()
@@ -68,9 +67,9 @@ func pinnedTestServerCounting(t *testing.T, h http.HandlerFunc) (*Client, Target
 
 	ipStr, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
 	addr, _ := netip.ParseAddr(ipStr)
-	c := newTestClient(t, fixedResolver{addrs: []netip.Addr{addr}})
-	tgt := Target{ServerID: "s1", Endpoint: "https://" + ipStr + ":" + portStr, PinnedIdentity: pin}
-	return c, tgt, &conns, &accepts, func() { srv.Close(); restore() }
+	client = newTestClient(t, fixedResolver{addrs: []netip.Addr{addr}})
+	tgt = Target{ServerID: "s1", Endpoint: "https://" + ipStr + ":" + portStr, PinnedIdentity: pin}
+	return client, tgt, live, accepts, func() { srv.Close(); restore() }
 }
 
 // SEC-MCP-10. roundTrip builds a fresh http.Transport per attempt. A Go
