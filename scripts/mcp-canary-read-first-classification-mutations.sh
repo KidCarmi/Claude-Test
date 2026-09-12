@@ -21,6 +21,11 @@
 #   M11  a stale F1 decision reaches upstream after F1→F2
 #   M12  tools/list is used as a substitute for exact tool execution
 #
+# Two more the campaign added because the code made them reachable:
+#
+#   M13  the read-first gate itself stops refusing a write-class operation
+#   M14  the promotion is computed and then dropped before it reaches the decision tuple
+#
 # A COMPILE FAILURE IS NOT PROOF unless the mutation targets a structural wall whose stated purpose
 # is compile-time prevention (those declare --compile-wall). Every other mutation here is written to
 # compile and change behaviour, so the failure comes from an assertion.
@@ -339,6 +344,19 @@ run_mutation M13 \
   'TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass' \
   . "$LGATE" \
   's/\tif !g\.readFirst\(in\.Operation\) \{/\tif false \&\& !g.readFirst(in.Operation) {/'
+
+# M14 — THE PROMOTION IS DROPPED ON THE FLOOR. `in.Operation = op` moves ABOVE the call that may
+# promote it, so the classification is computed correctly and then never reaches the decision tuple.
+#
+# It is in the campaign because it is the quietest way this feature can stop working: nothing fails
+# to compile, nothing refuses, the classifier is consulted and answers correctly, and every
+# fail-closed gate still passes — the exact reviewed call is simply denied read-first forever, with
+# no signal anywhere. Only a gate that reads the class the EXECUTOR received can see it.
+run_mutation M14 \
+  'the promotion is computed and then dropped (in.Operation assigned before classification)' \
+  'TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall' \
+  ./internal/mcp/runtime "$RTPOLICY" \
+  's/\top := policyOperation\(p\.capability, msg\.Method, req\.ServerID\)\n\tif p\.capability == protocol\.Gateway \{\n\t\tp\.attachGatewayRefs\(&in, req\.ServerID, msg, &op\)\n\t\}\n\tin\.Operation = op/\top := policyOperation(p.capability, msg.Method, req.ServerID)\n\tin.Operation = op\n\tif p.capability == protocol.Gateway \{\n\t\tp.attachGatewayRefs(&in, req.ServerID, msg, &op)\n\t}/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"
