@@ -15,6 +15,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
+	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
 
 // Whole-Canary AUTOMATIC ABORT (First Controlled Canary review, blocker #7).
@@ -614,11 +615,23 @@ func realAdmissionGate(t *testing.T, capb rollout.Capability) *mcpLiveSideEffect
 }
 
 // driftGateInput is one admission input against the seeded controlled target.
+//
+// ResolvedScopeHash is the scope CURRENTLY installed, which is what a genuinely resolved request
+// carries: State.ResolveFor stamps the envelope it decided under, and in these fixtures nothing
+// has changed it since. A fixture that left it empty would be modelling a request that never went
+// through resolution at all — fail-closed at the boundary, and every assertion built on it would
+// be proving the wrong refusal.
 func driftGateInput(sid, tool, fp string, now time.Time) execution.LiveGateInput {
 	return execution.LiveGateInput{
 		Capability: 0, Operation: policy.OpRead, Tenant: ttTenant, Principal: liveRequester,
 		ServerID: sid, ToolName: tool, Fingerprint: fp, Now: now,
+		ResolvedScopeHash: installedScopeHash(),
 	}
+}
+
+// installedScopeHash reports the Gateway scope in force, as State.ResolveFor would have stamped it.
+func installedScopeHash() string {
+	return getMCPRollout().stateFor(rollout.CapabilityGateway).ScopeHash()
 }
 
 // armDriftFixture seeds the real inventory + a real four-eyes live approval and begins a real Canary
@@ -630,7 +643,11 @@ func armDriftFixture(t *testing.T, rt *canaryRuntime, capb rollout.Capability) (
 	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
 	_, clkFn := liveFakeClock()
 	composeToolTrust(t, clkFn)
-	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+	// READ-ONLY, because these tests admit the reviewed request through the real gate and only a
+	// read-first operation crosses it. The class still travels from the GRANT to the activation
+	// exactly as production derives it — the fixture states what the reviewer states, it does not
+	// invent a class of its own.
+	grant := requestAndApproveLiveClassified(t, sid, tool, fpHex, cat.Current().Revision(), tooltrust.ReviewedOpReadOnly)
 	// Arm the activation against the target that was actually seeded and approved: an activation
 	// carries the exact reviewed set, so a fixture that armed against a synthetic target would be
 	// refused as out-of-scope before any drift could be observed.
@@ -642,6 +659,10 @@ func armDriftFixture(t *testing.T, rt *canaryRuntime, capb rollout.Capability) (
 		Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
 		Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
 		ServerIdentity: live.ServerIdentity,
+		// Derived from the GRANT, exactly as reviewedTargetsFromBindings does in production: the
+		// fixture must not invent a class of its own, or it would stop proving that the class an
+		// activation arms with is the class a reviewer actually signed.
+		OperationClass: reviewedClassOrFail(t, grant),
 	}
 	if _, err := rt.beginCanaryActivation(capb, canaryActivationSpec{
 		Budget:          runtimeTestBudget(5),
@@ -1596,4 +1617,16 @@ func TestAutoStop_ActivationGenerationIsStrictlyMonotonic(t *testing.T) {
 			t.Fatalf("SECURITY: demote rolled the generation back %d -> %d", prev, after)
 		}
 	}
+}
+
+// reviewedClassOrFail maps a grant's reviewed determination onto the policy class an activation
+// records, failing the test if the grant carries none. It exists so a fixture cannot quietly
+// arm with OpUnset (which canonicalization refuses) or with a class the grant never stated.
+func reviewedClassOrFail(t *testing.T, a *tooltrust.ToolApproval) policy.OperationClass {
+	t.Helper()
+	class, ok := canary.OperationClassFromReviewed(a.ReviewedOperationClass)
+	if !ok {
+		t.Fatalf("grant carries no reviewed operation class")
+	}
+	return class
 }

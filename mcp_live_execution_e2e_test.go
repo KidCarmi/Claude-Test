@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
+	"github.com/KidCarmi/Culvert/internal/mcp/execution"
 	"github.com/KidCarmi/Culvert/internal/mcp/inspection"
 	"github.com/KidCarmi/Culvert/internal/mcp/mcperr"
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
@@ -32,10 +33,14 @@ func liveRealGate(capb rollout.Capability, trustOK bool) *mcpLiveSideEffectGate 
 		admit:         mcpLiveTierFor(capb).admitExecution,
 		readFirst:     canary.IsReadFirstOperation,
 		trustPrecheck: stubTrustPrecheckEligible,
-		approvalOK:    func(canary.LiveTarget, time.Time) (bool, string) { return trustOK, "" },
-		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return globalCanaryRuntime.admitLiveExecution(capb, now, ident, trust)
+		approvalOK:    func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) { return trustOK, "" },
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return globalCanaryRuntime.admitLiveExecution(capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
+		// The SAME state the executor resolves against (getMCPRollout().gateway), exactly as
+		// production composes it — so the envelope comparison is between two reads of one
+		// scope, never two different states that happen to agree.
+		currentScopeHash:  func() string { return getMCPRollout().stateFor(capb).ScopeHash() },
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
 		note:              noteMCPLiveGateDenied,
@@ -48,6 +53,21 @@ func liveRealGate(capb rollout.Capability, trustOK bool) *mcpLiveSideEffectGate 
 // controlled-trust gate and the given recording upstream. It returns the runtime Config (with
 // Deps.Executor installed). All global state is restored on cleanup.
 func armCanaryLiveTier(t *testing.T, up *recordingUpstream, trustOK bool, budgetTotal int) *mcpruntime.Config {
+	t.Helper()
+	return armCanaryLiveTierGate(t, up, func() *mcpLiveSideEffectGate {
+		return liveRealGate(rollout.CapabilityGateway, trustOK)
+	}, budgetTotal)
+}
+
+// armCanaryLiveTierGate is armCanaryLiveTier with the upstream and the gate supplied explicitly,
+// for the cases that need a double honouring CallOptions.PreSend or a mutable approval verdict.
+// Everything else — the fixed clock, the Canary scope, the arming, the budget — is identical, so
+// the two helpers cannot drift into testing two different appliances.
+//
+// The gate arrives as a FACTORY, not a value, and that is load-bearing: liveRealGate captures
+// mcpLiveTierFor(capb).admitExecution at construction, so a gate built before the reset below
+// binds to the PREVIOUS live tier and refuses every admission with rollout_mode_invalid.
+func armCanaryLiveTierGate(t *testing.T, up execution.UpstreamCaller, newGate func() *mcpLiveSideEffectGate, budgetTotal int) *mcpruntime.Config {
 	t.Helper()
 	resetLiveTierGlobals(t)
 	// This harness composes and activates at a FIXED fake instant (time.Unix(0,1)). Pin the
@@ -71,7 +91,7 @@ func armCanaryLiveTier(t *testing.T, up *recordingUpstream, trustOK bool, budget
 		Upstream: up, Events: liveTestEvents(t),
 		ResponseProfile: inspection.DefaultGatewayProfile(1),
 		Clock:           func() time.Time { return time.Unix(0, 1) },
-		LiveGate:        liveRealGate(rollout.CapabilityGateway, trustOK),
+		LiveGate:        newGate(),
 	}); err != nil {
 		t.Fatalf("compose live tier: %v", err)
 	}

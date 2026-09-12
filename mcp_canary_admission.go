@@ -7,6 +7,7 @@ import (
 	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 )
 
@@ -72,6 +73,16 @@ import (
 // materialization, no DNS, no upstream call, no unbounded or blocking work.
 type canaryTrustProbe func() canaryTrustObservation
 
+// canaryScopeProbe reports the content hash of the rollout scope CURRENTLY in force for this
+// capability. Like canaryTrustProbe it is evaluated INSIDE the activation lock, and the same
+// narrow contract makes that legitimate: one lock-free atomic load of local control-plane state
+// — no network I/O, no credential materialization, no blocking work.
+//
+// It is a probe rather than a value because the comparison has to happen at the moment budget
+// authority is decided. A hash read before the lock is a hash that may already be stale by the
+// time it matters, which is the defect class this whole boundary exists to close.
+type canaryScopeProbe func() string
+
 // canaryTrustObservation is one probe's report of the CURRENT authoritative state of the target a
 // request names. The transaction, not the probe, decides what it means for the activation: the
 // probe reports observations, the transaction compares them against what the activation was
@@ -120,6 +131,12 @@ const (
 	canaryAdmitUntrusted                                 // request-scoped: this request is not authorized
 	canaryAdmitNotReviewed                               // request-scoped: not a target THIS activation was reviewed for
 	canaryAdmitBudget                                    // budget / blast-radius denial
+	// canaryAdmitClassNotInForce — request-scoped: the operation class this request was decided
+	// under is not the class the activation that will be charged binds to this target.
+	canaryAdmitClassNotInForce
+	// canaryAdmitScopeNotInForce — request-scoped: the authorization envelope this request
+	// resolved under is not the one in force now. STALE AUTHORIZATION, never target drift.
+	canaryAdmitScopeNotInForce
 )
 
 // canaryAdmission is the bounded result of one atomic admission transaction. The caller receives
@@ -159,6 +176,8 @@ func (a canaryAdmission) Granted() bool { return a.Denial == canaryAdmitGranted 
 //	execution eligibility          — an already-aborted Canary admits nothing
 //	trust probe                    — evaluated against the activation that will be latched
 //	drift  ⇒ trip(G) + persist     — fail-closed; the request is denied
+//	class in force under G         — the classification the request carries is still the one G binds
+//	scope in force                 — the authorization envelope it resolved under is still installed
 //	untrusted ⇒ deny               — request-scoped; nothing is latched and nothing persisted
 //	reserve(G) + persist           — only a trusted request spends budget
 //
@@ -166,7 +185,7 @@ func (a canaryAdmission) Granted() bool { return a.Denial == canaryAdmitGranted 
 // preserving the gate's prior ordering. The reservation can therefore only ever be made under the
 // SAME generation the trust verdict was computed against: "trust under G, reserve under G+1" is not
 // a race that is unlikely here, it is a state the code cannot express.
-func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 	cr := rt.capRuntime(capb)
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
@@ -224,6 +243,80 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 		return canaryAdmission{Denial: canaryAdmitNotReviewed, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
 	}
 
+	// (5b) THE CLASS THE REQUEST CARRIES MUST BE THE CLASS THIS ACTIVATION BINDS (blocker #4).
+	//
+	// The operation class is decided once, at policy time, from the activation armed AT THAT
+	// INSTANT — which is what makes the policy engine, the activation gate and the live gate read
+	// one value instead of three. But "decided once" is a statement about how many times it is
+	// COMPUTED, not about how long it stays true, and the request that carries it is charged to
+	// whatever activation is current HERE.
+	//
+	// So this sequence was admissible and must not be (Codex P1, PR #1370):
+	//
+	//	T0     G1 is armed, reviewed read-only for tool X at F1. A request is decided: OpRead.
+	//	T+     the request pauses — a credential path, a durable commit, a scheduler stall.
+	//	T++    G1 is demoted. G2 is armed for the SAME tool at the SAME fingerprint, but its
+	//	       review states MUTATING: a reviewer corrected the earlier determination.
+	//	T+++   the request resumes. Gate 2 reads OpRead off its own decision and admits it; the
+	//	       target identity still matches, so nothing drifts; the reservation is charged to G2.
+	//
+	// The call then reaches upstream under a read-first classification that the activation paying
+	// for it does not make. The correction lands in the one window where it matters most.
+	//
+	// This is REVALIDATION, not a second classification, and the distinction is the whole reason
+	// it does not violate the one-classification rule: nothing here computes a class from a
+	// different set of inputs and hopes it agrees. It re-reads the SAME authority — the activation's
+	// immutable reviewed record — under the lock that decides which activation is paying, and
+	// requires the answer to be the one the request is relying on. It is the same discipline the
+	// trust probe and the drift comparison above already follow at this boundary.
+	//
+	// EQUALITY, not "read is still read". Today only OpRead reaches here (gate 2 refuses every
+	// other class for a tool call), so the two are the same predicate; equality is chosen because
+	// it stays correct if a later phase admits a non-read class, and because it fails closed when
+	// the record cannot speak for the target at all rather than treating silence as agreement.
+	if !canaryClassInForce(cr.reviewed, obs.Current, opClass) {
+		return canaryAdmission{Denial: canaryAdmitClassNotInForce, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
+	}
+
+	// (5c) THE AUTHORIZATION ENVELOPE MUST STILL BE THE ONE THAT AUTHORIZED THIS REQUEST.
+	//
+	// Sibling of (5b), and the same defect class one axis over. (5b) asks whether the CLASS the
+	// request carries is still the one this activation binds; this asks whether the SCOPE the
+	// request resolved under is still installed at all. Scope membership is decided once, at
+	// resolution (rollout.Scope.Contains, via the executor's Resolve), and until now nothing
+	// re-read it — so this sequence was admissible and must not be (Codex P1, PR #1370, round 2):
+	//
+	//	T0     G armed. Scope S1 permits principal A. A's request resolves executable under S1.
+	//	T+     the request pauses — a credential path, a durable commit, a scheduler stall.
+	//	T++    a SAME-MODE scope update installs S2: A removed, B added. The reviewed target and
+	//	       the budget are unchanged, so reconcileCanaryRuntimeAfterCommit accepts it and the
+	//	       generation stays G.
+	//	T+++   the request resumes. The target has not moved, so nothing drifts; (5b) agrees,
+	//	       because S2 binds the same target to the same class; and the budget merely COUNTS
+	//	       principals, so A — already counted — passes the blast-radius ceiling too.
+	//
+	// The request then spends authority granted by an envelope that no longer exists.
+	//
+	// WHY EXACT HASH EQUALITY, and not "is the principal still in scope". Re-running membership
+	// would close the principal case and leave every sibling open: a tool removed from the scope,
+	// a server removed, a tenant changed, an exclusion added, a percentage or bucket-salt edit.
+	// The hash covers every selector dimension at once (see rollout.Scope.computeHash), so ONE
+	// comparison closes the whole family — and it fails closed on the dimensions nobody thought
+	// to enumerate, which is the point. A request resolved under one authorization envelope
+	// cannot spend authority under another, full stop.
+	//
+	// AN EMPTY RESOLVED HASH IS A REFUSAL, NOT A WILDCARD. "" is what a request carries when it
+	// never went through State.ResolveFor, and an executing Canary request always does. Treating
+	// it as a match would make the whole check optional for exactly the requests that skipped the
+	// path that stamps it.
+	//
+	// AND IT IS REQUEST-SCOPED: nothing is latched. An operator narrowing a scope is the system
+	// working, not evidence that the reviewed target drifted — latching the whole experiment for
+	// it would let an ordinary scope edit stop a healthy Canary (the round-15/31 rule).
+	if !canaryScopeInForce(resolvedScope, scopeNow) {
+		return canaryAdmission{Denial: canaryAdmitScopeNotInForce, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
+	}
+
 	// (6) Untrusted without drift is request-scoped: the target still matches what was reviewed,
 	// this request simply is not authorized (expired, revoked, never granted). Nothing is latched
 	// and nothing is persisted.
@@ -241,6 +334,30 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 		Denial: denial, Active: true, Generation: gen, Trusted: true, Outcome: outcome,
 		Latched: !cr.aborter.ExecutionEligible(gen),
 	}
+}
+
+// canaryClassInForce decides step (5b): is the operation class this request carries still the one
+// the activation that will be charged binds to the target in front of it?
+//
+// Pure, and deliberately EQUALITY rather than "read is still read" — see the call site for why.
+// A record that cannot speak for the target at all (!ok) is a refusal, never silent agreement.
+func canaryClassInForce(reviewed canary.ReviewedTargetSet, current canary.ReviewedTarget, opClass policy.OperationClass) bool {
+	got, ok := reviewed.OperationClassFor(current)
+	return ok && got == opClass
+}
+
+// canaryScopeInForce decides step (5c): is the authorization envelope this request resolved under
+// still the one installed?
+//
+// Pure apart from the probe, which reads local control-plane state only (§5). Both degenerate
+// inputs fail CLOSED and neither is a wildcard: a nil probe means this boundary cannot see the
+// scope in force, and an empty resolvedScope means the request never went through the path that
+// stamps one — which is exactly the set that must not be exempted from the comparison.
+func canaryScopeInForce(resolvedScope string, scopeNow canaryScopeProbe) bool {
+	if scopeNow == nil || resolvedScope == "" {
+		return false
+	}
+	return scopeNow() == resolvedScope
 }
 
 // canaryDriftCause is THE ordering rule for what stopped the experiment, shared by every latch

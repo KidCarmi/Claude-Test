@@ -112,6 +112,22 @@ type Resolution struct {
 	ShadowOverride  bool
 	Executed        bool
 	BlockReason     mcperr.Reason
+	// ScopeHash identifies the EXACT authorization envelope this resolution was decided
+	// against — the content hash of the active scope, covering every selector dimension
+	// (tenants, servers, tools, fingerprints, principals, agents, clients, groups,
+	// environments, every exclusion set, the operation set, the percentage and bucket salt,
+	// and the scope revision).
+	//
+	// It is a BOUNDARY FACT, not policy semantics: nothing here decides anything, and it is
+	// deliberately absent from policy.DecisionInput. Its only consumer is the live
+	// side-effect admission transaction, which requires it to still equal the scope in force
+	// before it grants budget authority — so a request cannot resolve under one authorization
+	// envelope and spend authority under another.
+	//
+	// It is populated ONLY by State.ResolveFor, from the SAME atomic snapshot that decided
+	// InScope. A Resolution built by the pure Resolve() carries "" — which the admission
+	// boundary treats as fail-closed, never as a match.
+	ScopeHash string
 }
 
 // Resolve computes the effective disposition. It is pure (no I/O, no clock) and

@@ -37,7 +37,7 @@ import (
 type orderingGate struct {
 	admit      bool
 	reason     mcperr.Reason
-	revalidate func() bool
+	revalidate func() mcperr.Reason
 
 	mu       sync.Mutex
 	calls    int
@@ -223,7 +223,7 @@ func TestLiveGate_DenialReachesNoUpstreamAndReleasesNothing(t *testing.T) {
 // rather than ReasonNone, and still releases exactly once.
 func TestLiveGate_RevalidateFalseRefusesBeforeUpstreamAndReleasesOnce(t *testing.T) {
 	up := &fakeUpstream{}
-	gate := &orderingGate{admit: true, revalidate: func() bool { return false }}
+	gate := &orderingGate{admit: true, revalidate: func() mcperr.Reason { return mcperr.ReasonRolloutModeInvalid }}
 	e := newGatedExec(t, stateForMode(t, rollout.ModeCanary), up, gate)
 
 	in := execInput(policy.ActionAllow, false)
@@ -251,7 +251,7 @@ func TestLiveGate_RevalidateFalseRefusesBeforeUpstreamAndReleasesOnce(t *testing
 // live execution entirely.
 func TestLiveGate_RevalidateTrueStillExecutes(t *testing.T) {
 	up := &fakeUpstream{}
-	gate := &orderingGate{admit: true, revalidate: func() bool { return true }}
+	gate := &orderingGate{admit: true, revalidate: func() mcperr.Reason { return mcperr.ReasonNone }}
 	e := newGatedExec(t, stateForMode(t, rollout.ModeCanary), up, gate)
 
 	in := execInput(policy.ActionAllow, false)

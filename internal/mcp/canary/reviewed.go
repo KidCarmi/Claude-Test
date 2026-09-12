@@ -3,6 +3,7 @@ package canary
 import (
 	"sort"
 
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
 
@@ -55,6 +56,21 @@ type ReviewedTarget struct {
 	// ServerIdentity is the registry's pinned verified identity, canonical string form, as
 	// observed at activation review.
 	ServerIdentity string
+	// OperationClass is the operation class the review bound to THIS exact capability at THIS
+	// exact fingerprint — the fact that decides whether a tools/call for it may be read-first.
+	//
+	// It lives here, on the activation's immutable record, rather than in a classifier of its
+	// own, for the reason this whole file exists: two authorities that can answer the same
+	// question about the same tool will eventually disagree, and the disagreement is silent.
+	// The activation already answers "what was this experiment reviewed to execute"; "and with
+	// what semantics" is the same question's second half. A separate classifier keyed on
+	// (server, tool) would additionally be keyed on the WRONG thing — see Compare: the
+	// classification is only ever consulted for a target whose fingerprint still matches, so a
+	// tool that moves carries no determination at all until a new review states one.
+	//
+	// CanonicalizeReviewedTargets refuses a set whose class is unset or outside the reviewable
+	// vocabulary, so an activation cannot arm carrying a target it cannot classify.
+	OperationClass policy.OperationClass
 }
 
 // key is the exact identity a reviewed target is looked up by. Fingerprint is deliberately
@@ -81,7 +97,61 @@ const (
 	ReviewedNoServerIdentity ReviewedReason = "reviewed_target_no_server_identity"
 	ReviewedDuplicate        ReviewedReason = "reviewed_target_duplicate"
 	ReviewedAmbiguous        ReviewedReason = "reviewed_target_ambiguous"
+	// ReviewedNoOperationClass — a target whose reviewed operation class is unset. An
+	// activation that cannot say what a target's semantics were reviewed to be must not arm:
+	// the alternative is a record that later has to be guessed at, and the read-first gate is
+	// where that guess would land.
+	ReviewedNoOperationClass ReviewedReason = "reviewed_target_no_operation_class"
+	// ReviewedBadOperationClass — a class outside the reviewable vocabulary (see
+	// reviewableOperationClasses). Discovery and control are not properties of a TOOL; a
+	// reviewed target carrying one is malformed, not merely non-read.
+	ReviewedBadOperationClass ReviewedReason = "reviewed_target_invalid_operation_class"
 )
+
+// reviewableOperationClasses is the complete set a REVIEW may bind to an exact tool
+// capability. It is deliberately narrower than policy.OperationClass:
+//
+//   - OpUnset is "nobody answered" and is refused on its own named reason;
+//   - OpDiscovery describes a PROTOCOL method (tools/list), not a tool's effect — a tool
+//     reviewed as "discovery" would be a category error, and one that later reached the
+//     read-first gate would pass it (IsReadFirstOperation admits discovery) on a
+//     classification no reviewer meant as "this tool is safe to invoke";
+//   - OpControl is a control-plane operation, likewise not a tool's effect on the world.
+//
+// That leaves the two answers a reviewer is actually being asked for, plus the destructive
+// refinement of the mutating one. None of the three but OpRead is read-first, so admitting
+// OpDestructive costs nothing and lets a reviewed record stay honest about severity.
+func reviewableOperationClasses() []policy.OperationClass {
+	return []policy.OperationClass{policy.OpRead, policy.OpWrite, policy.OpDestructive}
+}
+
+// reviewableOperationClass reports whether c is a class a review may bind to a tool.
+func reviewableOperationClass(c policy.OperationClass) bool {
+	for _, v := range reviewableOperationClasses() {
+		if c == v {
+			return true
+		}
+	}
+	return false
+}
+
+// OperationClassFromReviewed maps a tooltrust review determination onto the policy operation
+// class an activation records. It is the ONE translation between the two vocabularies, so a
+// consumer never re-derives it — and the one place a reader checks to confirm that a server's
+// metadata has no path into a policy class.
+//
+// The mapping is deliberately total and fail-closed: an unstated determination yields
+// (OpUnset, false), and a caller that ignores the bool gets a class canonicalization refuses.
+func OperationClassFromReviewed(c tooltrust.ReviewedOperationClass) (policy.OperationClass, bool) {
+	switch c {
+	case tooltrust.ReviewedOpReadOnly:
+		return policy.OpRead, true
+	case tooltrust.ReviewedOpMutating:
+		return policy.OpWrite, true
+	default:
+		return policy.OpUnset, false
+	}
+}
 
 // ReviewedTargetSet is a canonical, immutable reviewed-target set. The zero value is EMPTY
 // and therefore never grants anything — an activation holding it can execute nothing, which
@@ -163,6 +233,10 @@ func CanonicalizeReviewedTargets(in []ReviewedTarget) (ReviewedTargetSet, Review
 			return ReviewedTargetSet{}, ReviewedBadFormat
 		case t.ServerIdentity == "":
 			return ReviewedTargetSet{}, ReviewedNoServerIdentity
+		case t.OperationClass == policy.OpUnset:
+			return ReviewedTargetSet{}, ReviewedNoOperationClass
+		case !reviewableOperationClass(t.OperationClass):
+			return ReviewedTargetSet{}, ReviewedBadOperationClass
 		}
 		if prev, dup := seen[t.key()]; dup {
 			if prev == t {
@@ -288,4 +362,58 @@ func (s ReviewedTargetSet) Compare(cur ReviewedTarget) ReviewedVerdict {
 		return ReviewedTenantDrift
 	}
 	return ReviewedOutOfScope
+}
+
+// OperationClassFor returns the operation class the review bound to the CURRENT target, and
+// whether the activation's record can speak for it at all.
+//
+// This is the read-first classifier, and its entire correctness argument is the first line:
+// it delegates to Compare, so it answers ONLY for a target that still matches the reviewed
+// record exactly — same tenant, same server, same tool, same pinned server identity, same
+// fingerprint AND same fingerprint format. Every other verdict yields (OpUnset, false).
+//
+// That is what makes the classification FINGERPRINT-BOUND rather than name-bound. A tool
+// reviewed read-only at F1 that republishes as F2 produces ReviewedFingerprintDrift here, so
+// F2 inherits nothing: it is not "read-only until someone notices", it is unclassified, and
+// an unclassified target is not read-first. The same holds for a moved trust anchor
+// (ReviewedServerIdentityDrift), a tool that changed tenants (ReviewedTenantDrift), a target
+// the activation was never reviewed for (ReviewedOutOfScope), and the zero set — the last of
+// which is why an activation that somehow armed with nothing reviewed classifies nothing.
+//
+// It is PURE and reads NOTHING but the caller-supplied current target and the immutable
+// reviewed record: no clock, no catalog, no request, no server-supplied metadata. The caller
+// is responsible for building `cur` from AUTHORITATIVE inventory state — that is the property
+// the root's classifier seam exists to guarantee, and no amount of care here can substitute
+// for it.
+//
+// cur.OperationClass is IGNORED. Compare does not read it, and it must not: the class is an
+// output of this function, never an input to the match. A caller that could supply a class
+// and have it honoured would be classifying its own request.
+func (s ReviewedTargetSet) OperationClassFor(cur ReviewedTarget) (policy.OperationClass, bool) {
+	if s.Compare(cur) != ReviewedMatches {
+		return policy.OpUnset, false
+	}
+	for i := range s.targets { // index-based: ReviewedTarget carries a 32-byte digest
+		if s.targets[i].key() == cur.key() {
+			return s.targets[i].OperationClass, true
+		}
+	}
+	// Unreachable: Compare returned ReviewedMatches, which it does only from inside the loop
+	// over this same slice on this same key. Kept as the fail-closed answer rather than a
+	// panic — a classifier is the wrong place to be right about being unreachable.
+	return policy.OpUnset, false
+}
+
+// ReviewedReadFirst reports whether the CURRENT target is bound, by the activation's immutable
+// reviewed record, to a read-only reviewed class.
+//
+// It exists so the one question the read-first gate actually asks is answered in one place,
+// as a boolean, rather than each consumer comparing a class it fetched. The difference is not
+// cosmetic: `class != policy.OpWrite` and `ok || class == policy.OpRead` are both plausible
+// mis-readings of OperationClassFor that admit an UNSET class, and this predicate makes both
+// impossible to write by accident. Both halves are required — a class is read-first only when
+// the record could speak for the target AND said read.
+func (s ReviewedTargetSet) ReviewedReadFirst(cur ReviewedTarget) bool {
+	class, ok := s.OperationClassFor(cur)
+	return ok && class == policy.OpRead
 }

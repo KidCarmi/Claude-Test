@@ -56,7 +56,12 @@ type mcpLiveSideEffectGate struct {
 	// the activation lock. It can only ever produce a request-scoped verdict — it never reports
 	// drift and never latches anything, which is exactly why it does not need to be attributed to
 	// an activation generation.
-	approvalOK func(tgt canary.LiveTarget, now time.Time) (satisfied bool, driftCode string)
+	// It also takes the CLASS IN FORCE, because a satisfying approval is not enough: an approval
+	// carries its own reviewed operation class, and a later approval for the same exact fingerprint
+	// can state a DIFFERENT one — a reviewer correcting an earlier determination. Matching "any live
+	// grant" would then let a tool the current review calls MUTATING keep executing read-first on
+	// the strength of the activation's older immutable record (Codex P1, PR #1370, round 5).
+	approvalOK func(tgt canary.LiveTarget, class policy.OperationClass, now time.Time) (satisfied bool, driftCode string)
 	// admitUnderActivation is THE atomic activation-bound admission transaction: it verifies an
 	// armed activation, captures its exact generation, evaluates the trust probe, latches an
 	// authoritative drift against that generation, and reserves the budget — all under one
@@ -66,7 +71,16 @@ type mcpLiveSideEffectGate struct {
 	// itself. That composition was the defect: no ordering of unlocked reads can establish that the
 	// generation being latched was continuously active across the trust observation, and Codex
 	// rounds 15-19 produced a P1 against every arrangement of them.
-	admitUnderActivation func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission
+	//
+	// It takes the request's DECIDED operation class so the transaction can revalidate it against
+	// the activation it is about to charge — see step (5b) in admitLiveExecution. The class is not
+	// recomputed here; it is the one the decision carries, handed to the only place that knows
+	// which activation is paying.
+	admitUnderActivation func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission
+	// currentScopeHash reports the rollout scope in force for this capability. It is handed to
+	// the transaction as a PROBE so the read happens inside the activation lock, at the moment
+	// budget authority is decided — a hash read out here could already be stale by then.
+	currentScopeHash func() string
 	// releaseBudget returns the in-flight concurrency slot for a reservation made under gen.
 	releaseBudget func(gen uint64)
 	// generationCurrent is the final-boundary revalidation: it reports whether the activation
@@ -76,6 +90,13 @@ type mcpLiveSideEffectGate struct {
 	generationCurrent func(gen uint64) bool
 	// note records a bounded denial reason for metrics/telemetry (never a secret). Optional.
 	note func(reason mcperr.Reason)
+	// now is the clock the FINAL-BOUNDARY revalidation reads. It is deliberately separate from
+	// LiveGateInput.Now, which is stamped when the gate input is built: the boundary predicate may
+	// run much later — after the durable commit, after credential materialization, and after an
+	// unbounded wait for an upstream pool slot — and an approval's validity must be judged at the
+	// instant it is about to be spent, not at the instant the request was admitted. Nil ⇒ the
+	// admission instant is reused, which is the pre-existing behaviour and never falsely refuses.
+	now func() time.Time
 }
 
 var _ execution.LiveExecutionGate = (*mcpLiveSideEffectGate)(nil)
@@ -91,12 +112,14 @@ func newMCPLiveSideEffectGate(capb rollout.Capability) *mcpLiveSideEffectGate {
 		readFirst:     canary.IsReadFirstOperation,
 		trustPrecheck: mcpLiveTrustPrecheck,
 		approvalOK:    mcpLiveApprovalSatisfied,
-		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return globalCanaryRuntime.admitLiveExecution(capb, now, ident, trust)
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return globalCanaryRuntime.admitLiveExecution(capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
+		currentScopeHash:  func() string { return getMCPRollout().stateFor(capb).ScopeHash() },
 		releaseBudget:     func(gen uint64) { globalCanaryRuntime.releaseCanaryExecution(capb, gen) },
 		generationCurrent: func(gen uint64) bool { return globalCanaryRuntime.generationActive(capb, gen) },
 		note:              noteMCPLiveGateDenied,
+		now:               func() time.Time { return canaryNow() },
 	}
 }
 
@@ -152,7 +175,7 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 	// through an atomic pointer), so the §5 hazard is removed rather than relocated, and the
 	// admission transaction can evaluate the whole predicate under one lock exactly as it did
 	// before the split.
-	adm := g.admitUnderActivation(in.Now, canary.ExecutionIdentity{
+	adm := g.admitUnderActivation(in.Now, in.Operation, in.ResolvedScopeHash, g.currentScopeHash, canary.ExecutionIdentity{
 		Principal: in.Principal,
 		Tool:      in.ToolName,
 		Server:    in.ServerID,
@@ -191,7 +214,7 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 			FingerprintFormat: live.Target.FingerprintFormat,
 			ServerIdentity:    live.ServerIdentity,
 		}
-		trusted, _ := g.approvalOK(live.Target, in.Now)
+		trusted, _ := g.approvalOK(live.Target, in.Operation, in.Now)
 		return canaryTrustObservation{Found: true, Current: cur, Trusted: trusted}
 	})
 	// The denial class is read from an EXPLICIT field, never inferred from which other field is
@@ -227,6 +250,23 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		// the target it named is not one this experiment is authorized to execute.
 		releaseAdmit()
 		return deny(mcperr.ReasonLiveTrustRevalidationFailed)
+	case canaryAdmitScopeNotInForce:
+		// The authorization envelope this request resolved under is no longer installed — a
+		// scope edit landed between resolution and the boundary. Request-scoped: NOTHING is
+		// latched, because an operator changing a scope is the system working, not evidence
+		// that the reviewed target drifted. Reported as out-of-scope, which is literally what
+		// happened from the caller's side: it is not in the scope that is in force.
+		releaseAdmit()
+		return deny(mcperr.ReasonRolloutOutOfScope)
+	case canaryAdmitClassNotInForce:
+		// The activation that would be charged does not bind this request's operation class to this
+		// target — a read-first decision taken under an activation that has since been replaced by
+		// one whose review says otherwise. Request-scoped (nothing latched: the TARGET did not
+		// move, the review of it changed), and reported with the read-first gate's own bounded
+		// reason, because from the caller's side that is exactly what happened — this operation is
+		// not read-first here.
+		releaseAdmit()
+		return deny(mcperr.ReasonRolloutOutOfScope)
 	case canaryAdmitAborted, canaryAdmitBudget:
 		releaseAdmit()
 		return deny(mcperr.ReasonRolloutBudgetExhausted)
@@ -283,11 +323,94 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		Admit:                true,
 		ReservationID:        resID,
 		ActivationGeneration: gen,
-		Revalidate: func() bool {
-			if g.generationCurrent == nil {
-				return true // no revalidation seam wired ⇒ preserve prior behavior (never falsely refuse)
+		Revalidate: func() mcperr.Reason {
+			// THREE AUTHORITIES, ALL RE-ASKED AT THE FINAL BOUNDARY — and the answer NAMES which
+			// one was withdrawn, because the same withdrawal must be diagnosed identically whether
+			// admission or the boundary caught it (Codex P2, PR #1370, round 4).
+			//
+			// Admission is one atomic transaction under cr.mu, but none of these three facts is
+			// frozen by it. The scope is published under rollout.State's OWN lock (swapMu), which
+			// this transaction does not hold and must not (taking a rollout lock inside the
+			// activation lock would invert the order every other caller uses). The approval lives
+			// in the durable tooltrust store, which an operator can revoke at any moment. The
+			// generation moves on a demotion. So admission can only ever prove all three were in
+			// force AT THAT INSTANT — and between that instant and Upstream.Call the request still
+			// has to get through credential materialization, the durable decision commit, and an
+			// unbounded wait for an upstream pool slot.
+			//
+			// That window is exactly why the kill state is re-read here (PREREQ-MCP-KILL-1), and a
+			// withdrawn envelope, a demoted generation and a revoked four-eyes grant all deserve
+			// the same treatment (Codex P1, PR #1370, rounds 3 and 4).
+			//
+			// Serializing any of these with the admission transaction was the alternative remedy
+			// and is deliberately NOT taken: it would make an operator's scope edit or revocation
+			// block behind every in-flight admission, and it would still leave the post-admission
+			// window open, since the request continues long after the transaction returns.
+			// Re-asking at the boundary closes the window instead of narrowing it.
+			//
+			// ORDER: generation, then scope, then approval — and the order is part of the
+			// contract, not a performance choice. Asking "is there still an activation" FIRST
+			// matches admission's own precedence and is what makes the other two answers
+			// meaningful: they describe a live experiment rather than reporting on one that has
+			// already ended. See the generation branch below for the leaving-live window that
+			// makes a scope-first order report a diagnosis a fresh request would never get
+			// (Codex P3, PR #1370, round 6 — this line still said scope-first after the order
+			// was changed, which is exactly the stale instruction beside a security predicate
+			// that invites a future maintainer to restore the defect).
+			//
+			// The durable approval store is consulted last, so it is reached only for a request
+			// the other two still authorize.
+			//
+			// No "unwired ⇒ allow" escape hatch is needed on the scope half, unlike the generation
+			// seam: an admitted request has already passed step (5c), which fails closed on a nil
+			// probe and on an empty envelope, so neither degenerate input can reach this closure.
+			// GENERATION FIRST, matching admission's own precedence (step (1): no activation owns
+			// the transaction at all). A Canary→non-live commit un-arms the tier and publishes the
+			// new scope BEFORE demoteCanary invalidates the generation, so in that window BOTH are
+			// withdrawn — and a scope-first order would report `rollout_out_of_scope` for an
+			// already-admitted request while a fresh request in the identical final state is
+			// refused `rollout_mode_invalid` by the unarmed lifecycle gate. That is the same
+			// diagnosis-depends-on-timing defect the reason plumbing was added to remove, one layer
+			// in (Codex P2, PR #1370, round 5). Asking "is there still an activation" first makes
+			// the scope and approval answers meaningful: they describe a LIVE experiment.
+			if g.generationCurrent != nil && !g.generationCurrent(gen) {
+				return mcperr.ReasonRolloutModeInvalid
 			}
-			return g.generationCurrent(gen)
+			if !canaryScopeInForce(in.ResolvedScopeHash, g.currentScopeHash) {
+				return mcperr.ReasonRolloutOutOfScope
+			}
+			// THE APPROVAL IS RE-ASKED AT A FRESH INSTANT, AND MUST STILL STATE THIS CLASS. Round 22
+			// moved the approval lookup INTO the admission transaction so a revocation racing the
+			// lock could not be admitted, and recorded in this file that "the final boundary re-reads
+			// tool freshness, generation and kill state, not approval status". That residual is this
+			// branch: a grant revoked or expired after admission — while the request waited on the
+			// durable commit or a pool slot — otherwise still authorized an irreversible call.
+			// ToolStillCurrent does not cover it (it checks catalog freshness), and neither the scope
+			// nor the generation moves when an approval is withdrawn.
+			//
+			// The CLASS is part of the question for the reason on approvalOK's declaration: an
+			// approval states its own reviewed class, so a later approval for the same fingerprint
+			// can correct an earlier determination, and "some live grant exists" would let the
+			// correction be ignored for the rest of the activation's window.
+			//
+			// The target is re-resolved from the SAME lock-free pointer-published inventory the
+			// admission probe used, never from a request-supplied claim, and the time is read NOW
+			// rather than at admission — an approval that expired while this request waited must not
+			// be spent on the strength of how fresh it was when the wait began.
+			if g.approvalOK != nil && g.trustPrecheck != nil {
+				live := g.trustPrecheck(in.Tenant, in.ServerID, in.ToolName, in.Fingerprint)
+				if !live.Eligible {
+					return mcperr.ReasonLiveTrustRevalidationFailed
+				}
+				at := in.Now
+				if g.now != nil {
+					at = g.now()
+				}
+				if ok, _ := g.approvalOK(live.Target, in.Operation, at); !ok {
+					return mcperr.ReasonLiveTrustRevalidationFailed
+				}
+			}
+			return mcperr.ReasonNone
 		},
 		Release: func() {
 			g.releaseBudget(gen)
@@ -336,11 +459,14 @@ func (g *mcpLiveSideEffectGate) AdmitAuxiliary(_ execution.LiveGateInput) execut
 	}
 	return execution.LiveGateDecision{
 		Admit: true,
-		Revalidate: func() bool {
+		Revalidate: func() mcperr.Reason {
 			if g.admitOpen == nil {
-				return true // no revalidation seam wired ⇒ preserve the admission decision
+				return mcperr.ReasonNone // no revalidation seam wired ⇒ preserve the admission decision
 			}
-			return g.admitOpen()
+			if !g.admitOpen() {
+				return mcperr.ReasonRolloutModeInvalid
+			}
+			return mcperr.ReasonNone
 		},
 		Release: releaseAdmit,
 	}
@@ -535,14 +661,31 @@ func mcpLiveTrustPrecheck(tenant, serverID, toolName, decisionFP string) liveTru
 //
 // The driftCode result is retained as always-empty so the seam's shape is unchanged for callers
 // and a future authorization-scoped drift has somewhere to go; nothing produces one today.
-func mcpLiveApprovalSatisfied(tgt canary.LiveTarget, now time.Time) (satisfied bool, driftCode string) {
+func mcpLiveApprovalSatisfied(tgt canary.LiveTarget, class policy.OperationClass, now time.Time) (satisfied bool, driftCode string) {
 	if mcpToolTrust == nil {
 		return false, ""
 	}
 	for _, a := range mcpToolTrust.activeLiveApprovals(now) {
-		if canary.SatisfiesLiveExecution(a, tgt, now) == canary.TrustOK {
-			return true, ""
+		if canary.SatisfiesLiveExecution(a, tgt, now) != canary.TrustOK {
+			continue
 		}
+		// THE SATISFYING APPROVAL MUST STATE THE CLASS IN FORCE.
+		//
+		// An approval carries its own reviewed operation class, and nothing stops a later approval
+		// for the SAME exact fingerprint from stating a different one — that is precisely how a
+		// reviewer corrects an earlier determination. Accepting "any live grant" meant the
+		// activation's older immutable record kept saying OpRead while the only live approval said
+		// MUTATING, and both admission and the boundary let it execute read-first (Codex P1,
+		// PR #1370, round 5).
+		//
+		// A class the approval cannot state at all (unset, or outside the reviewable vocabulary)
+		// fails CLOSED here rather than being read as agreement, the same discipline the activation
+		// gate applies at arming time.
+		got, ok := canary.OperationClassFromReviewed(a.ReviewedOperationClass)
+		if !ok || got != class {
+			continue
+		}
+		return true, ""
 	}
 	// No satisfying approval: request-scoped. This request simply is not authorized (expired,
 	// revoked, never granted).

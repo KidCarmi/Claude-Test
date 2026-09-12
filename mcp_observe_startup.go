@@ -284,6 +284,13 @@ func assembleGatewayConfig(sc mcpObserveStartupConfig, modes gatewayModes, tlsCf
 		// Read BEFORE the rollout resolution and compared under the activation lock at latch
 		// time. It narrows which activation an observation may stop; it never proves one.
 		CanaryGeneration: canaryGenerationForCapability,
+		// Blocker #4: the ONLY way a tools/call may be classified read-first. The runtime hands
+		// this seam nothing but (capability, serverID, toolName) — no request, no arguments, no
+		// server-supplied metadata — and the root resolver answers from the immutable reviewed
+		// activation snapshot compared against the CURRENT authoritative target. Nil (the
+		// disabled-by-default posture, and every path that does not compose this config) leaves
+		// every tools/call at OpWrite exactly as before.
+		CanaryOperationClass: canaryReadFirstClassifier,
 	}
 	if modes.senderProfile.RequiresDPoP() {
 		deps.Replay = senderconstraint.NewReplayCache(limits.DefaultAuth(), nil)

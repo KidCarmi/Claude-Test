@@ -344,12 +344,17 @@ type RequestInput struct {
 	Fingerprint              FingerprintDigest
 	FingerprintFormatVersion uint16
 	Purpose                  Purpose
-	CatalogRevision          uint64
-	ServerRevision           uint64
-	RequestedBy              string
-	Reason                   string
-	TicketRef                string
-	ExpiresAt                *time.Time
+	// ReviewedOperationClass is what the review determined about this exact capability's
+	// effect on the world (see reviewed_operation.go). It is REQUIRED for a
+	// PurposeLiveExecution request and optional for a shadow one — a shadow approval never
+	// authorizes a side effect, so there is nothing for the class to widen there.
+	ReviewedOperationClass ReviewedOperationClass
+	CatalogRevision        uint64
+	ServerRevision         uint64
+	RequestedBy            string
+	Reason                 string
+	TicketRef              string
+	ExpiresAt              *time.Time
 }
 
 // CreateRequest records a new pending trust request. It validates every bound,
@@ -404,6 +409,7 @@ func (s *Store) CreateRequest(in RequestInput) (*ToolApproval, error) {
 		CatalogRevision:          in.CatalogRevision,
 		ServerRevision:           in.ServerRevision,
 		Purpose:                  in.Purpose,
+		ReviewedOperationClass:   in.ReviewedOperationClass,
 		Status:                   StatusPending,
 		RequestedBy:              in.RequestedBy,
 		RequestedAt:              now,
@@ -999,6 +1005,15 @@ func (in RequestInput) validate() error {
 	// in CreateRequest (and again at Approve, from ApprovedAt, the authoritative instant).
 	if in.Purpose == PurposeLiveExecution && in.ExpiresAt == nil {
 		return mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.request", "live_execution approval requires an explicit expiry")
+	}
+	// A live_execution request MUST also state what the review determined about the tool's
+	// effect. An approval that can authorize a REAL upstream side effect and never answered
+	// "does this mutate?" is exactly the silence a later consumer would have to guess at, and
+	// the only safe guess — mutating — is better made a refusal here, where an operator can
+	// fix it, than a surprise at the read-first gate. Either determination is accepted; only
+	// the absence of one is refused (fail closed).
+	if in.Purpose == PurposeLiveExecution && !in.ReviewedOperationClass.Stated() {
+		return mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.request", "live_execution approval requires an explicit reviewed operation class")
 	}
 	if len(in.Reason) > maxReasonBytes {
 		return mcperr.New(mcperr.ReasonAdminRequestInvalid, "tooltrust.request", "reason exceeds byte bound")

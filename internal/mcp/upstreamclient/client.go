@@ -69,6 +69,35 @@ type CallOptions struct {
 	// set only from inside the broker materialization callback and lives only for the
 	// duration of the request.
 	AuthHeader string
+	// PreSend, when non-nil, is the caller's authority predicate, re-asked at every point on this
+	// path where an unbounded wait has just ended and nothing has yet been written. A non-nil error
+	// aborts that leg with no request bytes on any connection.
+	//
+	// IT EXISTS BECAUSE THE WAITS HERE ARE UNBOUNDED. The executor's boundary guards (tool drift,
+	// rollout authority, emergency kill) run immediately before Call, and the code there said
+	// nothing sits between them and the send — true of that function, false of this one. A kill, a
+	// demotion, a scope withdrawal or an approval revocation can land, return successfully, and the
+	// waiting request then sends anyway (Codex P1, PR #1370, rounds 4 and 6).
+	//
+	// TWO SITES, covering different phases, neither able to stand in for the other:
+	//
+	//	roundTrip, before client.Do  — after `pool.acquire` (which ends only when ANOTHER request
+	//	                               finishes) and after DNS resolution.
+	//	pinnedDialTLS, after the TLS handshake — after the TCP connect and the handshake, with the
+	//	                               connection established and nothing written.
+	//
+	// Neither substitutes for the other because they BRACKET DIFFERENT PHASES: the pool wait and
+	// the DNS lookup are already behind the first site and the dialer never sees them, while the
+	// connect and the handshake are still ahead of it and only the dialer can sit after them.
+	//
+	// Both run PER LEG: a retry is a second physical send, and re-sending on the strength of a
+	// check made before an earlier leg is the same defect one loop iteration over. The dialer site
+	// reaches every leg because each leg builds its OWN transport and releases its idle connections
+	// when it ends (see roundTrip), so no leg can inherit a connection another leg opened.
+	//
+	// It is deliberately OPAQUE: this package learns nothing about generations, scopes, approvals
+	// or kill state — it runs a predicate the executor owns and reports the error verbatim.
+	PreSend func() error
 	// AttemptID names the ONE potential physical tool invocation this call carries
 	// (review §5). It is emitted as a request header so the controlled recording
 	// upstream can attribute each received invocation to exactly one authorized
@@ -137,6 +166,10 @@ func (c *Client) Call(ctx context.Context, target Target, method string, params 
 		return nil, markNeverSent(err)
 	}
 	defer release()
+	// The pool slot is held from here, so the wait above — which is unbounded in time, since it
+	// ends only when another request finishes — is over. The caller's predicate is re-asked further
+	// down, in roundTrip and again in the TLS dialer; see CallOptions.PreSend for why there and not
+	// here (nothing between this line and those sites can have a side effect).
 
 	budget := c.cfg.Limits.MaxReadRetries()
 	// Retry-free mode is decided ONCE, outside the loop, from immutable validated
@@ -213,7 +246,7 @@ func (c *Client) attempt(ctx context.Context, target Target, method string, para
 	if err != nil {
 		return nil, legFacts{}, err
 	}
-	raw, facts, err := c.roundTrip(ctx, target, body, opts.AuthHeader, opts.AttemptID)
+	raw, facts, err := c.roundTrip(ctx, target, body, opts.AuthHeader, opts.AttemptID, opts.PreSend)
 	if err != nil {
 		return nil, facts, err
 	}

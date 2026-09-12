@@ -118,6 +118,7 @@ func TestRequest_LiveExecutionRequiresExplicitExpiry(t *testing.T) {
 	s := newTestStore(t, clk)
 	in := goodRequest()
 	in.Purpose = PurposeLiveExecution
+	in.ReviewedOperationClass = ReviewedOpMutating
 	in.ExpiresAt = nil
 	_, err := s.CreateRequest(in)
 	mustReason(t, err, mcperr.ReasonAdminRequestInvalid)
@@ -129,6 +130,7 @@ func TestRequest_LiveExecutionTTLCeiling(t *testing.T) {
 	s := newTestStore(t, clk)
 	in := goodRequest()
 	in.Purpose = PurposeLiveExecution
+	in.ReviewedOperationClass = ReviewedOpMutating
 	tooLong := clk.t.Add(MaxLiveExecutionApprovalTTL + time.Hour)
 	in.ExpiresAt = &tooLong
 	_, err := s.CreateRequest(in)
@@ -142,6 +144,7 @@ func TestRequest_LiveExecutionWithExpirySucceeds(t *testing.T) {
 	s := newTestStore(t, clk)
 	in := goodRequest()
 	in.Purpose = PurposeLiveExecution
+	in.ReviewedOperationClass = ReviewedOpMutating
 	exp := clk.t.Add(time.Hour)
 	in.ExpiresAt = &exp
 	a, err := s.CreateRequest(in)
@@ -160,6 +163,7 @@ func TestRequest_LiveExecutionWithExpirySucceeds(t *testing.T) {
 func liveRequest(clk *fakeClock) RequestInput {
 	in := goodRequest()
 	in.Purpose = PurposeLiveExecution
+	in.ReviewedOperationClass = ReviewedOpMutating
 	exp := clk.t.Add(time.Hour)
 	in.ExpiresAt = &exp
 	return in
@@ -195,6 +199,7 @@ func TestLiveApprove_TTLCeilingFromApprovedAt(t *testing.T) {
 	s := newTestStore(t, clk)
 	in := goodRequest()
 	in.Purpose = PurposeLiveExecution
+	in.ReviewedOperationClass = ReviewedOpMutating
 	exp := clk.t.Add(23 * time.Hour)
 	in.ExpiresAt = &exp
 	a, err := s.CreateRequest(in)
@@ -1493,5 +1498,62 @@ func TestLoad_ReasonOnlyTerminalEvidenceFailsClosed(t *testing.T) {
 		if err := s.Load(); err == nil {
 			t.Fatalf("[%s] a record carrying a terminal reason without a decider must fail closed", name)
 		}
+	}
+}
+
+// TestRequest_LiveExecutionRequiresReviewedOperationClass pins the blocker-#4 issuance rule: a
+// live_execution approval is the artifact a reviewer signs, and it may not be signed without
+// stating what the reviewed tool's semantics are. The refusal is a request-shape error, so an
+// approval that cannot answer "read-only or mutating?" never becomes an approval at all —
+// which is what stops the question from being asked later, at the read-first gate, by something
+// with no authority to answer it.
+func TestRequest_LiveExecutionRequiresReviewedOperationClass(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	s := newTestStore(t, clk)
+	in := goodRequest()
+	in.Purpose = PurposeLiveExecution
+	exp := clk.t.Add(time.Hour)
+	in.ExpiresAt = &exp
+	in.ReviewedOperationClass = ReviewedOpUnset
+	_, err := s.CreateRequest(in)
+	mustReason(t, err, mcperr.ReasonAdminRequestInvalid)
+}
+
+// TestRequest_ShadowEvaluationNeedsNoReviewedOperationClass is the CONTROL for the rule above.
+// Shadow evaluation never executes anything, so requiring a reviewed semantic determination for
+// it would be ceremony — and ceremony is how a required field becomes a field everyone fills in
+// with whatever passes. The requirement is scoped to the purpose that can reach an upstream.
+func TestRequest_ShadowEvaluationNeedsNoReviewedOperationClass(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	s := newTestStore(t, clk)
+	in := goodRequest()
+	if in.Purpose != PurposeShadowEvaluation {
+		t.Fatalf("fixture drifted: want shadow purpose, got %v", in.Purpose)
+	}
+	in.ReviewedOperationClass = ReviewedOpUnset
+	if _, err := s.CreateRequest(in); err != nil {
+		t.Fatalf("shadow request must not require a reviewed operation class, got %v", err)
+	}
+}
+
+// TestApproval_CarriesTheReviewedOperationClass pins that the class survives onto the stored
+// artifact rather than being validated and discarded. The activation snapshot is derived from
+// the approval, so a class that did not reach ToolApproval would leave the canary record with
+// nothing to bind — and the canonicalizer would refuse the activation rather than silently
+// arm, which is correct but would make the field useless.
+func TestApproval_CarriesTheReviewedOperationClass(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	s := newTestStore(t, clk)
+	in := goodRequest()
+	in.Purpose = PurposeLiveExecution
+	exp := clk.t.Add(time.Hour)
+	in.ExpiresAt = &exp
+	in.ReviewedOperationClass = ReviewedOpReadOnly
+	a, err := s.CreateRequest(in)
+	if err != nil {
+		t.Fatalf("create live request: %v", err)
+	}
+	if a.ReviewedOperationClass != ReviewedOpReadOnly {
+		t.Fatalf("approval must carry the reviewed class, got %v", a.ReviewedOperationClass)
 	}
 }

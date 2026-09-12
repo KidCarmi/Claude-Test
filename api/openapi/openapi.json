@@ -18662,6 +18662,14 @@
                     "maxLength": 512,
                     "type": "string"
                   },
+                  "reviewed_operation_class": {
+                    "description": "What the REVIEW determined about this exact tool at this exact fingerprint. REQUIRED for live_execution — an approval that may authorize a real side effect must say what it reviewed — and ignored for shadow_evaluation, which executes nothing. read_only is the ONLY value that can later let a tools/call be classified read-first under a Canary activation, and it is a determination about the TOOL CONTRACT for every admissible invocation, not about one request: a tool whose effect depends on its arguments is mutating. It is never derived from the server (an MCP readOnlyHint is input to the review, never runtime authority), from the tool name, or from the request. An unrecognised value is rejected; there is no permissive default.",
+                    "enum": [
+                      "read_only",
+                      "mutating"
+                    ],
+                    "type": "string"
+                  },
                   "server_id": {
                     "description": "Nonempty; backend limit is 256 UTF-8 BYTES (maxLength counts characters).",
                     "maxLength": 256,

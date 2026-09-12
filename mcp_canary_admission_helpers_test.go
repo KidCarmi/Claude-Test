@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
@@ -14,8 +15,8 @@ import (
 //
 // It deliberately reproduces the real transaction's ordering — drift beats untrusted beats budget —
 // so a test using it cannot pass against a gate that reads the result fields in the wrong order.
-func stubAdmitUnderActivation(outcome canary.BudgetOutcome, gen uint64) func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
-	return func(_ time.Time, _ canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+func stubAdmitUnderActivation(outcome canary.BudgetOutcome, gen uint64) func(time.Time, policy.OperationClass, string, canaryScopeProbe, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+	return func(_ time.Time, _ policy.OperationClass, _ string, _ canaryScopeProbe, _ canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 		trusted, drift := true, ""
 		if trust != nil {
 			obs := trust()
@@ -61,6 +62,11 @@ func testReviewedTarget() canary.ReviewedTarget {
 		Fingerprint:       tooltrust.FingerprintDigest{0xF1},
 		FingerprintFormat: 1,
 		ServerIdentity:    reviewedIdentity,
+		// READ-ONLY: the canonical synthetic target stands in for THE First-Canary experiment, and
+		// the only reviewed class that experiment can execute is read-only — a tool call reaches
+		// the side-effect gate as OpRead or not at all. A test that needs a mutating target to be
+		// refused states that explicitly rather than inheriting it here.
+		OperationClass: policy.OpRead,
 	}
 }
 

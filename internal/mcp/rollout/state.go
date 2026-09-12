@@ -124,7 +124,7 @@ func (s *State) ShadowInScope(subj Subject) bool {
 // executor calls at the seam; it reads state lock-free and delegates to Resolve.
 func (s *State) ResolveFor(subj Subject, action ActionKind, hardFailure bool, hardReason mcperr.Reason, obligationsSatisfied bool) Resolution {
 	a := s.cur.Load()
-	return Resolve(ResolveInput{
+	r := Resolve(ResolveInput{
 		Mode:                 a.mode,
 		InScope:              a.scope.Contains(subj),
 		ShadowEnabled:        a.hasShadow,
@@ -134,6 +134,12 @@ func (s *State) ResolveFor(subj Subject, action ActionKind, hardFailure bool, ha
 		HardReason:           hardReason,
 		ObligationsSatisfied: obligationsSatisfied,
 	})
+	// The authorization envelope this resolution was decided against, taken from the SAME
+	// snapshot `a` that decided InScope just above. Reading it from a second s.cur.Load()
+	// would be the exact time-of-check/time-of-use gap the admission boundary exists to
+	// close — the request could then be stamped with an envelope that never authorized it.
+	r.ScopeHash = a.scope.Hash()
+	return r
 }
 
 // SetConfig validates cfg, compiles its scopes, and atomically installs it. It is
