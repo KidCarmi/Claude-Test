@@ -631,24 +631,31 @@ func TestBoundaryAuthority_ScopeWithdrawnDuringThePoolWaitRefusesBeforeSend(t *t
 // boundary still permitted execution as read-first, and the correction never landed for the rest
 // of the activation's window (Codex P1, PR #1370, round 5).
 func TestBoundaryAuthority_ApprovalMustStateTheClassInForce(t *testing.T) {
-	r := newReviewedRig(t)
-	_, cat := mcpInventory.sharedInventory()
-	// A genuine, current, four-eyes live approval that states MUTATING for the exact target.
-	requestAndApproveLive(t, r.sid, r.tool, r.fp1, cat.Current().Revision())
+	// Built WITHOUT newReviewedRig on purpose: that rig issues its own read-only approval, and the
+	// scenario is precisely the one where the read-only grant that armed the activation is gone and
+	// the MUTATING correction is the only live approval left.
+	_ = withCanaryRuntimeTestEnv(t, "v9.9.9")
+	resetInventory(t)
+	resetExecDeps(t)
+	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
+	_, clkFn := liveFakeClock()
+	composeToolTrust(t, clkFn)
+	requestAndApproveLiveClassified(t, sid, tool, fpHex, cat.Current().Revision(), tooltrust.ReviewedOpMutating)
+	now := mcpToolTrust.now()
 
 	tgt := canary.LiveTarget{
-		Tenant: ttTenant, ServerID: r.sid, ToolName: r.tool,
-		Fingerprint: mustDigest(t, r.fp1), FingerprintFormat: 1,
+		Tenant: ttTenant, ServerID: sid, ToolName: tool,
+		Fingerprint: mustDigest(t, fpHex), FingerprintFormat: 1,
 	}
 
 	// CONTROL FIRST: the approval is real and satisfies its own class. Without this the refusal
 	// below could be a matcher that has simply stopped matching anything.
-	if ok, _ := mcpLiveApprovalSatisfied(tgt, policy.OpWrite, r.now); !ok {
+	if ok, _ := mcpLiveApprovalSatisfied(tgt, policy.OpWrite, now); !ok {
 		t.Fatal("premise: the MUTATING approval must satisfy a MUTATING request — otherwise this " +
 			"test proves nothing about the class comparison")
 	}
 
-	if ok, _ := mcpLiveApprovalSatisfied(tgt, policy.OpRead, r.now); ok {
+	if ok, _ := mcpLiveApprovalSatisfied(tgt, policy.OpRead, now); ok {
 		t.Fatal("SECURITY: an approval stating MUTATING satisfied a read-first request — a " +
 			"reviewer's correction would then be ignored for the rest of the activation's window")
 	}

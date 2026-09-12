@@ -105,9 +105,18 @@ func requestLiveClassified(t *testing.T, sid, tool, fpHex string, catRev uint64,
 }
 
 // requestAndApproveLive drives the full four-eyes live path and returns the active grant.
+// The default is READ-ONLY, because that is the only shape a First-Canary tool call can actually
+// take end to end: it reaches the side-effect gate as OpRead or not at all, the activation binds
+// that class, and — since round 5 — the satisfying approval must STATE it.
+//
+// It used to default to MUTATING, which was an internally inconsistent fixture: the rigs arm a
+// READ-ONLY activation (observedReviewedTarget), and in production an activation's class comes FROM
+// an approval, so "read-only activation, mutating approval" is a state the product cannot reach.
+// Nothing noticed while the approval matcher ignored the class. A fixture that needs a genuinely
+// mutating approval asks for one explicitly below.
 func requestAndApproveLive(t *testing.T, sid, tool, fpHex string, catRev uint64) *tooltrust.ToolApproval {
 	t.Helper()
-	return requestAndApproveLiveClassified(t, sid, tool, fpHex, catRev, tooltrust.ReviewedOpMutating)
+	return requestAndApproveLiveClassified(t, sid, tool, fpHex, catRev, tooltrust.ReviewedOpReadOnly)
 }
 
 // requestAndApproveLiveClassified is requestAndApproveLive with the reviewed determination stated.
