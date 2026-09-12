@@ -19,8 +19,9 @@ every mandatory NO/CONDITIONAL row in §25, though the mapping is grouped, not s
 witness-reconciliation row folds under blocker 7 and also depends on blockers 1 and 6): (1) no controlled upstream reachable AND usable under the supported
 production trust model (a provisioned HTTPS+SPKI target must ALSO speak a protocol that permits Culvert's sessionless calls — a standard initialization-requiring server is rejected because the client drives no MCP initialize/version/session lifecycle); (2) the production activation preflight cannot return `Ready:true` on a stock
 node; (3) no governed production arming entry point — `armLiveTier` has no production caller, so an
-operator cannot arm the tier; (4) the read-first classifier refuses the one-exact-tool call and
-discovery cannot bind one tool; (5) the machine gate does not enforce exactly-one tool/principal
+operator cannot arm the tier; (4) **CLOSED** — the read-first classifier refused the one-exact-tool
+call and discovery cannot bind one tool; an exact reviewed fingerprint-bound `tools/call` now
+classifies `OpRead` while every unknown/unreviewed/drifted case stays non-read (§25a); (5) the machine gate does not enforce exactly-one tool/principal
 (`MaxCanaryTools`/`MaxCanaryPrincipals` = 2); (6) the budget does not bound physical upstream
 invocations (idempotent read retries send the POST up to ~3× per reservation); and — genuine PRODUCT
 DEFECTS, not merely capability gaps — (7) whole-Canary auto-abort is unwired for the eight declared
@@ -211,16 +212,23 @@ asserting it is NOT used). Read-first is enforced twice: the scope fact `ScopeRe
 `canary.IsReadFirstOperation` (`operation.go:25-33`) wired at `mcp_live_gate.go:96-100`. A `tools/call`
 defaulting to `OpWrite` is refused read-first at the boundary.
 
-**Blocker (Codex P1) — the read-first classifier makes the "one exact harmless tool call"
-unexecutable today.** `policyOperation` classifies ONLY `tools/list` as `OpDiscovery`; every
-`tools/call` is `OpWrite`, which the live gate rejects at its read-first check. So a "one exact
-tool" call — the experiment's §3 shape — cannot pass read-first. The only read-first-admissible
-method, `tools/list`, resolves no specific tool, so `liveGateInput` supplies an empty tool
-name/fingerprint and the exact-tool live-approval revalidation (`mcpLiveTrustRevalidate`) fails.
-Consequently NO request can execute the claimed one exact harmless tool even after the §5 target and
-§13 activation inputs are provided: a **shipped finer operation classifier** (proving a specific
-tool `OpRead`) OR a **separately designed discovery-trust path** is an additional, independent
-prerequisite. This is a first-class blocker in §26, not "a further constraint."
+~~**Blocker (Codex P1) — the read-first classifier makes the "one exact harmless tool call"
+unexecutable today.**~~ **CLOSED (blocker 4) — the exact read-first tool classification.** The
+finding was correct and is preserved verbatim for the record: `policyOperation` classified ONLY
+`tools/list` as `OpDiscovery`, every `tools/call` as `OpWrite`, and the live gate rejected the
+latter at its read-first check — so the experiment's §3 shape could not pass read-first, while the
+one read-first-admissible method resolved no specific tool and therefore failed the exact-tool
+live-approval revalidation.
+
+The remedy taken is the FIRST of the two the finding named — a finer operation classifier — and
+deliberately not the second. A discovery-trust path would have made `tools/list` stand in for an
+invocation, which is §7's explicit prohibition: blocker 4 is not closed by pretending a listing is
+the live tool execution.
+
+The conservative default is UNCHANGED. `tools/call` is still `OpWrite` unless one narrow,
+authoritative fact says otherwise, and that fact is the activation's own immutable reviewed record
+(blocker 7's snapshot, now carrying the reviewed operation class beside the fingerprint it was
+reviewed at). See §25a for the full closure argument and proofs.
 
 ---
 
@@ -731,6 +739,9 @@ code:
 
 - **P1 — read-first classifier (§6):** a `tools/call` is `OpWrite` and refused read-first; discovery
   (`tools/list`) cannot bind one exact tool for the live-approval revalidation. Confirmed.
+  **Since CLOSED as blocker 4 (§25a)** by the first of the two remedies the finding named — a finer
+  classifier bound to the reviewed fingerprint. The second, a discovery-trust path, was deliberately
+  refused: it would make `tools/list` stand in for the live tool execution.
 - **P2 — credential conditional (§4):** `CredentialProfile` is a policy obligation, so no-credential
   status is unverifiable until the exact tool + rule are fixed. Corrected.
 - **P1 — durable outcome evidence (§15/§18):** every event is a `PhaseDecision` with no
@@ -796,7 +807,7 @@ BLOCKED-vs-FAILED note in §26).
 | Exactly one tenant / principal / server / tool / fingerprint, read-only, synthetic | Specifiable — YES |
 | Exactly one NODE, enforced PREVENTIVELY (before or at DP apply) | **NO — `ScopeSpec` has no node dimension, `pushAll` delivers to every `Dist.Nodes()` entry, `mcpPullDistributor.Push` discards its node argument (shared `ConfigSnapshot` reaches every DP), and the apply path has no intended-node check; a post-apply ack is detective, not preventive (§3/§13, blocker 15)** |
 | Tool requires no production credential | **CONDITIONAL — unverifiable until tool + rule fixed (§4)** |
-| A read-first-admissible one-exact-tool operation exists | **NO — classifier refuses `tools/call`; discovery cannot bind one tool (§6)** |
+| A read-first-admissible one-exact-tool operation exists | ~~**NO**~~ **YES (blocker 4 CLOSED, §25a)** — an exact reviewed fingerprint-bound `tools/call` classifies `OpRead`; the conservative `OpWrite` default and the `tools/list`-binds-no-tool fact are both unchanged, so nothing was widened to get here (§6) |
 | Supported upstream trust model for a controlled server available today | **NO** (§5) |
 | A provisioned target is USABLE (MCP initialize/version/session lifecycle) | **NO — client sends no `initialize`/version/session; a spec-compliant server rejects sessionless calls (§5)** |
 | Reviewed fingerprint bound to the OBSERVED live peer (not operator-declared) | **NO — seeded from operator JSON; identity verified against its own register stamp; no non-test `Discovery.Discover` caller (§7, blocker 11)** |
@@ -826,11 +837,55 @@ blocker 8 narrowed but still OPEN. The other eleven are untouched and the §26 v
 
 ---
 
-## §25a Blocker 5, 6 and 7 closure, blocker 8 status (post-review evidence)
+## §25a Blocker 4, 5, 6 and 7 closure, blocker 8 status (post-review evidence)
 
 This section records the ONLY status changes made to the frozen ledger since it was adopted:
-blockers 5, 6 and 7 are CLOSED and blocker 8 is narrowed but still OPEN. The other eleven blockers
+blockers 4, 5, 6 and 7 are CLOSED and blocker 8 is narrowed but still OPEN. The other ten blockers
 are untouched, the baseline is still fifteen, and nothing here changes the §26 verdict.
+
+### Blocker 4 — CLOSED
+
+The closure bar was: the machine must be able to prove that ONE exact reviewed fingerprint-bound
+`tools/call` classifies as `OpRead`, while every unknown, unreviewed, hinted, drifted or ambiguous
+case stays non-read and fail-closed. The governing invariant, stated once:
+
+> a `tools/call` may become `OpRead` only when Culvert itself holds authoritative reviewed evidence
+> that exact tenant / exact server / exact tool / exact fingerprint / exact fingerprint format /
+> exact reviewed operation class = read-only. Unknown or ambiguous ⇒ `OpWrite` / deny.
+
+| Clause | Evidence |
+|---|---|
+| Culvert's own authority, never the server's | `tooltrust.ReviewedOperationClass` is stated by a REVIEWER on the four-eyes live approval; `ParseReviewedOperationClass` is strict and total, so no hint spelling (`true`, `readonly`, `readOnlyHint`) parses into a determination (`TestReadFirstClass_C03_ServerHintIsNotAnInputToClassification`). A live approval that states no class is refused at creation (`TestRequest_LiveExecutionRequiresReviewedOperationClass`), with the shadow control beside it |
+| No NEW authority — the fact lives on the existing reviewed record | `canary.ReviewedTarget.OperationClass`, on blocker 7's activation-bound immutable snapshot. There is no separate classifier store that could disagree with the activation about the same tool |
+| Bound to the FINGERPRINT, not the name | `ReviewedTargetSet.OperationClassFor` delegates to `Compare` and answers only on `ReviewedMatches`, so F2 inherits nothing from F1 (`TestReadFirstClass_C04_F2DoesNotInheritF1ReadClassification`). The FORMAT version is part of the binding (`TestReadFirstClass_FingerprintFormatIsPartOfTheBinding`) |
+| The caller cannot assert its own class | `Compare` never reads `cur.OperationClass`; an asserted class is ignored and the reviewed one returned (same test) |
+| No unstated class can arm | `CanonicalizeReviewedTargets` refuses `OpUnset` (`reviewed_target_no_operation_class`) and any class outside the reviewable vocabulary (`reviewed_target_invalid_operation_class`) — so `OpDiscovery`/`OpControl` can never be bound to a TOOL and reach the read-first predicate (`TestReadFirstClass_C02`, `TestReadFirstClass_C08`) |
+| Arguments cannot upgrade authority | the classifier seam takes `(capability, serverID, toolName)` and nothing else; the root resolves fingerprint, format, tenant and identity from its own authoritative inventory. Pinned on the TYPE (`TestReadFirstWall_ClassifierTakesNoServerSuppliedInput`), because a behavioural test can only show an input is ignored, not that there is none to give |
+| Unknown / unusable targets are never classified | `TestReadFirstClass_C06_UnreviewedToolIsNeverRead`, `TestReadFirstClass_C07_UnusableServerIsNotClassified`, `TestReadFirstRuntime_UnknownToolIsNeverClassified` |
+| Discovery stays discovery | `tools/list` keeps `OpDiscovery` and is never routed through the classifier at all (`TestReadFirstRuntime_DiscoveryNeverReachesTheClassifier`) — blocker 4 is not closed by substituting a listing for an invocation |
+| ONE classification, flowing through the decision tuple | `TestReadFirstWall_OperationClassHasExactlyOneClassificationSite` (AST: exactly one site in `internal/mcp/runtime` may write a tool call's class) and `TestReadFirstParity_ClassIsReadFromTheDecisionAndNowhereElse` (AST: `liveGateInput` reads `in.Input.Operation.Class`), with the behavioural parity across the whole class vocabulary in `TestReadFirstParity_GateReceivesTheDecidedClass`. So the policy engine, the activation gate and the live side-effect gate read ONE value rather than three that agree today |
+| Durable across restart, immutable within a generation | `canaryRuntimeSchemaVersion` 3; a record that cannot state its class from its own bytes does not restore armed (`TestReadFirstClass_DurableRecordWithoutAClassDoesNotRestoreArmed`), a restart restores the same classification (`C11`), and a same-generation update that changes only the class is refused (`C12`) |
+| The freshness boundary is not weakened | `TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2` — a decision computed under F1 does not reach upstream once the target is F2; the promotion is not the last word |
+| Anti-vacuity (MANDATORY positive controls) | `TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead`, `TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall` and `TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass` — a classifier that answered "no" to everything would satisfy every negative gate while being the feature deleted |
+| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 13 mutations, 13 caught, 0 survived, 0 skipped |
+
+**Two things the campaign taught, recorded because they change how a survivor should be read.**
+A single-edit mutation of the stale-decision boundary SURVIVED, and the reason was not a missing
+gate: that boundary is guarded twice and independently (the trust precheck revalidates the
+decision's fingerprint; the approval binds the exact tool it was granted for), so removing either
+alone changes nothing observable. The same held for the unset-class guard, which is enforced both by
+its own named case and by the reviewable-vocabulary membership test. A mutation that never managed
+to break anything is not evidence of a hole — but it is also not evidence of a gate, so both were
+rewritten to remove BOTH guards.
+
+**Default posture unchanged.** No activation arms in the shipped build, so the classifier answers
+`false` for every request and every `tools/call` stays `OpWrite` — byte-identical to the behaviour
+before this work.
+
+**What this does NOT close.** A read-first-EXECUTABLE classification says nothing about whether a
+controlled upstream exists (blocker 1), the activation preflight can reach `Ready:true` (2), an
+operator can arm (3), the target is `catalog.Usable` (13), or the request resolves to an exact
+policy ALLOW with satisfiable obligations (14). Those remain open and untouched.
 
 ### Blocker 5 — CLOSED
 
@@ -858,9 +913,10 @@ Runtime scope matching still denies an out-of-scope principal/server/tool
 closure argument: the argument is that the broader scope never activates.
 
 **What this does NOT close.** Exactly one tool being AUTHORIZED BY SCOPE says nothing about whether
-`tools/call` for it is read-first EXECUTABLE (blocker 4, the operation-classifier problem), nor that
-the target is `catalog.Usable`, resolves to an exact policy ALLOW, or has satisfiable obligations
-(blockers 13/14). Those remain open and untouched.
+`tools/call` for it is read-first EXECUTABLE (blocker 4, the operation-classifier problem — since
+CLOSED separately, see "Blocker 4" above; it was open when this closure was written), nor that the
+target is `catalog.Usable`, resolves to an exact policy ALLOW, or has satisfiable obligations
+(blockers 13/14). Those last two remain open and untouched.
 
 ### Blocker 6 — CLOSED
 
@@ -1800,10 +1856,11 @@ every mandatory NO/CONDITIONAL row in §25, so closing ALL of them is necessary 
 blocker 7's auto-abort and also depends on blockers 1 and 6).
 
 **Post-adoption status (see §25a).** The baseline remains **fifteen**; the list below is preserved
-as adopted, and nothing is renumbered or deleted. Four entries have changed status since:
-**blocker 5 is CLOSED**, **blocker 6 is CLOSED**, **blocker 7 is CLOSED**, and **blocker 8 is
-narrowed but still OPEN**. Eleven are untouched, and the verdict above is unchanged — closing
-blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the prohibition.
+as adopted, and nothing is renumbered or deleted. Five entries have changed status since:
+**blocker 4 is CLOSED**, **blocker 5 is CLOSED**, **blocker 6 is CLOSED**, **blocker 7 is CLOSED**,
+and **blocker 8 is narrowed but still OPEN**. Ten are untouched, and the verdict above is unchanged
+— closing blockers 4, 5, 6 and 7 removes four of fifteen reasons a GO is forbidden, not the
+prohibition.
 
 1. **No controlled upstream reachable AND usable under the supported production trust model (§5).**
    The only documented controlled inventory fails closed on scheme (`mcp+https://`), host (private
@@ -1818,9 +1875,22 @@ blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the 
    `Budget` fail-closed.
 3. **No governed production arming entry point (§12).** `armLiveTier` has no production caller (only
    tests invoke it), so an operator cannot arm the tier in the shipped process.
-4. **The read-first classifier refuses the one-exact-tool call (§6).** `tools/call` is `OpWrite`
-   (refused read-first); `tools/list` binds no exact tool for the live-approval revalidation. A
-   finer classifier or a designed discovery-trust path is required.
+4. ~~**The read-first classifier refuses the one-exact-tool call (§6).**~~ **CLOSED** — exact
+   read-first tool classification. The finding stands as written: `tools/call` WAS `OpWrite` with
+   no exception, and `tools/list` binds no exact tool. Of the two remedies it named, the finer
+   classifier was taken and the discovery-trust path was deliberately NOT — substituting a listing
+   for an invocation is the thing §7 forbids.
+
+   A `tools/call` now becomes `OpRead` if and only if the ACTIVE activation's immutable reviewed
+   record binds this exact (tenant, server, tool), at this exact fingerprint AND fingerprint
+   format, under this exact pinned server identity, to a four-eyes reviewed read-only class.
+   Everything else — no activation, no reviewed entry, a moved fingerprint, a moved identity, a
+   moved tenant, an unstated class, an unknown or unusable tool — stays `OpWrite`. The reviewed
+   class rides on blocker 7's activation snapshot rather than a classifier of its own, so there is
+   no second authority to diverge from it; the seam the runtime is handed carries
+   `(capability, serverID, toolName)` and nothing a request, an argument or a server could supply.
+   Classification happens once and flows through the existing decision tuple, walled structurally
+   at both ends. See §25a for the full closure argument and proofs.
 5. ~~**The machine gate does not enforce exactly-one tool/principal (§10).**~~ **CLOSED** — the
    exact First-Canary scope gate. `MaxCanaryTools`/`MaxCanaryPrincipals` are still 2 and are
    deliberately UNCHANGED: they bound the Canary ARCHITECTURE, which a later graduation phase may
@@ -1873,8 +1943,9 @@ blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the 
 
    **Scope discipline.** This establishes only that exactly one tool is AUTHORIZED BY SCOPE. It does
    NOT establish that `tools/call` for that tool is read-first executable (blocker 4 — the
-   operation-classifier problem, untouched), nor that the target is `catalog.Usable`, exact-policy
-   ALLOWed, or has satisfiable obligations (blockers 13/14, untouched).
+   operation-classifier problem, untouched by THIS entry and closed separately in its own), nor that
+   the target is `catalog.Usable`, exact-policy ALLOWed, or has satisfiable obligations
+   (blockers 13/14, untouched).
 6. ~~**The budget does not bound physical upstream invocations (§9).**~~ **CLOSED** — see
    "Blocker 6 closure" below. Idempotent read retries could send the POST ~3× per single budget
    reservation; the Canary path is now retry-free and the bound is proven at the wire.
@@ -2008,9 +2079,11 @@ blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the 
    BEFORE any user rule is evaluated (`internal/mcp/policy/engine.go:132-135`). `ApproveLive`
    DELIBERATELY performs no promotion ("live trust never materializes `catalog.Usable`",
    `mcp_tooltrust.go:413-450`), and the only non-test `catalog.Promote` callers are the shadow
-   `promoteFor` path (`mcp_tooltrust.go:536`, `:629`). So even with blockers 1–12 closed and a finer
-   read-first classifier (blocker 4), every exact-tool request is hard-denied at the quarantine
-   override. Catalog USABILITY must be a mandatory criterion: a `shadow_evaluation` approval (which
+   `promoteFor` path (`mcp_tooltrust.go:536`, `:629`). So even with blockers 1–12 closed and the
+   finer read-first classifier now shipped (blocker 4, CLOSED), every exact-tool request is still
+   hard-denied at the quarantine override — a read-first CLASSIFICATION is not catalog USABILITY,
+   and the classifier deliberately declines to speak for an unusable target rather than substituting
+   for this control. Catalog USABILITY must be a mandatory criterion: a `shadow_evaluation` approval (which
    promotes) or another governed promotion path must make the exact tool `catalog.Usable`.
 14. **The exact request must resolve to an ALLOW-class decision with satisfiable obligations (§4/§13).**
    Closing the credential condition (blocker 9) by choosing a rule with no `CredentialProfile` does not
