@@ -95,6 +95,38 @@ everything else is triaged below with a suggested PR and required tests for foll
 > in a committed placeholder row at the START of a sweep), and at six
 > occurrences it is well past overdue.
 
+**2026-09-11 — CHAOS-65 sweep (the OCSP revocation path). FIRST SWEEP TO CLAIM
+ITS ID BEFORE WRITING CODE.** The id was committed as a placeholder row in this
+file as commit one, which is the remedy the header above reaches twice
+independently after ten collisions. It cost one line and the id never moved.
+The finding: every input this engine acts on is written by **the party being
+checked** — the responder URLs come out of the peer's own AIA extension, so the
+peer picks which responder is asked, how many, and therefore what comes back —
+and nothing in the pipeline treated that as hostile. Seven defects, six closed.
+The sharpest is a **complete revocation bypass performed by the certificate's
+own subject**: `ParseResponse` with a nil certificate takes `Responses[0]` and
+never compares the serial, so a genuine CA-signed `good` about any other
+certificate of the same issuer — obtained by asking that CA about any live cert
+and keeping the bytes — was accepted as this one's verdict, and a revoked
+certificate went through. Alongside it: no freshness check at all on a protocol
+that carries no nonce over plaintext HTTP (replay), `unknown` treated as a pass
+while *unreachable* failed closed, a verdict cache keyed on the serial alone
+(cross-issuer confusion, both directions), the peer-controlled responder URL
+reached with `http.DefaultClient` and no guard (SSRF, redirects followed), and
+an unbounded responder walk under a **per-responder** timeout that let one
+certificate park a request goroutine for ~17 minutes while aiming 200 outbound
+POSTs wherever it named. The seventh is the reason the other six survived
+unnoticed: the control is wired only to the shared upstream transport, so on a
+Secure Web Gateway it runs on the `https://`-parent-proxy handshake and never
+on inspected HTTPS — enabled, logged, panelled, and consulted by almost
+nothing. That one is **reported, not wired**: closing it fail-closed would make
+every inspected HTTPS request depend on outbound port 80 to arbitrary responder
+hosts, a fleet-wide outage one checkbox away. Governance note: row **CA-6**
+recorded the SSRF caveat in July and scored the row **✓ (+2 caveats), L/M** —
+the evidence column named the property that makes all seven reachable, and the
+verdict looked past it. Re-scored **H** and split. See §35, rows CA-6/CA-6b and
+OCSP-1…OCSP-10, and `docs/operator/ocsp-revocation-checking.md`.
+
 **2026-09-02 — CHAOS-58 sweep (the directory that accepts and then stops answering).**
 CHAOS-47 solved the *unreachable* directory: fail closed, arm a provider-wide cooldown, deny
 without dialing, recover on evidence. This sweep asked which faults can actually ARM that
@@ -966,7 +998,17 @@ Severity key: **C**ritical / **H**igh / **M**edium / **L**ow / **✓** handled w
 | CA-17 | **Cluster-CA install path SELF-DEADLOCKS**: `ImportCA` held `ca.mu.Lock()` across `onRotate`→`rebuildCPCertPool`→`AllCACertsPEM`→`RLock` AND across `CurrentConfigSnapshot()`→`CACertFingerprint`→`RLock`; `CleanupSecondary` repeated the first. Non-reentrant `sync.RWMutex` ⇒ write lock held for the life of the process ⇒ every cluster-CA reader blocks, incl. every CP→DP ConfigSnapshot. Total CP stall; restart does not clear the unattended triggers. Plus a nil-deref on `ca.secondaryCert` on a FIRST import. Invisible to the suite because every prior test used a LOCAL `clusterCA` while the re-entrant reads go through `globalClusterCA`. | NEW → **CLOSED** (CHAOS-51: `installLocked` + post-lock effects; `TestChaos51_*` install the object AS the global and stand up `cpTLSConfig`) | **Critical** | was: `enrollment.go:1128,1185,1201,1223`; see the 2026-08-14 review |
 | CA-4 | Auto-rotation loop: **no immediate startup check** (24h blind spot after boot), **no retry/backoff** on failure (waits a fixed 24h). | GAP → **PARTLY CLOSED** (CHAOS-28: the startup blind spot is closed — one guarded round runs before the ticker, sharing the CHAOS-24 guard. Retry/backoff on a FAILED rotation still waits the full 24h) | M/H | `ca.go` `StartCAAutoRotation`; see §16 |
 | CA-5 | `cert_expiry` alert only fires **on rotation**, not as an early warning — contract says "fired on startup if ≤30 days" but the only producer is the rotation observer. | GAP (contract mismatch) | M | producer `ca.go:45-53`; contract `internal/alerts/store.go:17` |
-| CA-6 | OCSP fails **closed** when a cert lists responders and none answer; `VerifyConnection` re-checks resumed sessions. Caveats: nil-issuer → fail-open; OCSP client has no SSRF guard on the peer-controlled responder URL. | ✓ (+2 caveats) | L/M | `internal/ocsp/ocsp.go:177-181`, `ocsp.go:41-56`; caveats `ocsp.go:139-142,187-206` |
+| CA-6 | OCSP fails **closed** when a cert lists responders and none answer; `VerifyConnection` re-checks resumed sessions. Caveats: nil-issuer → fail-open; OCSP client has no SSRF guard on the peer-controlled responder URL. | ~~✓ (+2 caveats)~~ → **RE-SCORED by CHAOS-65**: the fail-closed half was right; the ✓ was not. The "caveat" was one of **seven** defects in the same pipeline, six of them closed in §35 and the seventh (CA-6b) open. **The row's own evidence pointed at the finding and the verdict looked past it** — *"no SSRF guard on the peer-controlled responder URL"* names the property (the peer controls the input) that makes all seven reachable, and the row still reads ✓ because the one question asked was "does it fail closed?". A control can fail closed on the path you tested and be bypassable on the path you did not. | ~~L/M~~ → **H** | `internal/ocsp/ocsp.go`; see §35 |
+| CA-6b | **OCSP is not consulted on the path that handshakes.** `ConfigureTLSConfigOCSP` has two call sites, both targeting `upstreamOpTLSCfg` behind the shared upstream transport — which for a forward proxy means an `https://` PARENT PROXY handshake and nothing else. Every inspected HTTPS request goes through `upstreamInspectTLSConfig`, which builds its own `tls.Config` with no OCSP callbacks. So on the one path where this appliance validates an origin certificate on a client's behalf, revocation is not checked, while the startup banner, the admin panel and the API all report "enabled" and every counter reads zero — "working perfectly" and "never consulted" are the same scrape. | NEW → **REPORTED, not closed** (CHAOS-65 / OCSP-8: `culvert_ocsp_path_checked{path}`, `coverage` on `/api/ocsp`, a WARNING from both enable paths, a panel banner, and a structural gate pinning the claim to the code. Wiring it fail-closed would make every inspected HTTPS request depend on outbound port 80 to arbitrary responder hosts — a fleet-wide outage one checkbox away — so it is an owner posture decision with a soft mode attached) | **H** | `ocsp_coverage.go`, `proxy_tunnel.go:627`; see §35 |
+| OCSP-1 | **A signed OCSP response was not bound to the certificate under test.** `ParseResponse(bytes, issuer)` is `ParseResponseForCert(bytes, nil, issuer)`, which takes `Responses[0]` and never compares the serial. The peer names the responder in its own AIA extension, so it also chooses the reply: a genuine CA-signed `good` about any OTHER certificate of the same issuer — obtained by asking that CA about any live cert and keeping the bytes — was accepted as this certificate's verdict. A **revoked certificate is accepted**, by its own subject, with no network position required. | NEW → **CLOSED** (CHAOS-65: `ParseResponseForCert(respBytes, leaf, issuer)`; `culvert_ocsp_response_rejected_total{reason="not_for_certificate"}` + a red panel banner, because a non-zero rate means something is answering with borrowed responses) | **C** | was: `internal/ocsp/ocsp.go` `queryOCSP`; see §35 |
+| OCSP-2 | **No freshness validation.** `ThisUpdate`/`NextUpdate` were parsed and never read, the request carries no nonce (`CreateRequest(leaf, issuer, nil)`), and OCSP rides plaintext HTTP — so a `good` captured before revocation replayed forever. Fixing OCSP-1 does not close it: a pre-revocation response for the CORRECT certificate binds perfectly. | NEW → **CLOSED** (CHAOS-65: `responseFresh`, 5-min skew tolerated in BOTH directions — a clock rollback is a fault, not an attack — plus a 24h ceiling when `NextUpdate` is absent) | **H** | was: `internal/ocsp/ocsp.go` `queryOCSP`; see §35 |
+| OCSP-3 | **`unknown` was a pass while "unreachable" failed closed** — two postures for one question. A CA must not answer `good` for a certificate it never issued (CA/B Forum BRs), so `unknown` is precisely the answer a mis-issued or forged certificate draws. | NEW → **CLOSED** (CHAOS-65: a verdict is `Good` or `Revoked` or it is not a verdict — CHAOS-53's rule; discarded under `reason="unknown_status"`, then the EXISTING fail-closed path, no new posture) | M/H | was: `internal/ocsp/ocsp.go` `checkResponders`; see §35 |
+| OCSP-4 | **Verdict cache keyed on the serial alone.** A serial is unique only within an issuer — which is why RFC 6960's CertID carries the issuer name and key hashes with it. The dangerous direction admits a genuinely REVOKED certificate from a different CA off another CA's cached `good`, with no responder query at all. Sequential serials are the norm in enterprise PKI (ADCS). | NEW → **CLOSED** (CHAOS-65: `certKey` = SHA-256 over issuer subject + issuer SPKI + serial) | **H** | was: `internal/ocsp/ocsp.go` `cacheResult`/`checkCached`; see §35 |
+| OCSP-5 | **The responder URL was an unguarded SSRF sink** (the CA-6 caveat, six weeks unaddressed): `http.DefaultClient.Do` against a URL from the peer's certificate — no scheme allow-list, no `isPrivateHost`, no SSRF dialer, and `DefaultClient` follows up to ten redirects, so even a URL-level guard would have been bypassed by a `302`. Any operator of any destination this gateway reaches could name an internal address and have the proxy POST to it from inside the trust boundary. | NEW/known → **CLOSED** (CHAOS-65: inline scheme + `ssrf.PrivateHost` at the call site per repo convention, `ssrf.SafeDialContext` under it to close the rebinding window, redirects refused outright, a dedicated client so `HTTP(S)_PROXY` and the shared pool are out of the path) | **H** | was: `internal/ocsp/ocsp.go` `queryOCSP`; see §35 |
+| OCSP-6 | **Unbounded responder fan-out inside a TLS handshake.** `leaf.OCSPServer` walked in full under a PER-RESPONDER 5 s timeout, on the request goroutine, holding the client conn, an FD and a per-IP `connlimit` slot: 200 blackholed responders ⇒ ~17 minutes parked AND 200 outbound POSTs at hosts the attacker named. Fan-out and targets both peer-written. CHAOS-58's finding one subsystem over. | NEW → **CLOSED** (CHAOS-65: `maxResponders` 4 inside ONE `queryBudget` 5 s envelope — deliberately the old per-responder value, so the ordinary one-responder certificate is unchanged and only the worst case shrinks; `culvert_ocsp_responders_truncated_total`) | **H** | was: `internal/ocsp/ocsp.go` `checkResponders`; see §35 |
+| OCSP-7 | **No single-flight**: N concurrent handshakes to one host each launched their own query (measured 24 → 24), amplifying client request rate 1:1 onto a responder that is by hypothesis already the slow dependency. The herd `hostIPCache` and `jwksCache` already collapse. | NEW → **CLOSED** (CHAOS-65: leader/follower per CertID, no follower timer, leader publishes on every exit path INCLUDING a panic, flight defaults are the fail-closed verdict) | M | was: `internal/ocsp/ocsp.go` `VerifyPeerCertificate`; see §35 |
+| OCSP-9 | **No OCSP stapling.** Culvert never requests or consumes `tls.ConnectionState.OCSPResponse` — the deployment shape that makes revocation checking cheap, private and egress-free, and the natural companion to closing CA-6b. | NEW (recorded, not in scope) | M | `proxy_tunnel.go` `upstreamInspectTLSConfig`; see §35 |
+| OCSP-10 | **No CRL fallback, and a certificate with no AIA responder is accepted unchecked.** The admin panel is titled "OCSP / CRL Revocation"; only OCSP exists. Unchanged by CHAOS-65. | NEW (recorded) | L/M | `internal/ocsp/ocsp.go` `checkResponders` (`len(responders) == 0` ⇒ pass); see §35 |
 | CA-7 | KEK-at-rest: rejects too-permissive/wrong-size files (never chmod-fixes, never silently regenerates), uses `os.Link` EEXIST to avoid racing mints, fails closed on decrypt error. | ✓ | — | `kek.go:174-239`, `cluster_ca_keyatrest.go:95-181` |
 | CA-8 | Session HMAC key is **random per-restart by default** (no env/config secret) → all admin sessions invalidated on every single-node restart. | GAP | M | `session.go:38-49`, `internal/session/session.go:80-86` |
 | CA-9 | Session HMAC runtime rotation / cluster sync is race-safe (lock-guarded set/read, hex+len validation before install, redacted on export). | ✓ | — | `internal/session/session.go:51-55,422-429`, `controlplane.go:1848-1862` |
@@ -5934,3 +5976,429 @@ them **before** any reload path is added.
 
 **Owner action:** treat "add a GeoIP reload" as blocked on the reader-lifetime
 fix, not as a standalone feature.
+
+---
+
+## 35. CHAOS-65 — The OCSP revocation path
+
+**Date:** 2026-09-11 · **Domain:** Certificates / revocation (never previously
+swept) · **Code:** `internal/ocsp/ocsp.go`, `ocsp_coverage.go`,
+`ocsp_metrics.go`, `ui_security.go`, `mtls_ocsp_startup.go` · **Runbook:**
+`docs/operator/ocsp-revocation-checking.md`
+
+> **Id claimed in a committed placeholder row BEFORE any code was written** —
+> the remedy the revision log at the head of this file reaches twice,
+> independently, after at least ten collisions across six sweeps. This is the
+> first sweep to follow it. It cost one commit and one line, and the id has
+> been stable since. Every subsequent sweep should do the same.
+
+### Executive summary
+
+The revocation check was reachable, enabled by an ordinary config flag, and
+wrong in six ways at once — and the reason they had all survived is the
+seventh: **it is wired to a path that almost never handshakes.**
+
+Every input this engine acts on is chosen by **the party being checked**. The
+responder URLs come out of the peer's own AIA extension, so the peer picks
+which responder is asked, how many are asked, and therefore which bytes come
+back. Nothing in the pipeline treated that input as hostile. The sharpest
+consequence is a complete revocation bypass performed by the certificate's own
+subject, with no network position required.
+
+### The row that already said it
+
+Register row **CA-6**, written in the original 2026-07-04 sweep, reads:
+
+> OCSP fails **closed** when a cert lists responders and none answer;
+> `VerifyConnection` re-checks resumed sessions. Caveats: nil-issuer →
+> fail-open; **OCSP client has no SSRF guard on the peer-controlled responder
+> URL.** — Verdict **✓ (+2 caveats)**, severity **L/M**
+
+The evidence column pointed straight at the finding and the verdict looked past
+it. *"Peer-controlled responder URL"* names the exact property — the input is
+written by the party being checked — that makes all seven defects reachable;
+it was filed as a caveat on a row scored ✓ because the one question asked was
+*"does it fail closed?"*, and on the path that was examined, it does.
+
+**The lesson is not "someone missed an SSRF bug".** It is that a control can
+fail closed on the path you test and be bypassable on the path you did not, and
+that "✓ with caveats" is where a finding goes to stop being looked at. Two
+cheap habits would have caught it: score the row by its WEAKEST property rather
+than its strongest, and — when a caveat says an input is attacker-controlled —
+re-ask every other question in the row with that assumption. CA-6 has been
+re-scored to **H** and split, with CA-6b carrying the coverage gap.
+
+### Failure scenarios
+
+**OCSP-1 — a response was not BOUND to the certificate under test. (Critical.)**
+`queryOCSP` called `cryptoocsp.ParseResponse(respBytes, issuer)`, which is
+`ParseResponseForCert(bytes, nil, issuer)`; with a nil certificate the library
+takes `basicResp.TBSResponseData.Responses[0]` and **never compares the
+serial** (`x/crypto@v0.56.0/ocsp/ocsp.go:509-528`). The signature *is* verified
+against the issuer, so the response must be genuinely CA-signed — which is a far
+lower bar than it sounds, because a genuine CA-signed `good` response about any
+*other* certificate of the same issuer is obtained by asking that CA about any
+live certificate and keeping the bytes. The peer names the responder, so the peer
+serves that reply, and a **revoked certificate is accepted**. RFC 6960 defines
+CertID with the issuer hashes precisely so a response can be bound to a request;
+the binding was simply not performed.
+
+**OCSP-2 — no freshness validation. (High.)** `ThisUpdate` and `NextUpdate` were
+parsed and never read. OCSP here rides plaintext HTTP and `CreateRequest(leaf,
+issuer, nil)` sends no nonce, so a response is replayable by anyone on the path —
+and, again, by the peer itself. A `good` captured before the certificate was
+revoked stayed authoritative forever. Fixing OCSP-1 alone does not close this:
+a pre-revocation response for the *correct* certificate binds perfectly.
+
+**OCSP-3 — `unknown` was a pass. (Medium-High.)** `checkResponders` set
+`anyResponded = true` for any parsed response and returned revoked only for
+`Status == Revoked`, so `unknown` admitted the connection — while a responder
+that could not be *reached* failed closed. Two postures for one question. Under
+the CA/Browser Forum baseline requirements a CA must not answer `good` for a
+certificate it never issued, which makes `unknown` exactly the answer a
+mis-issued or forged certificate draws: the one case where accepting is worst.
+
+**OCSP-4 — the verdict cache was keyed on the serial alone. (High.)**
+`cacheResult(serialHex, …)`. A serial is unique only *within* an issuer. The
+harmless direction blocks a good certificate; the dangerous one admits a
+genuinely **revoked** certificate from a different CA off another CA's cached
+`good`, with no responder query at all. Random 128-bit serials from public CAs
+make accidental collision negligible, but sequential serials are the norm in
+enterprise PKI (ADCS), and a Culvert deployment with two internal CAs in its
+trust store is ordinary, not exotic.
+
+**OCSP-5 — the responder URL was an unguarded SSRF sink. (High.)**
+`http.DefaultClient.Do(httpReq)` against a URL read from the peer's certificate:
+no scheme allow-list, no `isPrivateHost`, no SSRF-controlled dialer, and
+`DefaultClient` follows up to ten redirects, so even a URL-level guard would
+have been bypassed by a `302`. Any operator of any destination this gateway
+reaches could name `http://169.254.169.254/…` or an internal admin endpoint and
+have the proxy POST to it from inside the trust boundary. CLAUDE.md states the
+convention this path never followed, in as many words: *"inline `url.Parse` +
+scheme check + `isPrivateHost()` before outbound HTTP requests."*
+
+**OCSP-6 — the fan-out was unbounded, and so was the stall. (High.)**
+`leaf.OCSPServer` was walked in full with a **per-responder** 5 s timeout.
+`VerifyPeerCertificate` runs on the request goroutine inside a TLS handshake,
+holding the client connection, an FD and a per-IP `connlimit` slot. A
+certificate listing 200 blackholed responders parks that goroutine for ~17
+minutes *and* aims 200 outbound POSTs at whatever hosts it names — an outbound
+amplifier whose fan-out and targets are both written by the attacker. This is
+CHAOS-58's finding in a different subsystem: a per-step allowance is not a
+bound.
+
+**OCSP-7 — no single-flight. (Medium.)** Concurrent handshakes to one host all
+miss the same cold entry, and each launched its own query, so the gateway
+amplified client request rate 1:1 into load on a responder that is by
+hypothesis already the slow dependency. Measured pre-fix: 24 concurrent
+handshakes → 24 responder queries. The same herd `hostIPCache` (§28/§34) and
+`jwksCache` (CHAOS-49) already collapse.
+
+**OCSP-8 — the control is not on the path that handshakes. (High; REPORTED,
+not closed.)** `ConfigureTLSConfigOCSP` has exactly two call sites
+(`mtls_ocsp_startup.go`, the `/api/ocsp` toggle) and both target
+`upstreamOpTLSCfg`, the operator TLS template behind the shared upstream
+`*http.Transport`. That transport carries the plain-HTTP forward path — which
+never negotiates TLS to an origin — and a TLS connection to an `https://`
+**parent proxy** if one is configured. Every inspected HTTPS request takes a
+different path: `handleTunnelInspect` and `handleInspectNativeALPN` build their
+own `tls.Config` in `upstreamInspectTLSConfig` (`proxy_tunnel.go:627`), and
+nothing attaches the callbacks to it. So on the single path where this
+appliance terminates and validates an origin certificate on a client's behalf,
+revocation is not checked — while the log says "enabled", the panel says
+"enabled", and the counters read zero.
+
+**Zero counters are the problem, not the symptom.** "Found nothing wrong" and
+"never consulted" render identically, and until this sweep there was no
+`/metrics` exposition at all — the only OCSP surface was a role-gated admin
+JSON blob nothing scrapes. That is the exact sentence §27 had to write about
+the threat feed.
+
+### What shipped
+
+The engine, in `internal/ocsp`:
+
+1. **`ParseResponseForCert(respBytes, leaf, issuer)`** — a response is a verdict
+   only when it is about *this* certificate.
+2. **`responseFresh`** — `ThisUpdate` not in the future, inside `NextUpdate`,
+   and a 24 h ceiling when `NextUpdate` is absent (RFC 6960 §2.4 permits
+   omitting it, which without a ceiling is an unbounded replay window). Skew is
+   tolerated 5 min in **both** directions, reusing `caClockSkewTolerance`'s
+   value rather than inventing a second one: a clock rollback is a fault, not
+   an attack, and must not take revocation checking down.
+3. **A verdict is AFFIRMATIVE or it is not a verdict** — `Good` or `Revoked`.
+   `unknown`, an unbindable response and a stale one are each discarded under
+   their own counter, and the existing fail-closed path with its existing
+   2-minute `indeterminateTTL` and its existing counter handles the remainder.
+   No new posture, no second dialect: CHAOS-53's rule for the scan sidecar.
+4. **`certKey` = RFC 6960's CertID fields** (SHA-256 over issuer subject,
+   issuer SPKI, plus the serial).
+5. **SSRF**: scheme allow-list + `ssrf.PrivateHost` inline at the call site
+   (so CodeQL sees the guard, per repo convention), a dedicated client whose
+   `DialContext` is `ssrf.SafeDialContext` — closing the rebinding window the
+   pre-flight lookup leaves open — and `CheckRedirect` refusing outright.
+   Deliberately **not** `http.DefaultClient`: it shares the process-wide default
+   transport, follows redirects, and honours `HTTP(S)_PROXY` from the
+   environment, none of which is wanted for a request whose URL the peer chose.
+   The consequence — responder queries are direct and do not traverse a parent
+   proxy — is a behaviour change, recorded in the runbook rather than left to be
+   discovered.
+6. **One envelope, `maxResponders` 4 inside `queryBudget` 5 s.** The budget is
+   deliberately the *old per-responder* timeout, so the ordinary one-responder
+   certificate is unchanged and only the worst case shrinks.
+7. **Single-flight per certificate**, leader/follower, no follower timer (a
+   follower timeout releases it to start exactly the query being collapsed —
+   §34's rule). The leader publishes on **every** exit path including a panic,
+   and the flight's defaults are the **fail-closed** verdict, so a leader that
+   dies leaves its followers denied rather than admitted.
+
+The visibility, in package main: `ocspCoverage()` with a structural gate
+comparing each claim against the `tls.Config` the named path actually builds; a
+`WARNING` from both enable paths; `culvert_ocsp_*` including the
+`culvert_ocsp_path_checked{path}` coverage gauge; `coverage`,
+`uncheckedEnforcingPaths` and the four rejection counters on `GET /api/ocsp`;
+two banners on the OCSP panel.
+
+**Emitted only when enabled** — the standing rule (`socks5_health.go`,
+`cluster_ca_health.go`, `dns_health.go`): a flat zero from every appliance that
+never turned the feature on is indistinguishable from a broken one, and trains
+operators to ignore the series.
+
+### Why OCSP-8 was reported rather than wired
+
+Attaching the callbacks to `upstreamInspectTLSConfig` is one line. It would also
+make **every inspected HTTPS request** depend on reaching an external OCSP
+responder, **fail-closed**, on networks where outbound port 80 to arbitrary
+hosts is exactly what egress policy forbids. The failure mode is a total HTTPS
+outage for the fleet, arriving the moment an operator ticks a checkbox that
+today does almost nothing — a posture change with a blast radius the flag's
+wording warns nobody about, and reachable from the **live admin API**, so it is
+a runtime kill of a gateway carrying traffic rather than a boot decision. (That
+is the shape §31's own deferral note got wrong in the other direction, and it
+is worth not repeating from either side.)
+
+The engine had to be safe before anything could be wired to it, and now is.
+Wiring is a scoped feature with a posture decision attached — observe-only
+counters first, or fail-open-and-alert — so that enabling it is reversible in
+production instead of a cliff.
+
+### Risk matrix
+
+| Row | Finding | Likelihood | Impact | Status |
+|---|---|---|---|---|
+| **OCSP-1** | A signed response about another certificate of the same issuer is accepted as this one's verdict | Low-Medium (needs an attacker who wants it; trivial once wanted) | **Critical** — complete revocation bypass by the certificate's own subject | **CLOSED** |
+| **OCSP-2** | Pre-revocation response replays forever (no nonce, no freshness check) | Medium | High | **CLOSED** |
+| **OCSP-3** | `unknown` treated as a pass while "unreachable" fails closed | Medium | Medium-High | **CLOSED** |
+| **OCSP-4** | Verdict cache keyed on serial alone ⇒ cross-issuer confusion, both directions | Medium in enterprise PKI | High | **CLOSED** |
+| **OCSP-5** | Responder URL is an unguarded SSRF sink; redirects followed | Medium | High | **CLOSED** |
+| **OCSP-6** | Unbounded responder fan-out ⇒ ~17 min handshake stall + outbound amplifier | Low-Medium | High | **CLOSED** |
+| **OCSP-7** | No single-flight ⇒ 1:1 amplification onto a failing responder | High whenever it runs | Medium | **CLOSED** |
+| **OCSP-1b** | The response was bound to the certificate; the SIGNER was never bound to an authority. A peer signs a `good` about its own serial with its own leaf key and embeds that leaf as the responder — no `id-kp-OCSPSigning` check. Defeats OCSP-1 and is easier than it | Low-Medium | **Critical** — revocation bypass needing no other party at all | **CLOSED** (Codex review) |
+| **OCSP-2b** | Freshness checked at receipt, then discarded: a confirmed verdict cached for the full hour regardless of `NextUpdate`. OCSP-2's replay window reopened in the cache | Medium | High | **CLOSED** (Codex review) |
+| **OCSP-3b** | Every parse failure charged the "borrowed response" accusation, so a broken responder's HTML 502 raised a standing claim of attack | High (any broken responder) | Medium (false positive on a trust surface) | **CLOSED** (Codex review) |
+| **OCSP-7b** | `resolve` opened a flight without re-checking the cache — a late arrival queried again for a verdict already cached | Medium | Low-Medium | **CLOSED** (Codex review) |
+| **OCSP-11** | Bounding the responder loop also made the FIRST Good win, so the peer's own AIA ordering decides the verdict; a later Revoked was never consulted | Medium (replication lag alone reaches it) | **High** — a security posture moved as a side effect of a cost change | **CLOSED** (Codex review) |
+| **OCSP-12** | A dial-time SSRF refusal (DNS rebinding) was charged to nothing, so the guard's own success was invisible on the surface built to expose it | Low-Medium | Medium | **CLOSED** (Codex review) |
+| **OCSP-13** | The cache honoured the ASSERTION's deadline (OCSP-2b) but never the SIGNER's: a delegate expiring in seconds could sign a `good` valid for a day, and the cached verdict outlived the authority it rested on | Low-Medium (a CA rotating a delegated responder) | Medium | **CLOSED** (Codex review) |
+| **OCSP-14** | The SSRF pre-flight has THREE outcomes and the call site read two: a DNS failure charged the `responder_blocked` ACCUSATION, whose runbook tells the operator the responder resolved privately | High (any DNS outage) | Medium (false accusation on a trust surface) | **CLOSED** (Codex review) |
+| **OCSP-8** | Revocation not checked on inspected HTTPS; control reports itself healthy | **Certain** (it is the default wiring) | High (security control dark) | **OPEN — owner posture decision, now visible on three surfaces** |
+
+### Recovery assessment
+
+Automatic in every closed row. A fail-closed verdict is cached on the 2-minute
+`indeterminateTTL`, so connections resume within that window once responders
+answer again — there is nothing to clear by hand, and the CHAOS-04 amplification
+this TTL exists to prevent is unchanged. The break-glass is the existing toggle,
+audited as `ocsp.toggle`, deliberately off the config-version rollback surface.
+
+### Residual risk
+
+- **OCSP-8 is open by design** and is the dominant residual: on a Secure Web
+  Gateway, "revocation checking is on" currently means "for the parent-proxy
+  handshake". It is now stated in the log, the panel, the API and a metric, but
+  it is still the gap.
+- **Responder queries are direct.** They do not traverse a configured parent
+  proxy and no longer honour `HTTP(S)_PROXY`. An egress-restricted deployment
+  must allow the responder hosts; an internally-hosted enterprise responder is
+  refused by the SSRF guard and is, for now, unsupported. Recorded rather than
+  weakened — the alternative is re-opening OCSP-5.
+- **No stapling.** Culvert never asks for or consumes a stapled OCSP response
+  (`tls.ConnectionState.OCSPResponse`), which is the deployment shape that makes
+  revocation checking cheap, private and egress-free — and is the natural
+  companion to closing OCSP-8. Not in scope here; recorded as **OCSP-9**.
+- **No CRL fallback.** The panel is titled "OCSP / CRL Revocation"; only OCSP
+  exists. A certificate with no AIA responder is accepted without a check —
+  unchanged by this sweep, recorded as **OCSP-10**.
+- **`maxResponders` = 4 is a constant**, like every other bound in this file
+  whose only use would be widening an attack window.
+
+### The review round: binding a response is only half of it
+
+Codex reviewed the shipped engine and found four more, each reproduced against
+the tree that had just fixed OCSP-1. **The first defeats that fix outright, and
+it is the more important finding of the two.**
+
+**OCSP-1b — the RESPONSE was bound; the SIGNER was not. (Critical.)**
+`ParseResponseForCert` verifies an embedded responder certificate by asking one
+question — did the ISSUER sign it? — and never asks RFC 6960 §4.2.2.2's: does it
+carry `id-kp-OCSPSigning`? **The peer's own leaf is, by definition, a
+certificate the issuer signed, and the peer holds its private key.** So the peer
+signs a fresh `good` about its OWN serial, embeds its own leaf as the responder
+certificate, and serves it from the responder URL in its own AIA. A revoked
+certificate is accepted — needing no response from anyone else at all, which
+makes it *strictly easier* than the borrowed-response vector OCSP-1 closed.
+
+**The lesson is the one this sweep had already written down and then only half
+applied.** OCSP-1's own reasoning was "the peer picks the responder, so the peer
+picks the answer" — and the fix asked only *which certificate is this response
+about?* while leaving *who was allowed to say so?* unasked. Binding an assertion
+to its subject is worth nothing until the signer is also bound to an authority.
+Now only two signers are authorized: the issuer itself, and a delegate it signed
+that carries the OCSP-signing EKU and is inside its own validity window.
+`ExtKeyUsageAny` is deliberately refused — honouring it would re-admit every
+ordinary leaf the issuer ever signed, which is the whole attack. Delegated
+responders are ordinary, so refusing every embedded certificate is not the fix;
+that shape is pinned as a CONTROL.
+
+**OCSP-2b — freshness was checked at receipt and then thrown away. (High.)**
+Every confirmed verdict was cached for the fixed 1 h `cacheTTL`, so a `good`
+whose `NextUpdate` was a minute out kept admitting the certificate for another
+59 minutes after the responder stopped vouching for it: **the replay window
+OCSP-2 closed on the wire, reopened in the cache.** Same shape as OCSP-1b — a
+rule enforced at one layer and not carried to the next. The TTL is now the
+earlier of `cacheTTL` and the response's own deadline, and a verdict already at
+its deadline is not cached at all.
+
+**OCSP-3b — the accusation counter cried wolf at a 502. (Medium.)** Every
+`ParseResponseForCert` error charged `notForCertTotal`, whose metric help and
+red panel banner both read *"something is answering with borrowed responses"*.
+An HTML error page from a broken responder therefore raised a standing claim of
+attack — on a surface whose whole job is to be believed, and against this
+register's own rule about false positives on such surfaces. The accusation is
+now charged only when it is demonstrable (the response parses, its signature
+verifies against the issuer, and the serial is someone else's); everything else
+is `malformed`. Note *why* a second parse is needed rather than a string match:
+the library checks the serial BEFORE it verifies any signature, so its
+serial-mismatch error on its own proves nothing about who signed.
+
+**OCSP-11 — a security posture moved as a side effect of a cost change.
+(High.)** The pre-CHAOS-65 loop walked every responder and returned revoked if
+ANY of them said so. The rewrite added a `case Good: return` to save queries, so
+the FIRST responder decides — and **the peer writes the AIA list and its
+ORDER**, which hands the verdict back to the party being checked. That is this
+sweep's own finding, reintroduced by this sweep, inside the change that bounded
+the loop. It also accepts a certificate during ordinary responder replication
+lag. Restored: a Good is remembered (with the EARLIEST deadline among the Good
+answers, for the cache) and the loop continues; only Revoked short-circuits.
+**A cost change must not quietly move a security posture** — and the way to
+notice is to diff the CONTROL FLOW of the thing being sped up against what it
+replaced, not just its outputs on the happy path.
+
+**OCSP-12 — the guard fired and nothing counted it. (Medium.)** A responder host
+that answers public to the pre-flight `ssrf.PrivateHost` check and private to
+the dial is exactly what `ssrf.SafeDialContext` exists to catch, and it does —
+but its `ErrBlocked` arrived at the generic transport branch, so the
+DNS-rebinding attack moved neither `responderBlockedTotal` nor
+`culvert_ocsp_response_rejected_total{reason="responder_blocked"}`. The
+defence worked and was invisible on the surface built to expose it. Same family
+as OCSP-3b: the counters have to say what actually happened.
+
+**OCSP-7b — the single-flight had a hole on the late arrival. (Low-Medium.)**
+`resolve` opened a flight without re-checking the cache, so a handshake
+descheduled while the leader finished would start a redundant query for a
+verdict already cached — defeating the collapsing during exactly the cold-cache
+burst it exists for.
+
+**OCSP-14 — a DNS outage was reported as an SSRF refusal. (Medium.)**
+`ssrf.PrivateHostContext` has three outcomes — allowed, refused-as-private, and
+could-not-determine (DNS failure, or this query's own budget expiring
+mid-lookup) — and the call site treated any error as the middle one. So an
+ordinary resolver outage inflated
+`culvert_ocsp_response_rejected_total{reason="responder_blocked"}`, whose
+runbook states the responder resolved into a private range and sends the
+operator down an entirely different remediation.
+
+Neither branch of the guard wrapped a sentinel, so the caller could not have
+distinguished them: the fix is at both layers. `ErrBlocked` — previously
+documented as the connect-time `Control` sentinel — now wraps the pre-flight
+refusal too, so ONE identity means "we refused this destination as private" at
+whichever layer decided it, and the resolution-failure branch deliberately does
+NOT wrap it. The OCSP call site charges the counter only on
+`errors.Is(err, ssrf.ErrBlocked)`; a resolution failure is an unreachable
+responder, already accounted by the fail-closed path, and takes no
+`response_rejected_total` reason because no response existed to reject.
+
+**This is the second time in this sweep that an accusation counter was charged
+for something it could not demonstrate** — OCSP-3b was the same defect on
+`not_for_certificate`, where any parse failure raised a standing claim of
+attack. Both were introduced by the same reflex: the error path was treated as
+one thing because it arrives as one value. The rule the register keeps from
+this: *a counter an operator is told to act on must be charged only from
+evidence that supports the specific claim its runbook makes* — and when a guard
+can fail for more than one reason, the caller needs the guard to say which, not
+a best guess at the call site.
+
+**OCSP-13 — the cache outlived its SIGNER, after being taught to respect its
+ASSERTION. (Medium.)** OCSP-2b made `cacheResult` honour the response's own
+`NextUpdate`. Two checks bound a verdict at parse time, though, and only one of
+them was carried down: `responseFresh` bounds the assertion, `responderAuthorized`
+bounds the signer. `responseValidUntil` never looked at `resp.Certificate`, so a
+delegated responder valid for another thirty seconds could sign a `good` whose
+`NextUpdate` was a day out — the handshake that parsed it cached the verdict, and
+later handshakes kept admitting the certificate for the rest of the cache TTL
+while a re-parse of those identical bytes would have refused them as an
+unauthorized responder.
+
+The cap now mirrors `responderAuthorized`'s branch structure exactly, so the
+cache expires at precisely the instant a re-parse would begin rejecting.
+
+**This is the third instance of one pattern in a single sweep**, which is the
+part worth carrying forward. OCSP-1 bound the response to its subject; OCSP-1b
+bound the signer to an authority; OCSP-2b carried the assertion's deadline into
+the cache; OCSP-13 carried the signer's. Each time the rule was enforced where it
+was first noticed and not at the next layer down, and each time the gap was found
+by someone else rather than by the sweep that wrote the rule. *A check that runs
+at parse time governs a value that outlives the parse* — so for every new
+validity rule, ask what caches the result and for how long, in the same change.
+
+### Two defects the fix itself introduced
+
+Both found in an adversarial re-read of the diff, before merge, and both worth
+recording because each is a general trap rather than a slip.
+
+**The guard became the unbounded call.** `ssrf.PrivateHost` resolves under
+`context.Background()`. Reaching for it from a TLS handshake on the request
+goroutine makes the SSRF pre-check the thing that blocks for the system
+resolver's full budget — on a hostname written by the peer. That is §34's fault
+re-imported through the fix for OCSP-5, and strictly worse than what it
+replaced. `internal/ssrf` gains `PrivateHostContext`; `PrivateHost` delegates
+with a background context, so every existing caller is byte-identical. **The
+general trap: a guard added to a hot path is code on the hot path, and inherits
+every bound the path already required.**
+
+**The single-flight collapsed the REFUSALS along with the queries.** Followers
+inherited the leader's fail-closed verdict without charging
+`fail_closed_total`, so a fail-closed storm under-reported itself by however
+many handshakes happened to arrive concurrently — worst exactly when the storm
+is worst, and that counter is what the runbook tells an operator to alert on.
+The pre-existing cached-fail-closed path already charges every hit for this
+reason, which is what made the inconsistency findable. `revokedTotal` is
+deliberately *not* charged there: it counts responder CONFIRMATIONS, and the
+cached confirmed-revocation path does not charge it either. **The general trap:
+deduplicating work is not deduplicating events — ask, per counter, whether it
+measures the work or the outcome.**
+
+### Gates
+
+`internal/ocsp/ocsp_chaos_test.go` — 8 defect gates, **each verified failing
+against the pre-fix tree**, plus 2 gates for the self-review defects above
+(each mutation-checked against the shape it replaces), 7 gates for the two Codex
+rounds (each verified failing against the tree that shipped the original fix)
+and 6 controls (a checker that refused everything
+would pass all eight while being a fleet-wide HTTPS outage: a healthy `good` is
+still accepted and still cached, a genuine revocation still blocks and still
+counts as a revocation rather than a fail-close, and a disabled checker still
+queries nothing). `ocsp_coverage_test.go` — 4 gates pinning the AGREEMENT
+between the coverage claim and the `tls.Config` each named path builds, in both
+directions, plus the emit-only-when-enabled rule; the agreement gate was
+mutation-checked by flipping the claim and confirming the failure.

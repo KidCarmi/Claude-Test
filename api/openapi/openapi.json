@@ -2632,6 +2632,36 @@
           "cacheLen": {
             "type": "integer"
           },
+          "coverage": {
+            "description": "CHAOS-65 — which TLS-handshake paths actually consult the revocation checker. With counters alone, \"found nothing wrong\" and \"never consulted\" render identically (both all-zero), so this reports the wiring. `ssl_inspect_origin` is currently false: inspected HTTPS origin handshakes build their own TLS config and are NOT revocation-checked (register row OCSP-8).",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "checked": {
+                  "type": "boolean"
+                },
+                "detail": {
+                  "description": "Fixed, bounded explanation. Never an error string or a host.",
+                  "type": "string"
+                },
+                "path": {
+                  "enum": [
+                    "upstream_transport",
+                    "ssl_inspect_origin",
+                    "connect_bypass"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "checked",
+                "detail"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "enabled": {
             "type": "boolean"
           },
@@ -2641,6 +2671,11 @@
           },
           "lastFailClosedAt": {
             "type": "string"
+          },
+          "malformedResponseTotal": {
+            "description": "OCSP responses discarded as unintelligible (unparseable DER, bad signature, an HTML error page). An ordinary broken responder, NOT an attack signal.",
+            "format": "int64",
+            "type": "integer"
           },
           "mtlsClientCertConfigured": {
             "description": "True when an upstream mTLS client certificate (client_cert_file/client_key_file) is configured. Omitted when unset.",
@@ -2667,7 +2702,44 @@
             "format": "date-time",
             "type": "string"
           },
+          "notForCertificateTotal": {
+            "description": "Issuer-signed OCSP responses discarded because they were about a different certificate than the one being checked. An accusation: sustained growth means something is answering with borrowed responses.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "responderBlockedTotal": {
+            "description": "Responder URLs refused before any request was made (disallowed scheme, or an address in a private range). The URL comes from the peer's certificate.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "respondersTruncatedTotal": {
+            "description": "Certificates whose AIA responder list exceeded the cap and was truncated.",
+            "format": "int64",
+            "type": "integer"
+          },
           "revokedTotal": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "staleResponseTotal": {
+            "description": "OCSP responses discarded as outside their ThisUpdate/NextUpdate window (replay, or clock skew).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "unauthorizedResponderTotal": {
+            "description": "OCSP responses discarded because the signer is not an RFC 6960 authorized responder for the issuer — most importantly a certificate signing a verdict about itself. An accusation.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "uncheckedEnforcingPaths": {
+            "description": "Paths where this appliance validates an origin certificate on a client's behalf and yet does not consult the revocation checker. Excludes bypassed CONNECT tunnels, which never terminate TLS.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unknownStatusTotal": {
+            "description": "Responders that answered \"unknown\" — the issuer does not recognise the certificate. Not treated as a pass.",
             "format": "int64",
             "type": "integer"
           }
