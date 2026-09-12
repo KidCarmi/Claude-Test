@@ -19,6 +19,7 @@ func liveViewStore(t *testing.T) (*Store, time.Time) {
 	s := newTestStore(t, clk)
 	in := goodRequest()
 	in.Purpose = PurposeLiveExecution
+	in.ReviewedOperationClass = ReviewedOpMutating
 	exp := clk.t.Add(time.Hour)
 	in.ExpiresAt = &exp
 	a, err := s.CreateRequest(in)

@@ -14,13 +14,18 @@ production MCP server, and arms no production node.
 **Verdict (see §26): `BLOCKED — NO SAFE FIRST CANARY TARGET`.** The Canary CORE is fail-closed on
 several axes (scope validation, shadow≠live trust firewall, budget ceiling / N-allowed-N+1-impossible,
 per-request kill re-read, restart re-arm/allowance, no-secret evidence). But a safe first experiment
-cannot be assembled today on **FIFTEEN independent blockers** (exhaustive as a set — together they cover
+cannot be assembled today on **FIFTEEN independent blockers** (this review's set — together they cover
 every mandatory NO/CONDITIONAL row in §25, though the mapping is grouped, not strictly 1:1: the
-witness-reconciliation row folds under blocker 7 and also depends on blockers 1 and 6): (1) no controlled upstream reachable AND usable under the supported
+witness-reconciliation row folds under blocker 7 and also depends on blockers 1 and 6). **The fifteen
+are what THIS review found against §25; they are not the complete set of what must be closed before a
+First Canary.** Later adversarial rounds have found further defects that no §25 criterion names — they
+are tracked in §24 under their own headings, are NOT renumbered into the fifteen, and must also be
+closed (see §26): (1) no controlled upstream reachable AND usable under the supported
 production trust model (a provisioned HTTPS+SPKI target must ALSO speak a protocol that permits Culvert's sessionless calls — a standard initialization-requiring server is rejected because the client drives no MCP initialize/version/session lifecycle); (2) the production activation preflight cannot return `Ready:true` on a stock
 node; (3) no governed production arming entry point — `armLiveTier` has no production caller, so an
-operator cannot arm the tier; (4) the read-first classifier refuses the one-exact-tool call and
-discovery cannot bind one tool; (5) the machine gate does not enforce exactly-one tool/principal
+operator cannot arm the tier; (4) **CLOSED** — the read-first classifier refused the one-exact-tool
+call and discovery cannot bind one tool; an exact reviewed fingerprint-bound `tools/call` now
+classifies `OpRead` while every unknown/unreviewed/drifted case stays non-read (§25a); (5) the machine gate does not enforce exactly-one tool/principal
 (`MaxCanaryTools`/`MaxCanaryPrincipals` = 2); (6) the budget does not bound physical upstream
 invocations (idempotent read retries send the POST up to ~3× per reservation); and — genuine PRODUCT
 DEFECTS, not merely capability gaps — (7) whole-Canary auto-abort is unwired for the eight declared
@@ -211,16 +216,23 @@ asserting it is NOT used). Read-first is enforced twice: the scope fact `ScopeRe
 `canary.IsReadFirstOperation` (`operation.go:25-33`) wired at `mcp_live_gate.go:96-100`. A `tools/call`
 defaulting to `OpWrite` is refused read-first at the boundary.
 
-**Blocker (Codex P1) — the read-first classifier makes the "one exact harmless tool call"
-unexecutable today.** `policyOperation` classifies ONLY `tools/list` as `OpDiscovery`; every
-`tools/call` is `OpWrite`, which the live gate rejects at its read-first check. So a "one exact
-tool" call — the experiment's §3 shape — cannot pass read-first. The only read-first-admissible
-method, `tools/list`, resolves no specific tool, so `liveGateInput` supplies an empty tool
-name/fingerprint and the exact-tool live-approval revalidation (`mcpLiveTrustRevalidate`) fails.
-Consequently NO request can execute the claimed one exact harmless tool even after the §5 target and
-§13 activation inputs are provided: a **shipped finer operation classifier** (proving a specific
-tool `OpRead`) OR a **separately designed discovery-trust path** is an additional, independent
-prerequisite. This is a first-class blocker in §26, not "a further constraint."
+~~**Blocker (Codex P1) — the read-first classifier makes the "one exact harmless tool call"
+unexecutable today.**~~ **CLOSED (blocker 4) — the exact read-first tool classification.** The
+finding was correct and is preserved verbatim for the record: `policyOperation` classified ONLY
+`tools/list` as `OpDiscovery`, every `tools/call` as `OpWrite`, and the live gate rejected the
+latter at its read-first check — so the experiment's §3 shape could not pass read-first, while the
+one read-first-admissible method resolved no specific tool and therefore failed the exact-tool
+live-approval revalidation.
+
+The remedy taken is the FIRST of the two the finding named — a finer operation classifier — and
+deliberately not the second. A discovery-trust path would have made `tools/list` stand in for an
+invocation, which is §7's explicit prohibition: blocker 4 is not closed by pretending a listing is
+the live tool execution.
+
+The conservative default is UNCHANGED. `tools/call` is still `OpWrite` unless one narrow,
+authoritative fact says otherwise, and that fact is the activation's own immutable reviewed record
+(blocker 7's snapshot, now carrying the reviewed operation class beside the fingerprint it was
+reviewed at). See §25a for the full closure argument and proofs.
 
 ---
 
@@ -731,6 +743,292 @@ code:
 
 - **P1 — read-first classifier (§6):** a `tools/call` is `OpWrite` and refused read-first; discovery
   (`tools/list`) cannot bind one exact tool for the live-approval revalidation. Confirmed.
+  **Since CLOSED as blocker 4 (§25a)** by the first of the two remedies the finding named — a finer
+  classifier bound to the reviewed fingerprint. The second, a discovery-trust path, was deliberately
+  refused: it would make `tools/list` stand in for the live tool execution.
+- **P1 — THE RESOLVED SCOPE IS NOT REVALIDATED AT THE ADMISSION BOUNDARY (NEW, NOT ONE OF THE
+  FIFTEEN; Codex on PR #1370, round 2). FOUND AND CLOSED IN #1370.** Confirmed against the code, and
+  recorded here rather than filed under a nearby blocker precisely because it is not one of them —
+  the fifteen are what §25's criteria produced, and this is a defect no §25 criterion names.
+
+  The sequence, as it stood before the fix: a request from principal A resolves to execute under a
+  Canary scope naming A, then
+  pauses before the side-effect boundary; a SAME-MODE scope update replaces A with B;
+  `reconcileCanaryRuntimeAfterCommit` (`mcp_rollout.go:509-530`) refuses only a changed BUDGET and a
+  changed REVIEWED-TARGET SET, and `canary.ReviewedTarget` carries no principal — so the update
+  proceeds and the generation is unchanged. The request resumes and is admitted: scope membership
+  lives in `internal/mcp/rollout/scope.go` (`s.principals`, via `Contains` ← `resolveEnforcing`) and
+  was decided at RESOLUTION only, `admitLiveExecution` never re-checked it, and `MaxPrincipals` is a
+  COUNTER of distinct principals rather than a membership test — A is already counted, so the cap
+  cannot catch it. `genAtResolve` is captured (`internal/mcp/runtime/policy.go:123`) but reaches only
+  `refuseOnToolDrift` for evidence attribution; neither it nor the resolved scope identity reaches
+  admission.
+
+  **Same defect class as blocker 4's own round-1 finding** — a fact decided at resolution and never
+  revalidated at the boundary — applied to scope membership instead of operation class. Blocker 4's
+  fix (step 5b) does NOT close it and does not claim to: the equality holds whenever the current
+  activation binds the same target to the same class, which an A→B principal swap does not disturb.
+
+  PRE-EXISTING and UNWIDENED by that fix, which only ADDS an admission condition. Unreachable in the
+  shipped build, since the sequence needs a live scope update on an armed Canary and therefore
+  blockers 2, 3 and 12 closed first — an ordering statement, not a severity one.
+
+  **REMEDY, SHIPPED IN PR #1370.** The finding is pre-existing, but it is in the exact live admission
+  boundary that PR was already hardening and is the same defect class as its round-1 P1, so it was
+  closed there rather than left standing behind a fix for its sibling.
+
+  `rollout.Scope` already had a content hash (`scope.go:621`). `State.ResolveFor` now stamps it onto
+  the `Resolution` **from the same atomic snapshot that decided `InScope`** — reading it from a
+  second `s.cur.Load()` would be the very time-of-check/time-of-use gap this closes. It travels as a
+  BOUNDARY FACT, never as policy semantics, and is deliberately absent from `policy.DecisionInput`:
+  `Resolution.ScopeHash` → `ExecInput.ResolvedScopeHash` (stamped inside `Executor.Execute` from the
+  resolution that execution is acting on, so a caller holding both values cannot forget to copy one)
+  → `LiveGateInput` → admission. Step **(5c)** of `admitLiveExecution`, under the same activation lock
+  that revalidates the reviewed target and the operation class, requires the installed scope's hash to
+  equal the one the request resolved under before any budget authority is granted. On mismatch:
+  denied, no reservation, no upstream call, no physical effect, bounded denial
+  `canaryAdmitScopeNotInForce`, reported to the caller as out-of-scope.
+
+  **Exact hash equality, not a re-run of `Contains`.** Re-checking principal membership closes the
+  headline case and leaves every sibling open — a tool removed, a server removed, a tenant changed,
+  an exclusion added, a percentage or bucket-salt edit. One comparison closes the whole family at
+  once, and fails closed on the dimensions nobody enumerated. A request resolved under one
+  authorization envelope cannot spend authority under another.
+
+  **An empty hash is a refusal, not a wildcard** — it is what a request carries when it never went
+  through `State.ResolveFor`, which is exactly the set that must not be exempted from the comparison.
+
+  **Request-scoped; nothing is latched.** An operator narrowing a scope is the system working, not
+  evidence that the reviewed target drifted, so it must not stop a healthy experiment (the
+  round-15/31 rule).
+
+  Conservative in one direction, deliberately: `Scope.Hash()` folds the scope REVISION, so a revision
+  bump with identical selectors also refuses the stale request. That hash is already the definition of
+  "did the scope change" used by `sameModeSameScope` (`mcp_rollout.go:435`), and a second
+  selector-only hash would create two definitions of scope identity that can disagree.
+
+  Gates (`mcp_canary_scope_in_force_test.go`): the exact stale sequence (G active, S1 permits A, a
+  request resolves under H1, a same-mode update installs S2 with A→B while the reviewed target, the
+  budget and the generation are unchanged, and the stale request is refused before any reservation);
+  the mandatory positive control (an unchanged envelope still proceeds through the normal read-first
+  path); an identical reapply does not reject; any selector edit — principal, server set, tool set,
+  exclusion, tenant — refuses the stale request; a missing envelope fails closed; demote/reactivate
+  cannot reuse an old envelope as fresh authority; the class revalidation still works independently;
+  emergency kill remains the last check before `Upstream.Call`; and an end-to-end gate proving the
+  envelope is CARRIED from a real `Resolve` to the boundary rather than only compared there.
+  Mutations M17–M21 (the hash is never captured; admission ignores it; a missing hash is treated as a
+  match; only the generation is compared; a principal-only recheck) each fail a named gate.
+
+  **ROUND 3 CLOSED THE OTHER HALF OF THE SAME FINDING: THE POST-ADMISSION WINDOW.** Codex observed
+  that step (5c) can only ever prove the envelope was in force AT ITS OWN INSTANT — admission is
+  atomic under `cr.mu`, but the scope is published under `rollout.State`'s own `swapMu`, which that
+  transaction does not hold and must not (taking a rollout lock inside the activation lock would
+  invert the order every other caller uses). The request then travels on through credential
+  materialization, the durable decision commit and connection setup before anything physical
+  happens, and the final-boundary `Revalidate` re-read only the ACTIVATION GENERATION — which a
+  same-mode scope update deliberately leaves alone, which is the whole premise of this finding. So
+  a scope withdrawn in that window was invisible.
+
+  The remedy is the one this boundary already uses for the emergency kill (PREREQ-MCP-KILL-1): the
+  window is not narrowed, it is RE-ASKED. `Revalidate` now requires BOTH authorities — the reserved
+  generation still current AND the resolved envelope still installed — immediately before
+  `Upstream.Call`. Serializing scope publication with the admission transaction was the alternative
+  Codex offered and is deliberately NOT taken: it would make an operator's scope edit block behind
+  every in-flight admission AND would still leave the post-admission window open, since the request
+  continues long after the transaction returns.
+
+  The internal sentinel was renamed with it (`errLiveGenerationDemotedAtBoundary` →
+  `errLiveAuthorityWithdrawnAtBoundary`, `boundaryRefusal.demoted` → `.withdrawn`): a name that says
+  "generation demoted" while also meaning "scope replaced" is the quiet drift this ledger exists to
+  prevent. WHICH of the two withdrew the authority is deliberately not distinguished at that layer —
+  `internal/mcp/execution` must not learn to reason about scopes or generations to decide that a
+  physical attempt is no longer authorized; the client reason is unchanged.
+
+  Gates: `TestScopeInForce_ScopeWithdrawnAfterAdmissionRefusesBeforeUpstream` (the swap is injected
+  through `ToolStillCurrent`, which `preCallGuard` evaluates immediately before `Revalidate` — the
+  narrowest place a test can stand inside the window; the upstream must see ZERO calls) with
+  `..._UnchangedEnvelopeSurvivesThePostAdmissionWindow` as its mandatory control, because a
+  `Revalidate` wired to refuse unconditionally would satisfy the first while deleting live
+  execution entirely. Mutation M22 removes only the final-boundary half, leaving step (5c) intact so
+  every direct-admission gate still passes.
+
+  **ROUND 4 FOUND THAT THE WINDOW WAS STILL TOO SHORT, AND THE PREDICATE STILL TOO NARROW.** Three
+  findings, each confirmed against the code before acting, and all closed in #1370.
+
+  **(a) The pool wait is unbounded.** `preCallGuard`'s comment claimed nothing blocking sits between
+  it and the send. That was true of THAT function and false of the one it calls: `Client.Call`
+  blocks in `pool.acquire` on a per-server semaphore until a slot frees or the context is done, so a
+  kill, a demotion, a scope withdrawal or an approval revocation could land, return successfully,
+  and the waiting request would then send anyway. The retry loop had the same shape one level in — a
+  second leg re-sent on the strength of a check made before the first. **This exposure was not new
+  with the scope work: the emergency kill re-read, the flagship "last authoritative state read
+  before `Upstream.Call`" of PREREQ-MCP-KILL-1, sat behind the same wait.** `CallOptions.PreSend`
+  now carries the executor's predicate into the client, where it is re-run holding the slot, before
+  EVERY physical attempt. The hook is deliberately OPAQUE — `internal/mcp/upstreamclient` learns
+  nothing about generations, scopes, approvals or kill state. Serializing publication with the
+  admission transaction was the alternative remedy and is again NOT taken: it would block an
+  operator's edit behind every in-flight admission and would still leave this window open.
+
+  **(b) The live approval was never re-asked.** Round 22 moved the approval lookup INTO the admission
+  transaction so a revocation racing the lock could not be admitted, and recorded in
+  `mcp_live_gate.go` that the final boundary re-reads *"tool freshness, generation and kill state,
+  not approval status"*. That residual is now closed: the grant is re-checked at a FRESH instant
+  (not the admission instant — an approval that expired while the request waited must not be spent
+  on the strength of how fresh it was when the wait began), against the same lock-free
+  pointer-published inventory the admission probe used. Neither the scope nor the generation moves
+  when an approval is withdrawn, and `ToolStillCurrent` only checks catalog freshness, so nothing
+  else could have caught it.
+
+  **(c) A withdrawal was diagnosed by a fixed reason.** The SAME scope mismatch read
+  `rollout_out_of_scope` when admission caught it and `rollout_mode_invalid` when the boundary did —
+  two contradictory answers for one fact, separated only by timing, in the block telemetry an
+  operator reads during an incident, while the mode stayed a perfectly valid Canary throughout.
+  `Revalidate` now returns the gate's own bounded `mcperr.Reason` instead of a bool, and ONE shared
+  `applyBoundaryRefusal` classifies both refusal sites so they cannot drift apart. Which authority
+  withdrew is still not distinguished INSIDE `internal/mcp/execution` — that package must not learn
+  to reason about scopes, generations or approvals to decide a physical attempt is unauthorized; the
+  gate names the reason and the executor carries it.
+
+  Gates: `TestBoundaryAuthority_ApprovalRevokedAfterAdmissionRefusesBeforeUpstream`,
+  `..._ScopeWithdrawnDuringThePoolWaitRefusesBeforeSend` (which also pins the reason), and
+  `..._ValidApprovalSurvivesThePreSendReAsk` as the mandatory control — a `Revalidate` wired to
+  refuse unconditionally would satisfy both negative gates while deleting live execution. The
+  client's half of the contract is pinned separately in `internal/mcp/upstreamclient`
+  (`TestPreSend_*`: a refusal stops the call with nothing sent and is provably never-sent; a
+  permitting hook does not interfere; the hook runs AFTER the pool slot is held, proven
+  deterministically by saturating the pool and waiting for exactly that many handler entries; and it
+  runs on EVERY retry leg). Mutations M23–M26.
+
+  **ROUND 5 CLOSED TWO MORE AND DREW THE LINE ON A THIRD.**
+
+  **(d) A satisfying approval was not required to state the class in force.**
+  `mcpLiveApprovalSatisfied` matched any live grant for the target and never compared
+  `ReviewedOperationClass`. An approval carries its own class, and a later approval for the SAME
+  exact fingerprint can state a different one — that is precisely how a reviewer corrects an earlier
+  determination. So with the read-only approval that armed the activation gone and only a MUTATING
+  one live, both admission and the boundary kept executing read-first on the strength of the
+  activation's older immutable record, and the correction never landed for the rest of the
+  activation's window. The class is now part of the question at BOTH sites, and a class no review
+  can bind to a tool (`OpUnset`/`OpDiscovery`/`OpControl`) fails closed rather than reading as
+  agreement.
+
+  **(e) The boundary predicate asked about scope before the generation.** A leaving-live commit
+  un-arms the tier and publishes the new scope BEFORE `demoteCanary` invalidates the generation, so
+  for a window both are withdrawn — and scope-first reported `rollout_out_of_scope` for an
+  already-admitted request while a fresh request in the identical final state reads
+  `rollout_mode_invalid` from the unarmed lifecycle gate. That is the same
+  diagnosis-depends-on-timing defect (c) removed, one layer in. The order now matches admission's own
+  precedence: is there still an activation, and only then what it authorizes.
+
+  **(f) "Revalidate at the actual request-write boundary" — PARTIALLY ACCEPTED, and the rest
+  REFUSED with reasons.** `destination.Resolve` sits between the pool-boundary re-ask and the
+  transport, and a DNS lookup is the least bounded of the three things that happen before any
+  request byte exists, so the predicate is re-asked once more in `roundTrip`, after resolution and
+  immediately before `client.Do`. What remains is TCP connect plus the TLS handshake, and that is
+  where re-asking stops buying anything: `net/http` exposes no hook there that can ABORT cleanly —
+  an `httptrace` callback observes but cannot refuse, and cancelling the request context from
+  underneath RACES THE WRITE, turning a deterministic refusal into `may_have_been_sent`, which is
+  strictly worse evidence than the window it would close. Both remaining steps are bounded by
+  CONFIGURED timeouts (`ConnectTimeout`, `TLSHandshakeTimeout`, and the whole attempt by
+  `RequestTimeout`), unlike the pool wait, which was bounded only by another request finishing.
+  **That bounded-vs-unbounded distinction is the principled stopping point**, and it is recorded
+  here rather than left implicit so a later round does not have to re-derive it.
+
+  Gates: `TestBoundaryAuthority_ApprovalMustStateTheClassInForce` and
+  `..._ApprovalWithNoStatedClassSatisfiesNothing` (both with the control that the MUTATING approval
+  still satisfies a MUTATING request — a matcher that stopped matching anything would pass the
+  refusal gate); `..._GenerationOutranksScopeWhenBothAreWithdrawn` with
+  `..._ScopeStillNamedWhenTheGenerationIsCurrent` as its control, because "generation first" must
+  not become "generation only". Mutations M27–M29.
+
+  **ROUND 6 OVERTURNED (f), AND THAT IS THE RIGHT OUTCOME.** The refusal above rested on two claims
+  and Codex falsified both: `net/http`'s `DialTLSContext` IS a cleanly abortable seam — perform the
+  pinned dial and the handshake there, re-ask, and close/return before handing the connection to the
+  transport, with no race against the write and `neverSent` evidence preserved exactly — and
+  "bounded by configured timeouts" does not mean bounded by anything small, since the defaults allow
+  seconds per phase and `NewLimits` accepts arbitrarily large positive durations. The invitation to
+  disagree was explicit and the disagreement was correct; the window is closed rather than argued
+  away.
+
+  The shape settled at **TWO re-ask sites**, each covering a different unbounded wait and neither
+  able to stand in for the other: `roundTrip` before `client.Do` (after the pool wait, which ends
+  only when another request finishes, and after DNS resolution), and `pinnedDialTLS` after the TCP
+  connect and the TLS handshake. They BRACKET DIFFERENT PHASES — the two waits are already behind
+  the first site and the dialer never sees them, while the connect and the handshake are still
+  ahead of it and only the dialer can sit after them. The **pool-boundary
+  site added in round 4 was REMOVED as redundant** — `roundTrip`'s re-ask is strictly later on the
+  same path with nothing between them that can have an effect — because a site that can only ever be
+  absorbed by another is a liability in a mutation campaign, not defence in depth.
+
+  Two implementation notes worth keeping. The TLS config is the transport's own with `ServerName`
+  filled in: `net/http` derives SNI from the request host when it owns the handshake, and it no
+  longer does, so omitting it would silently stop sending SNI on a path whose entire point is pinned
+  identity. And the dialer's refusal rides out in a typed error (`preSendRefusalErr`) rather than a
+  captured variable: `net/http` may dial on its own goroutine, so reading a value the dialer wrote
+  after `Do` returns is a data race — carrying the fact IN THE ERROR needs no synchronisation, and
+  `roundTrip` recovers the caller's verdict verbatim instead of classifying it as a connect failure
+  and reporting `may_have_been_sent` for a leg that demonstrably wrote nothing.
+
+  Round 6 also caught a **stale instruction beside the security predicate**: the summary line still
+  read "scope, then approval, then generation" after (e) changed the order. Exactly the kind of
+  comment that invites a future maintainer to restore a just-fixed defect; corrected, with the
+  reason for the order stated rather than implied.
+
+  Gates: `TestPreSend_RefusalBeforeTheTransportOpensNoConnection` (no TCP connection is even
+  accepted) and `..._RefusalAfterTheHandshakeStillSendsNothing` (a connection IS accepted, no HTTP
+  request is served, and the refusal is still provably never-sent), with
+  `..._PermittingHookDoesNotInterfere` as the control. **Each site is pinned by an observable the
+  other cannot produce** — counting hook invocations was the earlier instrument and it could not say
+  WHICH site ran, which is what let one absorb the other. Mutations M25, M29, M30.
+
+  **A SIXTH instance of the guarded-twice pattern, self-inflicted in the round that created it.**
+  Adding the second pre-send re-ask immediately made M25 (remove the pool-boundary one) absorbable
+  by the new site. The per-leg re-ask count is therefore pinned EXACTLY (`preSendsPerLeg`), both
+  removals verified failing independently, and M29 added for the new site. The rule has now earned
+  a stronger form: **adding a second guard for an invariant is itself a reason to re-check every
+  mutation that targeted the first.**
+
+  **A fifth instance of the guarded-twice pattern, and a new form of it.** M22's perl pattern stopped
+  matching when round 4 rewrote the closure it targeted, so the campaign reported it SKIPPED rather
+  than silently passing — the check that exists for exactly this. The lesson recorded last round
+  ("a refactor that moves a guard is a reason to re-read the mutation that targeted it") is now
+  itself load-bearing: it happened again, in the same file, one round later.
+
+  **ROUND 7 RETURNED NO FINDINGS**, on the head carrying all six remedies. That is the closure
+  evidence for this whole sub-section: six consecutive rounds each found the next place the previous
+  fix did not reach, and the seventh found none. It is evidence and not proof — a clean round bounds
+  what one reviewer found, not what is there — which is why the standing claim below remains what
+  the gates and the campaign establish, not what the review failed to object to.
+
+  Self-audit on that same head corrected a SEVENTH instance of the stale-comment class, found here
+  rather than by review: the two-site rationale claimed the dialer site was needed because "a
+  connection reused across retry legs never reaches the dialer". That reuse cannot occur —
+  `roundTrip` builds its own `http.Transport` per leg and releases its idle connections when the leg
+  ends, so every leg dials. The real reason the sites are independent is that they bracket different
+  phases, which is what both comments and this paragraph now say. The per-leg transport is the
+  stronger fact and is recorded in its place: no leg can inherit a connection another leg opened,
+  which is why the dialer site reaches every leg. Checking it also re-confirmed that a redirect
+  follow-up cannot become a second unguarded physical send on this path, since `RetryFreeLimits`
+  forces `MaxRedirects = 0` — closed in an earlier round for exactly that reason.
+
+  **AN EIGHTH INSTANCE, AND A NEW FORM: THE WRONG OBSERVABLE.** The same self-audit ran the boundary
+  gates under `-race` and `TestPreSend_RefusalAfterTheHandshakeStillSendsNothing` FAILED — the defect
+  being in the test, not the code. `pinnedTestServer` exposes `conns` as a GAUGE (+1 on accept, -1 on
+  close), and both pre-send site tests read it as if it were a cumulative accept counter. That is
+  wrong in BOTH directions, and only one of them is noisy: the post-handshake test asserted
+  `live >= 1` AFTER `Call` returned, which races the server's own `StateClosed` — our refusal has
+  already closed the socket by then — and its sibling asserted `live == 0` to mean "no connection was
+  opened", which is equally true of a connection opened and then closed, so it could pass while
+  proving nothing. One direction fails loudly under `-race`; the other is SILENT, and a silent
+  false-pass on a security gate is the worse of the two. `pinnedTestServerCounting` now exposes both
+  observables with their meanings named, and each gate reads the one it needs; the leak test keeps
+  the gauge. The post-handshake premise is now carried by two facts that cannot both be satisfied by
+  accident — `asks >= 2` proves OUR side of the handshake completed (the second ask is unreachable
+  until `HandshakeContext` returns nil) and a non-zero ACCEPT COUNT proves the peer established a
+  connection. Both repaired gates were re-verified against M25 and M30, so fixing the instrument did
+  not weaken what they catch. The rule this adds to the guarded-twice family: **a gate can be wrong
+  about WHAT IT MEASURES rather than about what it asserts, and a gauge read as a counter fails one
+  way and lies the other.**
 - **P2 — credential conditional (§4):** `CredentialProfile` is a policy obligation, so no-credential
   status is unverifiable until the exact tool + rule are fixed. Corrected.
 - **P1 — durable outcome evidence (§15/§18):** every event is a `PhaseDecision` with no
@@ -796,7 +1094,7 @@ BLOCKED-vs-FAILED note in §26).
 | Exactly one tenant / principal / server / tool / fingerprint, read-only, synthetic | Specifiable — YES |
 | Exactly one NODE, enforced PREVENTIVELY (before or at DP apply) | **NO — `ScopeSpec` has no node dimension, `pushAll` delivers to every `Dist.Nodes()` entry, `mcpPullDistributor.Push` discards its node argument (shared `ConfigSnapshot` reaches every DP), and the apply path has no intended-node check; a post-apply ack is detective, not preventive (§3/§13, blocker 15)** |
 | Tool requires no production credential | **CONDITIONAL — unverifiable until tool + rule fixed (§4)** |
-| A read-first-admissible one-exact-tool operation exists | **NO — classifier refuses `tools/call`; discovery cannot bind one tool (§6)** |
+| A read-first-admissible one-exact-tool operation exists | ~~**NO**~~ **YES (blocker 4 CLOSED, §25a)** — an exact reviewed fingerprint-bound `tools/call` classifies `OpRead`; the conservative `OpWrite` default and the `tools/list`-binds-no-tool fact are both unchanged, so nothing was widened to get here (§6) |
 | Supported upstream trust model for a controlled server available today | **NO** (§5) |
 | A provisioned target is USABLE (MCP initialize/version/session lifecycle) | **NO — client sends no `initialize`/version/session; a spec-compliant server rejects sessionless calls (§5)** |
 | Reviewed fingerprint bound to the OBSERVED live peer (not operator-declared) | **NO — seeded from operator JSON; identity verified against its own register stamp; no non-test `Discovery.Discover` caller (§7, blocker 11)** |
@@ -826,11 +1124,112 @@ blocker 8 narrowed but still OPEN. The other eleven are untouched and the §26 v
 
 ---
 
-## §25a Blocker 5, 6 and 7 closure, blocker 8 status (post-review evidence)
+## §25a Blocker 4, 5, 6 and 7 closure, blocker 8 status (post-review evidence)
 
 This section records the ONLY status changes made to the frozen ledger since it was adopted:
-blockers 5, 6 and 7 are CLOSED and blocker 8 is narrowed but still OPEN. The other eleven blockers
+blockers 4, 5, 6 and 7 are CLOSED and blocker 8 is narrowed but still OPEN. The other ten blockers
 are untouched, the baseline is still fifteen, and nothing here changes the §26 verdict.
+
+### Blocker 4 — CLOSED
+
+The closure bar was: the machine must be able to prove that ONE exact reviewed fingerprint-bound
+`tools/call` classifies as `OpRead`, while every unknown, unreviewed, hinted, drifted or ambiguous
+case stays non-read and fail-closed. The governing invariant, stated once:
+
+> a `tools/call` may become `OpRead` only when Culvert itself holds authoritative reviewed evidence
+> that exact tenant / exact server / exact tool / exact fingerprint / exact fingerprint format /
+> exact reviewed operation class = read-only. Unknown or ambiguous ⇒ `OpWrite` / deny.
+
+| Clause | Evidence |
+|---|---|
+| Culvert's own authority, never the server's | `tooltrust.ReviewedOperationClass` is stated by a REVIEWER on the four-eyes live approval; `ParseReviewedOperationClass` is strict and total, so no hint spelling (`true`, `readonly`, `readOnlyHint`) parses into a determination (`TestReadFirstClass_C03_ServerHintIsNotAnInputToClassification`). A live approval that states no class is refused at creation (`TestRequest_LiveExecutionRequiresReviewedOperationClass`), with the shadow control beside it |
+| No NEW authority — the fact lives on the existing reviewed record | `canary.ReviewedTarget.OperationClass`, on blocker 7's activation-bound immutable snapshot. There is no separate classifier store that could disagree with the activation about the same tool |
+| Bound to the FINGERPRINT, not the name | `ReviewedTargetSet.OperationClassFor` delegates to `Compare` and answers only on `ReviewedMatches`, so F2 inherits nothing from F1 (`TestReadFirstClass_C04_F2DoesNotInheritF1ReadClassification`). The FORMAT version is part of the binding (`TestReadFirstClass_FingerprintFormatIsPartOfTheBinding`) |
+| The caller cannot assert its own class | `Compare` never reads `cur.OperationClass`; an asserted class is ignored and the reviewed one returned (same test) |
+| No unstated class can arm | `CanonicalizeReviewedTargets` refuses `OpUnset` (`reviewed_target_no_operation_class`) and any class outside the reviewable vocabulary (`reviewed_target_invalid_operation_class`) — so `OpDiscovery`/`OpControl` can never be bound to a TOOL and reach the read-first predicate (`TestReadFirstClass_C02`, `TestReadFirstClass_C08`) |
+| Arguments cannot upgrade authority | the classifier seam takes `(capability, serverID, toolName)` and nothing else; the root resolves fingerprint, format, tenant and identity from its own authoritative inventory. Pinned on the TYPE (`TestReadFirstWall_ClassifierTakesNoServerSuppliedInput`), because a behavioural test can only show an input is ignored, not that there is none to give |
+| Unknown / unusable targets are never classified | `TestReadFirstClass_C06_UnreviewedToolIsNeverRead`, `TestReadFirstClass_C07_UnusableServerIsNotClassified`, `TestReadFirstRuntime_UnknownToolIsNeverClassified` |
+| Discovery stays discovery | `tools/list` keeps `OpDiscovery` and is never routed through the classifier at all (`TestReadFirstRuntime_DiscoveryNeverReachesTheClassifier`) — blocker 4 is not closed by substituting a listing for an invocation |
+| ONE classification, flowing through the decision tuple | `TestReadFirstWall_OperationClassHasExactlyOneClassificationSite` (AST: exactly one site in `internal/mcp/runtime` may write a tool call's class) and `TestReadFirstParity_ClassIsReadFromTheDecisionAndNowhereElse` (AST: `liveGateInput` reads `in.Input.Operation.Class`), with the behavioural parity across the whole class vocabulary in `TestReadFirstParity_GateReceivesTheDecidedClass`. So the policy engine, the activation gate and the live side-effect gate read ONE value rather than three that agree today |
+| Durable across restart, immutable within a generation | `canaryRuntimeSchemaVersion` 3; a record that cannot state its class from its own bytes does not restore armed (`TestReadFirstClass_DurableRecordWithoutAClassDoesNotRestoreArmed`), a restart restores the same classification (`C11`), and a same-generation update that changes only the class is refused (`C12`) |
+| The freshness boundary is not weakened | `TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2` — a decision computed under F1 does not reach upstream once the target is F2; the promotion is not the last word |
+| The classification does not outlive the activation that made it | `admitLiveExecution` step (5b): the decided class must EQUAL the one the activation being charged binds to this target, decided inside the lock that decides which activation that is. `TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating` (the full G1→G2 sequence through the real gate) + `TestAtomicBinding_I_ClassNotInForceIsRefused` (the transaction-level half, with its own positive control) |
+| Anti-vacuity (MANDATORY positive controls) | `TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead`, `TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall` and `TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass` — a classifier that answered "no" to everything would satisfy every negative gate while being the feature deleted |
+| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 30 mutations, 30 caught, 0 survived, 0 skipped (M17–M30 belong to the §24 boundary finding below, not to blocker 4's own criteria) |
+
+**Two things the campaign taught, recorded because they change how a survivor should be read.**
+A single-edit mutation of the stale-decision boundary SURVIVED, and the reason was not a missing
+gate: that boundary is guarded twice and independently (the trust precheck revalidates the
+decision's fingerprint; the approval binds the exact tool it was granted for), so removing either
+alone changes nothing observable. The same held for the unset-class guard, which is enforced both by
+its own named case and by the reviewable-vocabulary membership test. A mutation that never managed
+to break anything is not evidence of a hole — but it is also not evidence of a gate, so both were
+rewritten to remove BOTH guards — and then a THIRD instance appeared, in the other direction: the
+boundary revalidation added for the P1 above independently refuses a write-class request, so the
+mutation that disables the read-first gate stopped reintroducing anything the moment that guard
+landed. A FOURTH appeared when naming the boundary revalidation as its own predicate moved a
+mutation's target and quietly narrowed what it proved: the predicate's `!ok` clause — "the record
+cannot speak for this target" — has no independently reachable case, because step (5)'s
+out-of-scope refusal and the trust probe both refuse first. It is kept as defense in depth, the
+mutation was restored to disabling the predicate outright, and its description now says so.
+Four instances in one campaign is a pattern, not a coincidence: on this path most invariants are
+guarded twice, so a surviving single-edit mutation is re-read before it is believed — and a
+refactor that moves a guard is a reason to re-read the mutation that targeted it.
+
+**The sharpest finding came from adversarial review, not from the campaign** (Codex P1, PR #1370).
+The class is decided ONCE, at policy time, under whatever activation is armed at that instant — but
+"decided once" is a statement about how many times it is COMPUTED, not about how long it stays
+true, and the request carrying it is charged, at the boundary, to whatever activation is armed
+THEN. So: G1 reviewed a tool read-only and a request was decided `OpRead`; the request paused; G1
+was demoted and G2 armed for the SAME tool at the SAME fingerprint with a review stating MUTATING —
+a reviewer correcting the earlier determination; the request resumed and crossed, because gate 2
+read `OpRead` off its own decision and every drift control was correctly silent (the target did not
+move; the review of it did). The correction landed in the one window where it mattered most.
+
+`admitLiveExecution` now revalidates the class inside the transaction. That is REVALIDATION, not a
+second classification, and the distinction is why it does not violate the one-classification rule:
+nothing recomputes a class from different inputs and hopes it agrees — it re-reads the SAME
+authority under the lock that decides which activation is paying, exactly as the trust probe and
+the drift comparison already do at this boundary. Equality rather than "read is still read", so it
+stays correct if a later phase admits a non-read class and so a record that cannot speak for the
+target fails closed instead of reading as agreement.
+
+It also corrected a fixture error the campaign had not caught: several fixtures armed a MUTATING
+reviewed target and then asserted "the reviewed request must be admitted" — a state the product
+cannot reach, since a tool call crosses the side-effect gate as `OpRead` or not at all. The
+revalidation exposed every one of them on the first run.
+
+**And one the campaign found rather than confirmed.** `in.Operation = op` sits AFTER the call that
+may promote it, and the ordering is load-bearing in the quietest possible way: reversed, the
+classifier is still consulted and still answers correctly, nothing refuses, nothing fails to
+compile, and every fail-closed gate still passes — the exact reviewed call is simply denied
+read-first forever, with no signal anywhere. Only a gate that reads the class the EXECUTOR received
+can see it, which is why the positive control asserts on the executor's `DecisionInput` rather than
+on the classifier's answer (M14).
+
+**Default posture unchanged.** No activation arms in the shipped build, so the classifier answers
+`false` for every request and every `tools/call` stays `OpWrite` — byte-identical to the behaviour
+before this work.
+
+**What this does NOT close.** A read-first-EXECUTABLE classification says nothing about whether a
+controlled upstream exists (blocker 1), the activation preflight can reach `Ready:true` (2), an
+operator can arm (3), the target is `catalog.Usable` (13), or the request resolves to an exact
+policy ALLOW with satisfiable obligations (14). Those remain open and untouched.
+
+**A SECOND, SEPARATE defect was closed in the same PR, and it is NOT part of this closure.** Codex
+round 2 found that the resolved SCOPE was never revalidated at the admission boundary — the same
+stale-resolution class as the P1 above, one axis over. It is recorded in §24 with its own remedy and
+its own gates, and it is deliberately not folded into blocker 4: blocker 4's criteria are the table
+above and they stand or fall on their own. It was fixed there rather than deferred because it sits in
+the exact admission boundary this work was already hardening, and a known P1 in that boundary is not
+carried across a merge merely because it predates the branch. Its gates are
+`mcp_canary_scope_in_force_test.go`, `internal/mcp/upstreamclient/presend_test.go`, and campaign mutations M17–M30.
+
+It also does not close the SCOPE half of the same defect class: step (5b) revalidates the operation
+class at the boundary, and nothing revalidates the resolved SCOPE there — a request that resolved
+under a scope naming principal A can still be admitted after a same-mode update replaced A with B.
+That is a NEW finding, not one of the fifteen, pre-existing on `main` and unwidened by this work;
+see §24 for the evidence and the proposed remedy. Do not read blocker 4's closure as covering it.
 
 ### Blocker 5 — CLOSED
 
@@ -858,9 +1257,10 @@ Runtime scope matching still denies an out-of-scope principal/server/tool
 closure argument: the argument is that the broader scope never activates.
 
 **What this does NOT close.** Exactly one tool being AUTHORIZED BY SCOPE says nothing about whether
-`tools/call` for it is read-first EXECUTABLE (blocker 4, the operation-classifier problem), nor that
-the target is `catalog.Usable`, resolves to an exact policy ALLOW, or has satisfiable obligations
-(blockers 13/14). Those remain open and untouched.
+`tools/call` for it is read-first EXECUTABLE (blocker 4, the operation-classifier problem — since
+CLOSED separately, see "Blocker 4" above; it was open when this closure was written), nor that the
+target is `catalog.Usable`, resolves to an exact policy ALLOW, or has satisfiable obligations
+(blockers 13/14). Those last two remain open and untouched.
 
 ### Blocker 6 — CLOSED
 
@@ -1794,16 +2194,24 @@ The Canary core is fail-closed across scope, trust firewall, budget ceiling, per
 re-read, restart re-arm/allowance, and no-secret evidence. But a safe first experiment cannot be
 assembled today on **fifteen independent blockers** — some are intentional capability gaps, some are
 prerequisites, and two are genuine product defects the Codex adversarial rounds (§24) surfaced and
-this review verified against the code. The list below is exhaustive AS A SET: together the fifteen cover
-every mandatory NO/CONDITIONAL row in §25, so closing ALL of them is necessary and sufficient to pass
-§25 — but the mapping is grouped, not strictly 1:1 (e.g. §25's independent-witness row folds under
-blocker 7's auto-abort and also depends on blockers 1 and 6).
+this review verified against the code. The list below is complete AGAINST §25: together the fifteen
+cover every mandatory NO/CONDITIONAL row there, so closing ALL of them is necessary and sufficient to
+pass §25 — but the mapping is grouped, not strictly 1:1 (e.g. §25's independent-witness row folds
+under blocker 7's auto-abort and also depends on blockers 1 and 6).
+
+**Passing §25 is not the same as being safe to run, and this list is not a complete inventory of what
+must be closed.** Later adversarial rounds have found real defects that no §25 criterion names — they
+are recorded in §24 under their own headings, deliberately NOT renumbered into the fifteen (which
+would let them inherit a neighbour's closure) and NOT filed as a sixteenth blocker (the original
+fifteen are preserved exactly as adopted). A First Canary requires the fifteen closed AND every such
+§24 finding closed.
 
 **Post-adoption status (see §25a).** The baseline remains **fifteen**; the list below is preserved
-as adopted, and nothing is renumbered or deleted. Four entries have changed status since:
-**blocker 5 is CLOSED**, **blocker 6 is CLOSED**, **blocker 7 is CLOSED**, and **blocker 8 is
-narrowed but still OPEN**. Eleven are untouched, and the verdict above is unchanged — closing
-blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the prohibition.
+as adopted, and nothing is renumbered or deleted. Five entries have changed status since:
+**blocker 4 is CLOSED**, **blocker 5 is CLOSED**, **blocker 6 is CLOSED**, **blocker 7 is CLOSED**,
+and **blocker 8 is narrowed but still OPEN**. Ten are untouched, and the verdict above is unchanged
+— closing blockers 4, 5, 6 and 7 removes four of fifteen reasons a GO is forbidden, not the
+prohibition.
 
 1. **No controlled upstream reachable AND usable under the supported production trust model (§5).**
    The only documented controlled inventory fails closed on scheme (`mcp+https://`), host (private
@@ -1818,9 +2226,22 @@ blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the 
    `Budget` fail-closed.
 3. **No governed production arming entry point (§12).** `armLiveTier` has no production caller (only
    tests invoke it), so an operator cannot arm the tier in the shipped process.
-4. **The read-first classifier refuses the one-exact-tool call (§6).** `tools/call` is `OpWrite`
-   (refused read-first); `tools/list` binds no exact tool for the live-approval revalidation. A
-   finer classifier or a designed discovery-trust path is required.
+4. ~~**The read-first classifier refuses the one-exact-tool call (§6).**~~ **CLOSED** — exact
+   read-first tool classification. The finding stands as written: `tools/call` WAS `OpWrite` with
+   no exception, and `tools/list` binds no exact tool. Of the two remedies it named, the finer
+   classifier was taken and the discovery-trust path was deliberately NOT — substituting a listing
+   for an invocation is the thing §7 forbids.
+
+   A `tools/call` now becomes `OpRead` if and only if the ACTIVE activation's immutable reviewed
+   record binds this exact (tenant, server, tool), at this exact fingerprint AND fingerprint
+   format, under this exact pinned server identity, to a four-eyes reviewed read-only class.
+   Everything else — no activation, no reviewed entry, a moved fingerprint, a moved identity, a
+   moved tenant, an unstated class, an unknown or unusable tool — stays `OpWrite`. The reviewed
+   class rides on blocker 7's activation snapshot rather than a classifier of its own, so there is
+   no second authority to diverge from it; the seam the runtime is handed carries
+   `(capability, serverID, toolName)` and nothing a request, an argument or a server could supply.
+   Classification happens once and flows through the existing decision tuple, walled structurally
+   at both ends. See §25a for the full closure argument and proofs.
 5. ~~**The machine gate does not enforce exactly-one tool/principal (§10).**~~ **CLOSED** — the
    exact First-Canary scope gate. `MaxCanaryTools`/`MaxCanaryPrincipals` are still 2 and are
    deliberately UNCHANGED: they bound the Canary ARCHITECTURE, which a later graduation phase may
@@ -1873,8 +2294,9 @@ blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the 
 
    **Scope discipline.** This establishes only that exactly one tool is AUTHORIZED BY SCOPE. It does
    NOT establish that `tools/call` for that tool is read-first executable (blocker 4 — the
-   operation-classifier problem, untouched), nor that the target is `catalog.Usable`, exact-policy
-   ALLOWed, or has satisfiable obligations (blockers 13/14, untouched).
+   operation-classifier problem, untouched by THIS entry and closed separately in its own), nor that
+   the target is `catalog.Usable`, exact-policy ALLOWed, or has satisfiable obligations
+   (blockers 13/14, untouched).
 6. ~~**The budget does not bound physical upstream invocations (§9).**~~ **CLOSED** — see
    "Blocker 6 closure" below. Idempotent read retries could send the POST ~3× per single budget
    reservation; the Canary path is now retry-free and the bound is proven at the wire.
@@ -2008,9 +2430,11 @@ blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the 
    BEFORE any user rule is evaluated (`internal/mcp/policy/engine.go:132-135`). `ApproveLive`
    DELIBERATELY performs no promotion ("live trust never materializes `catalog.Usable`",
    `mcp_tooltrust.go:413-450`), and the only non-test `catalog.Promote` callers are the shadow
-   `promoteFor` path (`mcp_tooltrust.go:536`, `:629`). So even with blockers 1–12 closed and a finer
-   read-first classifier (blocker 4), every exact-tool request is hard-denied at the quarantine
-   override. Catalog USABILITY must be a mandatory criterion: a `shadow_evaluation` approval (which
+   `promoteFor` path (`mcp_tooltrust.go:536`, `:629`). So even with blockers 1–12 closed and the
+   finer read-first classifier now shipped (blocker 4, CLOSED), every exact-tool request is still
+   hard-denied at the quarantine override — a read-first CLASSIFICATION is not catalog USABILITY,
+   and the classifier deliberately declines to speak for an unusable target rather than substituting
+   for this control. Catalog USABILITY must be a mandatory criterion: a `shadow_evaluation` approval (which
    promotes) or another governed promotion path must make the exact tool `catalog.Usable`.
 14. **The exact request must resolve to an ALLOW-class decision with satisfiable obligations (§4/§13).**
    Closing the credential condition (blocker 9) by choosing a rule with no `CredentialProfile` does not

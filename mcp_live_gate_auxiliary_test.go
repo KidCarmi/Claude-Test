@@ -63,11 +63,11 @@ func newAuxGate(s *auxSeams) *mcpLiveSideEffectGate {
 			s.trustCalls++
 			return liveTrustPrecheck{Eligible: true}
 		},
-		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
+		approvalOK: func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) {
 			s.trustCalls++
 			return true, ""
 		},
-		admitUnderActivation: func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+		admitUnderActivation: func(time.Time, policy.OperationClass, string, canaryScopeProbe, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 			s.resCalls++
 			return canaryAdmission{Active: true, Generation: 7, Trusted: true}
 		},
@@ -146,12 +146,12 @@ func TestAdmitAuxiliary_RevalidatesTheLifecycleAtTheBoundary(t *testing.T) {
 	if !d.Admit || d.Revalidate == nil {
 		t.Fatalf("expected an admitted decision carrying a Revalidate; admit=%v", d.Admit)
 	}
-	if !d.Revalidate() {
-		t.Fatal("revalidation refused while admission was still open")
+	if r := d.Revalidate(); r != mcperr.ReasonNone {
+		t.Fatalf("revalidation refused (%s) while admission was still open", r.Code())
 	}
 	// The tier closes admission after the grant.
 	s.admitOpen = false
-	if d.Revalidate() {
+	if d.Revalidate() == mcperr.ReasonNone {
 		t.Fatal("revalidation admitted after the tier closed admission mid-flight")
 	}
 }

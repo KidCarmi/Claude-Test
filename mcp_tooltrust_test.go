@@ -246,6 +246,9 @@ func TestToolTrust_LiveExecutionIssuableOnlyWithExpiry(t *testing.T) {
 		Tenant: ttTenant, ServerID: sid, ToolName: tool,
 		ExpectedFingerprint: fpHex, ExpectedCatalogRev: cat.Current().Revision(),
 		Purpose: tooltrust.PurposeLiveExecution, RequestedBy: "operator@corp",
+		// Stated, so this test keeps being about the expiry rule rather than about the reviewed
+		// class that is now equally required of a live request.
+		ReviewedOperationClass: tooltrust.ReviewedOpMutating,
 	}
 	// No expiry ⇒ refused as an invalid request (not purpose-unsupported).
 	if _, err := mcpToolTrust.RequestLiveApproval(base); mcperr.ReasonOf(err) != mcperr.ReasonAdminRequestInvalid {

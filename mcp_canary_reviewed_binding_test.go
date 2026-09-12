@@ -16,6 +16,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
 	"github.com/KidCarmi/Culvert/internal/mcp/catalog"
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/registry"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
@@ -121,6 +122,24 @@ func armReviewedActivation(t *testing.T, rt *canaryRuntime, capb rollout.Capabil
 // probe would, and shapes it as a reviewed record.
 func observedReviewedTarget(t *testing.T, sid, tool, fpHex string) canary.ReviewedTarget {
 	t.Helper()
+	// READ-ONLY, because that is the only reviewed class the First Canary can execute: a tool call
+	// reaches the side-effect gate as OpRead or not at all (gate 2), and the admission transaction
+	// requires the activation to still bind that class (step 5b). A fixture that armed a MUTATING
+	// target and then asserted "the reviewed request must be admitted" would be asserting a state
+	// the product cannot reach — which is what the first version of this fixture did, and what the
+	// boundary revalidation immediately exposed.
+	//
+	// Drift is a property of the target's IDENTITY, not of its semantics, so every case in this
+	// matrix is indifferent to WHICH class is bound; what it is not indifferent to is the class
+	// being the one the request carries.
+	return observedReviewedTargetClassified(t, sid, tool, fpHex, policy.OpRead)
+}
+
+// observedReviewedTargetClassified is observedReviewedTarget with the reviewed operation class
+// stated explicitly. The read-first matrix (blocker #4) uses it to arm a genuinely read-only
+// reviewed record; everything else takes the conservative default above.
+func observedReviewedTargetClassified(t *testing.T, sid, tool, fpHex string, class policy.OperationClass) canary.ReviewedTarget {
+	t.Helper()
 	live := mcpLiveTrustPrecheck(ttTenant, sid, tool, fpHex)
 	if !live.Eligible {
 		t.Fatalf("fixture: %s/%s must resolve to an eligible target, got %+v", sid, tool, live)
@@ -129,6 +148,7 @@ func observedReviewedTarget(t *testing.T, sid, tool, fpHex string) canary.Review
 		Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
 		Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
 		ServerIdentity: live.ServerIdentity,
+		OperationClass: class,
 	}
 }
 
@@ -300,7 +320,7 @@ func TestReviewedBinding_C05_ALaterApprovalForF2DoesNotResurrectG(t *testing.T) 
 	if ok, _ := mcpLiveApprovalSatisfied(canary.LiveTarget{
 		Tenant: ttTenant, ServerID: r.sid, ToolName: r.tool,
 		Fingerprint: mustDigest(t, fp2), FingerprintFormat: 1,
-	}, r.now); !ok {
+	}, policy.OpRead, r.now); !ok {
 		t.Fatal("premise: the F2 approval must itself be valid — otherwise this proves nothing")
 	}
 
@@ -696,7 +716,7 @@ func TestReviewedBinding_AnUnrecognisedDenialClassFailsClosed(t *testing.T) {
 	if unknownDenial == canaryAdmitGranted {
 		t.Fatal("premise: the injected class must not be the grant")
 	}
-	g.admitUnderActivation = func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+	g.admitUnderActivation = func(time.Time, policy.OperationClass, string, canaryScopeProbe, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 		return canaryAdmission{Denial: unknownDenial, Active: true, Generation: 7}
 	}
 	d := g.AdmitSideEffect(driftGateInput("s", "t", "fp", canaryRuntimeTestNow))
@@ -714,7 +734,7 @@ func TestReviewedBinding_AnUnrecognisedDenialClassFailsClosed(t *testing.T) {
 
 	// Control: the SAME harness admits an explicit grant, so the assertion above cannot be
 	// satisfied by a gate that refuses everything.
-	g.admitUnderActivation = func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+	g.admitUnderActivation = func(time.Time, policy.OperationClass, string, canaryScopeProbe, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 		return canaryAdmission{Denial: canaryAdmitGranted, Active: true, Generation: 7, Trusted: true, Outcome: canary.BudgetGranted}
 	}
 	ok := g.AdmitSideEffect(driftGateInput("s", "t", "fp", canaryRuntimeTestNow))

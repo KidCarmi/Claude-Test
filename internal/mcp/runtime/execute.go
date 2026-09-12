@@ -64,6 +64,19 @@ type ExecInput struct {
 	SnapshotHash string
 	Now          time.Time
 
+	// ResolvedScopeHash is the content hash of the rollout scope this request's disposition
+	// was resolved under — the exact authorization envelope that made it executable.
+	//
+	// It is a BOUNDARY FACT and deliberately NOT part of Input (policy.DecisionInput):
+	// nothing about the policy decision depends on it, and putting Canary scope identity
+	// into the policy vocabulary would make the decision tuple carry a second concern. It
+	// travels alongside the decision, not inside it.
+	//
+	// Set by the pipeline immediately after Resolve, from that resolution's own snapshot.
+	// Empty on every non-executing path, and empty is FAIL-CLOSED at the admission
+	// boundary — "no envelope" is never "the right envelope".
+	ResolvedScopeHash string
+
 	// ToolStillCurrent re-resolves the decision's tool against the LIVE catalog and
 	// reports whether it still carries the fingerprint the decision was computed
 	// against. It is called by the executor at the LAST moment before the

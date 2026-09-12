@@ -74,10 +74,32 @@ func (r *atomicRig) remaining() int {
 }
 
 func (r *atomicRig) admit(trust canaryTrustProbe) canaryAdmission {
-	return r.rt.admitLiveExecution(r.capb, canaryRuntimeTestNow, canary.ExecutionIdentity{
+	return r.admitAs(policy.OpRead, trust)
+}
+
+// admitAs drives one transaction with an explicit decided operation class. The default above is
+// OpRead because that is the class this file's fixtures arm and the only one a tool call can carry
+// through the First-Canary gate; a case ABOUT the class mismatch states the other one explicitly.
+func (r *atomicRig) admitAs(opClass policy.OperationClass, trust canaryTrustProbe) canaryAdmission {
+	return r.admitFull(opClass, testScopeHash, scopeProbe(testScopeHash), trust)
+}
+
+// admitFull drives one transaction with every boundary fact stated. Cases ABOUT the scope
+// envelope use it directly; everything else takes the agreeing pair above, since a rig whose
+// scope never matched would make every other assertion in this file unreachable.
+func (r *atomicRig) admitFull(opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, trust canaryTrustProbe) canaryAdmission {
+	return r.rt.admitLiveExecution(r.capb, canaryRuntimeTestNow, opClass, resolvedScope, scopeNow, canary.ExecutionIdentity{
 		Principal: "p1", Tool: "t1", Server: "s1",
 	}, trust)
 }
+
+// testScopeHash is the canonical synthetic authorization envelope: a request resolved under it and
+// it is still installed. Shaped like a real scope hash (hex) so a test cannot pass on a value the
+// production type would never carry.
+const testScopeHash = "5c09e0f2b1d34a7e8f6c2b0a9d1e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e"
+
+// scopeProbe returns a canaryScopeProbe reporting a fixed installed envelope.
+func scopeProbe(h string) canaryScopeProbe { return func() string { return h } }
 
 // probeDrift returns a probe reporting an authoritative drift ON A RESOLVED TARGET.
 //
@@ -433,7 +455,7 @@ func TestAtomicBinding_TrustProbeMayNotReEnterTheRuntime(t *testing.T) {
 	// subject stays the lock order rather than a reviewed-target mismatch.
 	if _, err := r.rt.beginCanaryActivation(r.capb, canaryActivationSpec{
 		Budget:          runtimeTestBudget(3),
-		ReviewedTargets: []canary.ReviewedTarget{obs.Current},
+		ReviewedTargets: []canary.ReviewedTarget{reviewedAsRead(obs.Current)},
 		StartedAt:       canaryRuntimeTestNow,
 	}); err != nil {
 		t.Fatalf("begin activation: %v", err)
@@ -764,7 +786,7 @@ func TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction(t *testing.T) {
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckEligible,
-		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
+		approvalOK: func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) {
 			// The store answers DIFFERENTLY either side of the lock, which is the whole point:
 			// a constant answer cannot tell a cached read from a live one. sync.Mutex is not
 			// reentrant, so on this single-threaded path a successful TryLock means we are NOT
@@ -776,8 +798,8 @@ func TestAtomicBinding_ApprovalIsEvaluatedInsideTheTransaction(t *testing.T) {
 			askedInsideLock = true
 			return false, "" // the revocation the transaction must observe
 		},
-		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return r.rt.admitLiveExecution(r.capb, now, ident, trust)
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
 		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },
@@ -835,11 +857,11 @@ func TestAtomicBinding_RugPullLatchesAtAdmission(t *testing.T) {
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckAt(fpF2),
-		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) {
+		approvalOK: func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) {
 			return false, "" // unauthorized, and saying nothing about what was reviewed
 		},
-		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return r.rt.admitLiveExecution(r.capb, now, ident, trust)
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
 		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },
@@ -884,9 +906,9 @@ func TestAtomicBinding_MissingApprovalIsNotDrift(t *testing.T) {
 		admit:         func() (func(), bool) { return func() {}, true },
 		readFirst:     func(policy.OperationClass) bool { return true },
 		trustPrecheck: stubTrustPrecheckEligible,
-		approvalOK:    func(canary.LiveTarget, time.Time) (bool, string) { return false, "" },
-		admitUnderActivation: func(now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
-			return r.rt.admitLiveExecution(r.capb, now, ident, trust)
+		approvalOK:    func(canary.LiveTarget, policy.OperationClass, time.Time) (bool, string) { return false, "" },
+		admitUnderActivation: func(now time.Time, opClass policy.OperationClass, resolvedScope string, scopeNow canaryScopeProbe, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+			return r.rt.admitLiveExecution(r.capb, now, opClass, resolvedScope, scopeNow, ident, trust)
 		},
 		releaseBudget:     func(gen uint64) { r.rt.releaseCanaryExecution(r.capb, gen) },
 		generationCurrent: func(gen uint64) bool { return r.rt.generationActive(r.capb, gen) },
@@ -908,5 +930,49 @@ func TestAtomicBinding_MissingApprovalIsNotDrift(t *testing.T) {
 		t.Fatal("SECURITY: an ordinary unauthorized request STOPPED the Canary — a missing " +
 			"approval is request-scoped, and treating it as a breach makes every unauthorized " +
 			"caller a kill switch")
+	}
+}
+
+// reviewedAsRead states the reviewed operation class on an OBSERVED target, which carries none:
+// mcpCurrentAuthoritativeTarget reports what is in force NOW, and a current target has no reviewed
+// class — that fact lives only on the activation's record. The lock-order tests arm against
+// whatever the composed fixture publishes and are indifferent to the semantics, so they take the
+// one class a First-Canary request can actually carry.
+func reviewedAsRead(t canary.ReviewedTarget) canary.ReviewedTarget {
+	t.OperationClass = policy.OpRead
+	return t
+}
+
+// TestAtomicBinding_I_ClassNotInForceIsRefused is the transaction-level half of the boundary class
+// revalidation (Codex P1, PR #1370).
+//
+// The activation binds this target read-only. A request that arrives carrying a DIFFERENT decided
+// class — the shape a stale decision from a superseded activation produces — is refused
+// request-scoped: nothing latches, because the target did not move; the review of it did.
+func TestAtomicBinding_I_ClassNotInForceIsRefused(t *testing.T) {
+	r := newAtomicRig(t)
+	g := r.arm(t, 3)
+
+	// CONTROL first: the matching class is granted, so the refusal below cannot be a transaction
+	// that denies everything.
+	if adm := r.admitAs(policy.OpRead, probeTrusted()); !adm.Granted() {
+		t.Fatalf("control: the class the activation binds must be granted, got %v", adm.Denial)
+	}
+
+	adm := r.admitAs(policy.OpWrite, probeTrusted())
+	if adm.Granted() {
+		t.Fatal("SECURITY: a request whose operation class the activation does not bind must not be admitted")
+	}
+	if adm.Denial != canaryAdmitClassNotInForce {
+		t.Fatalf("the refusal must carry its own bounded reason, got %v", adm.Denial)
+	}
+	if adm.Generation != g {
+		t.Fatalf("the refusal must be attributed to the activation that refused it, got %d want %d", adm.Generation, g)
+	}
+	if r.rt.abortedNow(r.capb) {
+		t.Fatal("SECURITY: a class mismatch is request-scoped — the TARGET did not move, so nothing may latch")
+	}
+	if got, want := r.remaining(), 2; got != want {
+		t.Fatalf("a refused request must not spend budget: %d of %d left", got, want)
 	}
 }

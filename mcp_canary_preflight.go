@@ -5,6 +5,7 @@ import (
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
 	evmodel "github.com/KidCarmi/Culvert/internal/mcp/events/model"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
@@ -548,6 +549,17 @@ func reviewedTargetsFromBindings(bindings []canary.ToolApprovalBinding) []canary
 	out := make([]canary.ReviewedTarget, 0, len(bindings))
 	for i := range bindings { // index-based: the binding carries a 32-byte digest
 		t := bindings[i].Target
+		// The reviewed operation class comes from the APPROVAL — the four-eyes artifact bound
+		// to this exact fingerprint — and from nowhere else. A binding with no approval, or an
+		// approval that never stated the class, projects OpUnset, which
+		// canary.CanonicalizeReviewedTargets refuses: the activation does not arm rather than
+		// arming with a target it cannot classify. That refusal is the point. Defaulting the
+		// class here — in either direction — would make this function the authority on tool
+		// semantics, which is precisely what §4 forbids.
+		var class policy.OperationClass
+		if a := bindings[i].Approval; a != nil {
+			class, _ = canary.OperationClassFromReviewed(a.ReviewedOperationClass)
+		}
 		out = append(out, canary.ReviewedTarget{
 			Tenant:            t.Tenant,
 			ServerID:          t.ServerID,
@@ -555,6 +567,7 @@ func reviewedTargetsFromBindings(bindings []canary.ToolApprovalBinding) []canary
 			Fingerprint:       t.Fingerprint,
 			FingerprintFormat: t.FingerprintFormat,
 			ServerIdentity:    bindings[i].ServerIdentity,
+			OperationClass:    class,
 		})
 	}
 	return out
