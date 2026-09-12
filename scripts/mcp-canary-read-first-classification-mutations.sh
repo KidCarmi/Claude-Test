@@ -475,7 +475,7 @@ run_mutation M22 \
   'the authorization envelope is not revalidated in the post-admission window' \
   'TestScopeInForce_ScopeWithdrawnAfterAdmissionRefusesBeforeUpstream' \
   . "$GATE" \
-  's/\t\t\tif !canaryScopeInForce\(in\.ResolvedScopeHash, g\.currentScopeHash\) \{\n\t\t\t\treturn false\n\t\t\t\}\n//'
+  's/\t\t\tif !canaryScopeInForce\(in\.ResolvedScopeHash, g\.currentScopeHash\) \{\n\t\t\t\treturn mcperr\.ReasonRolloutOutOfScope\n\t\t\t\}\n//'
 
 RUN=internal/mcp/execution/run.go
 UCLIENT=internal/mcp/upstreamclient/client.go

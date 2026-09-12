@@ -851,6 +851,59 @@ code:
   `Revalidate` wired to refuse unconditionally would satisfy the first while deleting live
   execution entirely. Mutation M22 removes only the final-boundary half, leaving step (5c) intact so
   every direct-admission gate still passes.
+
+  **ROUND 4 FOUND THAT THE WINDOW WAS STILL TOO SHORT, AND THE PREDICATE STILL TOO NARROW.** Three
+  findings, each confirmed against the code before acting, and all closed in #1370.
+
+  **(a) The pool wait is unbounded.** `preCallGuard`'s comment claimed nothing blocking sits between
+  it and the send. That was true of THAT function and false of the one it calls: `Client.Call`
+  blocks in `pool.acquire` on a per-server semaphore until a slot frees or the context is done, so a
+  kill, a demotion, a scope withdrawal or an approval revocation could land, return successfully,
+  and the waiting request would then send anyway. The retry loop had the same shape one level in — a
+  second leg re-sent on the strength of a check made before the first. **This exposure was not new
+  with the scope work: the emergency kill re-read, the flagship "last authoritative state read
+  before `Upstream.Call`" of PREREQ-MCP-KILL-1, sat behind the same wait.** `CallOptions.PreSend`
+  now carries the executor's predicate into the client, where it is re-run holding the slot, before
+  EVERY physical attempt. The hook is deliberately OPAQUE — `internal/mcp/upstreamclient` learns
+  nothing about generations, scopes, approvals or kill state. Serializing publication with the
+  admission transaction was the alternative remedy and is again NOT taken: it would block an
+  operator's edit behind every in-flight admission and would still leave this window open.
+
+  **(b) The live approval was never re-asked.** Round 22 moved the approval lookup INTO the admission
+  transaction so a revocation racing the lock could not be admitted, and recorded in
+  `mcp_live_gate.go` that the final boundary re-reads *"tool freshness, generation and kill state,
+  not approval status"*. That residual is now closed: the grant is re-checked at a FRESH instant
+  (not the admission instant — an approval that expired while the request waited must not be spent
+  on the strength of how fresh it was when the wait began), against the same lock-free
+  pointer-published inventory the admission probe used. Neither the scope nor the generation moves
+  when an approval is withdrawn, and `ToolStillCurrent` only checks catalog freshness, so nothing
+  else could have caught it.
+
+  **(c) A withdrawal was diagnosed by a fixed reason.** The SAME scope mismatch read
+  `rollout_out_of_scope` when admission caught it and `rollout_mode_invalid` when the boundary did —
+  two contradictory answers for one fact, separated only by timing, in the block telemetry an
+  operator reads during an incident, while the mode stayed a perfectly valid Canary throughout.
+  `Revalidate` now returns the gate's own bounded `mcperr.Reason` instead of a bool, and ONE shared
+  `applyBoundaryRefusal` classifies both refusal sites so they cannot drift apart. Which authority
+  withdrew is still not distinguished INSIDE `internal/mcp/execution` — that package must not learn
+  to reason about scopes, generations or approvals to decide a physical attempt is unauthorized; the
+  gate names the reason and the executor carries it.
+
+  Gates: `TestBoundaryAuthority_ApprovalRevokedAfterAdmissionRefusesBeforeUpstream`,
+  `..._ScopeWithdrawnDuringThePoolWaitRefusesBeforeSend` (which also pins the reason), and
+  `..._ValidApprovalSurvivesThePreSendReAsk` as the mandatory control — a `Revalidate` wired to
+  refuse unconditionally would satisfy both negative gates while deleting live execution. The
+  client's half of the contract is pinned separately in `internal/mcp/upstreamclient`
+  (`TestPreSend_*`: a refusal stops the call with nothing sent and is provably never-sent; a
+  permitting hook does not interfere; the hook runs AFTER the pool slot is held, proven
+  deterministically by saturating the pool and waiting for exactly that many handler entries; and it
+  runs on EVERY retry leg). Mutations M23–M26.
+
+  **A fifth instance of the guarded-twice pattern, and a new form of it.** M22's perl pattern stopped
+  matching when round 4 rewrote the closure it targeted, so the campaign reported it SKIPPED rather
+  than silently passing — the check that exists for exactly this. The lesson recorded last round
+  ("a refactor that moves a guard is a reason to re-read the mutation that targeted it") is now
+  itself load-bearing: it happened again, in the same file, one round later.
 - **P2 — credential conditional (§4):** `CredentialProfile` is a policy obligation, so no-credential
   status is unverifiable until the exact tool + rule are fixed. Corrected.
 - **P1 — durable outcome evidence (§15/§18):** every event is a `PhaseDecision` with no
@@ -977,7 +1030,7 @@ case stays non-read and fail-closed. The governing invariant, stated once:
 | The freshness boundary is not weakened | `TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2` — a decision computed under F1 does not reach upstream once the target is F2; the promotion is not the last word |
 | The classification does not outlive the activation that made it | `admitLiveExecution` step (5b): the decided class must EQUAL the one the activation being charged binds to this target, decided inside the lock that decides which activation that is. `TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating` (the full G1→G2 sequence through the real gate) + `TestAtomicBinding_I_ClassNotInForceIsRefused` (the transaction-level half, with its own positive control) |
 | Anti-vacuity (MANDATORY positive controls) | `TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead`, `TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall` and `TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass` — a classifier that answered "no" to everything would satisfy every negative gate while being the feature deleted |
-| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 22 mutations, 22 caught, 0 survived, 0 skipped (M17–M22 belong to the §24 scope finding below, not to blocker 4's own criteria) |
+| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 26 mutations, 26 caught, 0 survived, 0 skipped (M17–M26 belong to the §24 boundary finding below, not to blocker 4's own criteria) |
 
 **Two things the campaign taught, recorded because they change how a survivor should be read.**
 A single-edit mutation of the stale-decision boundary SURVIVED, and the reason was not a missing
@@ -1045,7 +1098,7 @@ its own gates, and it is deliberately not folded into blocker 4: blocker 4's cri
 above and they stand or fall on their own. It was fixed there rather than deferred because it sits in
 the exact admission boundary this work was already hardening, and a known P1 in that boundary is not
 carried across a merge merely because it predates the branch. Its gates are
-`mcp_canary_scope_in_force_test.go` and campaign mutations M17–M22.
+`mcp_canary_scope_in_force_test.go`, `internal/mcp/upstreamclient/presend_test.go`, and campaign mutations M17–M26.
 
 It also does not close the SCOPE half of the same defect class: step (5b) revalidates the operation
 class at the boundary, and nothing revalidates the resolved SCOPE there — a request that resolved
