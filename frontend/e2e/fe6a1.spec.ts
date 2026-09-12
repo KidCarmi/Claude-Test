@@ -350,6 +350,66 @@ test.beforeAll(async () => {
   await yaml.dispose();
 });
 
+// Per-worker cleanup (mirrors the per-worker seed): the fixtures are the
+// spec's own and must not leak into the premises of other specs —
+// policy-2a counts exactly the harness's two Stage-1 rules. The rule goes
+// first (the SAML profile is referenced by it and its delete would be
+// refused 409 referenced until then); every delete is fenced on the
+// server-minted token it just read. The YAMLUP cutover profile stays: the
+// authority cutover is once-ever and deleting the profile would not (and
+// must not) un-retire the legacy block.
+test.afterAll(async () => {
+  const auth = await newAdminClient(AUTH_URL, "10.61.0.3");
+  const ap = await auth.get("/api/authpolicy");
+  const apv: unknown = await ap.json();
+  if (
+    isRecord(apv) &&
+    Array.isArray(apv["rules"]) &&
+    typeof apv["version"] === "number"
+  ) {
+    for (const r of apv["rules"]) {
+      if (
+        isRecord(r) &&
+        r["name"] === RULE_NAME &&
+        typeof r["id"] === "string"
+      ) {
+        const cur = await auth.get("/api/authpolicy");
+        const cv: unknown = await cur.json();
+        const version =
+          isRecord(cv) && typeof cv["version"] === "number"
+            ? cv["version"]
+            : apv["version"];
+        const qs = new URLSearchParams({
+          id: r["id"],
+          ifVersion: String(version),
+        });
+        const del = await auth.delete(`/api/authpolicy?${qs.toString()}`);
+        expect(del.ok(), await del.text()).toBe(true);
+      }
+    }
+  }
+  for (const name of [SAML_NAME, LDAP_NAME]) {
+    const list = await auth.get("/api/idp");
+    const lv: unknown = await list.json();
+    if (!isRecord(lv) || !Array.isArray(lv["profiles"])) continue;
+    for (const p of lv["profiles"]) {
+      if (
+        isRecord(p) &&
+        p["name"] === name &&
+        typeof p["id"] === "string" &&
+        typeof p["revision"] === "number"
+      ) {
+        const qs = new URLSearchParams({ revision: String(p["revision"]) });
+        const del = await auth.delete(
+          `/api/idp/${encodeURIComponent(p["id"])}?${qs.toString()}`,
+        );
+        expect(del.ok(), await del.text()).toBe(true);
+      }
+    }
+  }
+  await auth.dispose();
+});
+
 // ── J1 + J6 + J8 + J9 (admin storage state on AUTH) ────────────────────────
 test("J1/J6/J8 admin: navigation reaches both surfaces; the roster, lock set and registry render server truth with only GETs", async ({
   page,
