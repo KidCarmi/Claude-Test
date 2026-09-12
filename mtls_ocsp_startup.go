@@ -153,5 +153,8 @@ func loadMTLSAndOCSP(cfg mtlsOCSPStartupConfig) {
 	}
 	if cfg.OCSPCheck {
 		logger.Printf("OCSP: upstream certificate revocation checking enabled")
+		// CHAOS-65 / OCSP-8: say what the control does NOT cover, at the one
+		// moment an operator is reading this banner.
+		logOCSPCoverageWarning()
 	}
 }

@@ -196,9 +196,34 @@ Run these once when bringing up a new node, in order:
    (for example `https://proxy.example.com` or
    `https://proxy.example.com/culvert`). For SAML, this exact value is the
    SP Entity ID / Audience, and the ACS URL is
-   `proxy.base_url + /auth/saml/callback`. `trust_forwarded_headers` helps
-   request-derived URLs, but it does not replace `proxy.base_url` for SAML
-   SP metadata built at startup.
+   `proxy.base_url + /auth/saml/callback`. **`base_url` is REQUIRED for
+   SAML** — its SP metadata is built at startup with no HTTP request to
+   derive a URL from, so leaving it unset falls back to
+   `https://localhost:9090` regardless of `trust_forwarded_headers`. For
+   OIDC, `base_url` takes priority over `trust_forwarded_headers` when
+   set; `trust_forwarded_headers` affects the OIDC redirect URL only when
+   `base_url` is unset, and never affects SAML at all.
+
+   `trust_forwarded_headers` is a global, unscoped trust of
+   `X-Forwarded-Host`/`X-Forwarded-Proto` from *any* direct peer (there is
+   no CIDR allowlist for it, unlike `trusted_proxy_cidrs`, and it plays no
+   role in admin-UI client-IP resolution — see RISK-019 in
+   `docs/engineering/TECHNICAL-RISK-REGISTER.md`). It also governs the
+   CP/DP bootstrap-script base URL — always, regardless of `base_url` —
+   and the embedded gRPC enrollment address, *unless* `-cp-grpc-addr` /
+   `cluster.grpc_addr` is itself set to an explicit, non-wildcard host, in
+   which case that configured address is used verbatim and neither the
+   request's `Host` header nor `X-Forwarded-Host` is consulted at all.
+
+   Leaving `trust_forwarded_headers` disabled does **not** by itself make
+   an unset `base_url` safe: every derivation above starts from the
+   request's own `Host` header regardless of this setting, and any client
+   that can reach Culvert directly can set that header to whatever it
+   wants. Set `base_url` explicitly (mandatory for SAML, strongly
+   recommended for OIDC) rather than relying on this flag for safety, and
+   enable `trust_forwarded_headers` only when Culvert is not directly
+   reachable by untrusted clients — e.g. always fronted by a proxy that
+   overwrites these headers.
 7. **First admin user.** Visit the UI, complete the setup wizard, and
    create the first admin account.
 8. **Open the Diagnostics page** (Infrastructure → Diagnostics). Resolve
