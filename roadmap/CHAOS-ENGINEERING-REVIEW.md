@@ -6199,6 +6199,7 @@ production instead of a cliff.
 | **OCSP-7b** | `resolve` opened a flight without re-checking the cache — a late arrival queried again for a verdict already cached | Medium | Low-Medium | **CLOSED** (Codex review) |
 | **OCSP-11** | Bounding the responder loop also made the FIRST Good win, so the peer's own AIA ordering decides the verdict; a later Revoked was never consulted | Medium (replication lag alone reaches it) | **High** — a security posture moved as a side effect of a cost change | **CLOSED** (Codex review) |
 | **OCSP-12** | A dial-time SSRF refusal (DNS rebinding) was charged to nothing, so the guard's own success was invisible on the surface built to expose it | Low-Medium | Medium | **CLOSED** (Codex review) |
+| **OCSP-13** | The cache honoured the ASSERTION's deadline (OCSP-2b) but never the SIGNER's: a delegate expiring in seconds could sign a `good` valid for a day, and the cached verdict outlived the authority it rested on | Low-Medium (a CA rotating a delegated responder) | Medium | **CLOSED** (Codex review) |
 | **OCSP-8** | Revocation not checked on inspected HTTPS; control reports itself healthy | **Certain** (it is the default wiring) | High (security control dark) | **OPEN — owner posture decision, now visible on three surfaces** |
 
 ### Recovery assessment
@@ -6306,6 +6307,29 @@ as OCSP-3b: the counters have to say what actually happened.
 descheduled while the leader finished would start a redundant query for a
 verdict already cached — defeating the collapsing during exactly the cold-cache
 burst it exists for.
+
+**OCSP-13 — the cache outlived its SIGNER, after being taught to respect its
+ASSERTION. (Medium.)** OCSP-2b made `cacheResult` honour the response's own
+`NextUpdate`. Two checks bound a verdict at parse time, though, and only one of
+them was carried down: `responseFresh` bounds the assertion, `responderAuthorized`
+bounds the signer. `responseValidUntil` never looked at `resp.Certificate`, so a
+delegated responder valid for another thirty seconds could sign a `good` whose
+`NextUpdate` was a day out — the handshake that parsed it cached the verdict, and
+later handshakes kept admitting the certificate for the rest of the cache TTL
+while a re-parse of those identical bytes would have refused them as an
+unauthorized responder.
+
+The cap now mirrors `responderAuthorized`'s branch structure exactly, so the
+cache expires at precisely the instant a re-parse would begin rejecting.
+
+**This is the third instance of one pattern in a single sweep**, which is the
+part worth carrying forward. OCSP-1 bound the response to its subject; OCSP-1b
+bound the signer to an authority; OCSP-2b carried the assertion's deadline into
+the cache; OCSP-13 carried the signer's. Each time the rule was enforced where it
+was first noticed and not at the next layer down, and each time the gap was found
+by someone else rather than by the sweep that wrote the rule. *A check that runs
+at parse time governs a value that outlives the parse* — so for every new
+validity rule, ask what caches the result and for how long, in the same change.
 
 ### Two defects the fix itself introduced
 

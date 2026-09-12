@@ -583,6 +583,13 @@ func TestChaos65_Control_DisabledCheckerNeverQueries(t *testing.T) {
 // and returns it with its private key so a test can sign a response with it.
 func (ca *testCA) issueDelegate(t *testing.T, serial int64, ocspSigning bool, responders ...string) (*x509.Certificate, *ecdsa.PrivateKey) {
 	t.Helper()
+	return ca.issueDelegateUntil(t, serial, ocspSigning, time.Now().Add(time.Hour), responders...)
+}
+
+// issueDelegateUntil is issueDelegate with an explicit NotAfter, so a test can
+// mint a signer that is valid NOW but expires well before the response it signs.
+func (ca *testCA) issueDelegateUntil(t *testing.T, serial int64, ocspSigning bool, notAfter time.Time, responders ...string) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("delegate key: %v", err)
@@ -591,7 +598,7 @@ func (ca *testCA) issueDelegate(t *testing.T, serial int64, ocspSigning bool, re
 		SerialNumber: big.NewInt(serial),
 		Subject:      pkix.Name{CommonName: "delegate"},
 		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotAfter:     notAfter,
 		OCSPServer:   responders,
 	}
 	if ocspSigning {
@@ -920,5 +927,82 @@ func TestChaos65_DNSRebindingRefusalIsCounted(t *testing.T) {
 	if got := oc.ResponderBlockedTotal(); got != 1 {
 		t.Fatalf("ResponderBlockedTotal() = %d, want 1 — a connect-time SSRF refusal "+
 			"is invisible on the surface built to expose it", got)
+	}
+}
+
+// TestChaos65_CachedVerdictExpiresAtTheSignersDeadline — Codex P1, round 3.
+//
+// Two checks bound a verdict at PARSE time and only one of them was carried
+// into the cache. responseFresh bounds the ASSERTION (NextUpdate); the earlier
+// Codex round made the cache respect it. responderAuthorized bounds the SIGNER
+// (the delegate's own validity window) and the cache ignored it entirely.
+//
+// So a delegate expiring in seconds could sign a "good" whose NextUpdate is a
+// day out: the handshake that parsed it cached the verdict, and every later
+// handshake kept accepting the certificate for the rest of the cache TTL — while
+// a re-parse of those identical bytes would have refused them as an unauthorized
+// responder. A verdict outliving the authority it rests on.
+//
+// The delegate here is valid now and expires long before both the response's
+// NextUpdate and the cache TTL, so the signer's deadline is the only thing that
+// can produce a correct expiry.
+//
+// No new CONTROL accompanies this gate, deliberately, and both halves of that
+// were checked rather than assumed. The dangerous wrong fix is capping so
+// aggressively that nothing caches at all; reintroducing it (responseValidUntil
+// returning ThisUpdate outright) fails three gates that already exist —
+// TestChaos65_Control_HealthyGoodResponseIsStillAccepted,
+// TestChaos65_CachedVerdictExpiresAtTheResponseDeadline and
+// TestChaos65_LateArrivalUsesTheCacheNotANewFlight — plus this one, so it is
+// covered several times over. The other candidate wrong fix — capping
+// unconditionally instead of mirroring responderAuthorized's branches — turns
+// out not to be harmful at all: it can differ only while the ISSUER itself has
+// less than cacheTTL remaining, i.e. while the whole chain is hours from dying,
+// and the cost is then a few extra responder queries. A gate pinning against it
+// would block a reasonable simplification rather than catch a defect, so there
+// isn't one. (The control written for it first was vacuous for exactly this
+// reason: the fixture CA's lifetime equals cacheTTL, so the issuer cap could
+// never bite and the test passed against the mutation it was meant to catch.)
+func TestChaos65_CachedVerdictExpiresAtTheSignersDeadline(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+
+	var body []byte
+	url, _ := staticResponder(t, func() []byte { return body })
+	leaf := ca.issueLeaf(t, 91, url)
+
+	// Authorized delegate, valid right now, gone in 30s.
+	delegateExpiry := time.Now().Add(30 * time.Second)
+	delegate, delegateKey := ca.issueDelegateUntil(t, 92, true, delegateExpiry)
+
+	// ...signing a response the responder claims is good for a whole day.
+	resp, err := cryptoocsp.CreateResponse(ca.cert, delegate, cryptoocsp.Response{
+		Status:       cryptoocsp.Good,
+		SerialNumber: leaf.SerialNumber,
+		ThisUpdate:   time.Now().Add(-time.Minute),
+		NextUpdate:   time.Now().Add(24 * time.Hour),
+		Certificate:  delegate,
+	}, delegateKey)
+	if err != nil {
+		t.Fatalf("create delegated response: %v", err)
+	}
+	body = resp
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err != nil {
+		t.Fatalf("a currently-valid delegate's GOOD response must be accepted: %v", err)
+	}
+
+	entry, ok := oc.cache[certKey(leaf, ca.cert)]
+	if !ok {
+		t.Fatal("the verdict should be cached")
+	}
+	limit := delegateExpiry.Add(responseClockSkew)
+	if entry.expiresAt.After(limit) {
+		t.Fatalf("verdict cached until %v, past the delegate's own NotAfter+skew %v — "+
+			"the cache keeps admitting a certificate on a signer that a re-parse "+
+			"would reject as unauthorized",
+			entry.expiresAt.UTC(), limit.UTC())
 	}
 }

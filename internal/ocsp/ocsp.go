@@ -656,7 +656,7 @@ func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate
 		oc.staleTotal.Add(1)
 		return 0, time.Time{}, fmt.Errorf("ocsp: response for %s is outside its validity window", leaf.SerialNumber.Text(16))
 	}
-	return ocspResp.Status, responseValidUntil(ocspResp), nil
+	return ocspResp.Status, responseValidUntil(ocspResp, issuer), nil
 }
 
 // errUnauthorizedResponder is returned for a response whose signer is not an
@@ -731,13 +731,40 @@ func (oc *Checker) noteUnusableResponse(body []byte, leaf, issuer *x509.Certific
 	oc.malformedTotal.Add(1)
 }
 
-// responseValidUntil is the instant past which responseFresh would no longer
-// accept resp — the end of the window the responder actually authorized.
-func responseValidUntil(resp *cryptoocsp.Response) time.Time {
+// responseValidUntil is the instant past which this response would no longer be
+// accepted if it were parsed again — the EARLIER of what the assertion claims
+// and what the signer's own authority permits.
+//
+// Both terms are needed because both checks run at PARSE time while a verdict
+// outlives its parse inside the cache. responseFresh bounds the assertion;
+// responderAuthorized bounds the signer. Taking only the first meant a delegate
+// expiring in two minutes could sign a "good" whose NextUpdate was days out: the
+// handshake that parsed it cached the verdict, and later handshakes kept
+// admitting the certificate for the rest of the cache TTL even though a re-parse
+// would have refused the identical bytes as an unauthorized responder (Codex
+// review, PR #1369).
+//
+// That is the same shape as the NextUpdate finding this function was added for —
+// a rule enforced on the wire and dropped one layer down — so the cap is
+// expressed as "when would responderAuthorized start refusing", and MIRRORS its
+// branch structure exactly rather than approximating it. A response signed by
+// the issuer itself takes no signer deadline, because responderAuthorized
+// applies no window check there: capping on the issuer's own NotAfter would make
+// the cache refuse verdicts the parser still accepts, which costs responder
+// queries and buys nothing (an expired issuer fails the chain long before this).
+func responseValidUntil(resp *cryptoocsp.Response, issuer *x509.Certificate) time.Time {
+	until := resp.ThisUpdate.Add(maxResponseAge)
 	if !resp.NextUpdate.IsZero() {
-		return resp.NextUpdate.Add(responseClockSkew)
+		until = resp.NextUpdate.Add(responseClockSkew)
 	}
-	return resp.ThisUpdate.Add(maxResponseAge)
+	if resp.Certificate != nil && !resp.Certificate.Equal(issuer) {
+		// Same skew allowance responderAuthorized grants, so the cache expires
+		// at precisely the instant a re-parse would begin rejecting.
+		if signerUntil := resp.Certificate.NotAfter.Add(responseClockSkew); signerUntil.Before(until) {
+			until = signerUntil
+		}
+	}
+	return until
 }
 
 // responseFresh reports whether resp is currently authoritative.
