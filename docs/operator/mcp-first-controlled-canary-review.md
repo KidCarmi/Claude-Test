@@ -866,8 +866,9 @@ case stays non-read and fail-closed. The governing invariant, stated once:
 | ONE classification, flowing through the decision tuple | `TestReadFirstWall_OperationClassHasExactlyOneClassificationSite` (AST: exactly one site in `internal/mcp/runtime` may write a tool call's class) and `TestReadFirstParity_ClassIsReadFromTheDecisionAndNowhereElse` (AST: `liveGateInput` reads `in.Input.Operation.Class`), with the behavioural parity across the whole class vocabulary in `TestReadFirstParity_GateReceivesTheDecidedClass`. So the policy engine, the activation gate and the live side-effect gate read ONE value rather than three that agree today |
 | Durable across restart, immutable within a generation | `canaryRuntimeSchemaVersion` 3; a record that cannot state its class from its own bytes does not restore armed (`TestReadFirstClass_DurableRecordWithoutAClassDoesNotRestoreArmed`), a restart restores the same classification (`C11`), and a same-generation update that changes only the class is refused (`C12`) |
 | The freshness boundary is not weakened | `TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2` — a decision computed under F1 does not reach upstream once the target is F2; the promotion is not the last word |
+| The classification does not outlive the activation that made it | `admitLiveExecution` step (5b): the decided class must EQUAL the one the activation being charged binds to this target, decided inside the lock that decides which activation that is. `TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating` (the full G1→G2 sequence through the real gate) + `TestAtomicBinding_I_ClassNotInForceIsRefused` (the transaction-level half, with its own positive control) |
 | Anti-vacuity (MANDATORY positive controls) | `TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead`, `TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall` and `TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass` — a classifier that answered "no" to everything would satisfy every negative gate while being the feature deleted |
-| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 14 mutations, 14 caught, 0 survived, 0 skipped |
+| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 16 mutations, 16 caught, 0 survived, 0 skipped |
 
 **Two things the campaign taught, recorded because they change how a survivor should be read.**
 A single-edit mutation of the stale-decision boundary SURVIVED, and the reason was not a missing
@@ -876,7 +877,34 @@ decision's fingerprint; the approval binds the exact tool it was granted for), s
 alone changes nothing observable. The same held for the unset-class guard, which is enforced both by
 its own named case and by the reviewable-vocabulary membership test. A mutation that never managed
 to break anything is not evidence of a hole — but it is also not evidence of a gate, so both were
-rewritten to remove BOTH guards.
+rewritten to remove BOTH guards — and then a THIRD instance appeared, in the other direction: the
+boundary revalidation added for the P1 above independently refuses a write-class request, so the
+mutation that disables the read-first gate stopped reintroducing anything the moment that guard
+landed. Three instances in one campaign is a pattern, not a coincidence: on this path most
+invariants are guarded twice, so a surviving single-edit mutation is re-read before it is believed.
+
+**The sharpest finding came from adversarial review, not from the campaign** (Codex P1, PR #1370).
+The class is decided ONCE, at policy time, under whatever activation is armed at that instant — but
+"decided once" is a statement about how many times it is COMPUTED, not about how long it stays
+true, and the request carrying it is charged, at the boundary, to whatever activation is armed
+THEN. So: G1 reviewed a tool read-only and a request was decided `OpRead`; the request paused; G1
+was demoted and G2 armed for the SAME tool at the SAME fingerprint with a review stating MUTATING —
+a reviewer correcting the earlier determination; the request resumed and crossed, because gate 2
+read `OpRead` off its own decision and every drift control was correctly silent (the target did not
+move; the review of it did). The correction landed in the one window where it mattered most.
+
+`admitLiveExecution` now revalidates the class inside the transaction. That is REVALIDATION, not a
+second classification, and the distinction is why it does not violate the one-classification rule:
+nothing recomputes a class from different inputs and hopes it agrees — it re-reads the SAME
+authority under the lock that decides which activation is paying, exactly as the trust probe and
+the drift comparison already do at this boundary. Equality rather than "read is still read", so it
+stays correct if a later phase admits a non-read class and so a record that cannot speak for the
+target fails closed instead of reading as agreement.
+
+It also corrected a fixture error the campaign had not caught: several fixtures armed a MUTATING
+reviewed target and then asserted "the reviewed request must be admitted" — a state the product
+cannot reach, since a tool call crosses the side-effect gate as `OpRead` or not at all. The
+revalidation exposed every one of them on the first run.
 
 **And one the campaign found rather than confirmed.** `in.Operation = op` sits AFTER the call that
 may promote it, and the ordering is load-bearing in the quietest possible way: reversed, the
