@@ -42,6 +42,10 @@ func liveCreateBody(fpHex string, catRev uint64) string {
 	b, _ := json.Marshal(mcpToolApprovalRequestBody{
 		ServerID: "controlled", ToolName: "t", Fingerprint: fpHex, CatalogRevision: catRev,
 		Purpose: "live_execution", Reason: "reviewed for live", ExpiresInSeconds: 3600,
+		// Mutating: the admin surface now requires an explicit reviewed operation class on a live
+		// request, and these RBAC/four-eyes cases must exercise the conservative one so that none
+		// of them doubles as an assertion that read-first promotion is reachable over HTTP.
+		ReviewedOperationClass: "mutating",
 	})
 	return string(b)
 }

@@ -289,12 +289,45 @@ func (p *pipeline) attachGatewayRefs(in *policy.DecisionInput, serverID string, 
 			tl.Disposition, tl.Drift = policyDisposition(rec.Eligibility)
 			tl.Destination = policyDestination(rec.Fingerprint.Destination)
 			in.Tool = tl
+			p.classifyReadFirstToolCall(op, serverID, name)
 			return
 		}
 	}
-	// No catalog record ⇒ unknown tool (drives the hard quarantine override).
+	// No catalog record ⇒ unknown tool (drives the hard quarantine override). It is NOT
+	// classified: there is no current authoritative target to compare against a reviewed one,
+	// so an unknown tool keeps the conservative OpWrite default. The root's classifier would
+	// refuse it anyway (its own inventory read finds nothing), and both halves are pinned —
+	// a tool Culvert cannot identify is the last thing that should be called read-only.
 	tl.Disposition, tl.Drift = policy.DispQuarantined, policy.DriftUnknownTool
 	in.Tool = tl
+}
+
+// classifyReadFirstToolCall is THE ONE PLACE a tools/call may be promoted from the
+// conservative OpWrite default to OpRead, and it is deliberately the only place in this
+// package that writes op.Class for a tool call.
+//
+// One classification, taken here, flows through in.Operation.Class into the decision tuple —
+// which is what makes the policy engine, the Canary activation gate and the live side-effect
+// gate see the SAME class by construction rather than by three agreeing implementations. A
+// second classification anywhere downstream would reintroduce exactly the divergence that
+// makes an operation-class disagreement dangerous: policy authorizing a write while the
+// read-first gate admits a read, or the reverse.
+//
+// The promotion is ONE-DIRECTIONAL and affirmative-only. It never demotes (the default is
+// already the conservative answer) and it never promotes on anything but an explicit reviewed
+// read-only determination bound to this exact fingerprint. Every uncertainty — no classifier
+// composed, no armed activation, no reviewed entry, a drifted fingerprint or identity, an
+// unstated class — leaves OpWrite in place.
+//
+// Note what is NOT passed: no fingerprint, no catalog record, no annotation, no argument. The
+// root resolves those from its own authoritative inventory. See Deps.CanaryOperationClass.
+func (p *pipeline) classifyReadFirstToolCall(op *policy.Operation, serverID, toolName string) {
+	if p.capability != protocol.Gateway {
+		return
+	}
+	if p.deps.canaryReviewedReadFirst(p.capability.String(), serverID, toolName) {
+		op.Class = policy.OpRead
+	}
 }
 
 // --- translation helpers ---------------------------------------------------

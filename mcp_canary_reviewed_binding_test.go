@@ -16,6 +16,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
 	"github.com/KidCarmi/Culvert/internal/mcp/catalog"
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/registry"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
@@ -121,6 +122,18 @@ func armReviewedActivation(t *testing.T, rt *canaryRuntime, capb rollout.Capabil
 // probe would, and shapes it as a reviewed record.
 func observedReviewedTarget(t *testing.T, sid, tool, fpHex string) canary.ReviewedTarget {
 	t.Helper()
+	// MUTATING by default. Drift is a property of the target's IDENTITY, not of its semantics,
+	// so every case in this matrix is indifferent to the reviewed class — which is exactly why
+	// the shared fixture must state the conservative one: a drift matrix armed entirely with
+	// read-only targets would also, silently, be asserting that read-first promotion is safe.
+	return observedReviewedTargetClassified(t, sid, tool, fpHex, policy.OpWrite)
+}
+
+// observedReviewedTargetClassified is observedReviewedTarget with the reviewed operation class
+// stated explicitly. The read-first matrix (blocker #4) uses it to arm a genuinely read-only
+// reviewed record; everything else takes the conservative default above.
+func observedReviewedTargetClassified(t *testing.T, sid, tool, fpHex string, class policy.OperationClass) canary.ReviewedTarget {
+	t.Helper()
 	live := mcpLiveTrustPrecheck(ttTenant, sid, tool, fpHex)
 	if !live.Eligible {
 		t.Fatalf("fixture: %s/%s must resolve to an eligible target, got %+v", sid, tool, live)
@@ -129,6 +142,7 @@ func observedReviewedTarget(t *testing.T, sid, tool, fpHex string) canary.Review
 		Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
 		Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
 		ServerIdentity: live.ServerIdentity,
+		OperationClass: class,
 	}
 }
 

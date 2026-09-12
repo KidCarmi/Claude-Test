@@ -5,6 +5,7 @@ import (
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
 )
@@ -259,5 +260,8 @@ func seededReviewedTarget(t *testing.T, sid, tool, fpHex string) canary.Reviewed
 		Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
 		Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
 		ServerIdentity: live.ServerIdentity,
+		// MUTATING: these E2E cases are about drift on the target's identity, not about its
+		// semantics, so they arm on the conservative side of the read-first classification.
+		OperationClass: policy.OpWrite,
 	}
 }

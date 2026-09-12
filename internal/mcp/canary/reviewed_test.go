@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
 
@@ -21,6 +22,10 @@ func target(tenant, server, tool string, f byte, identity string) ReviewedTarget
 	return ReviewedTarget{
 		Tenant: tenant, ServerID: server, ToolName: tool,
 		Fingerprint: rfp(f), FingerprintFormat: 1, ServerIdentity: identity,
+		// Default the helper to the MUTATING class: every test that does not care about the
+		// read-first classification must still exercise the conservative side, so a helper that
+		// silently made every target read-only would hide a classifier defect behind fixtures.
+		OperationClass: policy.OpWrite,
 	}
 }
 

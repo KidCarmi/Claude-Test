@@ -15,6 +15,7 @@ import (
 	"github.com/KidCarmi/Culvert/internal/mcp/limits"
 	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
+	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
 
 // Whole-Canary AUTOMATIC ABORT (First Controlled Canary review, blocker #7).
@@ -630,7 +631,7 @@ func armDriftFixture(t *testing.T, rt *canaryRuntime, capb rollout.Capability) (
 	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
 	_, clkFn := liveFakeClock()
 	composeToolTrust(t, clkFn)
-	requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+	grant := requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
 	// Arm the activation against the target that was actually seeded and approved: an activation
 	// carries the exact reviewed set, so a fixture that armed against a synthetic target would be
 	// refused as out-of-scope before any drift could be observed.
@@ -642,6 +643,10 @@ func armDriftFixture(t *testing.T, rt *canaryRuntime, capb rollout.Capability) (
 		Tenant: live.Target.Tenant, ServerID: live.Target.ServerID, ToolName: live.Target.ToolName,
 		Fingerprint: live.Target.Fingerprint, FingerprintFormat: live.Target.FingerprintFormat,
 		ServerIdentity: live.ServerIdentity,
+		// Derived from the GRANT, exactly as reviewedTargetsFromBindings does in production: the
+		// fixture must not invent a class of its own, or it would stop proving that the class an
+		// activation arms with is the class a reviewer actually signed.
+		OperationClass: reviewedClassOrFail(t, grant),
 	}
 	if _, err := rt.beginCanaryActivation(capb, canaryActivationSpec{
 		Budget:          runtimeTestBudget(5),
@@ -1596,4 +1601,16 @@ func TestAutoStop_ActivationGenerationIsStrictlyMonotonic(t *testing.T) {
 			t.Fatalf("SECURITY: demote rolled the generation back %d -> %d", prev, after)
 		}
 	}
+}
+
+// reviewedClassOrFail maps a grant's reviewed determination onto the policy class an activation
+// records, failing the test if the grant carries none. It exists so a fixture cannot quietly
+// arm with OpUnset (which canonicalization refuses) or with a class the grant never stated.
+func reviewedClassOrFail(t *testing.T, a *tooltrust.ToolApproval) policy.OperationClass {
+	t.Helper()
+	class, ok := canary.OperationClassFromReviewed(a.ReviewedOperationClass)
+	if !ok {
+		t.Fatalf("grant carries no reviewed operation class")
+	}
+	return class
 }

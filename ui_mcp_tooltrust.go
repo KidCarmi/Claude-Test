@@ -81,29 +81,34 @@ func enrichToolViewWith(ann *toolTrustAnnotator, v adminapi.ToolView) mcpToolVie
 // capability facts), and lifecycle metadata — never a token, credential, or raw
 // schema/body.
 type mcpToolApprovalView struct {
-	ApprovalID               string     `json:"approval_id"`
-	Tenant                   string     `json:"tenant"`
-	ServerID                 string     `json:"server_id"`
-	ToolName                 string     `json:"tool_name"`
-	Fingerprint              string     `json:"fingerprint"`
-	FingerprintFormatVersion uint16     `json:"fingerprint_format_version"`
-	Purpose                  string     `json:"purpose"`
-	Status                   string     `json:"status"`
-	CatalogRevision          uint64     `json:"catalog_revision"`
-	ServerRevision           uint64     `json:"server_revision,omitempty"`
-	RequestedBy              string     `json:"requested_by"`
-	RequestedAt              time.Time  `json:"requested_at"`
-	ApprovedBy               string     `json:"approved_by,omitempty"`
-	ApprovedAt               *time.Time `json:"approved_at,omitempty"`
-	Reason                   string     `json:"reason,omitempty"`
-	TicketRef                string     `json:"ticket_ref,omitempty"`
-	ExpiresAt                *time.Time `json:"expires_at,omitempty"`
-	RevokedBy                string     `json:"revoked_by,omitempty"`
-	RevokedAt                *time.Time `json:"revoked_at,omitempty"`
-	RevocationReason         string     `json:"revocation_reason,omitempty"`
-	RejectedBy               string     `json:"rejected_by,omitempty"`
-	RejectedAt               *time.Time `json:"rejected_at,omitempty"`
-	RejectedReason           string     `json:"rejected_reason,omitempty"`
+	ApprovalID               string `json:"approval_id"`
+	Tenant                   string `json:"tenant"`
+	ServerID                 string `json:"server_id"`
+	ToolName                 string `json:"tool_name"`
+	Fingerprint              string `json:"fingerprint"`
+	FingerprintFormatVersion uint16 `json:"fingerprint_format_version"`
+	Purpose                  string `json:"purpose"`
+	// ReviewedOperationClass is what the review determined about this exact capability's
+	// effect: read_only | mutating | unset. It is READ-ONLY here and never accepted back on
+	// a decision body — the determination is bound to the request, at the fingerprint the
+	// request was created against, and an approve/revoke may never restate it.
+	ReviewedOperationClass string     `json:"reviewed_operation_class"`
+	Status                 string     `json:"status"`
+	CatalogRevision        uint64     `json:"catalog_revision"`
+	ServerRevision         uint64     `json:"server_revision,omitempty"`
+	RequestedBy            string     `json:"requested_by"`
+	RequestedAt            time.Time  `json:"requested_at"`
+	ApprovedBy             string     `json:"approved_by,omitempty"`
+	ApprovedAt             *time.Time `json:"approved_at,omitempty"`
+	Reason                 string     `json:"reason,omitempty"`
+	TicketRef              string     `json:"ticket_ref,omitempty"`
+	ExpiresAt              *time.Time `json:"expires_at,omitempty"`
+	RevokedBy              string     `json:"revoked_by,omitempty"`
+	RevokedAt              *time.Time `json:"revoked_at,omitempty"`
+	RevocationReason       string     `json:"revocation_reason,omitempty"`
+	RejectedBy             string     `json:"rejected_by,omitempty"`
+	RejectedAt             *time.Time `json:"rejected_at,omitempty"`
+	RejectedReason         string     `json:"rejected_reason,omitempty"`
 }
 
 func mcpToolApprovalViewOf(a *tooltrust.ToolApproval) mcpToolApprovalView {
@@ -115,6 +120,7 @@ func mcpToolApprovalViewOf(a *tooltrust.ToolApproval) mcpToolApprovalView {
 		Fingerprint:              hex.EncodeToString(a.Fingerprint[:]),
 		FingerprintFormatVersion: a.FingerprintFormatVersion,
 		Purpose:                  a.Purpose.String(),
+		ReviewedOperationClass:   a.ReviewedOperationClass.String(),
 		Status:                   a.Status.String(),
 		CatalogRevision:          a.CatalogRevision,
 		ServerRevision:           a.ServerRevision,
@@ -144,14 +150,20 @@ func mcpToolApprovalViewOf(a *tooltrust.ToolApproval) mcpToolApprovalView {
 // reason/ticket. The tenant is taken from the ?tenant= scope (validated against the
 // server's ownership), never trusted as a server fact.
 type mcpToolApprovalRequestBody struct {
-	ServerID         string `json:"server_id"`
-	ToolName         string `json:"tool_name"`
-	Fingerprint      string `json:"fingerprint"`      // 64-char hex of the reviewed digest
-	CatalogRevision  uint64 `json:"catalog_revision"` // REQUIRED: the reviewed per-record revision (ToolView.Revision); 0/omitted is rejected
-	Purpose          string `json:"purpose"`          // shadow_evaluation (default) | live_execution (requires expiry, four-eyes)
-	Reason           string `json:"reason"`
-	TicketRef        string `json:"ticket_ref"`
-	ExpiresInSeconds int64  `json:"expires_in_seconds"` // shadow: 0 ⇒ no expiry; live: REQUIRED, 1..≤24h; negative or > ~10y is rejected
+	ServerID        string `json:"server_id"`
+	ToolName        string `json:"tool_name"`
+	Fingerprint     string `json:"fingerprint"`      // 64-char hex of the reviewed digest
+	CatalogRevision uint64 `json:"catalog_revision"` // REQUIRED: the reviewed per-record revision (ToolView.Revision); 0/omitted is rejected
+	Purpose         string `json:"purpose"`          // shadow_evaluation (default) | live_execution (requires expiry, four-eyes)
+	// ReviewedOperationClass is the reviewer's determination of the tool's effect at this
+	// exact fingerprint: read_only | mutating. REQUIRED for live_execution and refused when
+	// absent or unrecognised — a typo must never land on read_only. It is the operator
+	// asserting what they reviewed; Culvert never derives it from the server's metadata, the
+	// tool's name, or the request's arguments.
+	ReviewedOperationClass string `json:"reviewed_operation_class"`
+	Reason                 string `json:"reason"`
+	TicketRef              string `json:"ticket_ref"`
+	ExpiresInSeconds       int64  `json:"expires_in_seconds"` // shadow: 0 ⇒ no expiry; live: REQUIRED, 1..≤24h; negative or > ~10y is rejected
 }
 
 // mcpToolApprovalDecisionBody is the approve/reject/revoke body.
@@ -234,6 +246,23 @@ func apiMCPToolApprovalCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	live := purpose == tooltrust.PurposeLiveExecution
+	// The reviewed operation class is parsed STRICTLY and only required for a live request. An
+	// unrecognised label is refused rather than folded to a default: the fail-closed default
+	// (mutating) would silently accept a typo'd "readonly" as a decision the operator did not
+	// make, and the read_only default would be catastrophic. Refusing says which it was.
+	var reviewedOp tooltrust.ReviewedOperationClass
+	if body.ReviewedOperationClass != "" {
+		parsed, rok := tooltrust.ParseReviewedOperationClass(body.ReviewedOperationClass)
+		if !rok {
+			mcpErr(w, mcperr.New(mcperr.ReasonAdminRequestInvalid, "mcp", "unrecognised reviewed operation class"))
+			return
+		}
+		reviewedOp = parsed
+	}
+	if live && !reviewedOp.Stated() {
+		mcpErr(w, mcperr.New(mcperr.ReasonAdminRequestInvalid, "mcp", "live_execution approval requires reviewed_operation_class"))
+		return
+	}
 	// A live_execution request is bound to the CANONICAL authenticated principal (session subject),
 	// not auditActor's username@IP string, so the four-eyes check at approval compares stable
 	// identities. It fails closed for an unauthenticated (IP-only) caller: a live-execution trust
@@ -248,16 +277,17 @@ func apiMCPToolApprovalCreate(w http.ResponseWriter, r *http.Request) {
 		requestedBy = principal
 	}
 	in := toolTrustRequestInput{
-		Tenant:              tenant,
-		ServerID:            body.ServerID,
-		ToolName:            body.ToolName,
-		ExpectedFingerprint: body.Fingerprint,
-		ExpectedCatalogRev:  body.CatalogRevision,
-		Purpose:             purpose,
-		RequestedBy:         requestedBy,
-		Reason:              body.Reason,
-		TicketRef:           body.TicketRef,
-		ExpiresAt:           expiresAt,
+		Tenant:                 tenant,
+		ServerID:               body.ServerID,
+		ToolName:               body.ToolName,
+		ExpectedFingerprint:    body.Fingerprint,
+		ExpectedCatalogRev:     body.CatalogRevision,
+		Purpose:                purpose,
+		ReviewedOperationClass: reviewedOp,
+		RequestedBy:            requestedBy,
+		Reason:                 body.Reason,
+		TicketRef:              body.TicketRef,
+		ExpiresAt:              expiresAt,
 	}
 	// Route through the dedicated live path (§3) so a live request can never be created with shadow
 	// semantics; the store enforces the mandatory ≤24h expiry either way.

@@ -5,6 +5,7 @@ import (
 
 	"github.com/KidCarmi/Culvert/internal/mcp/authn"
 	"github.com/KidCarmi/Culvert/internal/mcp/catalog"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/registry"
 	"github.com/KidCarmi/Culvert/internal/mcp/senderconstraint"
 )
@@ -117,8 +118,44 @@ type Deps struct {
 	// snapshot inside the activation critical section; a tool the activation was never reviewed for
 	// is request-scoped and latches nothing, which is what makes reporting every request safe.
 	CanaryTargetObserved func(capability string, obs CanaryTargetObservation)
+	// CanaryOperationClass is the OPTIONAL narrow seam through which the root may classify an
+	// exact tools/call as read-first. Nil ⇒ nothing composed and nothing classified, so every
+	// tools/call keeps the conservative OpWrite default — the disabled-by-default posture, and
+	// the shipped one.
+	//
+	// IT TAKES ONLY AN IDENTITY (server, tool) AND RETURNS A CLASS. That asymmetry is the
+	// design, not an accident of convenience:
+	//
+	//   - the runtime supplies NO fingerprint, NO catalog record, NO annotation, NO argument
+	//     and NO hint, so there is no parameter through which request data or server-supplied
+	//     metadata could influence the answer. The root resolves every authoritative fact — the
+	//     tenant, the current fingerprint and format, the pinned server identity — from its own
+	//     inventory, and compares them against the ACTIVATION's immutable reviewed record;
+	//   - the runtime does NOT receive the reviewed set, so it cannot re-implement the
+	//     comparison, cache it, or apply it to a target the root did not resolve.
+	//
+	// The returned class is ADVISORY IN ONE DIRECTION ONLY: the caller promotes a tools/call to
+	// OpRead when and only when ok is true AND the class is exactly policy.OpRead. Any other
+	// answer leaves the conservative default in place. See classifyReadFirstToolCall.
+	CanaryOperationClass func(capability string, serverID, toolName string) (policy.OperationClass, bool)
 	// Clock is injected for deterministic tests; nil ⇒ time.Now.
 	Clock func() time.Time
+}
+
+// canaryReviewedReadFirst reports whether the root's classifier affirmatively binds this exact
+// named tool to a REVIEWED read-only operation class.
+//
+// Nil-safe (no classifier ⇒ false), identity-complete (an unnamed tool is never classified),
+// and — the part that matters — it collapses the seam's two-value answer into the single
+// predicate the caller needs, so no call site can read `ok` and the class apart. `ok` alone
+// means "the record could speak for this target", which for a reviewed WRITE tool is true; a
+// caller that promoted on `ok` would classify every reviewed tool as read.
+func (d Deps) canaryReviewedReadFirst(capability, serverID, toolName string) bool {
+	if d.CanaryOperationClass == nil || serverID == "" || toolName == "" {
+		return false
+	}
+	class, ok := d.CanaryOperationClass(capability, serverID, toolName)
+	return ok && class == policy.OpRead
 }
 
 // CanaryDriftTarget names the exact target a pre-executor drift observation was made against.

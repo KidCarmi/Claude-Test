@@ -85,6 +85,10 @@ func validCanaryActivationInput(now time.Time) CanaryActivationInput {
 				Fingerprint: digest, FingerprintFormatVersion: 1,
 				Purpose: tooltrust.PurposeLiveExecution, Status: tooltrust.StatusActive,
 				RequestedBy: "alice", ApprovedBy: "bob", ApprovedAt: now, ExpiresAt: &exp,
+				// MUTATING, deliberately: the canonical "fully ready" fixture must arm on the
+				// conservative side of the read-first classification, so a test about activation
+				// readiness never accidentally becomes a test that grants read-first as well.
+				ReviewedOperationClass: tooltrust.ReviewedOpMutating,
 			},
 		}},
 		Budget: canary.Budget{

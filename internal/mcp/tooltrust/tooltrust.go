@@ -212,7 +212,17 @@ type ToolApproval struct {
 	ServerRevision  uint64 `json:"server_revision,omitempty"`
 
 	Purpose Purpose `json:"purpose"`
-	Status  Status  `json:"status"`
+	// ReviewedOperationClass records what the review determined about this exact
+	// capability's effect on the world, at THIS fingerprint (see reviewed_operation.go). It
+	// is the only authority that can make a tools/call read-first, and it is bound to the
+	// fingerprint beside it: a tool that moves to a new digest carries no determination at
+	// all until a new review states one.
+	//
+	// It is REQUIRED on a live_execution approval and refused at creation when absent. The
+	// zero value is "no review stated it", which every consumer reads as NOT read-only, so
+	// an older record that predates this field can never widen what may execute.
+	ReviewedOperationClass ReviewedOperationClass `json:"reviewed_operation_class"`
+	Status                 Status                 `json:"status"`
 
 	RequestedBy string    `json:"requested_by"`
 	RequestedAt time.Time `json:"requested_at"`

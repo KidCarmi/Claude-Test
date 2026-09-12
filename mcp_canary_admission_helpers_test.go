@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 	"github.com/KidCarmi/Culvert/internal/mcp/tooltrust"
 )
@@ -61,6 +62,11 @@ func testReviewedTarget() canary.ReviewedTarget {
 		Fingerprint:       tooltrust.FingerprintDigest{0xF1},
 		FingerprintFormat: 1,
 		ServerIdentity:    reviewedIdentity,
+		// MUTATING by default, deliberately. Activation tests that are not about the read-first
+		// classification must still arm on the conservative side of it: a shared fixture that
+		// classified every synthetic target read-only would make an over-permissive classifier
+		// invisible to every one of them.
+		OperationClass: policy.OpWrite,
 	}
 }
 

@@ -77,14 +77,25 @@ func liveScope(sid, tool, fpHex string) rollout.ScopeSpec {
 	}
 }
 
-// requestLive creates a pending live_execution request via the dedicated coordinator path.
+// requestLive creates a pending live_execution request via the dedicated coordinator path. It
+// states the MUTATING reviewed class: every live-trust test that is not itself about the
+// read-first classification must exercise the conservative side of it, so that a classifier
+// which promoted more than it should stays visible to the tests that are about something else.
+// A test that needs the read-only determination asks for it explicitly.
 func requestLive(t *testing.T, sid, tool, fpHex string, catRev uint64, requester string, ttl time.Duration) *tooltrust.ToolApproval {
+	t.Helper()
+	return requestLiveClassified(t, sid, tool, fpHex, catRev, requester, ttl, tooltrust.ReviewedOpMutating)
+}
+
+// requestLiveClassified is requestLive with the reviewed operation class stated explicitly.
+func requestLiveClassified(t *testing.T, sid, tool, fpHex string, catRev uint64, requester string, ttl time.Duration, class tooltrust.ReviewedOperationClass) *tooltrust.ToolApproval {
 	t.Helper()
 	exp := mcpToolTrust.now().Add(ttl)
 	in := toolTrustRequestInput{
 		Tenant: ttTenant, ServerID: sid, ToolName: tool,
 		ExpectedFingerprint: fpHex, ExpectedCatalogRev: catRev,
 		RequestedBy: requester, ExpiresAt: &exp, Reason: "reviewed for live execution",
+		ReviewedOperationClass: class,
 	}
 	a, err := mcpToolTrust.RequestLiveApproval(in)
 	if err != nil {
@@ -552,6 +563,9 @@ func TestLiveTrustMutationCampaign_Roster(t *testing.T) {
 		in := toolTrustRequestInput{
 			Tenant: ttTenant, ServerID: sid, ToolName: tool,
 			ExpectedFingerprint: fpHex, ExpectedCatalogRev: cat.Current().Revision(), RequestedBy: liveRequester,
+			// Stated, so the refusal this mutation asserts is attributable to the field it is
+			// about and not to the reviewed class being absent.
+			ReviewedOperationClass: tooltrust.ReviewedOpMutating,
 		}
 		if _, err := mcpToolTrust.RequestLiveApproval(in); mcperr.ReasonOf(err) != mcperr.ReasonAdminRequestInvalid {
 			t.Fatalf("mutation4: live request without expiry must be refused, got %v", mcperr.ReasonOf(err).Code())
@@ -566,6 +580,9 @@ func TestLiveTrustMutationCampaign_Roster(t *testing.T) {
 		in := toolTrustRequestInput{
 			Tenant: ttTenant, ServerID: sid, ToolName: tool,
 			ExpectedFingerprint: fpHex, ExpectedCatalogRev: cat.Current().Revision(), RequestedBy: liveRequester,
+			// Stated, so the refusal this mutation asserts is attributable to the field it is
+			// about and not to the reviewed class being absent.
+			ReviewedOperationClass: tooltrust.ReviewedOpMutating,
 		}
 		tooLong := mcpToolTrust.now().Add(25 * time.Hour)
 		in.ExpiresAt = &tooLong

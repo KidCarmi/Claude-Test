@@ -433,7 +433,7 @@ func TestAtomicBinding_TrustProbeMayNotReEnterTheRuntime(t *testing.T) {
 	// subject stays the lock order rather than a reviewed-target mismatch.
 	if _, err := r.rt.beginCanaryActivation(r.capb, canaryActivationSpec{
 		Budget:          runtimeTestBudget(3),
-		ReviewedTargets: []canary.ReviewedTarget{obs.Current},
+		ReviewedTargets: []canary.ReviewedTarget{reviewedAsWrite(obs.Current)},
 		StartedAt:       canaryRuntimeTestNow,
 	}); err != nil {
 		t.Fatalf("begin activation: %v", err)
@@ -909,4 +909,13 @@ func TestAtomicBinding_MissingApprovalIsNotDrift(t *testing.T) {
 			"approval is request-scoped, and treating it as a breach makes every unauthorized " +
 			"caller a kill switch")
 	}
+}
+
+// reviewedAsWrite states the conservative reviewed operation class on an observed target. The
+// lock-order tests in this file arm against whatever the composed fixture publishes and are
+// indifferent to the target's semantics, so they take the class that cannot be mistaken for a
+// read-first grant.
+func reviewedAsWrite(t canary.ReviewedTarget) canary.ReviewedTarget {
+	t.OperationClass = policy.OpWrite
+	return t
 }

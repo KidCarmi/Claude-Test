@@ -412,10 +412,16 @@ type toolTrustRequestInput struct {
 	ExpectedFingerprint string // hex of the 32-byte digest the reviewer saw
 	ExpectedCatalogRev  uint64
 	Purpose             tooltrust.Purpose
-	RequestedBy         string
-	Reason              string
-	TicketRef           string
-	ExpiresAt           *time.Time
+	// ReviewedOperationClass is the reviewer's determination of this exact capability's
+	// effect on the world. REQUIRED for a live request (the store refuses an unstated one);
+	// it is the single fact that can later make a tools/call read-first, and it is never
+	// derived from the server, the tool name, or the request — see
+	// internal/mcp/tooltrust/reviewed_operation.go.
+	ReviewedOperationClass tooltrust.ReviewedOperationClass
+	RequestedBy            string
+	Reason                 string
+	TicketRef              string
+	ExpiresAt              *time.Time
 }
 
 // RequestApproval records a pending trust request after resolving and validating the
@@ -484,6 +490,7 @@ func (c *mcpToolTrustCoordinator) RequestApproval(in toolTrustRequestInput) (*to
 		Fingerprint:              ti.target.Fingerprint,
 		FingerprintFormatVersion: ti.target.FingerprintFormatVersion,
 		Purpose:                  in.Purpose,
+		ReviewedOperationClass:   in.ReviewedOperationClass,
 		CatalogRevision:          ti.target.CatalogRevision,
 		ServerRevision:           ti.target.ServerRevision,
 		RequestedBy:              in.RequestedBy,

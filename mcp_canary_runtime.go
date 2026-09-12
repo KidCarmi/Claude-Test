@@ -37,7 +37,17 @@ import (
 // ever composed.
 
 // canaryRuntimeSchemaVersion is the durable-state schema version (fail-closed on any other value).
-const canaryRuntimeSchemaVersion = 2
+//
+// 3 (read-first tool classification): ReviewedTarget gained OperationClass — the reviewed
+// semantics bound to the fingerprint beside it. The bump is load-bearing rather than
+// bookkeeping: a schema-2 record carries reviewed targets with NO class, and Go would decode
+// the missing field as policy.OpUnset. Restoring such a record would produce an activation
+// whose targets are unclassified, and "unclassified" must never be resolved by a default —
+// in the read direction it is a silent widening, and in the write direction it is a Canary
+// that quietly stops being able to execute what it was reviewed for. Refusing the whole
+// record at the version check makes the operator re-activate, which is where the reviewed
+// class is stated.
+const canaryRuntimeSchemaVersion = 3
 
 // canaryRuntimeState is the restart-durable, node-local DTO for one capability's Canary activation
 // runtime. It carries ONLY the generation, build identity, the active budget, and the scalar
