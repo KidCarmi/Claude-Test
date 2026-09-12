@@ -305,13 +305,23 @@ run_mutation M10 \
   . "$REVIEWED" \
   's/\t\tif s\.targets\[i\] != o\.targets\[i\] \{\n\t\t\treturn false\n\t\t\}/\t\tif s.targets[i].key() != o.targets[i].key() {\n\t\t\treturn false\n\t\t}/'
 
-# M11 — a STALE decision reaches upstream: the fingerprint the decision was computed against stops
-# being revalidated, so a request decided under F1 executes against F2.
+# M11 — a STALE decision reaches upstream: the fingerprint boundary stops being revalidated, so a
+# request decided under F1 executes against F2.
+#
+# It takes TWO edits, and that is a finding rather than an inconvenience: the boundary is guarded
+# twice, independently — the trust precheck revalidates the DECISION's fingerprint against current
+# inventory, and the approval binds the tool it was granted for. Removing either alone changes
+# nothing observable, because the other still denies; only removing both reintroduces the defect.
+# A single-edit version of this mutation SURVIVED for exactly that reason, which is worth the
+# comment: a survivor is not always a missing gate, sometimes it is a mutation that never managed
+# to break anything.
 run_mutation M11 \
-  'a stale F1 decision reaches upstream after the target became F2' \
+  'a stale F1 decision reaches upstream after the target became F2 (BOTH fingerprint guards removed)' \
   'TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2' \
   . "$LGATE" \
-  's/\tif hex\.EncodeToString\(ti\.target\.Fingerprint\[:\]\) != decisionFP \{/\tif false \&\& hex.EncodeToString(ti.target.Fingerprint[:]) != decisionFP {/'
+  's/\tif hex\.EncodeToString\(ti\.target\.Fingerprint\[:\]\) != decisionFP \{/\tif false \&\& hex.EncodeToString(ti.target.Fingerprint[:]) != decisionFP {/' \
+  's/\t\t\tFingerprint:       ti\.target\.Fingerprint,/\t\t\tFingerprint:       mustDecodeDecisionFP(decisionFP, ti.target.Fingerprint),/' \
+  's/\/\/ mcpLiveApprovalSatisfied answers the APPROVAL half/\/\/ mustDecodeDecisionFP is mutation scaffolding.\nfunc mustDecodeDecisionFP(fp string, fallback tooltrust.FingerprintDigest) tooltrust.FingerprintDigest \{\n\traw, err := hex.DecodeString(fp)\n\tif err != nil || len(raw) != len(fallback) \{\n\t\treturn fallback\n\t\}\n\tvar out tooltrust.FingerprintDigest\n\tcopy(out[:], raw)\n\treturn out\n\}\n\n\/\/ mcpLiveApprovalSatisfied answers the APPROVAL half/'
 
 # M12 — DISCOVERY IS USED AS THE SUBSTITUTE. A tools/call is defaulted to OpDiscovery, so it passes
 # the read-first gate with no review at all — blocker #4 "closed" by pretending a listing is an
