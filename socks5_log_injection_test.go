@@ -98,7 +98,9 @@ func socks5ConnectRaw(t *testing.T, addr, host string, port uint16) {
 	if len(host) > 255 {
 		t.Fatalf("DOMAINNAME is a 1-byte length prefix; host of %d bytes cannot be sent", len(host))
 	}
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,21 +209,65 @@ func assertNoRawControlBytes(t *testing.T, captured string) {
 
 // assertNoForgedLine requires that every line of the captured log be one the
 // proxy actually emitted — i.e. the attacker's payload never became a record of
-// its own. Only one genuine line is expected here (the BLOCKED verdict).
-func assertNoForgedLine(t *testing.T, captured string) {
+// its own. Exactly one genuine line is expected, and it must carry one of the
+// prefixes the emitting path legitimately produces ("SOCKS5 " by default).
+func assertNoForgedLine(t *testing.T, captured string, prefixes ...string) {
 	t.Helper()
+	if len(prefixes) == 0 {
+		prefixes = []string{"SOCKS5 "}
+	}
 	lines := 0
 	for _, line := range strings.Split(captured, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		lines++
-		if !strings.HasPrefix(line, "SOCKS5 ") {
+		emitted := false
+		for _, p := range prefixes {
+			if strings.HasPrefix(line, p) {
+				emitted = true
+				break
+			}
+		}
+		if !emitted {
 			t.Errorf("forged log record %q: the client's DOMAINNAME produced a line the proxy never emitted", line)
 		}
 	}
 	if lines != 1 {
 		t.Errorf("expected exactly 1 emitted log record, got %d; captured:\n%q", lines, captured)
+	}
+}
+
+// blockingPlugin is a middleware that blocks everything, so the plugin branch
+// of handleSOCKS5 is reachable from a test.
+type blockingPlugin struct{}
+
+func (blockingPlugin) Name() string                      { return "test-blocker" }
+func (blockingPlugin) OnRequest(_, _, _ string) Decision { return DecisionBlock }
+func (blockingPlugin) OnResponse(*http.Response)         {}
+
+// TestSOCKS5_PluginBlockCannotForgeLogLines covers the INDIRECT log site.
+//
+// The plugin branch hands the raw destination to plugin.Decide, which emits it
+// through obs.Printf — a plain fmt.Sprintf into the same process logger. So
+// before the round-2 fix an unauthenticated client could still forge records
+// whenever any registered middleware blocked, even though every direct log site
+// in handleSOCKS5 was sanitised. Reported by Codex review on PR #1367.
+func TestSOCKS5_PluginBlockCannotForgeLogLines(t *testing.T) {
+	for _, tc := range controlBytePayloads {
+		t.Run(tc.name, func(t *testing.T) {
+			setupProxyTest(t)
+			sink := captureLoggerForTest(t) // BEFORE the listener: see captureLoggerForTest
+			prev := pluginReplace([]Middleware{blockingPlugin{}})
+			t.Cleanup(func() { pluginReplace(prev) })
+
+			ln := startSOCKS5Listener(t)
+			socks5ConnectRaw(t, ln.Addr().String(), tc.host, 443)
+
+			got := waitForLogContaining(t, sink, "Plugin[test-blocker] blocked")
+			assertNoRawControlBytes(t, got)
+			assertNoForgedLine(t, got, "Plugin[test-blocker] ")
+		})
 	}
 }
 
@@ -254,12 +300,33 @@ func TestSOCKS5_DestinationLogsStillNameTheHost(t *testing.T) {
 // either clientIP (a net.SplitHostPort product of the kernel-supplied peer
 // address — never client-chosen bytes) or a value routed through sanitizeLog.
 func TestSOCKS5_EveryDestinationLogSiteSanitises(t *testing.T) {
+	fset, fn := parseHandleSOCKS5(t)
+
+	checked := 0
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !isLoggerCall(call) {
+			return true
+		}
+		checked++
+		assertLogArgsSanitised(t, fset, call)
+		return true
+	})
+
+	// A selector typo that matched nothing would let this wall pass forever.
+	if checked < 4 {
+		t.Fatalf("the wall inspected only %d log calls in handleSOCKS5; it is no longer finding them", checked)
+	}
+}
+
+// parseHandleSOCKS5 returns the AST of the handler both walls read.
+func parseHandleSOCKS5(t *testing.T) (*token.FileSet, *ast.FuncDecl) {
+	t.Helper()
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "socks5.go", nil, parser.ParseComments)
 	if err != nil {
 		t.Fatalf("parse socks5.go: %v", err)
 	}
-
 	var fn *ast.FuncDecl
 	ast.Inspect(file, func(n ast.Node) bool {
 		if d, ok := n.(*ast.FuncDecl); ok && d.Name.Name == "handleSOCKS5" {
@@ -269,57 +336,142 @@ func TestSOCKS5_EveryDestinationLogSiteSanitises(t *testing.T) {
 		return true
 	})
 	if fn == nil {
-		t.Fatal("handleSOCKS5 not found in socks5.go — this wall must be re-aimed, not deleted")
+		t.Fatal("handleSOCKS5 not found in socks5.go — these walls must be re-aimed, not deleted")
 	}
+	return fset, fn
+}
 
-	// clientIP is the ONLY bare identifier this wall admits. Widening this set
-	// is how the defect comes back: add a name here only with the argument for
-	// why those bytes cannot be client-chosen.
+// isLoggerCall reports whether call is logger.Printf / logger.Println.
+func isLoggerCall(call *ast.CallExpr) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	if !ok || pkg.Name != "logger" {
+		return false
+	}
+	return sel.Sel.Name == "Printf" || sel.Sel.Name == "Println"
+}
+
+// assertLogArgsSanitised requires every interpolated argument to be either
+// clientIP — a net.SplitHostPort product of the kernel-supplied peer address,
+// never client-chosen bytes — or a value routed through sanitizeLog.
+//
+// clientIP is the ONLY bare identifier admitted. Widening this set is how the
+// defect comes back: add a name only with the argument for why those bytes
+// cannot be client-chosen.
+func assertLogArgsSanitised(t *testing.T, fset *token.FileSet, call *ast.CallExpr) {
+	t.Helper()
 	safeBare := map[string]bool{"clientIP": true}
+	for i, arg := range call.Args {
+		if i == 0 {
+			continue // the format string is a source-literal
+		}
+		if id, ok := arg.(*ast.Ident); ok && safeBare[id.Name] {
+			continue
+		}
+		expr := renderExpr(t, fset, arg)
+		if !strings.Contains(expr, "sanitizeLog") {
+			t.Errorf("handleSOCKS5 (%s): log argument %s is neither clientIP nor sanitised.\n"+
+				"The SOCKS5 DOMAINNAME is raw attacker bytes; wrap it with sanitizeLog and use %%q (CWE-117).",
+				fset.Position(call.Pos()), expr)
+		}
+	}
+}
 
-	checked := 0
+// renderExpr prints one AST expression back to source text.
+func renderExpr(t *testing.T, fset *token.FileSet, e ast.Expr) string {
+	t.Helper()
+	var b bytes.Buffer
+	if err := printer.Fprint(&b, fset, e); err != nil {
+		t.Fatalf("render expression: %v", err)
+	}
+	return b.String()
+}
+
+// destinationSinks is the AUDITED set of functions handleSOCKS5 may hand the
+// raw client-chosen destination to. Each entry records why that callee cannot
+// forge a log record with those bytes.
+//
+// This list exists because the FIRST version of this file walled only DIRECT
+// logger calls, and a reviewer found the raw host still reaching the process
+// log INDIRECTLY: pluginDecision → plugin.Decide → obs.Printf, which is a plain
+// fmt.Sprintf into the same logger. A wall scoped to one syntactic shape proves
+// less than it appears to — the same lesson as "sanitising one argument of a
+// call does not sanitise the call", one level up.
+var destinationSinks = map[string]string{
+	"normalizeHostStrict": "pure canonicalisation in internal/hostutil; logs nothing",
+	"IsBlocked":           "internal/blocklist; its own host log lines already route through obs.Sanitize",
+	"pluginDecision":      "plugin.Decide sanitises the destination before obs.Printf (SEC-SOCKS5-LOG-1 round 2)",
+	"isPrivateHost":       "internal/ssrf; contains no logging at all",
+	"recordRequest":       "structured JSONL — the encoder escapes control bytes",
+	"socks5Relay":         "byte relay; its only destination sink is recordTunnelClose — structured JSONL",
+	"JoinHostPort":        "net; string construction only",
+	"DialContext":         "net.Dialer; the error it returns is sanitised at the log site",
+	"sanitizeLog":         "the sanitiser itself",
+}
+
+// TestSOCKS5_EveryDestinationSinkIsAudited is the SECOND wall, and it closes
+// the class the first one could not see. It requires every function that
+// receives the raw destination (host / target) inside handleSOCKS5 to appear in
+// destinationSinks with a recorded reason. Adding a new sink — a metric, an
+// audit call, another middleware hop — then fails the build until somebody
+// states why those attacker-chosen bytes are safe in it.
+func TestSOCKS5_EveryDestinationSinkIsAudited(t *testing.T) {
+	fset, fn := parseHandleSOCKS5(t)
+	raw := map[string]bool{"host": true, "target": true}
+
+	seen := 0
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
-		if !ok {
+		if !ok || isLoggerCall(call) { // log calls are the FIRST wall's business
 			return true
 		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
+		if !callForwardsAny(call, raw) {
 			return true
 		}
-		pkg, ok := sel.X.(*ast.Ident)
-		if !ok || pkg.Name != "logger" {
-			return true
-		}
-		if sel.Sel.Name != "Printf" && sel.Sel.Name != "Println" {
-			return true
-		}
-		checked++
-		for i, arg := range call.Args {
-			if i == 0 {
-				continue // the format string is a source-literal
-			}
-			if id, ok := arg.(*ast.Ident); ok && safeBare[id.Name] {
-				continue
-			}
-			var b bytes.Buffer
-			if err := printer.Fprint(&b, fset, arg); err != nil {
-				t.Fatalf("render argument: %v", err)
-			}
-			expr := b.String()
-			if !strings.Contains(expr, "sanitizeLog") {
-				t.Errorf("handleSOCKS5 (%s): log argument %s is neither clientIP nor sanitised.\n"+
-					"The SOCKS5 DOMAINNAME is raw attacker bytes; wrap it with sanitizeLog and use %%q (CWE-117).",
-					fset.Position(call.Pos()), expr)
-			}
+		seen++
+		name := calleeName(call)
+		if _, audited := destinationSinks[name]; !audited {
+			t.Errorf("handleSOCKS5 (%s): %s() receives the raw client-chosen destination but is not in destinationSinks.\n"+
+				"Establish that it cannot emit those bytes unsanitised (CWE-117), then record the reason there.",
+				fset.Position(call.Pos()), name)
 		}
 		return true
 	})
 
-	// A selector typo that matched nothing would let this wall pass forever.
-	if checked < 4 {
-		t.Fatalf("the wall inspected only %d log calls in handleSOCKS5; it is no longer finding them", checked)
+	if seen < 5 {
+		t.Fatalf("the sink wall matched only %d forwarding calls; it is no longer finding them", seen)
 	}
+}
+
+// callForwardsAny reports whether any argument of call mentions one of names.
+func callForwardsAny(call *ast.CallExpr, names map[string]bool) bool {
+	found := false
+	for _, arg := range call.Args {
+		ast.Inspect(arg, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && names[id.Name] {
+				found = true
+			}
+			return !found
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// calleeName returns the bare function name of a call (pkg/receiver stripped).
+func calleeName(call *ast.CallExpr) string {
+	switch f := call.Fun.(type) {
+	case *ast.Ident:
+		return f.Name
+	case *ast.SelectorExpr:
+		return f.Sel.Name
+	}
+	return "<unknown>"
 }
 
 // TestNormalizeHostStrict_IsNotALogSanitiser records the ROOT CAUSE as an
