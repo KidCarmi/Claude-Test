@@ -407,6 +407,12 @@ func TestLiveCommit_DemotedGenerationRefusedAtFinalBoundary(t *testing.T) {
 		releaseBudget:        func(uint64) {},
 		generationCurrent:    func(uint64) bool { return false }, // demoted after reserve
 		note:                 noteMCPLiveGateDenied,
+		// The stubbed admission above bypasses step (5c), which in production guarantees that an
+		// ADMITTED request carries a non-empty envelope and a non-nil probe. Without this the
+		// final-boundary predicate would refuse on the SCOPE half — correctly, since a nil probe
+		// means the boundary cannot see the scope in force — and this test would pass for the
+		// wrong reason, proving nothing about the demoted generation it exists to pin.
+		currentScopeHash: func() string { return getMCPRollout().stateFor(capb).ScopeHash() },
 	}
 	cfg := &mcpruntime.Config{}
 	if err := composeGatewayLiveTierInto(cfg, liveTierComposition{
