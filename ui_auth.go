@@ -873,12 +873,13 @@ func apiSetupComplete(w http.ResponseWriter, r *http.Request) {
 // idpListReadModel assembles GET /api/idp.
 func idpListReadModel() map[string]any {
 	out := map[string]any{
-		"persisted": idpRegistry.Persisted(),
-		"degraded":  false,
-		"revision":  idpRegistry.DocumentRevision(),
-		"profiles":  publicIdPProfiles(idpRegistry.All()),
-		"scope":     "cluster-synced",
-		"cluster":   idpClusterReadModel(),
+		"persisted":  idpRegistry.Persisted(),
+		"degraded":   false,
+		"revision":   idpRegistry.DocumentRevision(),
+		"profiles":   publicIdPProfiles(idpRegistry.All()),
+		"scope":      "cluster-synced",
+		"cluster":    idpClusterReadModel(),
+		"operations": idpRegistry.operations().readModel(),
 	}
 	if d := idpRegistry.Degraded(); d != nil {
 		out["degraded"] = true
@@ -914,6 +915,15 @@ func writeIdPRefusal(w http.ResponseWriter, err error) {
 		writeRefusal(w, http.StatusBadGateway, refusalProviderCompileFailed,
 			"the identity provider could not be constructed from this profile (dependency failure); nothing was changed",
 			map[string]any{"reason": compile.reason})
+	case errors.Is(err, errIdPOperationLedgerDegraded):
+		writeRefusal(w, http.StatusServiceUnavailable, refusalOperationLedgerDegraded,
+			"the identity-provider operation ledger is damaged and fail-closed; restore or remove idp_operations.json and restart — nothing was changed", nil)
+	case errors.Is(err, errIdPOperationUnsettled):
+		writeRefusal(w, http.StatusServiceUnavailable, refusalOperationUnsettled,
+			"an outstanding operation on this profile could not be settled durably; nothing was changed — retry, or inspect GET /api/idp/operations/{operationId}", nil)
+	case errors.Is(err, errIdPOperationLedgerFull):
+		writeRefusal(w, http.StatusServiceUnavailable, refusalOperationLedgerFull,
+			"every operation-ledger slot holds an unresolved intent; resolve them (GET /api/idp/operations/{operationId}) before starting another operation — nothing was changed", nil)
 	case errors.Is(err, errIdPOperationPersist):
 		writeRefusal(w, http.StatusInternalServerError, refusalPersistFailed,
 			"the operation intent could not be persisted; nothing was changed", nil)
@@ -1148,11 +1158,8 @@ func apiIdPCreate(w http.ResponseWriter, r *http.Request) {
 	normalizeIdPProfileWriteInput(&p)
 	specDigest := idpSpecDigest(&p)
 	ops := idpRegistry.operations()
-	if opID != "" {
-		if prev := ops.Get(opID); prev != nil {
-			apiIdPReplayOperation(w, prev, specDigest)
-			return
-		}
+	if idpReplayKnownOperation(w, ops, opID, specDigest) {
+		return
 	}
 	docRev, ok := idpCreateDocumentFence(w, r)
 	if !ok {
@@ -1166,12 +1173,12 @@ func apiIdPCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	p.ID = mintIdPID()
 	if !idpBeginCreateIntent(w, ops, idpOperation{
-		OperationID: opID, Action: "idp.create", Actor: auditActor(r),
+		OperationID: opID, Action: "idp.create", Actor: auditActor(r), ProfileName: p.Name,
 		ProfileID: p.ID, SpecDigest: specDigest, RegistryRevision: docRev, Cutover: cutover != nil,
 	}) {
 		return
 	}
-	if err := idpRegistry.Create(&p, docRev, cutover); err != nil {
+	if err := idpRegistry.Create(&p, docRev, opID, cutover); err != nil {
 		idpFinishFailedOperation(ops, opID, err)
 		writeIdPRefusal(w, err)
 		return
@@ -1182,12 +1189,65 @@ func apiIdPCreate(w http.ResponseWriter, r *http.Request) {
 	detail := p.Name + fleet.auditSuffix()
 	if opID != "" {
 		result["operationId"] = opID
-		ops.Finish(opID, idpOpCommitted, "", idpRegistry.DocumentRevision(), result)
 		detail += " operationId=" + opID
+		if !idpRecordCommittedOperation(w, ops, opID, &p, result, detail) {
+			return
+		}
 	}
 	auditEventDiff(r, "idp.create", p.ID, detail, nil, auditIdPProfile(&p))
+	idpMarkOperationAudited(ops, opID)
 	logger.Printf("UI: IdP profile created id=%q name=%q type=%q fleet=%s", sanitizeLog(p.ID), sanitizeLog(p.Name), sanitizeLog(string(p.Type)), fleet.Publication)
 	jsonOK(w, result)
+}
+
+// idpReplayKnownOperation answers a re-dispatched operationId from its
+// durable record (or refuses on a degraded ledger). Returns true when the
+// response has been written. No-op without an operationId.
+func idpReplayKnownOperation(w http.ResponseWriter, ops *idpOperationStore, opID, specDigest string) bool {
+	if opID == "" {
+		return false
+	}
+	prev, err := ops.Get(opID)
+	if err != nil {
+		writeIdPRefusal(w, err) // degraded ledger: fail closed, nothing written
+		return true
+	}
+	if prev == nil {
+		return false
+	}
+	apiIdPReplayOperation(w, prev, specDigest)
+	return true
+}
+
+// idpMarkOperationAudited records durably that the success audit of an
+// operation-identified write was emitted; a failure is logged (the audit
+// happened; a replay of the mark is idempotent at reconciliation).
+func idpMarkOperationAudited(ops *idpOperationStore, opID string) {
+	if opID == "" {
+		return
+	}
+	if err := ops.MarkAudited(opID); err != nil {
+		logger.Printf("UI: IdP create operation %s audit emitted but not marked durable (%s)", sanitizeLog(opID), boundedPersistClass(err))
+	}
+}
+
+// idpRecordCommittedOperation persists the terminal record of a committed
+// create BEFORE success is reported (round 3, Blocker 1). A failed terminal
+// persist leaves the durable `pending` intent as the truth and answers the
+// NON-terminal 500 outcome_unknown: the profile IS committed (with its
+// provenance), but this response must not claim so — the lookup settles it
+// once the ledger is writable again, and the success audit is emitted then,
+// exactly once. Returns false when the response has been written.
+func idpRecordCommittedOperation(w http.ResponseWriter, ops *idpOperationStore, opID string, p *IdPProfile, result map[string]any, detail string) bool {
+	err := ops.Finish(opID, idpOpCommitted, "", idpRegistry.DocumentRevision(), result, detail, auditIdPProfile(p))
+	if err == nil {
+		return true
+	}
+	logger.Printf("UI: IdP create id=%q operation %s committed but its terminal record is not durable (%s)", sanitizeLog(p.ID), sanitizeLog(opID), boundedPersistClass(err))
+	writeRefusal(w, http.StatusInternalServerError, refusalOutcomeUnknown,
+		"outcome unknown: the registry write landed but the operation's terminal record could not be persisted; poll GET /api/idp/operations/{operationId} — the result is settled durably from the registry's own provenance",
+		map[string]any{"detail": "operation_record_not_durable", "operationId": opID, "id": p.ID})
+	return false
 }
 
 // idpCreateOperationID resolves the optional client operationId: malformed
@@ -1251,7 +1311,11 @@ func idpFinishFailedOperation(ops *idpOperationStore, opID string, err error) {
 	if errors.Is(err, errIdPOutcomeUnknown) {
 		state = idpOpOutcomeUnknown
 	}
-	ops.Finish(opID, state, refusalCodeOf(err), "", nil)
+	if ferr := ops.Finish(opID, state, refusalCodeOf(err), "", nil, "", nil); ferr != nil {
+		// The intent stays durably pending; reconciliation settles it from
+		// the registry's provenance (a refused write left no profile).
+		logger.Printf("UI: IdP operation %s refused (%s) but its terminal record is not durable (%s)", sanitizeLog(opID), refusalCodeOf(err), boundedPersistClass(ferr))
+	}
 }
 
 // apiIdPReplayOperation answers a re-dispatched operationId from the durable
@@ -1303,10 +1367,28 @@ func apiIdPOperations(w http.ResponseWriter, r *http.Request) {
 		writeRefusal(w, http.StatusBadRequest, refusalInvalidInput, "operationId must be a UUID", nil)
 		return
 	}
-	op := idpRegistry.operations().Get(id)
+	ops := idpRegistry.operations()
+	op, err := ops.Get(id)
+	if err != nil {
+		writeIdPRefusal(w, err) // degraded ledger: the lookup is refused, never guessed
+		return
+	}
 	if op == nil {
 		writeRefusal(w, http.StatusNotFound, refusalNotFound, "no such operation", nil)
 		return
+	}
+	if op.unresolved() {
+		// Round 3: settle from the registry's durable provenance NOW (the
+		// terminal persist may have failed at create time); the verdict is
+		// reported only once it is durable, else the record stays as is.
+		idpMutationMu.Lock()
+		serr := idpRegistry.settleOperation(ops, *op, idpRegistry.Get(op.ProfileID), "lookup")
+		idpMutationMu.Unlock()
+		if serr != nil {
+			logger.Printf("UI: IdP operation %s could not be settled at lookup (%s)", sanitizeLog(id), boundedPersistClass(serr))
+		} else if cur, gerr := ops.Get(id); gerr == nil && cur != nil {
+			op = cur
+		}
 	}
 	jsonOK(w, op.lookupReadModel())
 }

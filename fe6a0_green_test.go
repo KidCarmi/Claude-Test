@@ -283,7 +283,7 @@ func TestFE6A0_Green_OutcomeUnknownPublishesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := ldapTestProfile("ldap-split", "Split")
-	err = reg.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+	err = reg.mutate(false, "", func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
 		return applyProfileCandidate(cur, live, p, compiled), nil
 	}, func([]*IdPProfile) error {
 		// The pre-publish step fails AND the compensating rollback is made

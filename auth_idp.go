@@ -79,6 +79,14 @@ type IdPProfile struct {
 	// ignored on write; persisted so it survives restarts; carried CP→DP.
 	Revision int64 `json:"revision,omitempty"`
 
+	// OperationID is the durable PROVENANCE of the write that created this
+	// entry (round-3 correction, Blocker 1): the client operationId of the
+	// operation-identified create, co-written in the same atomic registry
+	// write as the profile. It is what proves a pending intent COMMITTED —
+	// never the profile's mere presence. Server-owned: a caller-supplied
+	// value is ignored, a replace preserves it, and it is carried CP→DP.
+	OperationID string `json:"operationId,omitempty"`
+
 	// Only one of OIDC/SAML/LDAP is populated depending on Type.
 	OIDC *OIDCProfileConfig `json:"oidc,omitempty"`
 	SAML *SAMLProfileConfig `json:"saml,omitempty"`
@@ -347,10 +355,9 @@ func (r *IdPRegistry) Load(path string) error {
 	live := make(map[string]IdentityProvider)
 	for _, p := range profiles {
 		if p.Enabled {
-			prov, err := compileIdPProfile(p)
+			prov, err := compileBounded(p)
 			if err != nil {
-				logger.Printf("IdP %q compile error: %v", p.ID, err)
-				continue
+				continue // bounded class already logged at the seam
 			}
 			live[p.ID] = prov
 		}
@@ -368,12 +375,124 @@ func (r *IdPRegistry) Load(path string) error {
 // reconcileOperations settles every non-terminal durable intent against the
 // registry content just loaded (Blocker 9: a process that died between the
 // intent and the outcome leaves a truth the file can decide).
+//
+// Round 3: a pending intent is proven COMMITTED only by a profile carrying
+// its provenance (never by presence); a committed record whose success
+// audit was never emitted is audited here EXACTLY ONCE (the `audited` flag
+// is durable, so a replay never audits twice). A degraded ledger settles
+// nothing — it is fail-closed until the operator restores it.
 func (r *IdPRegistry) reconcileOperations() {
 	ops := r.operations()
-	n := ops.Reconcile(func(id string) bool { return r.Get(id) != nil }, r.DocumentRevision())
-	if n > 0 {
-		logger.Printf("IdP: reconciled %d unsettled operation intent(s) from the registry file", n)
+	if ops.Degraded() != nil {
+		return
 	}
+	settled := 0
+	unresolved := ops.Unresolved()
+	for i := range unresolved {
+		op := &unresolved[i]
+		if err := r.settleOperation(ops, *op, r.Get(op.ProfileID), "reconciled"); err != nil {
+			logger.Printf("IdP: operation %s could not be settled at reconciliation (%s)", sanitizeLog(op.OperationID), boundedPersistClass(err))
+			continue
+		}
+		settled++
+	}
+	audited := 0
+	unaudited := ops.UnauditedCommits()
+	for i := range unaudited {
+		op := &unaudited[i]
+		if err := ops.emitOperationAudit(*op); err != nil {
+			logger.Printf("IdP: operation %s audit could not be marked durable (%s)", sanitizeLog(op.OperationID), boundedPersistClass(err))
+			continue
+		}
+		audited++
+	}
+	if settled > 0 || audited > 0 {
+		logger.Printf("IdP: reconciled %d unsettled operation intent(s) and completed %d pending success audit(s) from the registry file", settled, audited)
+	}
+}
+
+// boundedPersistClass names a ledger failure by its bounded class only —
+// the underlying filesystem error never reaches the log.
+func boundedPersistClass(err error) string {
+	switch {
+	case errors.Is(err, errIdPOperationLedgerDegraded):
+		return "ledger_degraded"
+	case errors.Is(err, errIdPOperationPersist):
+		return "ledger_not_durable"
+	default:
+		return "settle_failed"
+	}
+}
+
+// settleOperation decides one unresolved intent DURABLY from the registry's
+// own evidence and completes its audit:
+//
+//   - target present and carrying the intent's provenance ⇒ committed
+//     (the success audit is emitted from the recorded facts, exactly once);
+//   - target present WITHOUT that provenance ⇒ aborted (`<why>_unproven`):
+//     another writer owns the entry, so this intent never committed;
+//   - target absent ⇒ aborted (`<why>_absent`).
+//
+// The verdict is persisted BEFORE it is reported; a persist failure leaves
+// the intent unresolved and is returned to the caller.
+func (r *IdPRegistry) settleOperation(ops *idpOperationStore, op idpOperation, target *IdPProfile, why string) error {
+	switch {
+	case target == nil:
+		return ops.Finish(op.OperationID, idpOpAborted, why+"_absent", "", nil, "", nil)
+	case target.OperationID != op.OperationID:
+		return ops.Finish(op.OperationID, idpOpAborted, why+"_unproven", "", nil, "", nil)
+	}
+	result := map[string]any{"id": target.ID, "operationId": op.OperationID, "settled": why}
+	if err := ops.Finish(op.OperationID, idpOpCommitted, why+"_committed", r.DocumentRevision(), result, op.AuditDetail, auditIdPProfile(target)); err != nil {
+		return err
+	}
+	rec, err := ops.Get(op.OperationID)
+	if err != nil || rec == nil || rec.Audited {
+		return err
+	}
+	return ops.emitOperationAudit(*rec)
+}
+
+// settleBeforeWrite runs inside every registry transaction, after the
+// candidate is built and BEFORE anything is persisted: for every current
+// profile the candidate removes or replaces, an outstanding intent on that
+// profile (other than the transaction's own, activeOp) is settled durably
+// first. If it cannot be settled the transaction is refused with
+// errIdPOperationUnsettled and NOTHING is written — historical authorship
+// is never inferred from content the writer is about to change.
+//
+// A DEGRADED ledger cannot say whether an intent is outstanding, so it
+// refuses every write that changes or removes an EXISTING profile (a pure
+// add touches nothing an intent could target).
+func (r *IdPRegistry) settleBeforeWrite(cur, next []*IdPProfile, activeOp string) error {
+	ops := r.operations()
+	degraded := ops.Degraded() != nil
+	pending := ops.Unresolved()
+	if !degraded && len(pending) == 0 {
+		return nil
+	}
+	nextByID := make(map[string]*IdPProfile, len(next))
+	for _, p := range next {
+		nextByID[p.ID] = p
+	}
+	for _, p := range cur {
+		if n, ok := nextByID[p.ID]; ok && n == p {
+			continue // untouched entry
+		}
+		if degraded {
+			return fmt.Errorf("%w: %w", errIdPOperationUnsettled, errIdPOperationLedgerDegraded)
+		}
+		for i := range pending {
+			op := &pending[i]
+			if op.ProfileID != p.ID || op.OperationID == activeOp {
+				continue
+			}
+			if err := r.settleOperation(ops, *op, p, "settled_before_write"); err != nil {
+				return fmt.Errorf("%w: %v", errIdPOperationUnsettled, err)
+			}
+		}
+	}
+	return nil
 }
 
 // Degraded returns a copy of the degraded posture, or nil when healthy.
@@ -503,7 +622,10 @@ type idpCandidate struct {
 // candidate is durable and before it is published; its failure rolls the
 // registry file back to cur (a failed rollback is errIdPOutcomeUnknown).
 // allowDegraded lets the CP→DP sync rebuild a degraded DP registry.
-func (r *IdPRegistry) mutate(allowDegraded bool, build func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error), beforePublish func(next []*IdPProfile) error) error {
+// activeOp is the transaction's own operationId ("" for an unidentified
+// write): an outstanding intent on every OTHER profile the candidate changes
+// or removes is settled durably first (settleBeforeWrite, round 3).
+func (r *IdPRegistry) mutate(allowDegraded bool, activeOp string, build func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error), beforePublish func(next []*IdPProfile) error) error {
 	idpMutationMu.Lock()
 	defer idpMutationMu.Unlock()
 
@@ -520,6 +642,9 @@ func (r *IdPRegistry) mutate(allowDegraded bool, build func(cur []*IdPProfile, l
 	}
 	next, err := build(cur, curLive)
 	if err != nil {
+		return err
+	}
+	if err := r.settleBeforeWrite(cur, next.profiles, activeOp); err != nil {
 		return err
 	}
 	// Snapshot the prior file BYTES so a compensating rollback restores the
@@ -614,6 +739,7 @@ func normalizeIdPProfileWriteInput(p *IdPProfile) {
 		return
 	}
 	p.Revision = 0
+	p.OperationID = ""
 	if p.LDAP != nil {
 		p.LDAP.BindCredentialConfigured = false
 	}
@@ -636,19 +762,26 @@ func prepareProfile(p *IdPProfile) (IdentityProvider, error) {
 	if !p.Enabled {
 		return nil, nil
 	}
+	// A SAML profile carrying INLINE metadata XML that does not parse is
+	// the caller's own input, not a dependency: report it as validation
+	// (bounded wording — the blob is never echoed).
+	if p.Type == IdPTypeSAML && p.SAML != nil && p.SAML.MetadataXML != "" {
+		if _, perr := samlsp.ParseMetadata([]byte(p.SAML.MetadataXML)); perr != nil {
+			return nil, &idpValidationError{msg: "idp saml: metadata_xml is not valid SAML metadata"}
+		}
+	}
+	return compileBounded(p)
+}
+
+// compileBounded is THE single classification seam every provider
+// compilation crosses (admin write, boot Load, CP→DP ReplaceAll — round 3,
+// Blocker 3). The cause embeds the dependency's hostname / TLS / transport
+// text; it is dropped HERE and only the bounded class survives — in the
+// returned *idpCompileError, in the process log, and therefore in every
+// audit, diagnostic and read model downstream.
+func compileBounded(p *IdPProfile) (IdentityProvider, error) {
 	prov, err := compileIdPProfile(p)
 	if err != nil {
-		// A SAML profile carrying INLINE metadata XML that does not parse is
-		// the caller's own input, not a dependency: report it as validation
-		// (bounded wording — the blob is never echoed).
-		if p.Type == IdPTypeSAML && p.SAML != nil && p.SAML.MetadataXML != "" {
-			if _, perr := samlsp.ParseMetadata([]byte(p.SAML.MetadataXML)); perr != nil {
-				return nil, &idpValidationError{msg: "idp saml: metadata_xml is not valid SAML metadata"}
-			}
-		}
-		// Blocker 6: the cause embeds the dependency's hostname / TLS /
-		// transport text. It is dropped HERE — only the bounded class
-		// survives; the process log carries the class too (never the cause).
 		reason := idpCompileReason(p.Type)
 		logger.Printf("IdP: provider compile failed id=%q type=%q reason=%s", sanitizeLog(p.ID), sanitizeLog(string(p.Type)), reason)
 		return nil, &idpCompileError{reason: reason}
@@ -667,7 +800,7 @@ func (r *IdPRegistry) Upsert(p *IdPProfile) error {
 	if err != nil {
 		return err
 	}
-	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+	return r.mutate(false, "", func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
 		return applyProfileCandidate(cur, live, p, compiled), nil
 	}, nil)
 }
@@ -687,7 +820,9 @@ func mintIdPID() string {
 // decided INSIDE the transaction against the current profile set: "" skips
 // the fence (internal callers), a mismatch is *idpDocStaleError, and an id
 // collision is refused rather than silently replacing.
-func (r *IdPRegistry) Create(p *IdPProfile, expectedDocRev string, beforePublish func(next []*IdPProfile) error) error {
+// operationID, when non-empty, is stamped on the profile as its durable
+// PROVENANCE in the same atomic write (round 3).
+func (r *IdPRegistry) Create(p *IdPProfile, expectedDocRev, operationID string, beforePublish func(next []*IdPProfile) error) error {
 	if p.ID == "" {
 		p.ID = mintIdPID()
 	}
@@ -695,7 +830,8 @@ func (r *IdPRegistry) Create(p *IdPProfile, expectedDocRev string, beforePublish
 	if err != nil {
 		return err
 	}
-	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+	p.OperationID = operationID
+	return r.mutate(false, operationID, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
 		if expectedDocRev != "" {
 			if cur := idpDocumentRevisionOf(cur); cur != expectedDocRev {
 				return idpCandidate{}, &idpDocStaleError{Current: cur}
@@ -718,7 +854,7 @@ func (r *IdPRegistry) Update(p *IdPProfile, expectedRev int64, beforePublish fun
 	if err != nil {
 		return err
 	}
-	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+	return r.mutate(false, "", func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
 		existing := findIdPProfile(cur, p.ID)
 		if existing == nil {
 			return idpCandidate{}, errIdPVanished
@@ -739,6 +875,9 @@ func applyProfileCandidate(cur []*IdPProfile, live map[string]IdentityProvider, 
 	for i, existing := range nextProfiles {
 		if existing.ID == p.ID {
 			p.Revision = idpEntryRevision(existing) + 1
+			if p.OperationID == "" {
+				p.OperationID = existing.OperationID // provenance survives a replace
+			}
 			nextProfiles[i] = p
 			found = true
 			break
@@ -820,7 +959,7 @@ func (r *IdPRegistry) DeleteFenced(id string, expectedRev int64) error {
 }
 
 func (r *IdPRegistry) deleteWhere(id string, expectedRev *int64) error {
-	return r.mutate(false, func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
+	return r.mutate(false, "", func(cur []*IdPProfile, live map[string]IdentityProvider) (idpCandidate, error) {
 		for i, p := range cur {
 			if p.ID != id {
 				continue
@@ -892,9 +1031,9 @@ func (r *IdPRegistry) ReplaceAll(profiles []*IdPProfile) error {
 	}
 	nextLive := make(map[string]IdentityProvider)
 	for _, p := range nextProfiles {
-		rev := p.Revision
+		rev, prov := p.Revision, p.OperationID
 		normalizeIdPProfileWriteInput(p)
-		p.Revision = rev
+		p.Revision, p.OperationID = rev, prov
 		if p.Revision <= 0 {
 			p.Revision = 1
 		}
@@ -904,13 +1043,13 @@ func (r *IdPRegistry) ReplaceAll(profiles []*IdPProfile) error {
 		if !p.Enabled {
 			continue
 		}
-		prov, err := compileIdPProfile(p)
+		live, err := compileBounded(p) // bounded class only (round 3, Blocker 3)
 		if err != nil {
-			return fmt.Errorf("idp %q compile error: %w", p.ID, err)
+			return fmt.Errorf("idp %q: %w", p.ID, err)
 		}
-		nextLive[p.ID] = prov
+		nextLive[p.ID] = live
 	}
-	return r.mutate(true, func([]*IdPProfile, map[string]IdentityProvider) (idpCandidate, error) {
+	return r.mutate(true, "", func([]*IdPProfile, map[string]IdentityProvider) (idpCandidate, error) {
 		return idpCandidate{profiles: nextProfiles, live: nextLive}, nil
 	}, nil)
 }
@@ -1027,6 +1166,7 @@ func publicIdPProfile(p *IdPProfile) *IdPProfile {
 		Priority:     p.Priority,
 		KnownGroups:  append([]string(nil), p.KnownGroups...),
 		Revision:     idpEntryRevision(p),
+		OperationID:  p.OperationID,
 	}
 	if p.OIDC != nil {
 		cp.OIDC = &OIDCProfileConfig{

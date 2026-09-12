@@ -14309,7 +14309,22 @@ async function saveIdP() {
       loadIdPList();
       return;
     }
-    toast('Error: ' + apiErrorText(await res.text()), 'error');
+    const errText = await res.text();
+    // FE-6A.0 round 3 (Blocker 1): 500 outcome_unknown is NON-terminal — the
+    // registry write may have landed while the operation's record could not
+    // be persisted. Nothing is claimed; the list is reloaded and the
+    // operation settles durably from the profile's provenance on lookup.
+    let errBody = null;
+    try { errBody = JSON.parse(errText); } catch (e) { errBody = null; }
+    if (res.status === 500 && errBody && errBody.code === 'outcome_unknown' && !id) {
+      const opId = errBody.current && errBody.current.operationId;
+      toast('Outcome not yet proven: the write may have landed but its record is not durable. The list has been reloaded' +
+        (opId ? '; the operation settles on lookup (GET /api/idp/operations/' + escHtml(String(opId)) + ')' : '') + '.', 'error');
+      closeIdPModal();
+      loadIdPList();
+      return;
+    }
+    toast('Error: ' + apiErrorText(errText), 'error');
     return;
   }
   closeIdPModal();

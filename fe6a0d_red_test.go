@@ -146,30 +146,53 @@ func TestFE6A0D_DR1b_CommittedIntentSurvivesALaterDeleteAcrossRestart(t *testing
 	fe6aSwapConfigStore(t)
 	withConfigVersionsDir(t)
 	opsPath := fe6adOpsPath(regPath)
+	t.Cleanup(audit.SwapRingForTest())
 	const opID = "b1b1b1b1-0000-4000-8000-000000000002"
+	// CRASH SIMULATION at the ledger write itself: after the registry commit
+	// lands (idp_profiles.json written), the ledger's next atomic write is
+	// impossible, so the terminal record (and the audit that follows it)
+	// never becomes durable. The durable PENDING intent — exactly what a
+	// real crash leaves behind — is captured first and put back once the
+	// "volume" recovers, so the process continues against a file that says
+	// `pending` while the registry file carries the committed profile.
+	var pendingBytes []byte
+	fired := false
+	fileutil.SetWriteSuccessObserver(func(path string) {
+		if fired || filepath.Base(path) != filepath.Base(regPath) {
+			return
+		}
+		fired = true
+		pendingBytes, _ = os.ReadFile(opsPath)
+		_ = os.Remove(opsPath)
+		_ = os.MkdirAll(filepath.Join(opsPath, "blocker"), 0o700)
+	})
+	t.Cleanup(func() { fileutil.SetWriteSuccessObserver(noteStorageWriteSuccess) })
 	code, first := fe6acCreateFenced(t, ldapProfileBodyForPut("Provenance", nil), "operationId="+opID)
-	if code != http.StatusOK {
+	fileutil.SetWriteSuccessObserver(noteStorageWriteSuccess)
+	if !fired || len(pendingBytes) == 0 {
+		t.Fatal("precondition: the registry commit never fired the write observer with a durable pending intent on disk")
+	}
+	if code != http.StatusOK && code != http.StatusInternalServerError {
 		t.Fatalf("create = %d %v", code, first)
 	}
-	id, _ := first["id"].(string)
-	// CRASH SIMULATION: the registry commit is durable, the terminal record
-	// (and therefore the audit that follows it) never was.
-	t.Cleanup(audit.SwapRingForTest())
-	fe6adRewriteOps(t, opsPath, func(rec map[string]any) {
-		rec["state"] = idpOpPending
-		delete(rec, "finishedAt")
-		delete(rec, "result")
-		delete(rec, "committedRevision")
-		delete(rec, "audited")
-	})
+	all := reg.All()
+	if len(all) != 1 {
+		t.Fatalf("the registry commit itself must stand (%d profiles)", len(all))
+	}
+	id := all[0].ID
+	// The volume recovers: the ledger is writable again and still says pending.
+	if err := os.RemoveAll(opsPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(opsPath, pendingBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	// An administrator deletes the profile before anything reconciled it.
-	rev := fe6aIdPRevision(t, id)
 	w := httptest.NewRecorder()
 	apiIdPItem(w, fencedDeleteReq(fencedIdPPath(id)), id)
 	if w.Code != http.StatusOK && w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("delete = %d: %s", w.Code, w.Body.String())
 	}
-	_ = rev
 	// RESTART.
 	fresh := &IdPRegistry{live: make(map[string]IdentityProvider)}
 	if err := fresh.Load(regPath); err != nil {
@@ -188,7 +211,6 @@ func TestFE6A0D_DR1b_CommittedIntentSurvivesALaterDeleteAcrossRestart(t *testing
 	if n := fe6adCountAudit("idp.create", id); n != 1 {
 		t.Fatalf("DR1b: the success audit must be completed exactly once by settlement/reconciliation; got %d", n)
 	}
-	_ = reg
 }
 
 // ─── DR1c — crash after the durable terminal record, before the audit ───────
@@ -246,8 +268,8 @@ func TestFE6A0D_DR2a_PendingIntentsAreNeverEvictedAtCapacity(t *testing.T) {
 		t.Fatal("DR2a: a new operation was admitted while every slot holds an UNRESOLVED intent — something was evicted")
 	}
 	for _, id := range ids {
-		if op := ops.Get(id); op == nil || op.State != idpOpPending {
-			t.Fatalf("DR2a: pending intent %s was evicted or reinterpreted (%+v)", id, op)
+		if op, err := ops.Get(id); err != nil || op == nil || op.State != idpOpPending {
+			t.Fatalf("DR2a: pending intent %s was evicted or reinterpreted (%+v, %v)", id, op, err)
 		}
 	}
 	// The evicted id must not be accepted as NEW afterwards either.

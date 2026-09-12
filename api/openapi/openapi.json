@@ -29,7 +29,7 @@
             }
           }
         },
-        "description": "FE-6A.0 — the store cannot accept the administrative mutation: the identity-provider registry is degraded (corrupt file quarantined at boot; `code: registry_degraded` — acknowledge the repair via POST /api/idp/repair or restore the file and restart), or the store has NO persistence path (`code: persistence_not_configured` — no idp_profiles_file / no -ui-users-file; the mutation is refused BEFORE any runtime change, there is no `persisted:false` success). Nothing was changed."
+        "description": "FE-6A.0 — the store cannot accept the administrative mutation: the identity-provider registry is degraded (corrupt file quarantined at boot; `code: registry_degraded` — acknowledge the repair via POST /api/idp/repair or restore the file and restart), or the store has NO persistence path (`code: persistence_not_configured` — no idp_profiles_file / no -ui-users-file; the mutation is refused BEFORE any runtime change, there is no `persisted:false` success), or (round 3) the IdP operation ledger is fail-closed: `operation_ledger_degraded` (corrupt/unreadable idp_operations.json left in place as evidence — restore or remove it and restart), `operation_ledger_full` (every slot holds an unresolved intent — look them up and let them settle), `operation_unsettled` (an outstanding intent on this profile could not be settled durably before the write). Nothing was changed."
       },
       "AuthRefusalForbidden": {
         "content": {
@@ -59,7 +59,7 @@
             }
           }
         },
-        "description": "FE-6A.0 — the durable write failed (`code: persist_failed`; nothing changed in memory, on disk, in sessions or on the cluster) or, only on an enabling LDAP write, `code: outcome_unknown` (the registry file was written, the cutover sentinel was not durable and the rollback failed; NOTHING is published, `current.detail` names the split, the next restart reconciles from disk — non-terminal)."
+        "description": "FE-6A.0 — the durable write failed (`code: persist_failed`; nothing changed in memory, on disk, in sessions or on the cluster) or, only on an enabling LDAP write, `code: outcome_unknown` (the registry file was written, the cutover sentinel was not durable and the rollback failed; NOTHING is published, `current.detail` names the split, the next restart reconciles from disk — non-terminal). On an operation-identified create, `outcome_unknown` with `current.detail: operation_record_not_durable` means the registry commit landed but the operation's terminal record could not be persisted (round 3): the durable intent stays pending, no success is claimed and no success audit is emitted; poll GET /api/idp/operations/{operationId}, which settles it from the profile's durable provenance."
       },
       "AuthRefusalPreconditionRequired": {
         "content": {
@@ -478,7 +478,7 @@
       },
       "AuthRefusal": {
         "additionalProperties": false,
-        "description": "FE-6A.0 typed refusal shared by the Identity Providers and Administrators surfaces. `code` is bounded: invalid_input (400), forbidden / invalid_credentials (403), not_found / vanished (404), stale / last_admin / user_exists / referenced / confirm_mismatch / not_degraded / repair_unavailable / operation_mismatch / operation_in_progress / operation_aborted / operation_outcome_unknown (409), precondition_required / operation_id_required (428), persist_failed / outcome_unknown (500), provider_compile_failed (502), registry_degraded / persistence_not_configured (503), method_not_allowed (405). `current` carries typed facts for the retry (revision, documentRevision, generation, references, confirmValue, detail, reason, operationId, state, code). A refusal mutates nothing, audits no success and publishes no cluster snapshot.",
+        "description": "FE-6A.0 typed refusal shared by the Identity Providers and Administrators surfaces. `code` is bounded: invalid_input (400), forbidden / invalid_credentials (403), not_found / vanished (404), stale / last_admin / user_exists / referenced / confirm_mismatch / not_degraded / repair_unavailable / operation_mismatch / operation_in_progress / operation_aborted / operation_outcome_unknown (409), precondition_required / operation_id_required (428), persist_failed / outcome_unknown (500), provider_compile_failed (502), registry_degraded / persistence_not_configured / operation_ledger_degraded / operation_ledger_full / operation_unsettled (503), method_not_allowed (405). `current` carries typed facts for the retry (revision, documentRevision, generation, references, confirmValue, detail, reason, operationId, state, code). A refusal mutates nothing, audits no success and publishes no cluster snapshot.",
         "properties": {
           "code": {
             "type": "string"
@@ -2441,6 +2441,9 @@
             ],
             "type": "string"
           },
+          "operations": {
+            "$ref": "#/components/schemas/IdPOperationLedger"
+          },
           "persisted": {
             "type": "boolean"
           },
@@ -2511,8 +2514,12 @@
           "actor": {
             "type": "string"
           },
+          "audited": {
+            "description": "committed — the success audit has been emitted (exactly once; a crash between the durable terminal record and the audit is completed by settlement/reconciliation).",
+            "type": "boolean"
+          },
           "code": {
-            "description": "aborted/outcome_unknown — the refusal code; reconciled_committed / reconciled_absent after a boot reconciliation.",
+            "description": "aborted/outcome_unknown — the refusal code; `<why>_committed` / `<why>_absent` / `<why>_unproven` after a settlement, where why is reconciled (boot), lookup (this GET) or settled_before_write (a later writer on the same profile). unproven = the profile exists but carries another writer's provenance.",
             "type": "string"
           },
           "committedRevision": {
@@ -2549,6 +2556,7 @@
             "type": "string"
           },
           "state": {
+            "description": "A terminal state is reported ONLY once its durable record exists (round 3): a create whose terminal record could not be persisted answers 500 outcome_unknown and the record stays pending until the lookup, a later writer on the same profile, or the next boot settles it from the profile's durable provenance.",
             "enum": [
               "pending",
               "committed",
@@ -2566,7 +2574,43 @@
           "profileId",
           "registryRevision",
           "cutover",
-          "startedAt"
+          "startedAt",
+          "audited"
+        ],
+        "type": "object"
+      },
+      "IdPOperationLedger": {
+        "additionalProperties": false,
+        "description": "FE-6A.0 round-3 correction (Blockers 1–2) — the posture of the durable operation ledger (idp_operations.json). `degraded:true` means the file is corrupt or unreadable: it is left in place as evidence, every operation-identified write, every lookup and every write that would change or remove an existing profile is refused (503 operation_ledger_degraded) until the operator restores or removes the file and restarts. `unresolved` counts pending/outcome_unknown intents, which are never evicted; at `capacity` unresolved intents a new operation is refused (503 operation_ledger_full).",
+        "properties": {
+          "capacity": {
+            "type": "integer"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degradedDetail": {
+            "type": "string"
+          },
+          "degradedReason": {
+            "enum": [
+              "corrupt",
+              "unreadable"
+            ],
+            "type": "string"
+          },
+          "retained": {
+            "type": "integer"
+          },
+          "unresolved": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "degraded",
+          "retained",
+          "unresolved",
+          "capacity"
         ],
         "type": "object"
       },
@@ -2668,6 +2712,11 @@
             "additionalProperties": true,
             "nullable": true,
             "type": "object"
+          },
+          "operationId": {
+            "description": "Durable PROVENANCE of the operation-identified create that produced this entry (round 3): co-written with the profile, preserved across replaces, ignored on input.",
+            "format": "uuid",
+            "type": "string"
           },
           "priority": {
             "type": "integer"
@@ -15251,7 +15300,7 @@
         "x-culvert-visibility": "admin-supported"
       },
       "post": {
-        "description": "Creates a profile (FE-6A.0 correction). Fenced on the registry DOCUMENT revision (`documentRevision` query = IdPList.revision; 428 precondition_required / 409 stale with current.documentRevision, decided again inside the transaction). Optional client UUID `operationId`: REQUIRED (428 operation_id_required) when the write would retire the legacy YAML ldap authenticator; the non-secret intent (actor, candidate identity + spec digest, fenced revision) is persisted BEFORE the first irreversible write, a duplicate operationId REPLAYS the recorded result (`replayed:true`, never a second create/cutover; a different candidate under the same id is 409 operation_mismatch; an aborted/pending/unknown outcome is 409 operation_aborted / operation_in_progress / operation_outcome_unknown), and GET /api/idp/operations/{operationId} is the authoritative lookup. A profile that validates but whose provider cannot be constructed is 502 provider_compile_failed with a bounded `current.reason`. A registry without a persistence path refuses before any runtime change (503 persistence_not_configured). The local durable commit and the FLEET publication are reported separately: `cluster.publication` (published|rejected, bounded `cluster.reason`), and the audit detail carries `fleet=…`.",
+        "description": "Creates a profile (FE-6A.0 correction). Fenced on the registry DOCUMENT revision (`documentRevision` query = IdPList.revision; 428 precondition_required / 409 stale with current.documentRevision, decided again inside the transaction). Optional client UUID `operationId`: REQUIRED (428 operation_id_required) when the write would retire the legacy YAML ldap authenticator; the non-secret intent (actor, candidate identity + spec digest, fenced revision) is persisted BEFORE the first irreversible write, a duplicate operationId REPLAYS the recorded result (`replayed:true`, never a second create/cutover; a different candidate under the same id is 409 operation_mismatch; an aborted/pending/unknown outcome is 409 operation_aborted / operation_in_progress / operation_outcome_unknown), and GET /api/idp/operations/{operationId} is the authoritative lookup. A profile that validates but whose provider cannot be constructed is 502 provider_compile_failed with a bounded `current.reason`. A registry without a persistence path refuses before any runtime change (503 persistence_not_configured). The local durable commit and the FLEET publication are reported separately: `cluster.publication` (published|rejected, bounded `cluster.reason`), and the audit detail carries `fleet=…`. Round 3: the operation's terminal record is persisted BEFORE success is reported — a failed terminal persist is 500 outcome_unknown (`current.detail: operation_record_not_durable`, non-terminal, no success audit); the created profile carries the operationId as durable provenance; a fail-closed ledger refuses with 503 operation_ledger_degraded / operation_ledger_full.",
         "operationId": "createIdP",
         "parameters": [
           {
@@ -15522,7 +15571,7 @@
     },
     "/api/idp/operations/{operationId}": {
       "get": {
-        "description": "FE-6A.0 correction (Blocker 9): the authoritative record of an operation-identified IdP write — `state` is pending (dispatched, not yet decided), committed (the profile exists; `result` is the response the client received, `committedRevision` the registry document revision after the commit), aborted (refused; `code` names the refusal) or outcome_unknown (split durable state, reconciled at the next restart). A process that died mid-operation leaves a pending record that boot reconciles against the registry file. Admin-only: the record names the actor. Never carries a secret.",
+        "description": "FE-6A.0 correction (Blocker 9): the authoritative record of an operation-identified IdP write — `state` is pending (dispatched, not yet decided), committed (the profile exists; `result` is the response the client received, `committedRevision` the registry document revision after the commit), aborted (refused; `code` names the refusal) or outcome_unknown (split durable state, reconciled at the next restart). A process that died mid-operation leaves a pending record that boot reconciles against the registry file. Round 3: a pending record is settled from the profile's durable PROVENANCE (IdPProfileRead.operationId) — by this lookup, by a later writer on the same profile, or at boot — never from the profile's mere presence; the verdict is reported only once it is durable and the success audit is completed exactly once (`audited`). A degraded ledger refuses the lookup (503). Admin-only: the record names the actor. Never carries a secret.",
         "operationId": "getIdPOperation",
         "responses": {
           "200": {
@@ -15531,6 +15580,7 @@
                 "example": {
                   "action": "idp.create",
                   "actor": "admin@127.0.0.1",
+                  "audited": true,
                   "cutover": true,
                   "operationId": "3f0e0d3a-5b7f-4f2b-9a8f-1c2d3e4f5a6b",
                   "profileId": "d81fbbe5df51",
@@ -15553,6 +15603,9 @@
           },
           "404": {
             "$ref": "#/components/responses/AuthRefusalNotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/AuthRefusalDegraded"
           }
         },
         "security": [

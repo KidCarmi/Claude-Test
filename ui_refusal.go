@@ -45,17 +45,21 @@ const (
 	refusalOperationInProgress   = "operation_in_progress"     // 409: the same operation is still being decided
 	refusalOperationAborted      = "operation_aborted"         // 409: replay of an operation that aborted
 	refusalOperationUnknown      = "operation_outcome_unknown" // 409: replay of a split outcome awaiting reconciliation
-	refusalPersistFailed         = "persist_failed"
-	refusalOutcomeUnknown        = "outcome_unknown"
-	refusalLastAdmin             = "last_admin"
-	refusalUserExists            = "user_exists"
-	refusalReferenced            = "referenced"
-	refusalConfirmMismatch       = "confirm_mismatch"
-	refusalNotDegraded           = "not_degraded"
-	refusalRepairUnavailable     = "repair_unavailable"
-	refusalRegistryDegraded      = "registry_degraded"
-	refusalUpstreamError         = "upstream_error"
-	refusalMethodNotAllowed      = "method_not_allowed"
+	// Round-3 correction (Blockers 1–2): the operation ledger is fail-closed.
+	refusalOperationLedgerDegraded = "operation_ledger_degraded" // 503: corrupt/unreadable ledger, evidence preserved
+	refusalOperationLedgerFull     = "operation_ledger_full"     // 503: every slot holds an unresolved intent
+	refusalOperationUnsettled      = "operation_unsettled"       // 503: an outstanding intent on the target could not be settled durably
+	refusalPersistFailed           = "persist_failed"
+	refusalOutcomeUnknown          = "outcome_unknown"
+	refusalLastAdmin               = "last_admin"
+	refusalUserExists              = "user_exists"
+	refusalReferenced              = "referenced"
+	refusalConfirmMismatch         = "confirm_mismatch"
+	refusalNotDegraded             = "not_degraded"
+	refusalRepairUnavailable       = "repair_unavailable"
+	refusalRegistryDegraded        = "registry_degraded"
+	refusalUpstreamError           = "upstream_error"
+	refusalMethodNotAllowed        = "method_not_allowed"
 )
 
 // writeRefusal renders one typed refusal. current carries the authoritative

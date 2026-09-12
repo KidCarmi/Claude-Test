@@ -182,12 +182,14 @@ func TestFE6A0C_Green_Gate_DeleteFirstWriterRevalidatesAndRefuses(t *testing.T) 
 
 func TestFE6A0C_Green_PendingIntentIsReconciledFromTheRegistryFileAtBoot(t *testing.T) {
 	reg, path := fe6aSwapRegistry(t, "")
-	if err := reg.Upsert(&IdPProfile{ID: "present-id", Name: "Present", Type: IdPTypeSAML,
-		SAML: &SAMLProfileConfig{MetadataXML: "<EntityDescriptor/>"}}); err != nil {
+	const opPresent, opAbsent = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	// Round 3: the profile carries the intent's PROVENANCE (co-written by
+	// the create) — presence alone no longer proves a commit.
+	if err := reg.Create(&IdPProfile{ID: "present-id", Name: "Present", Type: IdPTypeSAML,
+		SAML: &SAMLProfileConfig{MetadataXML: "<EntityDescriptor/>"}}, "", opPresent, nil); err != nil {
 		t.Fatal(err)
 	}
 	ops := reg.operations()
-	const opPresent, opAbsent = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
 	for _, in := range []idpOperation{
 		{OperationID: opPresent, Action: "idp.create", Actor: "admin", ProfileID: "present-id", SpecDigest: "d", RegistryRevision: "r"},
 		{OperationID: opAbsent, Action: "idp.create", Actor: "admin", ProfileID: "absent-id", SpecDigest: "d", RegistryRevision: "r"},
@@ -225,8 +227,8 @@ func TestFE6A0C_Green_PendingIntentIsReconciledFromTheRegistryFileAtBoot(t *test
 	if err := again.Load(path); err != nil {
 		t.Fatal(err)
 	}
-	if op := again.operations().Get(opPresent); op == nil || op.State != idpOpCommitted {
-		t.Fatalf("reconciled state must be durable; got %+v", op)
+	if op, err := again.operations().Get(opPresent); err != nil || op == nil || op.State != idpOpCommitted {
+		t.Fatalf("reconciled state must be durable; got %+v (%v)", op, err)
 	}
 }
 
