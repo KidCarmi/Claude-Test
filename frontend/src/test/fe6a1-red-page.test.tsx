@@ -68,6 +68,7 @@ const OIDC = {
     clientSecretConfigured: true,
   },
 };
+const CUTOVER_ID = "HBVfpgASPQEYE1ZaJo8H1g"; // the cutover's OWN server-minted identity
 const LDAP = {
   id: "ldap-dc",
   name: "DC LDAP",
@@ -75,6 +76,7 @@ const LDAP = {
   enabled: false,
   priority: 5,
   revision: 2,
+  operationId: OP_ID, // create provenance = the ledger key
   ldap: {
     url: "ldaps://dc.example:636",
     bindDn: "cn=svc,dc=example",
@@ -137,7 +139,7 @@ const LEGACY_CUTOVER = {
   bindCredentialConfigured: true,
   cutoverDurability: "pending_reconciliation",
   cutover: {
-    operationId: OP_ID,
+    operationId: CUTOVER_ID,
     profileId: "ldap-dc",
     profileName: "DC LDAP",
     registryRevision: "r-abc123",
@@ -425,6 +427,8 @@ it("P3 admin: legacy cutover record + pending_reconciliation + the operation loo
   expect(t).toContain("admin@10.0.0.9");
   expect(t).toContain("Retired");
   expect(t).toContain("Bind credential: configured");
+  expect(t).toContain(CUTOVER_ID); // the cutover's own identity
+  expect(t).toContain(OP_ID); // the ledger key (enabling create provenance)
   expect(t).not.toContain("Committed");
   expect(t).not.toContain("succeeded");
   expect(t).not.toContain("failed");
@@ -452,6 +456,7 @@ it("P3b viewer: the cutover record renders but the admin-only lookup is never is
     expect(text()).toContain("Pending reconciliation");
   });
   expect(text()).toContain(OP_ID);
+  expect(text()).toContain(CUTOVER_ID);
   expect(text()).toContain("Operation record lookup is admin-only");
   expect(requests.some((r) => r.url.includes("/api/idp/operations/"))).toBe(
     false,

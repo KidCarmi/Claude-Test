@@ -378,12 +378,20 @@ function OperationRecord({
   return <span>Looking up the operation record…</span>;
 }
 
+// The cutover record carries its OWN identity (server-minted at the cutover);
+// the operation LEDGER is keyed on the enabling create's client operationId,
+// which the registry co-writes as that profile's provenance. The lookup is
+// therefore keyed on the enabling profile's provenance — a join over two
+// server facts, never a guess; without it (profile gone, or created without
+// an operationId) no lookup is issued and that is said.
 function LegacyCard({
   legacy,
   isAdmin,
+  ledgerKey,
 }: {
   legacy: LegacyLDAP;
   isAdmin: boolean;
+  ledgerKey: string | undefined;
 }): JSX.Element {
   const yesNo = (b: boolean | undefined): string =>
     b === undefined ? "—" : b ? "yes" : "no";
@@ -417,7 +425,7 @@ function LegacyCard({
           <h3>Cutover record</h3>
           <KeyValue
             items={[
-              ["Operation", <Mono key="op">{c.operationId}</Mono>],
+              ["Cutover identity", <Mono key="op">{c.operationId}</Mono>],
               [
                 "Enabling profile",
                 c.profileName !== undefined || c.profileId !== undefined
@@ -437,12 +445,27 @@ function LegacyCard({
               ["At", <Timestamp key="at" iso={c.at} />],
               ["Record durable", c.durable ? "yes" : "no"],
               [
+                "Ledger key (enabling create)",
+                ledgerKey !== undefined ? (
+                  <Mono key="lk">{ledgerKey}</Mono>
+                ) : (
+                  "—"
+                ),
+              ],
+              [
                 "Operation record",
-                <OperationRecord
-                  key="rec"
-                  operationId={c.operationId}
-                  isAdmin={isAdmin}
-                />,
+                ledgerKey !== undefined ? (
+                  <OperationRecord
+                    key="rec"
+                    operationId={ledgerKey}
+                    isAdmin={isAdmin}
+                  />
+                ) : (
+                  <span key="nolk">
+                    No ledger key: the enabling profile is not in the registry
+                    or carries no create provenance.
+                  </span>
+                ),
               ],
             ]}
           />
@@ -501,7 +524,15 @@ export function IdentityProvidersPage(): JSX.Element {
           <ProvidersCard snap={snap} />
           <LedgerCard list={snap.list} />
           {legacy.data !== undefined && (
-            <LegacyCard legacy={legacy.data} isAdmin={isAdmin} />
+            <LegacyCard
+              legacy={legacy.data}
+              isAdmin={isAdmin}
+              ledgerKey={
+                snap.list.profiles.find(
+                  (p) => p.id === legacy.data?.cutover?.profileId,
+                )?.operationId
+              }
+            />
           )}
           {legacy.data === undefined && legacy.isError && (
             <ErrorState title="Legacy YAML LDAP posture unavailable">
