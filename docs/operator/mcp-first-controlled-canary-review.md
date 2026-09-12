@@ -366,8 +366,22 @@ two-tool or two-principal scope PASSES the scope gate. Worse, `principalCount` s
 ZERO `Principals` — which leaves the principal dimension unrestricted, letting any non-synthetic user
 of that client/agent become the admitted caller. The correct external prerequisite is therefore:
 **exactly one `Principals` entry, zero `Clients`/`Agents`/`Groups`, and exactly one tool** (or a
-proof that the selected client/agent maps one-to-one to the synthetic principal). The machine gate
-alone enforces none of this — it is an external constraint on the unblock list (§26).
+proof that the selected client/agent maps one-to-one to the synthetic principal).
+
+**CLOSED (blocker 5) — the exact shape is now a machine gate.** `canary.ValidateFirstCanaryScope`
+(`internal/mcp/canary/firstcanary_scope.go`) is a SEPARATE predicate layered on top of
+`ValidateScope`: `MaxCanaryTools`/`MaxCanaryPrincipals` stay 2 (they bound the Canary architecture a
+later graduation phase may use; tightening them would redefine that architecture rather than this
+experiment), while the first experiment must be exactly 1 tenant + 1 server + 1 fully-pinned tool ON
+that server + 1 explicitly named `Principals` entry, with `Clients`/`Agents`/`Groups`/
+`Environments`/`ToolFingerprints`/all four `Exclude*` empty, `Percent` 0, no duplicate, empty,
+over-long or glob-shaped identifier. Identity is counted on `Principals` ALONE — the
+`principalCount` aggregate named above can never satisfy it. The verdict is taken on the SIGNED
+activation scope (raw, never compiled — `Compile` would deduplicate `[P1,P1]` into validity) inside
+the authoritative activation preflight, so a wider signed scope yields `Ready:false` and cannot
+activate at all. Near-misses that were external prerequisites are now named rejections: a second
+tool, a second principal, a client- or agent-only identity, a duplicate, a bare fingerprint
+dimension, an exclusion carve-out. See §26 blocker 5 for the full closure argument and proofs.
 
 ---
 
@@ -788,7 +802,7 @@ BLOCKED-vs-FAILED note in §26).
 | Reviewed fingerprint bound to the OBSERVED live peer (not operator-declared) | **NO — seeded from operator JSON; identity verified against its own register stamp; no non-test `Discovery.Discover` caller (§7, blocker 11)** |
 | Shadow trust ≠ live trust proven; live approval does not activate Canary | YES (§8) |
 | Tight scope validated (no percentage/group/wildcard; server & tenant capped at 1) | YES (§10) |
-| Machine gate enforces exactly-one tool AND exactly-one principal | **NO — caps are 2; must be an external prerequisite (§10)** |
+| Machine gate enforces exactly-one tool AND exactly-one principal | **YES — `canary.ValidateFirstCanaryScope`, a separate predicate layered on `ValidateScope` (the architecture caps stay 2 by design). Exactly 1 tenant/server/tool/named principal from the SIGNED scope; clients/agents/groups/environments/bare-fingerprints/exclusions/percentages forbidden; identity counted on `Principals` ALONE; no dedup of an ambiguous signed object. Enforced in the activation preflight, so a wider scope yields `Ready:false` (blocker 5 CLOSED, §10/§25a)** |
 | Tiny budget; N reservations allowed / N+1 impossible | YES for reservations (§9) |
 | Budget bounds PHYSICAL side-effect-bearing invocations via a RETRY-FREE path (charging not accepted) | **YES — `RetryMode`/`RetryDisabled` is representable and wired into the ONLY production upstream client; N reservations ⇒ ≤ N physical POSTs measured AT THE WIRE under concurrency and ambiguous transport failure (blocker 6 CLOSED)** |
 | Witness distinguishes side-effect-bearing tool invocations from auxiliary lifecycle/discovery traffic | **NO — no such controlled recording server exists; without the partition a correct run's `initialize`/`tools/list` POSTs misclassify as a breach (§9/§14)** |
@@ -807,16 +821,46 @@ BLOCKED-vs-FAILED note in §26).
 | Unresolved P0/P1 finding | **YES — the durable-outcome-evidence prerequisite remains, narrowed to the authoritative production witness adapter (blocker 8). The auto-abort wiring prerequisite is CLOSED (blocker 7, §25a) (§21/§24/§25a)** |
 
 Multiple mandatory criteria are NO and P1 product-defect work remains open. A GO is therefore
-forbidden. (§25a records the only post-adoption status changes: blockers 6 and 7 CLOSED, blocker 8
-narrowed but still OPEN. The other twelve are untouched and the §26 verdict is unchanged.)
+forbidden. (§25a records the only post-adoption status changes: blockers 5, 6 and 7 CLOSED,
+blocker 8 narrowed but still OPEN. The other eleven are untouched and the §26 verdict is unchanged.)
 
 ---
 
-## §25a Blocker 6 and 7 closure, blocker 8 status (post-review evidence)
+## §25a Blocker 5, 6 and 7 closure, blocker 8 status (post-review evidence)
 
 This section records the ONLY status changes made to the frozen ledger since it was adopted:
-blockers 6 and 7 are CLOSED and blocker 8 is narrowed but still OPEN. The other twelve blockers are
-untouched, the baseline is still fifteen, and nothing here changes the §26 verdict.
+blockers 5, 6 and 7 are CLOSED and blocker 8 is narrowed but still OPEN. The other eleven blockers
+are untouched, the baseline is still fifteen, and nothing here changes the §26 verdict.
+
+### Blocker 5 — CLOSED
+
+The closure bar was: the machine gate must enforce the ONE exact reviewed experiment — one tenant,
+one server, one tool, one explicitly named principal — from the SIGNED activation scope, in the
+authoritative activation preflight, without aggregate identity counting and without deduplicating an
+ambiguous signed object into a valid one. Each clause is now mechanically proven:
+
+| Clause | Evidence |
+|---|---|
+| A separate predicate, not a global tightening | `canary.ValidateFirstCanaryScope` layered ON TOP of `ValidateScope`; `MaxCanaryTools`/`MaxCanaryPrincipals` stay 2 and `TestFirstCanary_ArchitectureBoundsAreNotRedefined` fails if a future change "simplifies" exactness into those architecture caps |
+| Exactly 1 tenant / server / tool / principal | `TestFirstCanary_RejectionMatrix` (zero, two and duplicate rows for each dimension, each asserting its OWN named reason) |
+| Zero clients / agents / groups / environments / bare fingerprints / exclusions / percentages | same matrix; each forbidden class carries its own reason so a rejection is never attributed to an unrelated prerequisite |
+| No aggregate identity counting | `TestFirstCanary_NonPrincipalClassCannotSatisfyExactPrincipal` — asserts the base contract's `principalCount` DOES accept a lone client/agent (the hazard is real), that the exact gate refuses it by its own reason, and that removing it leaves the scope still refused for having no principal (it contributed nothing) |
+| Never deduplicated into validity | `TestFirstCanary_NeverDeduplicatesAnInvalidSignedScope` — proves `rollout.Compile` collapses the duplicate to the same content hash as its deduplicated counterpart, then requires the raw-slice gate to refuse anyway |
+| Every selector class explicitly ruled on | `TestFirstCanary_GovernsEverySelectorClass` (reflection over all 19 `rollout.ScopeSpec` fields) + `TestFirstCanary_EveryGovernedFieldIsDecisive` (a governed field must actually change the verdict) |
+| Decided from the signed scope alone | `TestFirstCanary_ValidatorReadsNoClockOrIO` (import + AST purity wall) and `TestFirstCanary_IsPureAndDeterministic` (same verdict at every revision; the input is never mutated) |
+| Enforced in the authoritative activation preflight | `TestExactScope_EnforcedInTheAuthoritativePreflightNotOnlyAtRuntime` — the verdict is taken exactly once in the root package, inside `evaluateActivationOnFacts`, on `in.Scope`, and BOTH preflight entry points route through that body |
+| A wider scope cannot activate at all | `TestExactScope_WiderScopeCannotBeReadyEvenWithEverythingElseSatisfied` — every other prerequisite true (with a positive control proving that fact set IS Ready for the exact experiment), twenty widenings each `Ready:false` carrying `canary_scope_not_exact_first_canary` |
+| Anti-vacuity | `TestFirstCanary_CanonicalExperimentPasses` and `TestExactScope_CanonicalExperimentSatisfiesTheActivationRow` — the ONE reviewed experiment (T1/S1/Tool1/P1) must PASS, so a reject-everything gate cannot score as exact |
+| Campaign | `scripts/mcp-first-canary-exact-scope-mutations.sh` — 30 mutations covering every widening, the bypass routes (skip the check, validate a request-derived scope, drop the readiness row, assert the fact at node level, substitute the base contract), and the two hollowing-out failure modes |
+
+Runtime scope matching still denies an out-of-scope principal/server/tool
+(`TestExactScope_RuntimeStillDeniesOutOfScopeIdentities`) and is DEFENSE-IN-DEPTH, explicitly not the
+closure argument: the argument is that the broader scope never activates.
+
+**What this does NOT close.** Exactly one tool being AUTHORIZED BY SCOPE says nothing about whether
+`tools/call` for it is read-first EXECUTABLE (blocker 4, the operation-classifier problem), nor that
+the target is `catalog.Usable`, resolves to an exact policy ALLOW, or has satisfiable obligations
+(blockers 13/14). Those remain open and untouched.
 
 ### Blocker 6 — CLOSED
 
@@ -1756,10 +1800,10 @@ every mandatory NO/CONDITIONAL row in §25, so closing ALL of them is necessary 
 blocker 7's auto-abort and also depends on blockers 1 and 6).
 
 **Post-adoption status (see §25a).** The baseline remains **fifteen**; the list below is preserved
-as adopted, and nothing is renumbered or deleted. Three entries have changed status since:
-**blocker 6 is CLOSED**, **blocker 7 is CLOSED**, and **blocker 8 is narrowed but still OPEN**.
-Twelve are untouched, and the verdict above is unchanged — closing blockers 6 and 7 removes two of
-fifteen reasons a GO is forbidden, not the prohibition.
+as adopted, and nothing is renumbered or deleted. Four entries have changed status since:
+**blocker 5 is CLOSED**, **blocker 6 is CLOSED**, **blocker 7 is CLOSED**, and **blocker 8 is
+narrowed but still OPEN**. Eleven are untouched, and the verdict above is unchanged — closing
+blockers 5, 6 and 7 removes three of fifteen reasons a GO is forbidden, not the prohibition.
 
 1. **No controlled upstream reachable AND usable under the supported production trust model (§5).**
    The only documented controlled inventory fails closed on scheme (`mcp+https://`), host (private
@@ -1777,8 +1821,60 @@ fifteen reasons a GO is forbidden, not the prohibition.
 4. **The read-first classifier refuses the one-exact-tool call (§6).** `tools/call` is `OpWrite`
    (refused read-first); `tools/list` binds no exact tool for the live-approval revalidation. A
    finer classifier or a designed discovery-trust path is required.
-5. **The machine gate does not enforce exactly-one tool/principal (§10).** `MaxCanaryTools`/
-   `MaxCanaryPrincipals` are 2, so the one-of-everything shape is an external prerequisite.
+5. ~~**The machine gate does not enforce exactly-one tool/principal (§10).**~~ **CLOSED** — the
+   exact First-Canary scope gate. `MaxCanaryTools`/`MaxCanaryPrincipals` are still 2 and are
+   deliberately UNCHANGED: they bound the Canary ARCHITECTURE, which a later graduation phase may
+   use, and tightening them would silently redefine that architecture as exact-only. The FIRST
+   experiment is a separate, narrower question, so it gets a separate predicate —
+   `canary.ValidateFirstCanaryScope` (`internal/mcp/canary/firstcanary_scope.go`) — layered ON TOP
+   of `ValidateScope`, never instead of it.
+
+   **What it requires**, on all 19 fields of `rollout.ScopeSpec` (the enumeration is machine-checked
+   by `TestFirstCanary_GovernsEverySelectorClass`, so a new selector class cannot arrive un-ruled):
+   exactly 1 `Tenants`, 1 `Servers`, 1 fully-pinned `Tools` entry **hosted by that one server**, and
+   1 `Principals` entry; `Clients`, `Agents`, `Groups`, `Environments`, `ToolFingerprints` (the
+   second, server-unbound tool-selecting class) and all four `Exclude*` dimensions EMPTY; `Percent`
+   0 with no `BucketSalt` and the default `BucketKey`; `HighRisk` false and `Operations` empty or
+   exactly one `RiskRead`; no duplicate, empty, over-long or glob-shaped identifier.
+
+   **No aggregate identity counting.** This is the specific hazard §10's correction named: the base
+   contract's `principalCount` sums `Principals`+`Clients`+`Agents`, so a `count==1` remedy is
+   satisfiable by one shared `Client` with zero `Principals`. The exact gate judges each identity
+   class on its own — `Principals` must be exactly one, and the other classes must be absent — and
+   `TestFirstCanary_NonPrincipalClassCannotSatisfyExactPrincipal` proves both halves: a lone client
+   or agent is refused by its own named reason, and removing it leaves the scope still refused for
+   having no principal, so it contributed nothing positive.
+
+   **It is decided on the SIGNED activation scope, and never deduplicated.** `rollout.Compile`
+   builds sets, so validating a COMPILED scope would collapse `[P1,P1]` into one principal and turn
+   an ambiguous signed object into a valid one. The gate therefore reads the RAW slices;
+   `TestFirstCanary_NeverDeduplicatesAnInvalidSignedScope` pins that the compiled form genuinely
+   collapses (the hazard) while the gate still refuses. Runtime telemetry is never proof either: if
+   the signed scope COULD authorize two identities, the First Canary is not exact even if only one
+   request ever arrives.
+
+   **It runs in the authoritative activation preflight, not at a runtime side-effect gate.** The
+   verdict is taken exactly once in the root package — inside `evaluateActivationOnFacts`, on
+   `in.Scope` — and both preflight entry points (the serialized commit gate and the restart
+   reconcile) route through that body. A wider signed scope therefore yields `Ready:false`, which is
+   what "cannot activate at all" means mechanically. The structural wall
+   `TestExactScope_EnforcedInTheAuthoritativePreflightNotOnlyAtRuntime` pins the call site, the
+   argument spelling, and both entry points; runtime scope matching stays defense-in-depth
+   (`TestExactScope_RuntimeStillDeniesOutOfScopeIdentities`) and is explicitly NOT the closure proof.
+
+   **Primary closure proof:** `TestExactScope_WiderScopeCannotBeReadyEvenWithEverythingElseSatisfied`
+   asserts EVERY other prerequisite true — node and activation alike, a state unreachable in the
+   shipped build — with a positive control proving that fact set IS `Ready` for the one exact
+   experiment, then shows twenty widenings each return `Ready:false` carrying
+   `canary_scope_not_exact_first_canary`. Full rejection matrix in
+   `internal/mcp/canary/firstcanary_scope_test.go`; anti-vacuity control
+   `TestFirstCanary_CanonicalExperimentPasses` (T1/S1/Tool1/P1). Campaign:
+   `scripts/mcp-first-canary-exact-scope-mutations.sh` (30 mutations).
+
+   **Scope discipline.** This establishes only that exactly one tool is AUTHORIZED BY SCOPE. It does
+   NOT establish that `tools/call` for that tool is read-first executable (blocker 4 — the
+   operation-classifier problem, untouched), nor that the target is `catalog.Usable`, exact-policy
+   ALLOWed, or has satisfiable obligations (blockers 13/14, untouched).
 6. ~~**The budget does not bound physical upstream invocations (§9).**~~ **CLOSED** — see
    "Blocker 6 closure" below. Idempotent read retries could send the POST ~3× per single budget
    reservation; the Canary path is now retry-free and the bound is proven at the wire.
@@ -1991,12 +2087,13 @@ verdict FAILED.)
   operation) matches an enabled ALLOW-class rule; an unmatched request default-denies
   (`engine.go:170-173`) and `resolveEnforcing` blocks every non-allow-class decision. The preflight's
   `PolicyHealthy` fact (`mcpPolicy.composed()`) does NOT prove this;
-- impose the exact one-of-everything identity shape as an authorization prerequisite: **exactly one
-  `Principals` entry, zero `Clients`/`Agents`/`Groups`, exactly one tool** (or prove the selected
-  client/agent maps one-to-one to the synthetic principal). A plain count==1 check is INSUFFICIENT —
-  `principalCount` sums Principals+Clients+Agents, so one shared client/agent with no Principals would
-  satisfy it while leaving the principal dimension unrestricted; and `ValidateScope` permits up to two
-  of each (`MaxCanaryTools`/`MaxCanaryPrincipals` = 2), so the machine gate enforces none of this (§10);
+- ~~impose the exact one-of-everything identity shape as an authorization prerequisite~~ **DONE
+  (blocker 5 CLOSED, §25a)** — it is no longer an external prerequisite. `canary.ValidateFirstCanaryScope`
+  enforces exactly one `Principals` entry, zero `Clients`/`Agents`/`Groups`, and exactly one tool (plus
+  one tenant and one server) as a MACHINE gate in the activation preflight. The count==1 insufficiency
+  named here is what the design avoids: identity is counted on `Principals` alone, so the
+  `principalCount` aggregate can never satisfy it, and `MaxCanaryTools`/`MaxCanaryPrincipals` stay 2
+  deliberately — they bound the Canary architecture, not this experiment (§10);
 - **[code change]** bound PHYSICAL upstream invocations to the budget AND keep the emergency kill
   authoritative across retries — `upstreamclient.Call` retries an idempotent read up to `MaxReadRetries`
   times outside the single budget `Reserve` AND without re-checking kill/generation between attempts

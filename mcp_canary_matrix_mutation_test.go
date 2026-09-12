@@ -95,7 +95,8 @@ func TestCanaryMatrix_DormantNodeRejections(t *testing.T) {
 func TestCanaryMatrix_EveryReasonReachable(t *testing.T) {
 	allTrue := canary.Facts{
 		CapabilityGateway: true, ShadowExitReviewPassed: true, ScopeBounded: true, ScopeReadFirst: true,
-		LiveExecutorComposed: true, UpstreamCallerPresent: true, CredentialPathReady: true,
+		ScopeExactFirstCanary: true,
+		LiveExecutorComposed:  true, UpstreamCallerPresent: true, CredentialPathReady: true,
 		DurableEventsHealthy: true, ResponseInspectionReady: true, RegistryHealthy: true, CatalogHealthy: true,
 		PolicyHealthy: true, EmergencyKillClear: true, KillBoundaryGuardPresent: true, ToolFreshnessGuardPresent: true,
 		LiveApprovalValid: true, ServerUsable: true, ToolFingerprintCurrent: true, RollbackPathHealthy: true,
@@ -109,6 +110,7 @@ func TestCanaryMatrix_EveryReasonReachable(t *testing.T) {
 		canary.ReasonShadowExitNotPassed:                 func(f *canary.Facts) { f.ShadowExitReviewPassed = false },
 		canary.ReasonScopeNotBounded:                     func(f *canary.Facts) { f.ScopeBounded = false },
 		canary.ReasonScopeNotReadFirst:                   func(f *canary.Facts) { f.ScopeReadFirst = false },
+		canary.ReasonScopeNotExactFirstCanary:            func(f *canary.Facts) { f.ScopeExactFirstCanary = false },
 		canary.ReasonLiveExecutorAbsent:                  func(f *canary.Facts) { f.LiveExecutorComposed = false },
 		canary.ReasonUpstreamCallerAbsent:                func(f *canary.Facts) { f.UpstreamCallerPresent = false },
 		canary.ReasonCredentialPathNotReady:              func(f *canary.Facts) { f.CredentialPathReady = false },
