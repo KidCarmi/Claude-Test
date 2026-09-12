@@ -742,6 +742,41 @@ code:
   **Since CLOSED as blocker 4 (§25a)** by the first of the two remedies the finding named — a finer
   classifier bound to the reviewed fingerprint. The second, a discovery-trust path, was deliberately
   refused: it would make `tools/list` stand in for the live tool execution.
+- **P1 — THE RESOLVED SCOPE IS NOT REVALIDATED AT THE ADMISSION BOUNDARY (NEW, OPEN, NOT ONE OF THE
+  FIFTEEN; Codex on PR #1370, round 2).** Confirmed against the code, and recorded here rather than
+  filed under a nearby blocker precisely because it is not one of them — §26 claims its fifteen are
+  exhaustive AS A SET against the §25 criteria, and this is a gap in that claim.
+
+  The sequence: a request from principal A resolves to execute under a Canary scope naming A, then
+  pauses before the side-effect boundary; a SAME-MODE scope update replaces A with B;
+  `reconcileCanaryRuntimeAfterCommit` (`mcp_rollout.go:509-530`) refuses only a changed BUDGET and a
+  changed REVIEWED-TARGET SET, and `canary.ReviewedTarget` carries no principal — so the update
+  proceeds and the generation is unchanged. The request resumes and is admitted: scope membership
+  lives in `internal/mcp/rollout/scope.go` (`s.principals`, via `Contains` ← `resolveEnforcing`) and
+  is decided at RESOLUTION only, `admitLiveExecution` never re-checks it, and `MaxPrincipals` is a
+  COUNTER of distinct principals rather than a membership test — A is already counted, so the cap
+  cannot catch it. `genAtResolve` is captured (`internal/mcp/runtime/policy.go:123`) but reaches only
+  `refuseOnToolDrift` for evidence attribution; neither it nor the resolved scope identity reaches
+  admission.
+
+  **Same defect class as blocker 4's own round-1 finding** — a fact decided at resolution and never
+  revalidated at the boundary — applied to scope membership instead of operation class. Blocker 4's
+  fix (step 5b) does NOT close it and does not claim to: the equality holds whenever the current
+  activation binds the same target to the same class, which an A→B principal swap does not disturb.
+
+  PRE-EXISTING and UNWIDENED by that fix, which only ADDS an admission condition. Unreachable in the
+  shipped build, since the sequence needs a live scope update on an armed Canary and therefore
+  blockers 2, 3 and 12 closed first — an ordering statement, not a severity one.
+
+  **Proposed remedy** (deliberately NOT taken in PR #1370, which was scoped to blocker 4 alone):
+  `rollout.Scope` already has a content hash (`scope.go:621`). Capture it beside `genAtResolve`,
+  carry it on `ExecInput` — NOT `DecisionInput`, since it is a boundary fact rather than a policy
+  input — pass it through `liveGateInput` beside the operation class, and add a step (5c) to
+  `admitLiveExecution` refusing when the currently installed scope's hash differs from the one the
+  request resolved under. Hash equality rather than re-running `Contains`, so it catches
+  tenant/server/tool/exclusion edits too and fails closed on ANY scope change instead of trying to
+  decide which changes are safe. Bounded denial `canaryAdmitScopeNotInForce`; request-scoped,
+  nothing latched — a scope change is not a breach of the target.
 - **P2 — credential conditional (§4):** `CredentialProfile` is a policy obligation, so no-credential
   status is unverifiable until the exact tool + rule are fixed. Corrected.
 - **P1 — durable outcome evidence (§15/§18):** every event is a `PhaseDecision` with no
@@ -922,6 +957,12 @@ before this work.
 controlled upstream exists (blocker 1), the activation preflight can reach `Ready:true` (2), an
 operator can arm (3), the target is `catalog.Usable` (13), or the request resolves to an exact
 policy ALLOW with satisfiable obligations (14). Those remain open and untouched.
+
+It also does not close the SCOPE half of the same defect class: step (5b) revalidates the operation
+class at the boundary, and nothing revalidates the resolved SCOPE there — a request that resolved
+under a scope naming principal A can still be admitted after a same-mode update replaced A with B.
+That is a NEW finding, not one of the fifteen, pre-existing on `main` and unwidened by this work;
+see §24 for the evidence and the proposed remedy. Do not read blocker 4's closure as covering it.
 
 ### Blocker 5 — CLOSED
 
