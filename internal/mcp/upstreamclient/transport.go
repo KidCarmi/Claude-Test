@@ -83,7 +83,7 @@ func (c *Client) roundTrip(ctx context.Context, target Target, body []byte, auth
 		return nil, legFacts{preResponse: true, neverSent: true}, mcperr.Wrap(mcperr.ReasonUpstreamConnectFailed, "upstreamclient", "resolve", err)
 	}
 
-	client, transport := c.httpClientFor(target, canon, pin)
+	client, transport := c.httpClientFor(target, canon, pin, preSend)
 	// SEC-MCP-10. The transport is built per call, and a Go http.Transport OWNS its
 	// idle connections: it sets no IdleConnTimeout, and nothing reclaims a Transport
 	// that has gone out of scope while a connection's read/write loops still
@@ -114,23 +114,16 @@ func (c *Client) roundTrip(ctx context.Context, target Target, body []byte, auth
 		req.Header.Set(AttemptHeader, attemptID)
 	}
 
-	// THE LAST RE-ASK, AND THE STOPPING POINT.
+	// RE-ASK ONE OF TWO: the pool wait and DNS resolution are behind us, nothing is written yet.
 	//
-	// `preSend` already ran in Call, holding the pool slot. Between there and here sits
-	// `destination.Resolve` — a DNS lookup, the least bounded of the three things that happen
-	// before any request byte exists — so the caller's predicate is re-asked once more, after
-	// resolution and immediately before the transport takes over (Codex P1, PR #1370, round 5).
+	// `pool.acquire` blocks on a per-server semaphore until a slot frees — unbounded, since it ends
+	// only when ANOTHER request finishes — and `destination.Resolve` above is a DNS lookup. Both
+	// happen before any request byte exists, so the caller's predicate is asked here.
 	//
-	// WHAT REMAINS AFTER THIS LINE IS DELIBERATE AND IS WHERE RE-ASKING STOPS BUYING ANYTHING.
-	// `client.Do` still has to obtain a connection (TCP connect, then the TLS handshake) before it
-	// writes the request, and `net/http` exposes no hook there that can ABORT cleanly: a
-	// `httptrace` callback can observe but not refuse, and cancelling the request context from
-	// underneath races the write — turning a deterministic refusal into `may_have_been_sent`,
-	// which is strictly worse evidence than the window it would close. Both remaining steps are
-	// bounded by CONFIGURED timeouts (`ConnectTimeout`, `TLSHandshakeTimeout`, and the whole
-	// attempt by `RequestTimeout` on reqCtx) — unlike the pool wait, which was bounded only by
-	// another request finishing. That is the difference that makes this a reasonable stopping
-	// point rather than an arbitrary one.
+	// The second re-ask is in pinnedDialTLS, after the TCP connect and the TLS handshake. Two sites
+	// rather than one because they cover DIFFERENT blocking phases and one cannot stand in for the
+	// other: a connection reused across retry legs never reaches the dialer, and a fresh connection
+	// spends its connect+handshake time after this point.
 	if preSend != nil {
 		if perr := preSend(); perr != nil {
 			return nil, legFacts{neverSent: true}, perr
@@ -139,6 +132,14 @@ func (c *Client) roundTrip(ctx context.Context, target Target, body []byte, auth
 
 	resp, err := client.Do(req)
 	if err != nil {
+		// A refusal from the TLS dialer is the CALLER'S verdict, not a transport fault: the socket
+		// was closed with nothing written, so it rides out verbatim with provable never-sent
+		// evidence. Classifying it as a connect failure would both lose the reason and tell the
+		// executor "may have been sent" about a leg that demonstrably was not.
+		var refusal *preSendRefusalErr
+		if errors.As(err, &refusal) {
+			return nil, legFacts{neverSent: true}, refusal.err
+		}
 		// net/http returns a NON-NIL response together with an error in exactly one
 		// case: CheckRedirect refused (its Body is already closed). That is the
 		// retry-free client rejecting a 3xx — and the peer demonstrably ANSWERED, so
@@ -178,11 +179,15 @@ func (c *Client) roundTrip(ctx context.Context, target Target, body []byte, auth
 // and refuses any redirect that leaves the approved server. The transport is
 // returned alongside the client so the caller can release its idle connections
 // when the call completes (SEC-MCP-10).
-func (c *Client) httpClientFor(target Target, canon destination.Canonical, pin destination.PinnedDestination) (*http.Client, *http.Transport) {
+func (c *Client) httpClientFor(target Target, canon destination.Canonical, pin destination.PinnedDestination, preSend func() error) (*http.Client, *http.Transport) {
 	tr := &http.Transport{
+		// DialContext serves a PLAIN-http endpoint; DialTLSContext serves https and owns the
+		// handshake itself, so the authority re-ask can happen with the connection established and
+		// nothing written (see pinnedDialTLS). TLSClientConfig/TLSHandshakeTimeout are deliberately
+		// NOT set here: net/http ignores both once DialTLSContext is supplied, and leaving them
+		// would be two sources of truth for the same policy, one of them silently dead.
 		DialContext:           c.pinnedDial(pin),
-		TLSClientConfig:       c.tlsConfig(target, canon),
-		TLSHandshakeTimeout:   c.cfg.Limits.TLSTimeout(),
+		DialTLSContext:        c.pinnedDialTLS(target, canon, pin, preSend),
 		MaxConnsPerHost:       c.cfg.Limits.MaxConnsPerServer(),
 		MaxIdleConnsPerHost:   c.cfg.Limits.MaxConnsPerServer(),
 		ResponseHeaderTimeout: c.cfg.Limits.RequestTimeout(),
@@ -258,6 +263,65 @@ func (c *Client) pinnedDial(pin destination.PinnedDestination) func(context.Cont
 			lastErr = mcperr.New(mcperr.ReasonUpstreamConnectFailed, "upstreamclient", "no pinned address dialable")
 		}
 		return nil, lastErr
+	}
+}
+
+// preSendRefusalErr marks a refusal produced by the caller's authority predicate INSIDE the TLS
+// dialer, so roundTrip can tell it apart from a genuine transport fault after net/http has wrapped
+// it in a *url.Error.
+//
+// A captured variable would have been simpler and wrong: net/http may dial on its own goroutine, so
+// reading a value the dialer wrote after Do returns is a data race the detector would (rightly)
+// flag. Carrying the fact IN THE ERROR needs no synchronisation at all.
+type preSendRefusalErr struct{ err error }
+
+func (e *preSendRefusalErr) Error() string { return e.err.Error() }
+func (e *preSendRefusalErr) Unwrap() error { return e.err }
+
+// pinnedDialTLS is the https dialer: it performs the pinned dial, completes the TLS handshake
+// itself, RE-ASKS the caller's authority predicate, and only then hands the connection to the
+// transport.
+//
+// THIS IS THE STOPPING POINT, and it is a real one rather than an argued one (Codex P1, PR #1370,
+// round 6). An earlier revision stopped at roundTrip and reasoned that connect+TLS was safe because
+// both are bounded by configured timeouts. That was wrong twice over: the defaults allow seconds
+// per phase and `NewLimits` accepts arbitrarily large positive durations, so "bounded" can be
+// minutes; and the premise that no cleanly abortable seam exists here was simply false —
+// `DialTLSContext` is one. Doing the handshake here means the predicate runs with the connection
+// ESTABLISHED and NOTHING WRITTEN, so a refusal closes the socket and returns an error. No race
+// against the write, and `neverSent` evidence is preserved exactly.
+//
+// The TLS configuration is the same one the transport would have used, with ServerName filled in:
+// net/http derives SNI from the request host when it owns the handshake, and it no longer does, so
+// omitting it would silently stop sending SNI — a behaviour change to which certificate a
+// name-based server presents, on a path whose whole point is pinned identity.
+func (c *Client) pinnedDialTLS(target Target, canon destination.Canonical, pin destination.PinnedDestination, preSend func() error) func(context.Context, string, string) (net.Conn, error) {
+	dial := c.pinnedDial(pin)
+	base := c.tlsConfig(target, canon)
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		cfg := base.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName = canon.Host
+		}
+		tconn := tls.Client(raw, cfg)
+		hsCtx, cancel := context.WithTimeout(ctx, c.cfg.Limits.TLSTimeout())
+		defer cancel()
+		if err := tconn.HandshakeContext(hsCtx); err != nil {
+			_ = raw.Close()
+			return nil, classifyTransportError(err)
+		}
+		// RE-ASK TWO OF TWO. Connected, handshaken, nothing written.
+		if preSend != nil {
+			if perr := preSend(); perr != nil {
+				_ = tconn.Close()
+				return nil, &preSendRefusalErr{err: perr}
+			}
+		}
+		return tconn, nil
 	}
 }
 

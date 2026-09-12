@@ -941,6 +941,45 @@ code:
   `..._ScopeStillNamedWhenTheGenerationIsCurrent` as its control, because "generation first" must
   not become "generation only". Mutations M27–M29.
 
+  **ROUND 6 OVERTURNED (f), AND THAT IS THE RIGHT OUTCOME.** The refusal above rested on two claims
+  and Codex falsified both: `net/http`'s `DialTLSContext` IS a cleanly abortable seam — perform the
+  pinned dial and the handshake there, re-ask, and close/return before handing the connection to the
+  transport, with no race against the write and `neverSent` evidence preserved exactly — and
+  "bounded by configured timeouts" does not mean bounded by anything small, since the defaults allow
+  seconds per phase and `NewLimits` accepts arbitrarily large positive durations. The invitation to
+  disagree was explicit and the disagreement was correct; the window is closed rather than argued
+  away.
+
+  The shape settled at **TWO re-ask sites**, each covering a different unbounded wait and neither
+  able to stand in for the other: `roundTrip` before `client.Do` (after the pool wait, which ends
+  only when another request finishes, and after DNS resolution), and `pinnedDialTLS` after the TCP
+  connect and the TLS handshake. A connection reused across retry legs never reaches the dialer; a
+  fresh connection spends its connect and handshake time after the first site. The **pool-boundary
+  site added in round 4 was REMOVED as redundant** — `roundTrip`'s re-ask is strictly later on the
+  same path with nothing between them that can have an effect — because a site that can only ever be
+  absorbed by another is a liability in a mutation campaign, not defence in depth.
+
+  Two implementation notes worth keeping. The TLS config is the transport's own with `ServerName`
+  filled in: `net/http` derives SNI from the request host when it owns the handshake, and it no
+  longer does, so omitting it would silently stop sending SNI on a path whose entire point is pinned
+  identity. And the dialer's refusal rides out in a typed error (`preSendRefusalErr`) rather than a
+  captured variable: `net/http` may dial on its own goroutine, so reading a value the dialer wrote
+  after `Do` returns is a data race — carrying the fact IN THE ERROR needs no synchronisation, and
+  `roundTrip` recovers the caller's verdict verbatim instead of classifying it as a connect failure
+  and reporting `may_have_been_sent` for a leg that demonstrably wrote nothing.
+
+  Round 6 also caught a **stale instruction beside the security predicate**: the summary line still
+  read "scope, then approval, then generation" after (e) changed the order. Exactly the kind of
+  comment that invites a future maintainer to restore a just-fixed defect; corrected, with the
+  reason for the order stated rather than implied.
+
+  Gates: `TestPreSend_RefusalBeforeTheTransportOpensNoConnection` (no TCP connection is even
+  accepted) and `..._RefusalAfterTheHandshakeStillSendsNothing` (a connection IS accepted, no HTTP
+  request is served, and the refusal is still provably never-sent), with
+  `..._PermittingHookDoesNotInterfere` as the control. **Each site is pinned by an observable the
+  other cannot produce** — counting hook invocations was the earlier instrument and it could not say
+  WHICH site ran, which is what let one absorb the other. Mutations M25, M29, M30.
+
   **A SIXTH instance of the guarded-twice pattern, self-inflicted in the round that created it.**
   Adding the second pre-send re-ask immediately made M25 (remove the pool-boundary one) absorbable
   by the new site. The per-leg re-ask count is therefore pinned EXACTLY (`preSendsPerLeg`), both
@@ -1079,7 +1118,7 @@ case stays non-read and fail-closed. The governing invariant, stated once:
 | The freshness boundary is not weakened | `TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2` — a decision computed under F1 does not reach upstream once the target is F2; the promotion is not the last word |
 | The classification does not outlive the activation that made it | `admitLiveExecution` step (5b): the decided class must EQUAL the one the activation being charged binds to this target, decided inside the lock that decides which activation that is. `TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating` (the full G1→G2 sequence through the real gate) + `TestAtomicBinding_I_ClassNotInForceIsRefused` (the transaction-level half, with its own positive control) |
 | Anti-vacuity (MANDATORY positive controls) | `TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead`, `TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall` and `TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass` — a classifier that answered "no" to everything would satisfy every negative gate while being the feature deleted |
-| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 29 mutations, 29 caught, 0 survived, 0 skipped (M17–M29 belong to the §24 boundary finding below, not to blocker 4's own criteria) |
+| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 30 mutations, 30 caught, 0 survived, 0 skipped (M17–M30 belong to the §24 boundary finding below, not to blocker 4's own criteria) |
 
 **Two things the campaign taught, recorded because they change how a survivor should be read.**
 A single-edit mutation of the stale-decision boundary SURVIVED, and the reason was not a missing
@@ -1147,7 +1186,7 @@ its own gates, and it is deliberately not folded into blocker 4: blocker 4's cri
 above and they stand or fall on their own. It was fixed there rather than deferred because it sits in
 the exact admission boundary this work was already hardening, and a known P1 in that boundary is not
 carried across a merge merely because it predates the branch. Its gates are
-`mcp_canary_scope_in_force_test.go`, `internal/mcp/upstreamclient/presend_test.go`, and campaign mutations M17–M29.
+`mcp_canary_scope_in_force_test.go`, `internal/mcp/upstreamclient/presend_test.go`, and campaign mutations M17–M30.
 
 It also does not close the SCOPE half of the same defect class: step (5b) revalidates the operation
 class at the boundary, and nothing revalidates the resolved SCOPE there — a request that resolved

@@ -39,11 +39,12 @@
 #   M22  the post-admission window is not revalidated for scope
 #   M23  the boundary stops re-asking the live approval
 #   M24  the executor does not supply the pre-send re-ask
-#   M25  the upstream client never invokes the pre-send re-ask
+#   M25  a dialer refusal is reclassified as a transport fault
 #   M26  a boundary withdrawal is diagnosed by a fixed reason, not the gate's
 #   M27  a satisfying approval need not state the class in force
 #   M28  the boundary predicate asks about scope before the generation
 #   M29  the pre-transport re-ask (after DNS resolution) is removed
+#   M30  the post-handshake re-ask (in the TLS dialer) is removed
 #
 # A COMPILE FAILURE IS NOT PROOF unless the mutation targets a structural wall whose stated purpose
 # is compile-time prevention (those declare --compile-wall). Every other mutation here is written to
@@ -502,17 +503,6 @@ run_mutation M24 \
   . "$RUN" \
   's/AttemptID: attemptIDOf\(attempt\), PreSend: preSend,/AttemptID: attemptIDOf(attempt), PreSend: func() error \{ _ = preSend; return nil \},/'
 
-# M25 — THE POOL-BOUNDARY RE-ASK IS REMOVED. The other half of the same contract, and the half the
-# root gates cannot see: the root double calls the hook itself, deliberately, so that the executor's
-# half is proven independently of the client's. Gated on the per-leg COUNT rather than on a refusal,
-# because the pre-transport re-ask (M29) would otherwise absorb this mutation — the guarded-twice
-# trap, self-inflicted in the same round that added the second site.
-run_mutation M25 \
-  'the upstream client never invokes the pre-send re-ask' \
-  'TestPreSend_RunsOnEveryRetryLeg' \
-  ./internal/mcp/upstreamclient "$UCLIENT" \
-  's/\t\tif opts\.PreSend != nil \{\n\t\t\tif perr := opts\.PreSend\(\); perr != nil \{\n\t\t\t\tif attempt == 0 \{\n\t\t\t\t\treturn nil, markNeverSent\(perr\)\n\t\t\t\t\}\n\t\t\t\treturn nil, markLegFacts\(perr, call\)\n\t\t\t\}\n\t\t\}\n//'
-
 # M26 — THE REFUSAL IS DIAGNOSED BY A FIXED REASON. The bug this reintroduces is not a bypass: the
 # request is still refused. It is that the SAME scope mismatch reads rollout_out_of_scope when
 # admission catches it and rollout_mode_invalid when the boundary does — two contradictory answers
@@ -554,6 +544,25 @@ run_mutation M29 \
   'TestPreSend_RunsOnEveryRetryLeg' \
   ./internal/mcp/upstreamclient "$UTRANSPORT" \
   's/\tif preSend != nil \{\n\t\tif perr := preSend\(\); perr != nil \{\n\t\t\treturn nil, legFacts\{neverSent: true\}, perr\n\t\t\}\n\t\}\n\n//'
+
+# M25 — A DIALER REFUSAL IS RECLASSIFIED AS A TRANSPORT FAULT. The re-ask still runs and still
+# stops the send; what is lost is that the caller's own verdict and its provable never-sent evidence
+# reach the executor, which would instead see a connect failure and record may_have_been_sent for a
+# leg that demonstrably wrote nothing.
+run_mutation M25 \
+  'a dialer refusal is reclassified as a transport fault' \
+  'TestPreSend_RefusalAfterTheHandshakeStillSendsNothing' \
+  ./internal/mcp/upstreamclient "$UTRANSPORT" \
+  's/\t\tvar refusal \*preSendRefusalErr\n\t\tif errors\.As\(err, &refusal\) \{\n\t\t\treturn nil, legFacts\{neverSent: true\}, refusal\.err\n\t\t\}\n//'
+
+# M30 — THE POST-HANDSHAKE RE-ASK IS REMOVED, reopening the connect+TLS window. Its sibling M29
+# removes the pre-transport site; each is gated on its OWN observable (no connection opened vs a
+# connection opened and no request served), so neither can be absorbed by the other.
+run_mutation M30 \
+  'the post-handshake re-ask in the TLS dialer is removed' \
+  'TestPreSend_RefusalAfterTheHandshakeStillSendsNothing' \
+  ./internal/mcp/upstreamclient "$UTRANSPORT" \
+  's/\t\tif preSend != nil \{\n\t\t\tif perr := preSend\(\); perr != nil \{\n\t\t\t\t_ = tconn\.Close\(\)\n\t\t\t\treturn nil, &preSendRefusalErr\{err: perr\}\n\t\t\t\}\n\t\t\}\n//'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"

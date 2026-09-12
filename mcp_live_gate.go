@@ -348,8 +348,18 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 			// window open, since the request continues long after the transaction returns.
 			// Re-asking at the boundary closes the window instead of narrowing it.
 			//
-			// ORDER: scope, then approval, then generation — cheapest local read first, and the
-			// durable store consulted only for a request the other two still authorize.
+			// ORDER: generation, then scope, then approval — and the order is part of the
+			// contract, not a performance choice. Asking "is there still an activation" FIRST
+			// matches admission's own precedence and is what makes the other two answers
+			// meaningful: they describe a live experiment rather than reporting on one that has
+			// already ended. See the generation branch below for the leaving-live window that
+			// makes a scope-first order report a diagnosis a fresh request would never get
+			// (Codex P3, PR #1370, round 6 — this line still said scope-first after the order
+			// was changed, which is exactly the stale instruction beside a security predicate
+			// that invites a future maintainer to restore the defect).
+			//
+			// The durable approval store is consulted last, so it is reached only for a request
+			// the other two still authorize.
 			//
 			// No "unwired ⇒ allow" escape hatch is needed on the scope half, unlike the generation
 			// seam: an admitted request has already passed step (5c), which fails closed on a nil

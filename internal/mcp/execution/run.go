@@ -236,8 +236,11 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 		// (Codex P1, PR #1370, round 4). The retry loop had the same shape one level in: a second
 		// leg re-sent on the strength of a check made before the first.
 		//
-		// The predicate is therefore handed to the client and re-run per attempt, holding the pool
-		// slot — so "the last authoritative state read before the send" is now literally true.
+		// The predicate is therefore handed to the client, which re-runs it at every point where an
+		// unbounded wait has just ended and nothing is yet written: after the pool wait and DNS
+		// resolution, and again after the TCP connect and TLS handshake, with the connection
+		// established (CallOptions.PreSend). "The last authoritative state read before the send" is
+		// now literally true rather than nearly true.
 		// Refusals are classified through the SAME applyBoundaryRefusal as the guard above.
 		var preSendErr error
 		var preSendDrift bool

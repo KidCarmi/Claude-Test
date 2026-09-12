@@ -69,24 +69,30 @@ type CallOptions struct {
 	// set only from inside the broker materialization callback and lives only for the
 	// duration of the request.
 	AuthHeader string
-	// PreSend, when non-nil, is run immediately before EACH physical attempt — after the
-	// per-server pool slot is held, and again at the top of every retry leg. A non-nil error
-	// aborts the call with nothing sent on that leg.
+	// PreSend, when non-nil, is the caller's authority predicate, re-asked at every point on this
+	// path where an unbounded wait has just ended and nothing has yet been written. A non-nil error
+	// aborts that leg with no request bytes on any connection.
 	//
-	// IT EXISTS BECAUSE THE POOL WAIT IS UNBOUNDED. The executor's boundary guards (tool drift,
-	// rollout authority, emergency kill) run immediately before Call, and the code there says
-	// nothing sits between them and the send — which was true of that function and false of this
-	// one: `pool.acquire` blocks on a per-server semaphore until a slot frees or the context is
-	// done, so a kill, a demotion, a scope withdrawal or an approval revocation could land, return
-	// successfully, and the waiting request would then send anyway (Codex P1, PR #1370, round 4).
-	// Re-running the predicate HERE is what makes "the last authoritative state read before the
-	// send" literally true.
+	// IT EXISTS BECAUSE THE WAITS HERE ARE UNBOUNDED. The executor's boundary guards (tool drift,
+	// rollout authority, emergency kill) run immediately before Call, and the code there said
+	// nothing sits between them and the send — true of that function, false of this one. A kill, a
+	// demotion, a scope withdrawal or an approval revocation can land, return successfully, and the
+	// waiting request then sends anyway (Codex P1, PR #1370, rounds 4 and 6).
+	//
+	// TWO SITES, covering different phases, neither able to stand in for the other:
+	//
+	//	roundTrip, before client.Do  — after `pool.acquire` (which ends only when ANOTHER request
+	//	                               finishes) and after DNS resolution.
+	//	pinnedDialTLS, after the TLS handshake — after the TCP connect and the handshake, with the
+	//	                               connection established and nothing written.
+	//
+	// A connection reused across retry legs never reaches the dialer; a fresh connection spends its
+	// connect and handshake time after the first site. Both run PER LEG: a retry is a second
+	// physical send, and re-sending on the strength of a check made before an earlier leg is the
+	// same defect one loop iteration over.
 	//
 	// It is deliberately OPAQUE: this package learns nothing about generations, scopes, approvals
 	// or kill state — it runs a predicate the executor owns and reports the error verbatim.
-	//
-	// PER ATTEMPT, not once: a retry leg is a second physical send, and a retry that re-sends on
-	// the strength of a check made before the first leg is the same defect one loop iteration over.
 	PreSend func() error
 	// AttemptID names the ONE potential physical tool invocation this call carries
 	// (review §5). It is emitted as a request header so the controlled recording
@@ -156,8 +162,10 @@ func (c *Client) Call(ctx context.Context, target Target, method string, params 
 		return nil, markNeverSent(err)
 	}
 	defer release()
-	// The pool slot is held from here, so the wait above — which is unbounded in time — is over.
-	// Every physical attempt below re-asks the caller's predicate first; see CallOptions.PreSend.
+	// The pool slot is held from here, so the wait above — which is unbounded in time, since it
+	// ends only when another request finishes — is over. The caller's predicate is re-asked further
+	// down, in roundTrip and again in the TLS dialer; see CallOptions.PreSend for why there and not
+	// here (nothing between this line and those sites can have a side effect).
 
 	budget := c.cfg.Limits.MaxReadRetries()
 	// Retry-free mode is decided ONCE, outside the loop, from immutable validated
@@ -172,19 +180,6 @@ func (c *Client) Call(ctx context.Context, target Target, method string, params 
 	// directions.
 	call := legFacts{neverSent: true}
 	for attempt := 0; ; attempt++ {
-		// RE-ASKED BEFORE EVERY PHYSICAL SEND, including each retry leg. On the first leg nothing
-		// has been sent, so the refusal is provably never-sent; on a retry an EARLIER leg may
-		// already have reached the peer, so the accumulated facts ride out instead — claiming
-		// never-sent there would tell witness reconciliation that no invocation exists when one
-		// might.
-		if opts.PreSend != nil {
-			if perr := opts.PreSend(); perr != nil {
-				if attempt == 0 {
-					return nil, markNeverSent(perr)
-				}
-				return nil, markLegFacts(perr, call)
-			}
-		}
 		resp, facts, err := c.attempt(ctx, target, method, params, opts)
 		if err == nil {
 			return resp, nil

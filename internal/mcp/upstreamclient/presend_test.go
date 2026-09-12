@@ -18,18 +18,20 @@ import (
 // EVERY leg, and that a refusal reaches the caller as provably-never-sent on the first one
 // (Codex P1, PR #1370, round 4).
 
-// preSendsPerLeg is how many times the caller's predicate is re-asked for ONE physical leg: once
-// at the pool boundary in Call, and once in roundTrip after DNS resolution and immediately before
-// the transport. Pinned as an exact count so removing either site fails a test rather than being
-// absorbed by the other — the guarded-twice trap this PR has hit five times already.
-const preSendsPerLeg = 2
+// TWO RE-ASK SITES, and each is pinned by an observable the other cannot produce:
+//
+//	roundTrip, before client.Do          → refusing here means NO TCP CONNECTION is ever accepted.
+//	pinnedDialTLS, after the handshake   → refusing here means a connection IS accepted and NO
+//	                                       HTTP request is ever served.
+//
+// Counting hook invocations was the earlier shape and it was the wrong instrument: it could not say
+// WHICH site ran, so removing either was absorbable by the other — the guarded-twice trap, which
+// this PR has now hit six times. Distinct observables cannot be absorbed.
 
-// A PreSend refusal stops the call before ANY request reaches the server, and the caller learns
-// that no bytes were ever sent — the evidence the executor needs to record definitely_not_sent
-// rather than sending a provably-undelivered attempt to witness reconciliation.
-func TestPreSend_RefusalStopsTheCallWithNothingSent(t *testing.T) {
+// Refusing at the FIRST site stops the call before a connection is even attempted.
+func TestPreSend_RefusalBeforeTheTransportOpensNoConnection(t *testing.T) {
 	var hits int
-	c, target, _, stop := pinnedTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	c, target, conns, stop := pinnedTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"call-1","result":{}}`)
@@ -48,13 +50,65 @@ func TestPreSend_RefusalStopsTheCallWithNothingSent(t *testing.T) {
 	if hits != 0 {
 		t.Fatalf("SECURITY: a pre-send refusal must stop the call before any request bytes exist, server saw %d", hits)
 	}
+	if got := conns.Load(); got != 0 {
+		t.Fatalf("refusing before the transport must not even open a connection, got %d", got)
+	}
 	if !SendNeverStarted(err) {
 		t.Fatal("a first-leg pre-send refusal is provably never-sent; without that evidence the " +
 			"executor records may_have_been_sent for an invocation that never happened")
 	}
 }
 
-// The mandatory control: a PreSend that permits the send does not interfere.
+// Refusing at the SECOND site — after the TCP connect and the TLS handshake — still sends nothing.
+//
+// This is the window an earlier revision left open on the argument that connect+TLS is "bounded by
+// configured timeouts". It is bounded only by whatever an operator configured, and DialTLSContext
+// is a clean abortable seam, so the argument did not survive contact (Codex P1, round 6). The hook
+// permits the first ask (roundTrip) and refuses the second (post-handshake), which is exactly the
+// state that used to send.
+func TestPreSend_RefusalAfterTheHandshakeStillSendsNothing(t *testing.T) {
+	var hits int
+	c, target, conns, stop := pinnedTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"call-1","result":{}}`)
+	})
+	defer stop()
+
+	refusal := errors.New("authority withdrawn during the handshake")
+	var asks atomic.Int64
+	_, err := c.Call(context.Background(), target, "tools/list", nil, CallOptions{
+		Idempotent: true, WireID: "call-1",
+		PreSend: func() error {
+			if asks.Add(1) == 1 {
+				return nil // the pre-transport site permits; the withdrawal lands during the handshake
+			}
+			return refusal
+		},
+	})
+
+	if asks.Load() < 2 {
+		t.Fatalf("premise: the predicate must be asked again after the handshake, asked %d time(s) — "+
+			"without a second ask this proves nothing about the connect/TLS window", asks.Load())
+	}
+	if !errors.Is(err, refusal) {
+		t.Fatalf("the caller must receive its own refusal verbatim, got %v", err)
+	}
+	if got := conns.Load(); got < 1 {
+		t.Fatal("premise: the connection must actually have been established, or the refusal is " +
+			"being caught before the window this test is about")
+	}
+	if hits != 0 {
+		t.Fatalf("SECURITY: authority was withdrawn after the handshake and %d request(s) were "+
+			"still served — the connect/TLS window", hits)
+	}
+	if !SendNeverStarted(err) {
+		t.Fatal("a post-handshake refusal is still provably never-sent: the socket is closed with " +
+			"nothing written, which is the whole reason this seam beats cancelling the context")
+	}
+}
+
+// The mandatory control: a predicate that permits does not interfere at either site.
 func TestPreSend_PermittingHookDoesNotInterfere(t *testing.T) {
 	var hits int
 	c, target, _, stop := pinnedTestServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -66,30 +120,27 @@ func TestPreSend_PermittingHookDoesNotInterfere(t *testing.T) {
 	})
 	defer stop()
 
-	calls := 0
+	var asks atomic.Int64
 	resp, err := c.Call(context.Background(), target, "tools/list", nil, CallOptions{
 		Idempotent: true, WireID: "call-1",
-		PreSend: func() error { calls++; return nil },
+		PreSend: func() error { asks.Add(1); return nil },
 	})
 	if err != nil {
 		t.Fatalf("CONTROL: a permitting hook must not block the call: %v", err)
 	}
-	// TWO re-asks per leg, and the exactness is deliberate: one at the pool boundary (after the
-	// unbounded wait for a slot) and one after DNS resolution, immediately before the transport
-	// takes over. Deleting EITHER site drops this to one and fails here, which is what keeps both
-	// independently pinned — a looser "at least one" would let either be removed silently.
-	if resp == nil || calls != preSendsPerLeg || hits != 1 {
-		t.Fatalf("CONTROL: expected %d hook calls and one request, hook=%d server=%d", preSendsPerLeg, calls, hits)
+	if resp == nil || hits != 1 {
+		t.Fatalf("CONTROL: expected exactly one served request, server=%d", hits)
+	}
+	if asks.Load() < 2 {
+		t.Fatalf("CONTROL: both re-ask sites must run on a fresh connection, asked %d time(s)", asks.Load())
 	}
 }
 
-// THE HOOK RUNS AFTER THE POOL SLOT IS HELD, which is the whole reason it exists: the executor's
+// THE FIRST SITE RUNS AFTER THE POOL SLOT IS HELD, which is why it exists at all: the executor's
 // own boundary guards run before Call, and the wait for a slot sits between them and the send.
 //
 // Deterministic, not timing-based: every slot is held by a request parked in the handler, and the
-// test waits for exactly that many handler entries before launching the queued call. While the
-// pool is saturated the queued call cannot have reached its hook; once the parked requests are
-// released it must.
+// test waits for exactly that many handler entries before launching the queued call.
 func TestPreSend_RunsAfterThePoolSlotIsAcquired(t *testing.T) {
 	lim := DefaultLimits().MaxInFlight()
 	if lim < 1 {
@@ -168,10 +219,10 @@ func TestPreSend_RunsOnEveryRetryLeg(t *testing.T) {
 	})
 	defer stop()
 
-	var hooks atomic.Int64
+	var asks atomic.Int64
 	_, err := c.Call(context.Background(), target, "tools/list", nil, CallOptions{
 		Idempotent: true, WireID: "retry",
-		PreSend: func() error { hooks.Add(1); return nil },
+		PreSend: func() error { asks.Add(1); return nil },
 	})
 	if err != nil {
 		t.Fatalf("premise: the retried read should succeed on its second leg: %v", err)
@@ -179,8 +230,11 @@ func TestPreSend_RunsOnEveryRetryLeg(t *testing.T) {
 	if got := hits.Load(); got < 2 {
 		t.Skipf("premise: the client did not retry in this run (%d leg(s)); nothing to prove", got)
 	}
-	if want := hits.Load() * preSendsPerLeg; hooks.Load() != want {
-		t.Fatalf("SECURITY: %d physical leg(s) should carry %d pre-send re-ask(s), got %d — a retry "+
-			"sent on the strength of a check made before an earlier leg", hits.Load(), want, hooks.Load())
+	// At least one re-ask per leg. Not an exact multiple: whether a leg dials (two asks) or reuses
+	// a connection (one) is the transport's business, and pinning it would make this a test of
+	// net/http's pooling rather than of the contract.
+	if asks.Load() < hits.Load() {
+		t.Fatalf("SECURITY: %d physical leg(s) but only %d pre-send re-ask(s) — a retry sent on the "+
+			"strength of a check made before an earlier leg", hits.Load(), asks.Load())
 	}
 }
