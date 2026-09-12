@@ -899,6 +899,55 @@ code:
   deterministically by saturating the pool and waiting for exactly that many handler entries; and it
   runs on EVERY retry leg). Mutations M23–M26.
 
+  **ROUND 5 CLOSED TWO MORE AND DREW THE LINE ON A THIRD.**
+
+  **(d) A satisfying approval was not required to state the class in force.**
+  `mcpLiveApprovalSatisfied` matched any live grant for the target and never compared
+  `ReviewedOperationClass`. An approval carries its own class, and a later approval for the SAME
+  exact fingerprint can state a different one — that is precisely how a reviewer corrects an earlier
+  determination. So with the read-only approval that armed the activation gone and only a MUTATING
+  one live, both admission and the boundary kept executing read-first on the strength of the
+  activation's older immutable record, and the correction never landed for the rest of the
+  activation's window. The class is now part of the question at BOTH sites, and a class no review
+  can bind to a tool (`OpUnset`/`OpDiscovery`/`OpControl`) fails closed rather than reading as
+  agreement.
+
+  **(e) The boundary predicate asked about scope before the generation.** A leaving-live commit
+  un-arms the tier and publishes the new scope BEFORE `demoteCanary` invalidates the generation, so
+  for a window both are withdrawn — and scope-first reported `rollout_out_of_scope` for an
+  already-admitted request while a fresh request in the identical final state reads
+  `rollout_mode_invalid` from the unarmed lifecycle gate. That is the same
+  diagnosis-depends-on-timing defect (c) removed, one layer in. The order now matches admission's own
+  precedence: is there still an activation, and only then what it authorizes.
+
+  **(f) "Revalidate at the actual request-write boundary" — PARTIALLY ACCEPTED, and the rest
+  REFUSED with reasons.** `destination.Resolve` sits between the pool-boundary re-ask and the
+  transport, and a DNS lookup is the least bounded of the three things that happen before any
+  request byte exists, so the predicate is re-asked once more in `roundTrip`, after resolution and
+  immediately before `client.Do`. What remains is TCP connect plus the TLS handshake, and that is
+  where re-asking stops buying anything: `net/http` exposes no hook there that can ABORT cleanly —
+  an `httptrace` callback observes but cannot refuse, and cancelling the request context from
+  underneath RACES THE WRITE, turning a deterministic refusal into `may_have_been_sent`, which is
+  strictly worse evidence than the window it would close. Both remaining steps are bounded by
+  CONFIGURED timeouts (`ConnectTimeout`, `TLSHandshakeTimeout`, and the whole attempt by
+  `RequestTimeout`), unlike the pool wait, which was bounded only by another request finishing.
+  **That bounded-vs-unbounded distinction is the principled stopping point**, and it is recorded
+  here rather than left implicit so a later round does not have to re-derive it.
+
+  Gates: `TestBoundaryAuthority_ApprovalMustStateTheClassInForce` and
+  `..._ApprovalWithNoStatedClassSatisfiesNothing` (both with the control that the MUTATING approval
+  still satisfies a MUTATING request — a matcher that stopped matching anything would pass the
+  refusal gate); `..._GenerationOutranksScopeWhenBothAreWithdrawn` with
+  `..._ScopeStillNamedWhenTheGenerationIsCurrent` as its control, because "generation first" must
+  not become "generation only". Mutations M27–M29.
+
+  **A SIXTH instance of the guarded-twice pattern, self-inflicted in the round that created it.**
+  Adding the second pre-send re-ask immediately made M25 (remove the pool-boundary one) absorbable
+  by the new site. The per-leg re-ask count is therefore pinned EXACTLY (`preSendsPerLeg`), both
+  removals verified failing independently, and M29 added for the new site. The rule has now earned
+  a stronger form: **adding a second guard for an invariant is itself a reason to re-check every
+  mutation that targeted the first.**
+
   **A fifth instance of the guarded-twice pattern, and a new form of it.** M22's perl pattern stopped
   matching when round 4 rewrote the closure it targeted, so the campaign reported it SKIPPED rather
   than silently passing — the check that exists for exactly this. The lesson recorded last round
@@ -1030,7 +1079,7 @@ case stays non-read and fail-closed. The governing invariant, stated once:
 | The freshness boundary is not weakened | `TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2` — a decision computed under F1 does not reach upstream once the target is F2; the promotion is not the last word |
 | The classification does not outlive the activation that made it | `admitLiveExecution` step (5b): the decided class must EQUAL the one the activation being charged binds to this target, decided inside the lock that decides which activation that is. `TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating` (the full G1→G2 sequence through the real gate) + `TestAtomicBinding_I_ClassNotInForceIsRefused` (the transaction-level half, with its own positive control) |
 | Anti-vacuity (MANDATORY positive controls) | `TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead`, `TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall` and `TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass` — a classifier that answered "no" to everything would satisfy every negative gate while being the feature deleted |
-| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 26 mutations, 26 caught, 0 survived, 0 skipped (M17–M26 belong to the §24 boundary finding below, not to blocker 4's own criteria) |
+| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 29 mutations, 29 caught, 0 survived, 0 skipped (M17–M29 belong to the §24 boundary finding below, not to blocker 4's own criteria) |
 
 **Two things the campaign taught, recorded because they change how a survivor should be read.**
 A single-edit mutation of the stale-decision boundary SURVIVED, and the reason was not a missing
@@ -1098,7 +1147,7 @@ its own gates, and it is deliberately not folded into blocker 4: blocker 4's cri
 above and they stand or fall on their own. It was fixed there rather than deferred because it sits in
 the exact admission boundary this work was already hardening, and a known P1 in that boundary is not
 carried across a merge merely because it predates the branch. Its gates are
-`mcp_canary_scope_in_force_test.go`, `internal/mcp/upstreamclient/presend_test.go`, and campaign mutations M17–M26.
+`mcp_canary_scope_in_force_test.go`, `internal/mcp/upstreamclient/presend_test.go`, and campaign mutations M17–M29.
 
 It also does not close the SCOPE half of the same defect class: step (5b) revalidates the operation
 class at the boundary, and nothing revalidates the resolved SCOPE there — a request that resolved
