@@ -428,10 +428,13 @@ it("P3 admin: legacy cutover record + pending_reconciliation + the operation loo
   expect(t).not.toContain("Committed");
   expect(t).not.toContain("succeeded");
   expect(t).not.toContain("failed");
+  // The lookup is issued (StrictMode's dev-only double subscription may
+  // cancel-and-restart the first fetch; the real-binary journey pins exactly
+  // one against the production bundle).
   expect(
     requests.filter((r) => r.url.includes(`/api/idp/operations/${OP_ID}`))
       .length,
-  ).toBe(1);
+  ).toBeGreaterThanOrEqual(1);
   expect(nonGET()).toEqual([]);
   expect(buttonTexts().every((b) => b === "Refresh")).toBe(true);
 });

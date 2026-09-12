@@ -70,6 +70,9 @@ import {
 } from "../api/admins";
 import { KNOWN_ROUTES, resolveRouteIntent } from "../auth/routeIntent";
 
+const omit = (o: Record<string, unknown>, k: string): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(o).filter(([key]) => key !== k));
+
 const OIDC = {
   id: "oidc-corp",
   name: "Corp OIDC",
@@ -220,10 +223,8 @@ describe("A1 decodeIdPList", () => {
   });
 
   it("fails closed on a missing required fact", () => {
-    const { revision: _r, ...noRev } = LIST;
-    expect(() => decodeIdPList(noRev)).toThrow(DecodeError);
-    const { persisted: _p, ...noPersisted } = LIST;
-    expect(() => decodeIdPList(noPersisted)).toThrow(DecodeError);
+    expect(() => decodeIdPList(omit(LIST, "revision"))).toThrow(DecodeError);
+    expect(() => decodeIdPList(omit(LIST, "persisted"))).toThrow(DecodeError);
   });
 });
 
@@ -513,8 +514,9 @@ describe("A6 decodeAdminRoster", () => {
     expect(() =>
       decodeAdminRoster({ ...ROSTER, scope: "cluster-synced" }),
     ).toThrow(DecodeError);
-    const { revision: _r, ...noRev } = ROSTER;
-    expect(() => decodeAdminRoster(noRev)).toThrow(DecodeError);
+    expect(() => decodeAdminRoster(omit(ROSTER, "revision"))).toThrow(
+      DecodeError,
+    );
   });
 });
 

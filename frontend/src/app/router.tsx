@@ -26,6 +26,8 @@ import { CategoryGroupsPage } from "../features/objects/CategoryGroupsPage";
 import { UrlCategoriesPage } from "../features/objects/UrlCategoriesPage";
 import { DecryptionProfilesPage } from "../features/objects/DecryptionProfilesPage";
 import { FileProfilesPage } from "../features/objects/FileProfilesPage";
+import { IdentityProvidersPage } from "../features/objects/IdentityProvidersPage";
+import { AdministratorsPage } from "../features/administration/AdministratorsPage";
 import { ContentSecurityPage } from "../features/security/ContentSecurityPage";
 import { DecryptionPage } from "../features/security/DecryptionPage";
 import { CDRPage } from "../features/security/CDRPage";
@@ -81,6 +83,11 @@ export function createAppRouter(): ReturnType<typeof createBrowserRouter> {
             path: "objects/file-profiles",
             element: <FileProfilesPage />,
           },
+          {
+            // FE-6A.1 (FE-V27 read): viewer floor — uiRoutes GET /api/idp.
+            path: "objects/identity-providers",
+            element: <IdentityProvidersPage />,
+          },
           { path: "policies/learning", element: <PolicyLearningPage /> },
           {
             path: "security/content-security",
@@ -104,6 +111,8 @@ export function createAppRouter(): ReturnType<typeof createBrowserRouter> {
           },
           { path: "diagnostics", element: <DiagnosticsPage /> },
           { path: "governance", element: <GovernancePage /> },
+          // FE-6A.1 (FE-V37 read): admin — uiRoutes GET /api/auth/users.
+          { path: "administrators", element: <AdministratorsPage /> },
           {
             path: "design-system",
             lazy: async () => {

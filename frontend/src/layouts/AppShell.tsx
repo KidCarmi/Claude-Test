@@ -114,6 +114,12 @@ const NAV: readonly NavSection[] = [
         to: "/objects/file-profiles",
         minRole: "viewer",
       },
+      {
+        // FE-6A.1: read surface (uiRoutes GET /api/idp = viewer).
+        label: "Identity Providers",
+        to: "/objects/identity-providers",
+        minRole: "viewer",
+      },
     ],
   },
   {
@@ -158,7 +164,8 @@ const NAV: readonly NavSection[] = [
     heading: "Administration",
     icon: <IconUsers />,
     entries: [
-      { label: "Administrators", minRole: "admin" },
+      // FE-6A.1: read surface (uiRoutes GET /api/auth/users = admin).
+      { label: "Administrators", to: "/administrators", minRole: "admin" },
       { label: "Settings", minRole: "admin" },
       { label: "Governance", to: "/governance", minRole: "admin" },
     ],

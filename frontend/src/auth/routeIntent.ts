@@ -28,6 +28,7 @@ export const KNOWN_ROUTES: readonly KnownRoute[] = [
   { path: "/objects/category-groups", minRole: "viewer" },
   { path: "/objects/decryption-profiles", minRole: "viewer" },
   { path: "/objects/file-profiles", minRole: "viewer" },
+  { path: "/objects/identity-providers", minRole: "viewer" }, // uiRoutes: /api/idp GET=viewer (FE-6A.1)
   { path: "/security/content-security", minRole: "viewer" },
   { path: "/security/decryption", minRole: "viewer" },
   { path: "/security/cdr", minRole: "viewer" },
@@ -35,6 +36,7 @@ export const KNOWN_ROUTES: readonly KnownRoute[] = [
   { path: "/network/upstream", minRole: "viewer" },
   { path: "/diagnostics", minRole: "viewer" },
   { path: "/governance", minRole: "admin" }, // uiRoutes: /api/governance/control-plane GET=admin
+  { path: "/administrators", minRole: "admin" }, // uiRoutes: /api/auth/users GET=admin (FE-6A.1)
   { path: "/design-system", minRole: "viewer" },
 ];
 
