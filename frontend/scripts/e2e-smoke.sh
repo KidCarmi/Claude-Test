@@ -135,7 +135,13 @@ start_instance() {
   name="$1"; uiport="$2"; pport="$3"; shift 3
   d="$WORK/run-$name"
   mkdir -p "$d"
-  (cd "$d" && CULVERT_EXPERIMENTAL_UI=1 CULVERT_DATA_DIR="$d" "$BIN" \
+  # exec: the recorded PID must be the APPLIANCE, not the subshell. With a
+  # plain subshell `$!` names the subshell, cleanup's SIGTERM kills only
+  # that, and the appliance is reparented to init and keeps its fixed ports
+  # — the next run's readiness probes then hit the previous run's
+  # instances and its seed login fails (FE-6A.0 correction requalification
+  # finding: two consecutive runs collided deterministically).
+  (cd "$d" && exec env CULVERT_EXPERIMENTAL_UI=1 CULVERT_DATA_DIR="$d" "$BIN" \
     -port "$pport" -ui-port "$uiport" -ui-no-tls "$@" \
     >"$WORK/$name.log" 2>&1) &
   eval "${name}_PID=\$!"
