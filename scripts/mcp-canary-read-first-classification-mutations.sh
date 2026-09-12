@@ -536,12 +536,17 @@ run_mutation M28 \
 
 UTRANSPORT=internal/mcp/upstreamclient/transport.go
 
-# M29 — THE PRE-TRANSPORT RE-ASK IS REMOVED, reopening the DNS-resolution window between the pool
-# boundary and the transport. Its sibling M25 removes the other site; each is gated on the per-leg
-# count, so neither can hide behind the other.
+# M29 — THE PRE-TRANSPORT RE-ASK IS REMOVED, reopening the pool-wait and DNS window. Gated on its
+# OWN observable — that refusing before the transport opens NO TCP connection at all — not on a
+# per-leg count. The count was the earlier gate and it let this mutation survive once the dialer
+# site landed: with a second site present, "at least one ask per leg" stays satisfied. Only an
+# observable the other site cannot produce distinguishes them.
+#
+# (That survivor is itself the recurring lesson: a redesign that moves or adds a guard is a reason
+# to re-point every mutation aimed at the old shape. It has now caught me on M13, M16, M22 and M29.)
 run_mutation M29 \
   'the pre-transport re-ask after DNS resolution is removed' \
-  'TestPreSend_RunsOnEveryRetryLeg' \
+  'TestPreSend_RefusalBeforeTheTransportOpensNoConnection' \
   ./internal/mcp/upstreamclient "$UTRANSPORT" \
   's/\tif preSend != nil \{\n\t\tif perr := preSend\(\); perr != nil \{\n\t\t\treturn nil, legFacts\{neverSent: true\}, perr\n\t\t\}\n\t\}\n\n//'
 
