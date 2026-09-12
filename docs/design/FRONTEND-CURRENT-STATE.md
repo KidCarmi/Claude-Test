@@ -7,6 +7,9 @@
   admin-only mutations (see the parity matrix rows FE-V31/FE-V32 and the security contract
   D15); the "§7 accounting table" pointer in the Routes bullet below is historical — the
   generated per-method inventory is `api/route-classification.yaml`.
+  FE-6A.1 note (2026-09-12): the Identity Providers (`/app/objects/identity-providers`, viewer
+  read) and Administrators (`/app/administrators`, admin read) READ surfaces have migrated
+  (parity rows FE-V27/FE-V37); every mutation of both stays on the legacy console until FE-6A.2.
 - **Companions**: `ADR-FE-001-frontend-platform.md` (decision), `FRONTEND-FEATURE-PARITY.md`
   (per-feature matrix), `FRONTEND-SECURITY-CONTRACT.md` (invariants),
   `FRONTEND-MIGRATION-PLAN.md` (program)
