@@ -317,7 +317,7 @@ func persistEntryErr(f io.Writer, path string, e Entry) error {
 // crash or failure between the append and the marker is retried by re-running
 // this function, which then only re-checks.
 
-// ErrOperationIDRequired: AppendOperation refuses an entry with no key.
+// ErrOperationIDRequired is returned by AppendOperation for an entry with no key.
 var ErrOperationIDRequired = errors.New("audit: operation entry requires an operationId")
 
 // opMu serialises the check-then-append of operation-keyed entries so two
