@@ -31,7 +31,7 @@ import (
 // Refusing at the FIRST site stops the call before a connection is even attempted.
 func TestPreSend_RefusalBeforeTheTransportOpensNoConnection(t *testing.T) {
 	var hits int
-	c, target, conns, stop := pinnedTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	c, target, _, accepts, stop := pinnedTestServerCounting(t, func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"call-1","result":{}}`)
@@ -50,8 +50,11 @@ func TestPreSend_RefusalBeforeTheTransportOpensNoConnection(t *testing.T) {
 	if hits != 0 {
 		t.Fatalf("SECURITY: a pre-send refusal must stop the call before any request bytes exist, server saw %d", hits)
 	}
-	if got := conns.Load(); got != 0 {
-		t.Fatalf("refusing before the transport must not even open a connection, got %d", got)
+	// The CUMULATIVE accept count, never the live gauge: a gauge of zero is equally true of a
+	// connection that was opened and then closed, which is precisely the state this test must
+	// distinguish itself from.
+	if got := accepts.Load(); got != 0 {
+		t.Fatalf("refusing before the transport must not even open a connection, accepted %d", got)
 	}
 	if !SendNeverStarted(err) {
 		t.Fatal("a first-leg pre-send refusal is provably never-sent; without that evidence the " +
@@ -68,7 +71,7 @@ func TestPreSend_RefusalBeforeTheTransportOpensNoConnection(t *testing.T) {
 // state that used to send.
 func TestPreSend_RefusalAfterTheHandshakeStillSendsNothing(t *testing.T) {
 	var hits int
-	c, target, conns, stop := pinnedTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	c, target, _, accepts, stop := pinnedTestServerCounting(t, func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"call-1","result":{}}`)
@@ -94,9 +97,14 @@ func TestPreSend_RefusalAfterTheHandshakeStillSendsNothing(t *testing.T) {
 	if !errors.Is(err, refusal) {
 		t.Fatalf("the caller must receive its own refusal verbatim, got %v", err)
 	}
-	if got := conns.Load(); got < 1 {
-		t.Fatal("premise: the connection must actually have been established, or the refusal is " +
-			"being caught before the window this test is about")
+	// CUMULATIVE again, and here the gauge was actively wrong: by the time Call returns, our own
+	// refusal has already closed the socket, so the server's StateClosed drives a live gauge back
+	// to zero and the assertion races it. `asks >= 2` above proves OUR side of the handshake
+	// completed (the second ask is unreachable until HandshakeContext returns nil); this proves the
+	// peer actually accepted a connection, which is what separates this site from the first one.
+	if got := accepts.Load(); got < 1 {
+		t.Fatalf("premise: the connection must actually have been established, or the refusal is "+
+			"being caught before the window this test is about, accepted %d", got)
 	}
 	if hits != 0 {
 		t.Fatalf("SECURITY: authority was withdrawn after the handshake and %d request(s) were "+

@@ -22,14 +22,34 @@ import (
 // target, and a counter of accepted TCP connections.
 func pinnedTestServer(t *testing.T, h http.HandlerFunc) (*Client, Target, *atomic.Int64, func()) {
 	t.Helper()
+	c, tgt, live, _, stop := pinnedTestServerCounting(t, h)
+	return c, tgt, live, stop
+}
+
+// pinnedTestServerCounting is pinnedTestServer with BOTH connection observables, because they
+// answer different questions and one cannot be read as the other.
+//
+//	live    — a GAUGE: +1 on accept, -1 on close. "How many connections are open right now."
+//	accepts — a COUNTER: +1 on accept, never decremented. "Was a connection ever established."
+//
+// Reading the gauge as if it were the counter is a defect in both directions and this package hit
+// both (PR #1370, self-audit after round 7). A post-handshake test asserted `live >= 1` AFTER the
+// call returned, which races the server's own StateClosed and fails under -race. Its sibling
+// asserted `live == 0` to mean "no connection was opened", which is equally true of a connection
+// that was opened and closed — a false pass. A leak test wants the gauge; an evidence test wants
+// the counter.
+func pinnedTestServerCounting(t *testing.T, h http.HandlerFunc) (*Client, Target, *atomic.Int64, *atomic.Int64, func()) {
+	t.Helper()
 	restore := ssrf.AllowLoopbackForTest()
 
-	var conns atomic.Int64 // LIVE connections: +1 on accept, -1 on close
+	var conns atomic.Int64   // LIVE connections: +1 on accept, -1 on close
+	var accepts atomic.Int64 // CUMULATIVE accepts: +1 on accept, monotonic
 	srv := httptest.NewUnstartedServer(h)
 	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
 		switch s {
 		case http.StateNew:
 			conns.Add(1)
+			accepts.Add(1)
 		case http.StateClosed, http.StateHijacked:
 			conns.Add(-1)
 		}
@@ -50,7 +70,7 @@ func pinnedTestServer(t *testing.T, h http.HandlerFunc) (*Client, Target, *atomi
 	addr, _ := netip.ParseAddr(ipStr)
 	c := newTestClient(t, fixedResolver{addrs: []netip.Addr{addr}})
 	tgt := Target{ServerID: "s1", Endpoint: "https://" + ipStr + ":" + portStr, PinnedIdentity: pin}
-	return c, tgt, &conns, func() { srv.Close(); restore() }
+	return c, tgt, &conns, &accepts, func() { srv.Close(); restore() }
 }
 
 // SEC-MCP-10. roundTrip builds a fresh http.Transport per attempt. A Go
