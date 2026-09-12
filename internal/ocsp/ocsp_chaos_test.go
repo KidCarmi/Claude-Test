@@ -1006,3 +1006,63 @@ func TestChaos65_CachedVerdictExpiresAtTheSignersDeadline(t *testing.T) {
 			entry.expiresAt.UTC(), limit.UTC())
 	}
 }
+
+// TestChaos65_ResolutionFailureIsNotCountedAsAnSSRFRefusal — Codex P2, round 4.
+//
+// ssrf.PrivateHostContext has THREE outcomes and the call site treated it as
+// two: allowed, refused-as-private, and could-not-determine (DNS failure, or
+// this query's budget expiring mid-lookup). Charging blockedTotal for "the
+// guard returned an error" meant an ordinary DNS outage inflated
+// culvert_ocsp_response_rejected_total{reason="responder_blocked"} — a counter
+// whose runbook tells the operator the responder resolved to a private address
+// and points them at a different remediation entirely.
+//
+// Same rule as the not_for_certificate finding earlier in this PR, one counter
+// over: an accusation is charged only when it is demonstrable.
+//
+// The responder host here is unresolvable, so the guard fails without ever
+// establishing anything about it.
+func TestChaos65_ResolutionFailureIsNotCountedAsAnSSRFRefusal(t *testing.T) {
+	allowLoopback(t)
+	ca := newTestCA(t, "issuer")
+	// RFC 6761 reserves .invalid as guaranteed-not-to-resolve.
+	leaf := ca.issueLeaf(t, 94, "http://responder.invalid./ocsp")
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err == nil {
+		t.Fatal("an unreachable responder must still fail closed")
+	}
+
+	if got := oc.ResponderBlockedTotal(); got != 0 {
+		t.Fatalf("responder_blocked charged %d for a DNS failure — the operator is told "+
+			"this responder resolved to a private address, and it did not; nothing "+
+			"about the host was established", got)
+	}
+	// It IS a refused handshake, and that accounting must still be there.
+	if got := oc.FailClosedTotal(); got == 0 {
+		t.Fatal("an unresolvable responder must still be counted as a fail-closed handshake")
+	}
+}
+
+// TestChaos65_Control_PrivateResponderIsStillCountedAsBlocked is the CONTROL
+// for the gate above, and it is not optional: the cheapest way to stop
+// miscounting DNS failures is to stop charging blockedTotal at all, which would
+// silently delete the only signal that a certificate is steering this appliance
+// at its own internal network.
+func TestChaos65_Control_PrivateResponderIsStillCountedAsBlocked(t *testing.T) {
+	ca := newTestCA(t, "issuer")
+	// NOT allowLoopback: the guard must genuinely refuse this one.
+	leaf := ca.issueLeaf(t, 95, "http://127.0.0.1:9/ocsp")
+
+	oc := New()
+	oc.Enable()
+	if err := oc.VerifyPeerCertificate([][]byte{leaf.Raw}, [][]*x509.Certificate{{leaf, ca.cert}}); err == nil {
+		t.Fatal("a private-address responder must fail closed")
+	}
+
+	if got := oc.ResponderBlockedTotal(); got == 0 {
+		t.Fatal("a responder resolving to a private address must still charge " +
+			"responder_blocked — narrowing the counter must not silence the real signal")
+	}
+}

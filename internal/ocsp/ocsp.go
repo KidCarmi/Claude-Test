@@ -599,8 +599,27 @@ func (oc *Checker) queryOCSP(ctx context.Context, leaf, issuer *x509.Certificate
 	// CHAOS-64 fault re-imported through the fix for CHAOS-65's SSRF hole.
 	// The budget it runs under is the same envelope the query itself gets.
 	if err := ssrf.PrivateHostContext(ctx, u.Host); err != nil {
-		oc.blockedTotal.Add(1)
-		return 0, time.Time{}, fmt.Errorf("ocsp: responder blocked: %w", err)
+		// blockedTotal is an ACCUSATION — its metric reason is
+		// `responder_blocked` and the runbook tells the operator it means this
+		// responder resolved to a private address. So it is charged only for a
+		// demonstrated refusal (errors.Is ErrBlocked), never for the guard's
+		// other failure mode: a DNS outage, or this query's own budget expiring
+		// mid-lookup, where nothing about the host was established.
+		//
+		// Both still fail closed and both still skip the responder — only the
+		// counter distinguishes them. A resolution failure is an UNREACHABLE
+		// responder and is already accounted as such by the fail-closed path,
+		// so it gets no `response_rejected_total` reason: no response existed
+		// to reject (Codex review, PR #1369).
+		//
+		// This is the same rule as the `not_for_certificate` finding earlier in
+		// this PR, one counter over: the surfaces that accuse have to be right,
+		// because their whole value is being believed.
+		if errors.Is(err, ssrf.ErrBlocked) {
+			oc.blockedTotal.Add(1)
+			return 0, time.Time{}, fmt.Errorf("ocsp: responder blocked: %w", err)
+		}
+		return 0, time.Time{}, fmt.Errorf("ocsp: responder unresolvable: %w", err)
 	}
 
 	ocspReq, err := cryptoocsp.CreateRequest(leaf, issuer, nil)

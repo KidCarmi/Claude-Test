@@ -130,6 +130,14 @@ climbing, `culvert_ocsp_revoked_total` flat.
    enterprise CA hosting OCSP on the corporate network), this configuration is
    not currently supported — record it and turn the check off rather than
    weakening the guard.
+
+   This counter is deliberately narrow: it moves only for a **demonstrated**
+   refusal. A responder whose name simply fails to resolve — a DNS outage, or
+   the query budget expiring mid-lookup — does **not** move it, because nothing
+   was established about where that host points. Those show up as
+   `culvert_ocsp_fail_closed_total` with no rejection reason, which is step 1
+   above (reachability), not this step. If you see `responder_blocked` climbing,
+   the resolution succeeded and the answer was private.
 3. **Is it the clock?** `reason="stale"` climbing with no other symptom is
    usually NTP. Five minutes of skew is tolerated in both directions; more is
    not. Fix the clock; do not widen the tolerance.

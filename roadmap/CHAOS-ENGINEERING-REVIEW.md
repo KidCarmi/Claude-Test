@@ -6200,6 +6200,7 @@ production instead of a cliff.
 | **OCSP-11** | Bounding the responder loop also made the FIRST Good win, so the peer's own AIA ordering decides the verdict; a later Revoked was never consulted | Medium (replication lag alone reaches it) | **High** — a security posture moved as a side effect of a cost change | **CLOSED** (Codex review) |
 | **OCSP-12** | A dial-time SSRF refusal (DNS rebinding) was charged to nothing, so the guard's own success was invisible on the surface built to expose it | Low-Medium | Medium | **CLOSED** (Codex review) |
 | **OCSP-13** | The cache honoured the ASSERTION's deadline (OCSP-2b) but never the SIGNER's: a delegate expiring in seconds could sign a `good` valid for a day, and the cached verdict outlived the authority it rested on | Low-Medium (a CA rotating a delegated responder) | Medium | **CLOSED** (Codex review) |
+| **OCSP-14** | The SSRF pre-flight has THREE outcomes and the call site read two: a DNS failure charged the `responder_blocked` ACCUSATION, whose runbook tells the operator the responder resolved privately | High (any DNS outage) | Medium (false accusation on a trust surface) | **CLOSED** (Codex review) |
 | **OCSP-8** | Revocation not checked on inspected HTTPS; control reports itself healthy | **Certain** (it is the default wiring) | High (security control dark) | **OPEN — owner posture decision, now visible on three surfaces** |
 
 ### Recovery assessment
@@ -6307,6 +6308,35 @@ as OCSP-3b: the counters have to say what actually happened.
 descheduled while the leader finished would start a redundant query for a
 verdict already cached — defeating the collapsing during exactly the cold-cache
 burst it exists for.
+
+**OCSP-14 — a DNS outage was reported as an SSRF refusal. (Medium.)**
+`ssrf.PrivateHostContext` has three outcomes — allowed, refused-as-private, and
+could-not-determine (DNS failure, or this query's own budget expiring
+mid-lookup) — and the call site treated any error as the middle one. So an
+ordinary resolver outage inflated
+`culvert_ocsp_response_rejected_total{reason="responder_blocked"}`, whose
+runbook states the responder resolved into a private range and sends the
+operator down an entirely different remediation.
+
+Neither branch of the guard wrapped a sentinel, so the caller could not have
+distinguished them: the fix is at both layers. `ErrBlocked` — previously
+documented as the connect-time `Control` sentinel — now wraps the pre-flight
+refusal too, so ONE identity means "we refused this destination as private" at
+whichever layer decided it, and the resolution-failure branch deliberately does
+NOT wrap it. The OCSP call site charges the counter only on
+`errors.Is(err, ssrf.ErrBlocked)`; a resolution failure is an unreachable
+responder, already accounted by the fail-closed path, and takes no
+`response_rejected_total` reason because no response existed to reject.
+
+**This is the second time in this sweep that an accusation counter was charged
+for something it could not demonstrate** — OCSP-3b was the same defect on
+`not_for_certificate`, where any parse failure raised a standing claim of
+attack. Both were introduced by the same reflex: the error path was treated as
+one thing because it arrives as one value. The rule the register keeps from
+this: *a counter an operator is told to act on must be charged only from
+evidence that supports the specific claim its runbook makes* — and when a guard
+can fail for more than one reason, the caller needs the guard to say which, not
+a best guess at the call site.
 
 **OCSP-13 — the cache outlived its SIGNER, after being taught to respect its
 ASSERTION. (Medium.)** OCSP-2b made `cacheResult` honour the response's own

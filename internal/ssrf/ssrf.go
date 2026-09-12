@@ -20,9 +20,18 @@ import (
 	"time"
 )
 
-// ErrBlocked is the sentinel every connect-time Control rejection wraps, so a
-// caller can errors.Is() an SSRF security block (a DNS-rebinding/private-IP
-// target refused at connect) apart from a genuine unreachable-origin dial error.
+// ErrBlocked is the sentinel every SSRF REFUSAL wraps — the connect-time
+// Control rejection and the pre-flight PrivateHostContext verdict alike — so a
+// caller can errors.Is() a security block apart from a genuine failure to reach
+// or resolve the destination.
+//
+// Both layers matter because the guard has THREE outcomes, not two: allowed,
+// refused-as-private, and could-not-determine (DNS failure, or the caller's
+// deadline expiring mid-lookup). Only the middle one is an accusation. Without
+// the sentinel a caller could tell them apart only by "the guard returned an
+// error", which charges an SSRF refusal for every DNS outage — and a counter
+// whose runbook says "this host resolved to a private address" must not move
+// when the truth is "we never found out" (Codex review, PR #1369).
 var ErrBlocked = errors.New("ssrf control: destination blocked")
 
 // privateRanges lists every non-routable / internal-infrastructure range that
@@ -188,7 +197,7 @@ func PrivateHostContext(ctx context.Context, hostport string) error {
 	// Check cache first.
 	if priv, ok := dnsCache.Lookup(host); ok {
 		if priv {
-			return fmt.Errorf("destination %s resolves to private address (cached)", host)
+			return fmt.Errorf("%w: destination %s resolves to private address (cached)", ErrBlocked, host)
 		}
 		return nil
 	}
@@ -197,12 +206,16 @@ func PrivateHostContext(ctx context.Context, hostport string) error {
 		// Fail closed: unresolvable hosts are rejected to prevent DNS-rebinding
 		// attacks where the check resolves to a public IP but Dial resolves to
 		// a private one after TTL expiry. DNS errors are NOT cached.
+		//
+		// Deliberately NOT wrapped in ErrBlocked: the destination is refused,
+		// but nothing was demonstrated about it. A caller that counts SSRF
+		// refusals must not charge one for a resolver outage.
 		return fmt.Errorf("destination %s: DNS resolution failed: %w", host, err)
 	}
 	for _, ipStr := range ips {
 		if ip := net.ParseIP(ipStr); ip != nil && PrivateIP(ip) {
 			dnsCache.Store(host, true)
-			return fmt.Errorf("destination %s resolves to private address %s", host, ipStr)
+			return fmt.Errorf("%w: destination %s resolves to private address %s", ErrBlocked, host, ipStr)
 		}
 	}
 	dnsCache.Store(host, false)
