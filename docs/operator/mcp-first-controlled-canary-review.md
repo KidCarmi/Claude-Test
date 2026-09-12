@@ -1010,6 +1010,25 @@ code:
   which is why the dialer site reaches every leg. Checking it also re-confirmed that a redirect
   follow-up cannot become a second unguarded physical send on this path, since `RetryFreeLimits`
   forces `MaxRedirects = 0` — closed in an earlier round for exactly that reason.
+
+  **AN EIGHTH INSTANCE, AND A NEW FORM: THE WRONG OBSERVABLE.** The same self-audit ran the boundary
+  gates under `-race` and `TestPreSend_RefusalAfterTheHandshakeStillSendsNothing` FAILED — the defect
+  being in the test, not the code. `pinnedTestServer` exposes `conns` as a GAUGE (+1 on accept, -1 on
+  close), and both pre-send site tests read it as if it were a cumulative accept counter. That is
+  wrong in BOTH directions, and only one of them is noisy: the post-handshake test asserted
+  `live >= 1` AFTER `Call` returned, which races the server's own `StateClosed` — our refusal has
+  already closed the socket by then — and its sibling asserted `live == 0` to mean "no connection was
+  opened", which is equally true of a connection opened and then closed, so it could pass while
+  proving nothing. One direction fails loudly under `-race`; the other is SILENT, and a silent
+  false-pass on a security gate is the worse of the two. `pinnedTestServerCounting` now exposes both
+  observables with their meanings named, and each gate reads the one it needs; the leak test keeps
+  the gauge. The post-handshake premise is now carried by two facts that cannot both be satisfied by
+  accident — `asks >= 2` proves OUR side of the handshake completed (the second ask is unreachable
+  until `HandshakeContext` returns nil) and a non-zero ACCEPT COUNT proves the peer established a
+  connection. Both repaired gates were re-verified against M25 and M30, so fixing the instrument did
+  not weaken what they catch. The rule this adds to the guarded-twice family: **a gate can be wrong
+  about WHAT IT MEASURES rather than about what it asserts, and a gauge read as a counter fails one
+  way and lies the other.**
 - **P2 — credential conditional (§4):** `CredentialProfile` is a policy obligation, so no-credential
   status is unverifiable until the exact tool + rule are fixed. Corrected.
 - **P1 — durable outcome evidence (§15/§18):** every event is a `PhaseDecision` with no
