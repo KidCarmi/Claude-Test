@@ -80,6 +80,31 @@ func TestAppendOperation_FindsTheEntryInTheRotatedArchive(t *testing.T) {
 	}
 }
 
+// failSyncWriter is a SYNCHRONISING sink whose append fails.
+type failSyncWriter struct{ err error }
+
+func (f failSyncWriter) Write([]byte) (int, error)     { return 0, f.err }
+func (f failSyncWriter) WriteSync([]byte) (int, error) { return 0, f.err }
+
+func TestAppendOperation_NonSyncableSinkIsRefusedNotTrusted(t *testing.T) {
+	t.Cleanup(ResetForTest())
+	t.Cleanup(ResetWriteErrorsForTest())
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = Close(); ClearPersistForTest() })
+	t.Cleanup(SetPersistForTest(&countingWriter{})) // io.Writer only: cannot fsync
+	const id = "0f0f0f0f-0000-4000-8000-000000000006"
+	durable, err := AppendOperation(opEntry(id))
+	if !errors.Is(err, ErrSinkNotSyncable) || durable {
+		t.Fatalf("a sink that cannot synchronise must never be acknowledged: durable=%v err=%v", durable, err)
+	}
+	if n := countKeyed(t, path, id); n != 0 || len(Get()) != 0 {
+		t.Fatalf("nothing may be appended through an unsyncable sink (file=%d ring=%d)", n, len(Get()))
+	}
+}
+
 func TestAppendOperation_WriteFailureAddsNothingAnywhere(t *testing.T) {
 	t.Cleanup(ResetForTest())
 	t.Cleanup(ResetWriteErrorsForTest())
@@ -88,7 +113,7 @@ func TestAppendOperation_WriteFailureAddsNothingAnywhere(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = Close(); ClearPersistForTest() })
-	restore := SetPersistForTest(failWriter{err: errors.New("enospc")})
+	restore := SetPersistForTest(failSyncWriter{err: errors.New("enospc")})
 	const id = "0f0f0f0f-0000-4000-8000-000000000003"
 	durable, err := AppendOperation(opEntry(id))
 	if err == nil || durable {

@@ -2598,7 +2598,7 @@
         "description": "FE-6A.0 round-3 correction (Blockers 1–2) — the posture of the durable operation ledger (idp_operations.json). `degraded:true` means the file is corrupt or unreadable: it is left in place as evidence, every operation-identified write, every lookup and every write that would change or remove an existing profile is refused (503 operation_ledger_degraded) until the operator restores or removes the file and restarts. `unresolved` counts pending/outcome_unknown intents, which are never evicted; at `capacity` unresolved intents a new operation is refused (503 operation_ledger_full).",
         "properties": {
           "auditSink": {
-            "description": "Where an operation's success audit is completed: `file` = the persistent JSONL audit log (audited means durably present once); `memory` = no audit log is configured on this node, the in-memory ring is its whole audit record.",
+            "description": "Where an operation's success audit is completed: `file` = the persistent JSONL audit log — `audited:true` means the operation-keyed entry is present exactly once AND has been synchronised to stable storage (fsync of the file; on rotation also the archive and the directory) before the marker was persisted; `memory` = no audit log is configured on this node, the in-memory ring is its whole audit record — NOT disk-durable, lost on restart by design.",
             "enum": [
               "file",
               "memory"

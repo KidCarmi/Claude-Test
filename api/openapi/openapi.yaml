@@ -2443,7 +2443,7 @@ components:
       additionalProperties: false
       properties:
         degraded: { type: boolean }
-        auditSink: { type: string, enum: [file, memory], description: "Where an operation's success audit is completed: `file` = the persistent JSONL audit log (audited means durably present once); `memory` = no audit log is configured on this node, the in-memory ring is its whole audit record." }
+        auditSink: { type: string, enum: [file, memory], description: "Where an operation's success audit is completed: `file` = the persistent JSONL audit log — `audited:true` means the operation-keyed entry is present exactly once AND has been synchronised to stable storage (fsync of the file; on rotation also the archive and the directory) before the marker was persisted; `memory` = no audit log is configured on this node, the in-memory ring is its whole audit record — NOT disk-durable, lost on restart by design." }
         degradedReason: { type: string, enum: [corrupt, unreadable] }
         degradedDetail: { type: string }
         retained: { type: integer }

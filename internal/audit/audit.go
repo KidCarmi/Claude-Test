@@ -320,20 +320,40 @@ func persistEntryErr(f io.Writer, path string, e Entry) error {
 // ErrOperationIDRequired is returned by AppendOperation for an entry with no key.
 var ErrOperationIDRequired = errors.New("audit: operation entry requires an operationId")
 
+// ErrSinkNotSyncable is returned by AppendOperation when the configured
+// durable sink cannot synchronise to stable storage (it lacks WriteSync):
+// nothing is appended and the operation stays audit-pending — an
+// acknowledgement that cannot be made durable is never given (round 5).
+var ErrSinkNotSyncable = errors.New("audit: durable sink cannot synchronise to stable storage")
+
+// durableAppender is the production append primitive whose success means
+// the COMPLETE record has been synchronised to stable storage (file, and on
+// rotation the archive and the directory). fileutil.RotatingFile implements
+// it.
+type durableAppender interface {
+	WriteSync(p []byte) (int, error)
+}
+
 // opMu serialises the check-then-append of operation-keyed entries so two
 // retries of the same operation cannot both observe "absent" and both append.
 var opMu sync.Mutex
 
 // AppendOperation appends e exactly once and reports whether it is DURABLY
-// present afterwards.
+// present afterwards — "durable" meaning SYNCHRONISED TO STABLE STORAGE
+// (round 5), not merely accepted by the kernel:
 //
-//   - durable=true, err=nil: the entry is in the JSONL file (appended now, or
-//     found already there from an earlier attempt — nothing was re-appended).
+//   - durable=true, err=nil: the entry is in the JSONL record and the file
+//     holding it has been fsync'd — appended now through the sink's WriteSync
+//     (file + archive + directory on rotation), or found already there from
+//     an earlier attempt and its containing file synchronised again (a
+//     readable entry whose synchronisation is uncertain is not enough).
 //   - durable=false, err=nil: no durable sink is configured; the in-memory
 //     ring is this appliance's whole audit record and holds the entry once.
-//   - err != nil: the durable write failed or the record could not be
-//     checked; NOTHING was added to the ring, SIEM or DP queue either, so the
-//     entry is absent everywhere and the caller must retry later.
+//   - err != nil: the write or its synchronisation failed, the record could
+//     not be checked, or the sink cannot synchronise at all; the ring, SIEM
+//     and DP queue received nothing, so the caller must retry later. The
+//     bytes MAY sit unsynchronised in the file — a retry finds them and
+//     synchronises them, or finds them gone and appends again.
 func AppendOperation(e Entry) (durable bool, err error) {
 	if e.OperationID == "" {
 		return false, ErrOperationIDRequired
@@ -350,14 +370,22 @@ func AppendOperation(e Entry) (durable bool, err error) {
 		}
 		return false, nil
 	}
-	present, err := HasOperation(e.Action, e.OperationID)
+	sink, ok := f.(durableAppender)
+	if !ok {
+		return false, ErrSinkNotSyncable
+	}
+	holder, present, err := findOperation(path, e.Action, e.OperationID)
 	if err != nil {
 		return false, err
 	}
 	if present {
+		// Found — but only a synchronised containing file makes it durable.
+		if err := fileutil.SyncPath(holder); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
-	if err := persistEntryErr(f, path, e); err != nil {
+	if err := persistEntryDurable(sink, path, e); err != nil {
 		return false, err
 	}
 	// Durable first, then the volatile fan-out (ring, SIEM, DP queue) —
@@ -388,6 +416,31 @@ func ringHasOperationLocked(action, opID string) bool {
 	return false
 }
 
+// persistEntryDurable writes one JSONL record through the sink's
+// synchronising append. A failure — write OR fsync — is charged exactly like
+// a best-effort loss (the storage-health plane must see it) and returned.
+func persistEntryDurable(sink durableAppender, path string, e Entry) error {
+	b, err := json.Marshal(e)
+	if err != nil {
+		countWriteError(path, fmt.Errorf("marshal audit entry: %w", err))
+		return err
+	}
+	b = append(b, '\n')
+	if needsBoundaryRepair.CompareAndSwap(true, false) {
+		b = append([]byte{'\n'}, b...)
+	}
+	n, werr := sink.WriteSync(b)
+	if n > 0 && n < len(b) {
+		needsBoundaryRepair.Store(true)
+	}
+	if werr != nil {
+		countWriteError(path, werr)
+		return werr
+	}
+	noteWriteSuccess(path)
+	return nil
+}
+
 // HasOperation reports whether the DURABLE record (the current JSONL file
 // and its rotated archive) holds an entry keyed to (action, opID). Without a
 // durable sink it answers from the ring. A read failure is returned, never
@@ -400,16 +453,23 @@ func HasOperation(action, opID string) (bool, error) {
 	if path == "" {
 		return inRing, nil
 	}
+	_, found, err := findOperation(path, action, opID)
+	return found, err
+}
+
+// findOperation locates the file of the durable record holding the keyed
+// entry (the current file first, then the rotated archive).
+func findOperation(path, action, opID string) (holder string, found bool, err error) {
 	for _, p := range []string{path, path + ".1"} {
 		found, err := fileHasOperation(p, action, opID)
 		if err != nil {
-			return false, err
+			return "", false, err
 		}
 		if found {
-			return true, nil
+			return p, true, nil
 		}
 	}
-	return false, nil
+	return "", false, nil
 }
 
 func fileHasOperation(path, action, opID string) (bool, error) {

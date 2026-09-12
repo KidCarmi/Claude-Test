@@ -107,9 +107,10 @@ func fe6afAssertFinal(t *testing.T, auditPath, id, opID string) {
 // ─── FR1 — write ok, sync fails ─────────────────────────────────────────────
 
 func TestFE6A0F_FR1_SyncFailureAfterAFullWriteIsNotDurable(t *testing.T) {
-	_, _ = fe6aSwapRegistry(t, "")
+	_, regPath := fe6aSwapRegistry(t, "")
 	fe6aSwapConfigStore(t)
 	auditPath := fe6aeAuditFile(t)
+	opsPath := fe6adOpsPath(regPath)
 	sw := fe6afOpenSyncWriter(t, auditPath)
 	sw.failSync = true
 	t.Cleanup(audit.SetPersistForTest(sw))
@@ -123,18 +124,33 @@ func TestFE6A0F_FR1_SyncFailureAfterAFullWriteIsNotDurable(t *testing.T) {
 	if n, _ := fe6aeJSONLCounts(t, auditPath, "idp.create", id, opID); n != 1 {
 		t.Fatalf("precondition: the bytes reached the file (page cache) exactly once; got %d", n)
 	}
-	_, lm := fe6adLookup(t, opID)
-	if lm["audited"] != false || lm["auditState"] != "pending" || lm["state"] != idpOpCommitted {
-		t.Fatalf("FR1: a write whose synchronisation failed was acknowledged durable — ledger says %v", lm)
+	// The durable ledger FILE — what a restart would read — must not carry
+	// the marker: the bytes were never acknowledged by stable storage.
+	if st, audited := fe6adLedgerState(t, opsPath, opID); st != idpOpCommitted || audited {
+		t.Fatalf("FR1: a write whose synchronisation failed was acknowledged durable — ledger file says state=%s audited=%v", st, audited)
 	}
 	if m["auditState"] != "pending" {
 		t.Fatalf("FR1: the create response must say the audit is still owed; got %v", m)
 	}
-	// The device recovers: the retry must SYNCHRONISE the containing file
-	// (finding the readable entry is not enough) and only then mark.
-	sw.failSync = false
-	if _, lm = fe6adLookup(t, opID); lm["audited"] != true {
-		t.Fatalf("after recovery = %v", lm)
+	// Recovery through the lookup: finding the readable entry is NOT enough
+	// — the retry must SYNCHRONISE the containing file before marking. The
+	// writer's own synchronisation is still failing; the observer proves the
+	// retry synchronised the file itself.
+	var mu sync.Mutex
+	fileSyncs := 0
+	t.Cleanup(fileutil.SetSyncObserverForTest(func(kind, path string) {
+		if kind == "file" && path == auditPath {
+			mu.Lock()
+			fileSyncs++
+			mu.Unlock()
+		}
+	}))
+	_, lm := fe6adLookup(t, opID)
+	mu.Lock()
+	synced := fileSyncs
+	mu.Unlock()
+	if lm["audited"] != true || synced == 0 {
+		t.Fatalf("FR1: recovery must synchronise the containing file (%d syncs) before marking; got %v", synced, lm)
 	}
 	fe6afAssertFinal(t, auditPath, id, opID)
 }
