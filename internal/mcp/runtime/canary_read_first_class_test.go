@@ -248,45 +248,7 @@ func TestReadFirstWall_ClassifierTakesNoServerSuppliedInput(t *testing.T) {
 // exists to make impossible. The check is an AST walk rather than a grep so a renamed receiver, a
 // different assignment spelling, or a write buried in a helper is still caught.
 func TestReadFirstWall_OperationClassHasExactlyOneClassificationSite(t *testing.T) {
-	fset := token.NewFileSet()
-	// "." is the package directory: `go test` runs with the package as its working directory,
-	// which is the same convention the sibling AST gate in canary_reviewed_target_test.go uses.
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
-	if err != nil {
-		t.Fatalf("parse package: %v", err)
-	}
-	// Every write to a field named Class anywhere in the package is collected, keyed by the
-	// function it sits in and by the exact target expression. Collecting ALL of them and then
-	// classifying is deliberate: a gate that only looked for `op.Class` would miss a second
-	// classification written through any other spelling, which is the thing being prevented.
-	type classWrite struct{ fn, target string }
-	var writes []classWrite
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			var fn string
-			ast.Inspect(file, func(n ast.Node) bool {
-				switch v := n.(type) {
-				case *ast.FuncDecl:
-					fn = v.Name.Name
-				case *ast.AssignStmt:
-					for _, lhs := range v.Lhs {
-						sel, isSel := lhs.(*ast.SelectorExpr)
-						if !isSel || sel.Sel.Name != "Class" {
-							continue
-						}
-						var b bytes.Buffer
-						if err := printer.Fprint(&b, fset, lhs); err != nil {
-							t.Fatalf("render assignment target: %v", err)
-						}
-						writes = append(writes, classWrite{fn: fn, target: b.String()})
-					}
-				}
-				return true
-			})
-		}
-	}
+	writes := classFieldWrites(t)
 	// Fields named Class that are NOT the policy operation class. Listed by their exact target
 	// expression so that a rename, a move, or a NEW unrelated Class field has to be re-declared
 	// here by a human rather than silently inheriting the exemption.
@@ -317,6 +279,61 @@ func TestReadFirstWall_OperationClassHasExactlyOneClassificationSite(t *testing.
 	if seen["policyOperation"] == 0 {
 		t.Fatal("the default-class site was not found — this gate is no longer checking anything")
 	}
+}
+
+// classWrite is one assignment to a field named Class, with the function it sits in and the exact
+// target expression it assigns to.
+type classWrite struct{ fn, target string }
+
+// classFieldWrites collects EVERY write to a field named Class in this package's non-test sources.
+// Collecting all of them and classifying afterwards is deliberate: a scan that only looked for
+// `op.Class` would miss a second classification written through any other spelling, which is the
+// thing being prevented.
+func classFieldWrites(t *testing.T) []classWrite {
+	t.Helper()
+	fset := token.NewFileSet()
+	// "." is the package directory: `go test` runs with the package as its working directory,
+	// which is the same convention the sibling AST gate in canary_reviewed_target_test.go uses.
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+	var writes []classWrite
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			writes = append(writes, classWritesInFile(t, fset, file)...)
+		}
+	}
+	return writes
+}
+
+// classWritesInFile walks one file, tracking the enclosing function so each write is attributable.
+func classWritesInFile(t *testing.T, fset *token.FileSet, file *ast.File) []classWrite {
+	t.Helper()
+	var out []classWrite
+	var fn string
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.FuncDecl:
+			fn = v.Name.Name
+		case *ast.AssignStmt:
+			for _, lhs := range v.Lhs {
+				sel, isSel := lhs.(*ast.SelectorExpr)
+				if !isSel || sel.Sel.Name != "Class" {
+					continue
+				}
+				var b bytes.Buffer
+				if err := printer.Fprint(&b, fset, lhs); err != nil {
+					t.Fatalf("render assignment target: %v", err)
+				}
+				out = append(out, classWrite{fn: fn, target: b.String()})
+			}
+		}
+		return true
+	})
+	return out
 }
 
 // §8 STRUCTURAL PARITY, half two: the class the executor acts on is the SAME VALUE the policy
