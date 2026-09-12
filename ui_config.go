@@ -184,6 +184,14 @@ func apiStats(w http.ResponseWriter, r *http.Request) {
 		// Cluster config-publish freeze (empty = healthy).
 		"configPublishRejected":   publishRejected,
 		"configPublishRejectedAt": publishRejectedAt,
+		// CHAOS-63: login attempts refused because the submitted username
+		// exceeded the byte bound (rejected before lockout/credential
+		// evaluation). Previously visible only via the
+		// culvert_login_oversize_rejected_total Prometheus metric or the
+		// rate-limited process log — invisible to an operator without a
+		// metrics scraper wired up. A climbing count means an unauthenticated
+		// source is probing /api/auth/login.
+		"loginOversizeRejected": loginOversizeRejected.Load(),
 	})
 }
 
@@ -1336,9 +1344,12 @@ func apiConfigImport(w http.ResponseWriter, r *http.Request) {
 	if b.RateLimitRPM > 0 {
 		rl.Configure(b.RateLimitRPM, time.Minute)
 	}
-	for _, ex := range b.RateLimitExempt {
-		_ = rl.AddExemption(ex)
-	}
+	// Bulk load: one pass, one view publish (an AddExemption loop is
+	// quadratic). Invalid entries stay silently skipped rather than joining
+	// `warnings` the way invalid IP-filter entries do above — surfacing them
+	// would change this endpoint's response, which is a contract change and
+	// not this change's concern.
+	_ = rl.AddExemptions(b.RateLimitExempt)
 
 	// PAC configuration.
 	if b.PACProxyHost != "" || b.PACProxyPort != 0 || len(b.PACExclusions) > 0 {

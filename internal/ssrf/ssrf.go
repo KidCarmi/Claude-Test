@@ -20,9 +20,18 @@ import (
 	"time"
 )
 
-// ErrBlocked is the sentinel every connect-time Control rejection wraps, so a
-// caller can errors.Is() an SSRF security block (a DNS-rebinding/private-IP
-// target refused at connect) apart from a genuine unreachable-origin dial error.
+// ErrBlocked is the sentinel every SSRF REFUSAL wraps — the connect-time
+// Control rejection and the pre-flight PrivateHostContext verdict alike — so a
+// caller can errors.Is() a security block apart from a genuine failure to reach
+// or resolve the destination.
+//
+// Both layers matter because the guard has THREE outcomes, not two: allowed,
+// refused-as-private, and could-not-determine (DNS failure, or the caller's
+// deadline expiring mid-lookup). Only the middle one is an accusation. Without
+// the sentinel a caller could tell them apart only by "the guard returned an
+// error", which charges an SSRF refusal for every DNS outage — and a counter
+// whose runbook says "this host resolved to a private address" must not move
+// when the truth is "we never found out" (Codex review, PR #1369).
 var ErrBlocked = errors.New("ssrf control: destination blocked")
 
 // privateRanges lists every non-routable / internal-infrastructure range that
@@ -164,7 +173,23 @@ func PrivateIP(ip net.IP) bool {
 // proxy CONNECT to loopback, RFC 1918, link-local, or metadata endpoints.
 // Results are cached in the package DNS cache (30s TTL) to avoid redundant
 // DNS lookups.
+//
+// The lookup on the miss path is UNBOUNDED — it runs under
+// context.Background(), so a wedged resolver blocks the calling goroutine for
+// the system resolver's full budget. Callers on a request goroutine should use
+// PrivateHostContext and pass the deadline they are already working to.
 func PrivateHost(hostport string) error {
+	return PrivateHostContext(context.Background(), hostport)
+}
+
+// PrivateHostContext is PrivateHost with the DNS lookup bounded by ctx.
+//
+// Added by CHAOS-65: the OCSP responder URL is read from the peer's own
+// certificate and guarded on a TLS handshake running on the request goroutine,
+// so the guard itself must not become the unbounded call. Behaviour is
+// otherwise identical, cache included; PrivateHost delegates here with a
+// background context so every existing caller is byte-identical.
+func PrivateHostContext(ctx context.Context, hostport string) error {
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host = hostport // no port
@@ -172,21 +197,25 @@ func PrivateHost(hostport string) error {
 	// Check cache first.
 	if priv, ok := dnsCache.Lookup(host); ok {
 		if priv {
-			return fmt.Errorf("destination %s resolves to private address (cached)", host)
+			return fmt.Errorf("%w: destination %s resolves to private address (cached)", ErrBlocked, host)
 		}
 		return nil
 	}
-	ips, err := net.DefaultResolver.LookupHost(context.Background(), host)
+	ips, err := net.DefaultResolver.LookupHost(ctx, host)
 	if err != nil {
 		// Fail closed: unresolvable hosts are rejected to prevent DNS-rebinding
 		// attacks where the check resolves to a public IP but Dial resolves to
 		// a private one after TTL expiry. DNS errors are NOT cached.
+		//
+		// Deliberately NOT wrapped in ErrBlocked: the destination is refused,
+		// but nothing was demonstrated about it. A caller that counts SSRF
+		// refusals must not charge one for a resolver outage.
 		return fmt.Errorf("destination %s: DNS resolution failed: %w", host, err)
 	}
 	for _, ipStr := range ips {
 		if ip := net.ParseIP(ipStr); ip != nil && PrivateIP(ip) {
 			dnsCache.Store(host, true)
-			return fmt.Errorf("destination %s resolves to private address %s", host, ipStr)
+			return fmt.Errorf("%w: destination %s resolves to private address %s", ErrBlocked, host, ipStr)
 		}
 	}
 	dnsCache.Store(host, false)

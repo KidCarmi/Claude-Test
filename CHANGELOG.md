@@ -9,6 +9,72 @@ version is `info.version` in `api/openapi/openapi.yaml` and follows
 
 ### Security
 
+- OCSP revocation checking accepted responses it should have refused
+  (CHAOS-65). Every input the checker acts on comes from the peer's own
+  certificate — the responder URLs live in its AIA extension — so the party
+  being checked chooses which responder is asked and therefore what comes
+  back. `ParseResponse` was called with a nil certificate, which takes the
+  first status in the response and never compares the serial, so a genuine
+  CA-signed "good" about any *other* certificate of the same issuer was
+  accepted as this one's verdict: a revoked certificate went through, with no
+  network position required. Alongside it, `ThisUpdate`/`NextUpdate` were
+  parsed and never checked (the request carries no nonce and OCSP rides
+  plaintext HTTP, so a pre-revocation "good" replayed indefinitely); an
+  `unknown` status — which a CA returns for a certificate it never issued —
+  was treated as a pass while an *unreachable* responder failed closed; and
+  the verdict cache was keyed on the certificate serial alone, which is unique
+  only within an issuer, so a cached "good" could admit a revoked certificate
+  from a different CA. Responses are now bound to the certificate under test
+  (`ParseResponseForCert`), validated for freshness with a 5-minute skew
+  tolerance and a 24-hour ceiling, accepted only when affirmative, and cached
+  under the full RFC 6960 CertID.
+- The OCSP responder URL was an unguarded SSRF sink: it was fetched with
+  `http.DefaultClient` with no scheme allow-list, no private-address check and
+  redirects followed, so any operator of any destination the gateway reaches
+  could name an internal address and have the proxy POST to it. It is now
+  guarded inline, dialed through the SSRF-controlled dialer, and redirects are
+  refused. The responder list was also walked in full under a *per-responder*
+  5-second timeout: a certificate listing 200 blackholed responders held a
+  request goroutine — and its connection, file descriptor and per-IP limiter
+  slot — for about seventeen minutes inside one TLS handshake while aiming 200
+  outbound requests at hosts it chose. At most four responders are now
+  consulted, all inside one 5-second envelope, single-flighted per
+  certificate.
+- OCSP: binding a response to a certificate was only half the check — the
+  *signer* was never bound to an authority. Go's OCSP library verifies an
+  embedded responder certificate by asking only whether the issuer signed it,
+  never whether it carries the `id-kp-OCSPSigning` extended key usage RFC 6960
+  requires. A peer's own certificate is, by definition, one the issuer signed,
+  and the peer holds its private key — so it could sign a "good" response about
+  its own serial, embed its own certificate as the responder, and have a revoked
+  certificate accepted with no other party involved. Only the issuer, and
+  delegates it signed that carry the OCSP-signing usage and are within their own
+  validity period, are now accepted as responders. Related: a confirmed verdict
+  was cached for a fixed hour regardless of the response's own `NextUpdate`, so
+  a response a minute from expiry kept admitting the certificate for another 59;
+  cache lifetime is now capped at the responder's own deadline.
+- **Behaviour change for operators running `security.ocsp_check: true`:**
+  responder queries are now made directly and no longer honour `HTTP(S)_PROXY`
+  from the environment, and a responder on a private address is refused. An
+  egress-restricted deployment must allow the responder hosts named in its
+  upstreams' certificates. See `docs/operator/ocsp-revocation-checking.md`.
+
+### Changed
+
+- OCSP now reports which TLS handshakes it actually covers. Enabling it
+  installs the check on the shared upstream transport only, which for a
+  forward proxy means the handshake to an `https://` parent proxy — inspected
+  HTTPS origin handshakes build their own TLS config and are **not**
+  revocation-checked. Because every counter reads zero either way, "found
+  nothing wrong" and "never consulted" were the same reading. The appliance now
+  says so in a warning at the moment the control is enabled, in a banner on the
+  OCSP panel, in `coverage`/`uncheckedEnforcingPaths` on `GET /api/ocsp`, and
+  in `culvert_ocsp_path_checked{path}` — alongside a new `culvert_ocsp_*`
+  series set (the only OCSP surface before this was an admin JSON endpoint
+  nothing scrapes). Covering inspected HTTPS is tracked as an owner decision:
+  doing it fail-closed would make every inspected HTTPS request depend on
+  outbound port 80 to arbitrary responder hosts.
+
 - Scan-service credential exposure on the viewer-role read surfaces
   (`GET /api/security-scan/svc`, `GET /api/security-scan/status`). The
   userinfo redaction added for those surfaces returned unparseable input
@@ -103,6 +169,24 @@ endpoints for credentialed parents.
 
 ### Performance
 
+- The rate-limit exempt check is lock-free and flat in the exempt-CIDR count.
+  `RateLimiter.IsExempt` is the first decision inside `Allow`, so once a rate
+  limit is configured it runs on every proxied request; it took a
+  process-wide `RWMutex` read lock and then ran a linear `net.IPNet.Contains`
+  scan, which made the length of an operator's exempt list the price of the
+  gate for every *other* client. On a 4-core box it measured 59.7 ns with no
+  exemptions and 3.95 µs at 256 exempt CIDRs (~15 ns per configured CIDR);
+  reading an immutable view and probing a prefix-length-bucketed set it
+  measures 3.06 ns and 63.9 ns — flat from 1 to 256 prefixes. End to end the
+  whole `Allow` gate goes 1176 → 279 ns at 256 exempt CIDRs at four cores,
+  and the per-op cost now falls with core count (3.99x from 1→4) where it used
+  to rise (0.65x). The prefix-bucketing machinery is now one implementation
+  (`prefixSet`) shared with the IP filter rather than a second copy. Verdicts
+  are preserved exactly, including an IPv4-mapped probe continuing *not* to
+  match a plain-v4 single-IP exemption — canonicalising that would widen an
+  exemption. `RateLimiter.AddExemptions` is added as the bulk-load primitive
+  and used by the boot settings restore and config import, so restoring a
+  large exempt list stays linear. No API, metric, or dashboard change.
 - The top-hosts counter's tracked-host path is lock-free. `topHosts.Record`
   runs on every allowed request and took a process-wide `RWMutex` read lock
   to read a map that in steady state never changes; `RLock`/`RUnlock` are two
