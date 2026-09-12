@@ -67,7 +67,7 @@ func newAuxGate(s *auxSeams) *mcpLiveSideEffectGate {
 			s.trustCalls++
 			return true, ""
 		},
-		admitUnderActivation: func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+		admitUnderActivation: func(time.Time, policy.OperationClass, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 			s.resCalls++
 			return canaryAdmission{Active: true, Generation: 7, Trusted: true}
 		},

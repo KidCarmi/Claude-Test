@@ -7,7 +7,7 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
-	"io/fs"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -292,19 +292,33 @@ type classWrite struct{ fn, target string }
 func classFieldWrites(t *testing.T) []classWrite {
 	t.Helper()
 	fset := token.NewFileSet()
-	// "." is the package directory: `go test` runs with the package as its working directory,
-	// which is the same convention the sibling AST gate in canary_reviewed_target_test.go uses.
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	// "*.go" in the package directory: `go test` runs with the package as its working directory,
+	// the same convention the sibling AST gate in canary_reviewed_target_test.go uses.
+	//
+	// A glob rather than parser.ParseDir, which is deprecated as of Go 1.25 — and the deprecation
+	// reason does not apply here anyway (it is about build-tag-aware package association, while
+	// this gate wants every non-test source file regardless of tags), so the replacement is the
+	// explicit walk rather than x/tools/go/packages.
+	paths, err := filepath.Glob("*.go")
 	if err != nil {
-		t.Fatalf("parse package: %v", err)
+		t.Fatalf("list package sources: %v", err)
 	}
 	var writes []classWrite
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			writes = append(writes, classWritesInFile(t, fset, file)...)
+	var scanned int
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
 		}
+		file, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", path, perr)
+		}
+		scanned++
+		writes = append(writes, classWritesInFile(t, fset, file)...)
+	}
+	// A glob that matched nothing would make every assertion downstream vacuous.
+	if scanned == 0 {
+		t.Fatal("no package sources were scanned — this gate is no longer checking anything")
 	}
 	return writes
 }

@@ -107,7 +107,16 @@ func requestLiveClassified(t *testing.T, sid, tool, fpHex string, catRev uint64,
 // requestAndApproveLive drives the full four-eyes live path and returns the active grant.
 func requestAndApproveLive(t *testing.T, sid, tool, fpHex string, catRev uint64) *tooltrust.ToolApproval {
 	t.Helper()
-	req := requestLive(t, sid, tool, fpHex, catRev, liveRequester, time.Hour)
+	return requestAndApproveLiveClassified(t, sid, tool, fpHex, catRev, tooltrust.ReviewedOpMutating)
+}
+
+// requestAndApproveLiveClassified is requestAndApproveLive with the reviewed determination stated.
+// A fixture whose reviewed request must go on to be ADMITTED needs read-only: a tool call reaches
+// the side-effect gate as OpRead or not at all, and the admission transaction requires the
+// activation to still bind that class.
+func requestAndApproveLiveClassified(t *testing.T, sid, tool, fpHex string, catRev uint64, class tooltrust.ReviewedOperationClass) *tooltrust.ToolApproval {
+	t.Helper()
+	req := requestLiveClassified(t, sid, tool, fpHex, catRev, liveRequester, time.Hour, class)
 	g, err := mcpToolTrust.ApproveLive(req.ApprovalID, liveApprover, ttTenant)
 	if err != nil {
 		t.Fatalf("ApproveLive: %v", err)

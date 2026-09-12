@@ -25,6 +25,8 @@
 #
 #   M13  the read-first gate itself stops refusing a write-class operation
 #   M14  the promotion is computed and then dropped before it reaches the decision tuple
+#   M15  the classification outlives the activation that made it (Codex P1)
+#   M16  the boundary revalidation reads an unspeakable record as agreement
 #
 # A COMPILE FAILURE IS NOT PROOF unless the mutation targets a structural wall whose stated purpose
 # is compile-time prevention (those declare --compile-wall). Every other mutation here is written to
@@ -224,6 +226,7 @@ LIVEGATE=internal/mcp/execution/livegate.go
 ROOTCLS=mcp_canary_read_first.go
 RTSTATE=mcp_canary_runtime.go
 LGATE=mcp_live_gate.go
+ADM=mcp_canary_admission.go
 
 # M01 — the SERVER's own vocabulary becomes Culvert's. A hint spelling parses into a reviewed
 # determination, so anything that reaches the parser with "true" is read-only by assertion.
@@ -357,6 +360,25 @@ run_mutation M14 \
   'TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall' \
   ./internal/mcp/runtime "$RTPOLICY" \
   's/\top := policyOperation\(p\.capability, msg\.Method, req\.ServerID\)\n\tif p\.capability == protocol\.Gateway \{\n\t\tp\.attachGatewayRefs\(&in, req\.ServerID, msg, &op\)\n\t\}\n\tin\.Operation = op/\top := policyOperation(p.capability, msg.Method, req.ServerID)\n\tin.Operation = op\n\tif p.capability == protocol.Gateway \{\n\t\tp.attachGatewayRefs(&in, req.ServerID, msg, &op)\n\t}/'
+
+# M15 — THE CLASSIFICATION OUTLIVES ITS ACTIVATION. The boundary stops revalidating the class, so a
+# read-first decision taken under an activation that has since been replaced by one whose review
+# says MUTATING still crosses. Every drift control stays silent, correctly: the target did not move,
+# the review of it did (Codex P1, PR #1370).
+run_mutation M15 \
+  'a read-first decision crosses under an activation whose review says mutating' \
+  'TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating' \
+  . "$ADM" \
+  's/\tif current, ok := cr\.reviewed\.OperationClassFor\(obs\.Current\); !ok \|\| current != opClass \{\n\t\treturn canaryAdmission\{Denial: canaryAdmitClassNotInForce, Active: true, Generation: gen, Outcome: canary\.BudgetDeniedInvalid\}\n\t\}\n//'
+
+# M16 — the revalidation treats "the record cannot speak for this target" as agreement. The !ok half
+# is what makes an absent determination a refusal rather than a pass, and dropping it is the
+# permissive-default failure this whole PR exists to prevent, one layer down.
+run_mutation M16 \
+  'the boundary revalidation reads an unspeakable record as agreement' \
+  'TestAtomicBinding_I_ClassNotInForceIsRefused' \
+  . "$ADM" \
+  's/\tif current, ok := cr\.reviewed\.OperationClassFor\(obs\.Current\); !ok \|\| current != opClass \{/\tif current, ok := cr.reviewed.OperationClassFor(obs.Current); ok \&\& current != opClass \&\& false \{\n\t\t_ = current/'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"

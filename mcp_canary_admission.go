@@ -7,6 +7,7 @@ import (
 	mcpruntime "github.com/KidCarmi/Culvert/internal/mcp/runtime"
 
 	"github.com/KidCarmi/Culvert/internal/mcp/canary"
+	"github.com/KidCarmi/Culvert/internal/mcp/policy"
 	"github.com/KidCarmi/Culvert/internal/mcp/rollout"
 )
 
@@ -120,6 +121,9 @@ const (
 	canaryAdmitUntrusted                                 // request-scoped: this request is not authorized
 	canaryAdmitNotReviewed                               // request-scoped: not a target THIS activation was reviewed for
 	canaryAdmitBudget                                    // budget / blast-radius denial
+	// canaryAdmitClassNotInForce — request-scoped: the operation class this request was decided
+	// under is not the class the activation that will be charged binds to this target.
+	canaryAdmitClassNotInForce
 )
 
 // canaryAdmission is the bounded result of one atomic admission transaction. The caller receives
@@ -159,6 +163,7 @@ func (a canaryAdmission) Granted() bool { return a.Denial == canaryAdmitGranted 
 //	execution eligibility          — an already-aborted Canary admits nothing
 //	trust probe                    — evaluated against the activation that will be latched
 //	drift  ⇒ trip(G) + persist     — fail-closed; the request is denied
+//	class in force under G         — the classification the request carries is still the one G binds
 //	untrusted ⇒ deny               — request-scoped; nothing is latched and nothing persisted
 //	reserve(G) + persist           — only a trusted request spends budget
 //
@@ -166,7 +171,7 @@ func (a canaryAdmission) Granted() bool { return a.Denial == canaryAdmitGranted 
 // preserving the gate's prior ordering. The reservation can therefore only ever be made under the
 // SAME generation the trust verdict was computed against: "trust under G, reserve under G+1" is not
 // a race that is unlikely here, it is a state the code cannot express.
-func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Time, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
+func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Time, opClass policy.OperationClass, ident canary.ExecutionIdentity, trust canaryTrustProbe) canaryAdmission {
 	cr := rt.capRuntime(capb)
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
@@ -222,6 +227,41 @@ func (rt *canaryRuntime) admitLiveExecution(capb rollout.Capability, now time.Ti
 	// here, it simply does not stop an experiment that never depended on it.
 	if cr.reviewed.Compare(obs.Current) == canary.ReviewedOutOfScope {
 		return canaryAdmission{Denial: canaryAdmitNotReviewed, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
+	}
+
+	// (5b) THE CLASS THE REQUEST CARRIES MUST BE THE CLASS THIS ACTIVATION BINDS (blocker #4).
+	//
+	// The operation class is decided once, at policy time, from the activation armed AT THAT
+	// INSTANT — which is what makes the policy engine, the activation gate and the live gate read
+	// one value instead of three. But "decided once" is a statement about how many times it is
+	// COMPUTED, not about how long it stays true, and the request that carries it is charged to
+	// whatever activation is current HERE.
+	//
+	// So this sequence was admissible and must not be (Codex P1, PR #1370):
+	//
+	//	T0     G1 is armed, reviewed read-only for tool X at F1. A request is decided: OpRead.
+	//	T+     the request pauses — a credential path, a durable commit, a scheduler stall.
+	//	T++    G1 is demoted. G2 is armed for the SAME tool at the SAME fingerprint, but its
+	//	       review states MUTATING: a reviewer corrected the earlier determination.
+	//	T+++   the request resumes. Gate 2 reads OpRead off its own decision and admits it; the
+	//	       target identity still matches, so nothing drifts; the reservation is charged to G2.
+	//
+	// The call then reaches upstream under a read-first classification that the activation paying
+	// for it does not make. The correction lands in the one window where it matters most.
+	//
+	// This is REVALIDATION, not a second classification, and the distinction is the whole reason
+	// it does not violate the one-classification rule: nothing here computes a class from a
+	// different set of inputs and hopes it agrees. It re-reads the SAME authority — the activation's
+	// immutable reviewed record — under the lock that decides which activation is paying, and
+	// requires the answer to be the one the request is relying on. It is the same discipline the
+	// trust probe and the drift comparison above already follow at this boundary.
+	//
+	// EQUALITY, not "read is still read". Today only OpRead reaches here (gate 2 refuses every
+	// other class for a tool call), so the two are the same predicate; equality is chosen because
+	// it stays correct if a later phase admits a non-read class, and because it fails closed when
+	// the record cannot speak for the target at all rather than treating silence as agreement.
+	if current, ok := cr.reviewed.OperationClassFor(obs.Current); !ok || current != opClass {
+		return canaryAdmission{Denial: canaryAdmitClassNotInForce, Active: true, Generation: gen, Outcome: canary.BudgetDeniedInvalid}
 	}
 
 	// (6) Untrusted without drift is request-scoped: the target still matches what was reviewed,

@@ -439,12 +439,12 @@ func TestReadFirstClass_C12_SameGenerationCannotMutateTheClassification(t *testi
 	capb := rollout.CapabilityGateway
 	budget := runtimeTestBudget(10)
 
-	writeTgt := reviewedAt(fpF1) // OpWrite, from the shared fixture
-	readTgt := writeTgt
-	readTgt.OperationClass = policy.OpRead // the ONLY difference
+	readTgt := reviewedAt(fpF1) // OpRead, from the shared fixture
+	writeTgt := readTgt
+	writeTgt.OperationClass = policy.OpWrite // the ONLY difference
 
 	if _, err := globalCanaryRuntime.beginCanaryActivation(capb, canaryActivationSpec{
-		Budget: budget, ReviewedTargets: []canary.ReviewedTarget{writeTgt}, StartedAt: time.Unix(0, 1),
+		Budget: budget, ReviewedTargets: []canary.ReviewedTarget{readTgt}, StartedAt: time.Unix(0, 1),
 	}); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestReadFirstClass_C12_SameGenerationCannotMutateTheClassification(t *testi
 		setStatus: func(string) {}, countTransition: func() {}, reconcileRuntime: true,
 	}
 	err := r.reconcileCanaryRuntimeAfterCommit(tgt, cfg, prevCfg.Mode, prevCfg, st.Evidence(),
-		canaryActivationSpec{Budget: budget, ReviewedTargets: []canary.ReviewedTarget{readTgt}, StartedAt: time.Unix(0, 2)},
+		canaryActivationSpec{Budget: budget, ReviewedTargets: []canary.ReviewedTarget{writeTgt}, StartedAt: time.Unix(0, 2)},
 		"new", time.Unix(0, 2))
 	if !errors.Is(err, errRolloutCanaryReviewedTargetsChanged) {
 		t.Fatalf("a same-generation update that rebinds the reviewed CLASS must be refused, got %v", err)
@@ -472,7 +472,7 @@ func TestReadFirstClass_C12_SameGenerationCannotMutateTheClassification(t *testi
 	if !ok {
 		t.Fatal("the running activation must still be armed after a refused update")
 	}
-	if !set.Equal(mustCanonical(t, writeTgt)) {
+	if !set.Equal(mustCanonical(t, readTgt)) {
 		t.Fatal("SECURITY: the refused update mutated the active reviewed classification")
 	}
 }
@@ -661,5 +661,103 @@ func TestReadFirstClass_FingerprintFormatIsPartOfTheBinding(t *testing.T) {
 	asserted.OperationClass = policy.OpWrite
 	if class, ok := set.OperationClassFor(asserted); !ok || class != policy.OpRead {
 		t.Fatalf("SECURITY: the caller's asserted class was consulted; got (%v, %v)", class, ok)
+	}
+}
+
+// ── Codex P1 (PR #1370) ──────────────────────────────────────────────────────────────────────
+// THE CLASSIFICATION MUST NOT OUTLIVE THE ACTIVATION THAT MADE IT.
+//
+// The operation class is decided once, at policy time, under whatever activation is armed at that
+// instant — and the request that carries it is charged, at the boundary, to whatever activation is
+// armed THEN. Those need not be the same one, and the gap is the whole finding:
+//
+//	G1 armed, tool X at F1 reviewed READ-ONLY   → a request is decided OpRead
+//	the request pauses (credential path, durable commit, scheduler stall)
+//	G1 demoted; G2 armed for the SAME tool at the SAME fingerprint, reviewed MUTATING
+//	the request resumes → gate 2 reads OpRead off its own decision and lets it through;
+//	                      the target identity still matches, so nothing drifts;
+//	                      the reservation is charged to G2
+//
+// Nothing about the TARGET moved, so every drift control stays silent — correctly. What moved is
+// the review OF it, which is exactly the case where a correction most needs to take effect: a
+// reviewer looked again and said this tool mutates.
+//
+// The test drives the real gate through the real activations. The "pause" needs no goroutine: the
+// class is a value the request carries, so re-admitting the SAME decided class after the swap is
+// the identical state, and a deterministic test is worth more than a raced one.
+func TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating(t *testing.T) {
+	rt := withCanaryRuntimeTestEnv(t, "v9.9.9")
+	capb := rollout.CapabilityGateway
+	resetInventory(t)
+	resetExecDeps(t)
+	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
+	_, clkFn := liveFakeClock()
+	composeToolTrust(t, clkFn)
+	requestAndApproveLiveClassified(t, sid, tool, fpHex, cat.Current().Revision(), tooltrust.ReviewedOpReadOnly)
+
+	readTarget := observedReviewedTargetClassified(t, sid, tool, fpHex, policy.OpRead)
+	g1, err := rt.beginCanaryActivation(capb, canaryActivationSpec{
+		Budget: runtimeTestBudget(20), ReviewedTargets: []canary.ReviewedTarget{readTarget}, StartedAt: canaryRuntimeTestNow,
+	})
+	if err != nil {
+		t.Fatalf("arm G1: %v", err)
+	}
+	g := realAdmissionGate(t, capb)
+	in := driftGateInput(sid, tool, fpHex, mcpToolTrust.now())
+	in.Operation = policy.OpRead
+
+	// PREMISE: under G1 the read-first decision is admitted. Without this the refusal below could
+	// be anything at all.
+	d := g.AdmitSideEffect(in)
+	if d.Release != nil {
+		d.Release()
+	}
+	if !d.Admit {
+		t.Fatalf("premise: a read-reviewed target must be admitted under G1, reason=%s", d.Reason.Code())
+	}
+
+	// The review is corrected: same tenant, same server, same tool, same fingerprint, same pinned
+	// identity — only the reviewed class changes. A same-generation rebind is refused (C12), so the
+	// correction lands the way it must: demote, then arm a new generation.
+	if err := rt.demoteCanary(capb); err != nil {
+		t.Fatalf("demote G1: %v", err)
+	}
+	writeTarget := readTarget
+	writeTarget.OperationClass = policy.OpWrite
+	g2, err := rt.beginCanaryActivation(capb, canaryActivationSpec{
+		Budget: runtimeTestBudget(20), ReviewedTargets: []canary.ReviewedTarget{writeTarget}, StartedAt: canaryRuntimeTestNow,
+	})
+	if err != nil {
+		t.Fatalf("arm G2: %v", err)
+	}
+	if g2 == g1 {
+		t.Fatalf("premise: the corrected review must be a NEW generation, still %d", g1)
+	}
+
+	// PREMISE, and it is the reason this test is not simply re-proving drift detection: NOTHING
+	// about the target moved. The classifier still resolves it, and the only thing that changed is
+	// what the activation says about it.
+	if class, ok := canaryReadFirstClassifier(capb.String(), sid, tool); !ok || class != policy.OpWrite {
+		t.Fatalf("premise: G2 must bind this exact target to OpWrite, got (%v, %v)", class, ok)
+	}
+
+	// THE GATE. The stale OpRead decision must not cross, and the refusal must be the read-first
+	// gate's own reason rather than a drift or a budget denial — from the caller's side this
+	// operation is simply not read-first here.
+	stale := g.AdmitSideEffect(in)
+	if stale.Release != nil {
+		stale.Release()
+	}
+	if stale.Admit {
+		t.Fatal("SECURITY: a read-first classification decided under G1 crossed the boundary under " +
+			"G2, whose review states the tool MUTATES — the classification outlived the authority " +
+			"that made it")
+	}
+	if stale.Reason != mcperr.ReasonRolloutOutOfScope {
+		t.Fatalf("the refusal must be the read-first gate's bounded reason, got %s", stale.Reason.Code())
+	}
+	// And it is REQUEST-SCOPED: the target did not move, so the experiment must not be stopped.
+	if rt.abortedNow(capb) {
+		t.Fatal("SECURITY: a corrected review is not a breach of the target — nothing may latch")
 	}
 }

@@ -35,7 +35,7 @@ func gateWithAdmission(adm canaryAdmission) *mcpLiveSideEffectGate {
 			return liveTrustPrecheck{Eligible: true}
 		},
 		approvalOK: func(canary.LiveTarget, time.Time) (bool, string) { return true, "" },
-		admitUnderActivation: func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+		admitUnderActivation: func(time.Time, policy.OperationClass, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 			return adm
 		},
 		releaseBudget:     func(uint64) {},

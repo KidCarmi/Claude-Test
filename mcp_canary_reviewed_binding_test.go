@@ -122,11 +122,17 @@ func armReviewedActivation(t *testing.T, rt *canaryRuntime, capb rollout.Capabil
 // probe would, and shapes it as a reviewed record.
 func observedReviewedTarget(t *testing.T, sid, tool, fpHex string) canary.ReviewedTarget {
 	t.Helper()
-	// MUTATING by default. Drift is a property of the target's IDENTITY, not of its semantics,
-	// so every case in this matrix is indifferent to the reviewed class — which is exactly why
-	// the shared fixture must state the conservative one: a drift matrix armed entirely with
-	// read-only targets would also, silently, be asserting that read-first promotion is safe.
-	return observedReviewedTargetClassified(t, sid, tool, fpHex, policy.OpWrite)
+	// READ-ONLY, because that is the only reviewed class the First Canary can execute: a tool call
+	// reaches the side-effect gate as OpRead or not at all (gate 2), and the admission transaction
+	// requires the activation to still bind that class (step 5b). A fixture that armed a MUTATING
+	// target and then asserted "the reviewed request must be admitted" would be asserting a state
+	// the product cannot reach — which is what the first version of this fixture did, and what the
+	// boundary revalidation immediately exposed.
+	//
+	// Drift is a property of the target's IDENTITY, not of its semantics, so every case in this
+	// matrix is indifferent to WHICH class is bound; what it is not indifferent to is the class
+	// being the one the request carries.
+	return observedReviewedTargetClassified(t, sid, tool, fpHex, policy.OpRead)
 }
 
 // observedReviewedTargetClassified is observedReviewedTarget with the reviewed operation class
@@ -710,7 +716,7 @@ func TestReviewedBinding_AnUnrecognisedDenialClassFailsClosed(t *testing.T) {
 	if unknownDenial == canaryAdmitGranted {
 		t.Fatal("premise: the injected class must not be the grant")
 	}
-	g.admitUnderActivation = func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+	g.admitUnderActivation = func(time.Time, policy.OperationClass, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 		return canaryAdmission{Denial: unknownDenial, Active: true, Generation: 7}
 	}
 	d := g.AdmitSideEffect(driftGateInput("s", "t", "fp", canaryRuntimeTestNow))
@@ -728,7 +734,7 @@ func TestReviewedBinding_AnUnrecognisedDenialClassFailsClosed(t *testing.T) {
 
 	// Control: the SAME harness admits an explicit grant, so the assertion above cannot be
 	// satisfied by a gate that refuses everything.
-	g.admitUnderActivation = func(time.Time, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
+	g.admitUnderActivation = func(time.Time, policy.OperationClass, canary.ExecutionIdentity, canaryTrustProbe) canaryAdmission {
 		return canaryAdmission{Denial: canaryAdmitGranted, Active: true, Generation: 7, Trusted: true, Outcome: canary.BudgetGranted}
 	}
 	ok := g.AdmitSideEffect(driftGateInput("s", "t", "fp", canaryRuntimeTestNow))

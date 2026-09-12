@@ -631,7 +631,11 @@ func armDriftFixture(t *testing.T, rt *canaryRuntime, capb rollout.Capability) (
 	_, cat, sid, tool, fpHex := seedToolTrustInventory(t)
 	_, clkFn := liveFakeClock()
 	composeToolTrust(t, clkFn)
-	grant := requestAndApproveLive(t, sid, tool, fpHex, cat.Current().Revision())
+	// READ-ONLY, because these tests admit the reviewed request through the real gate and only a
+	// read-first operation crosses it. The class still travels from the GRANT to the activation
+	// exactly as production derives it — the fixture states what the reviewer states, it does not
+	// invent a class of its own.
+	grant := requestAndApproveLiveClassified(t, sid, tool, fpHex, cat.Current().Revision(), tooltrust.ReviewedOpReadOnly)
 	// Arm the activation against the target that was actually seeded and approved: an activation
 	// carries the exact reviewed set, so a fixture that armed against a synthetic target would be
 	// refused as out-of-scope before any drift could be observed.
