@@ -818,6 +818,39 @@ code:
   envelope is CARRIED from a real `Resolve` to the boundary rather than only compared there.
   Mutations M17–M21 (the hash is never captured; admission ignores it; a missing hash is treated as a
   match; only the generation is compared; a principal-only recheck) each fail a named gate.
+
+  **ROUND 3 CLOSED THE OTHER HALF OF THE SAME FINDING: THE POST-ADMISSION WINDOW.** Codex observed
+  that step (5c) can only ever prove the envelope was in force AT ITS OWN INSTANT — admission is
+  atomic under `cr.mu`, but the scope is published under `rollout.State`'s own `swapMu`, which that
+  transaction does not hold and must not (taking a rollout lock inside the activation lock would
+  invert the order every other caller uses). The request then travels on through credential
+  materialization, the durable decision commit and connection setup before anything physical
+  happens, and the final-boundary `Revalidate` re-read only the ACTIVATION GENERATION — which a
+  same-mode scope update deliberately leaves alone, which is the whole premise of this finding. So
+  a scope withdrawn in that window was invisible.
+
+  The remedy is the one this boundary already uses for the emergency kill (PREREQ-MCP-KILL-1): the
+  window is not narrowed, it is RE-ASKED. `Revalidate` now requires BOTH authorities — the reserved
+  generation still current AND the resolved envelope still installed — immediately before
+  `Upstream.Call`. Serializing scope publication with the admission transaction was the alternative
+  Codex offered and is deliberately NOT taken: it would make an operator's scope edit block behind
+  every in-flight admission AND would still leave the post-admission window open, since the request
+  continues long after the transaction returns.
+
+  The internal sentinel was renamed with it (`errLiveGenerationDemotedAtBoundary` →
+  `errLiveAuthorityWithdrawnAtBoundary`, `boundaryRefusal.demoted` → `.withdrawn`): a name that says
+  "generation demoted" while also meaning "scope replaced" is the quiet drift this ledger exists to
+  prevent. WHICH of the two withdrew the authority is deliberately not distinguished at that layer —
+  `internal/mcp/execution` must not learn to reason about scopes or generations to decide that a
+  physical attempt is no longer authorized; the client reason is unchanged.
+
+  Gates: `TestScopeInForce_ScopeWithdrawnAfterAdmissionRefusesBeforeUpstream` (the swap is injected
+  through `ToolStillCurrent`, which `preCallGuard` evaluates immediately before `Revalidate` — the
+  narrowest place a test can stand inside the window; the upstream must see ZERO calls) with
+  `..._UnchangedEnvelopeSurvivesThePostAdmissionWindow` as its mandatory control, because a
+  `Revalidate` wired to refuse unconditionally would satisfy the first while deleting live
+  execution entirely. Mutation M22 removes only the final-boundary half, leaving step (5c) intact so
+  every direct-admission gate still passes.
 - **P2 — credential conditional (§4):** `CredentialProfile` is a policy obligation, so no-credential
   status is unverifiable until the exact tool + rule are fixed. Corrected.
 - **P1 — durable outcome evidence (§15/§18):** every event is a `PhaseDecision` with no
@@ -944,7 +977,7 @@ case stays non-read and fail-closed. The governing invariant, stated once:
 | The freshness boundary is not weakened | `TestReadFirstClass_StaleF1DecisionIsRefusedAfterF2` — a decision computed under F1 does not reach upstream once the target is F2; the promotion is not the last word |
 | The classification does not outlive the activation that made it | `admitLiveExecution` step (5b): the decided class must EQUAL the one the activation being charged binds to this target, decided inside the lock that decides which activation that is. `TestReadFirstClass_StaleReadClassIsRefusedAfterAReviewSaysMutating` (the full G1→G2 sequence through the real gate) + `TestAtomicBinding_I_ClassNotInForceIsRefused` (the transaction-level half, with its own positive control) |
 | Anti-vacuity (MANDATORY positive controls) | `TestReadFirstClass_C01_ExactReviewedReadOnlyToolClassifiesAsRead`, `TestReadFirstRuntime_ReviewedReadAnswerPromotesTheToolCall` and `TestReadFirstClass_LiveGateAdmitsTheReadClassAndRefusesTheWriteClass` — a classifier that answered "no" to everything would satisfy every negative gate while being the feature deleted |
-| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 21 mutations, 21 caught, 0 survived, 0 skipped (M17–M21 belong to the §24 scope finding below, not to blocker 4's own criteria) |
+| Campaign | `scripts/mcp-canary-read-first-classification-mutations.sh` — 22 mutations, 22 caught, 0 survived, 0 skipped (M17–M22 belong to the §24 scope finding below, not to blocker 4's own criteria) |
 
 **Two things the campaign taught, recorded because they change how a survivor should be read.**
 A single-edit mutation of the stale-decision boundary SURVIVED, and the reason was not a missing
@@ -1012,7 +1045,7 @@ its own gates, and it is deliberately not folded into blocker 4: blocker 4's cri
 above and they stand or fall on their own. It was fixed there rather than deferred because it sits in
 the exact admission boundary this work was already hardening, and a known P1 in that boundary is not
 carried across a merge merely because it predates the branch. Its gates are
-`mcp_canary_scope_in_force_test.go` and campaign mutations M17–M21.
+`mcp_canary_scope_in_force_test.go` and campaign mutations M17–M22.
 
 It also does not close the SCOPE half of the same defect class: step (5b) revalidates the operation
 class at the boundary, and nothing revalidates the resolved SCOPE there — a request that resolved

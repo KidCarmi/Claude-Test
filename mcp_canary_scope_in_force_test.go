@@ -408,3 +408,79 @@ func TestScopeInForce_EnvelopeIsCarriedFromResolutionToTheBoundary(t *testing.T)
 			up.callCount())
 	}
 }
+
+// ── THE POST-ADMISSION WINDOW ─────────────────────────────────────────────────────────────────
+//
+// Admission is one atomic transaction under cr.mu, but the scope is published under
+// rollout.State's own swapMu, which that transaction does not hold. So step (5c) proves the
+// envelope was in force AT THAT INSTANT and nothing more — and the request then travels on
+// through credential materialization, the durable decision commit and connection setup before
+// anything physical happens. A scope update landing in that window used to be invisible: the
+// final-boundary Revalidate re-read only the activation generation, which a same-mode scope
+// update deliberately leaves alone (Codex P1, PR #1370, round 3).
+//
+// The injection point is ToolStillCurrent, which preCallGuard evaluates immediately BEFORE
+// Revalidate — the narrowest place a test can stand inside the window without reaching into
+// the executor.
+func TestScopeInForce_ScopeWithdrawnAfterAdmissionRefusesBeforeUpstream(t *testing.T) {
+	up := &recordingUpstream{}
+	cfg := armCanaryLiveTier(t, up, true, 5)
+	ex := cfg.Deps.Executor
+	gw := getMCPRollout().gateway
+
+	in := liveExecInput(policy.OpRead, "t1", "p1")
+	swapped := false
+	in.ToolStillCurrent = func() bool {
+		// Inside the window: admission has granted and reserved; the physical call has not begun.
+		// Install a DIFFERENT scope at the same mode, so the activation generation is untouched
+		// and the generation half of Revalidate stays silent.
+		if !swapped {
+			swapped = true
+			installScope(t, gw, 2, rollout.ScopeSpec{
+				Capability: rollout.CapabilityGateway,
+				Servers:    []string{"s1", "s2-added-mid-flight"},
+			})
+		}
+		return true // the TOOL did not drift; only the envelope changed
+	}
+
+	res := ex.Resolve(in)
+	if res.ScopeHash == "" {
+		t.Fatal("premise: the resolution must carry an envelope for the boundary to revalidate")
+	}
+	out := ex.Execute(t.Context(), in, res)
+
+	if !swapped {
+		t.Fatal("premise: the scope swap never ran, so this proves nothing about the window")
+	}
+	if up.callCount() != 0 {
+		t.Fatalf("SECURITY: the authorization envelope was withdrawn after admission and the "+
+			"request still reached upstream %d time(s) — a physical effect under a scope that "+
+			"no longer exists", up.callCount())
+	}
+	if out.Executed {
+		t.Fatalf("a request refused at the boundary must not report Executed, out=%+v", out)
+	}
+}
+
+// The mandatory control for the gate above: with the envelope UNCHANGED across the same window,
+// the request still executes. Without it, a Revalidate wired to refuse unconditionally would
+// satisfy the gate above while deleting live execution entirely.
+func TestScopeInForce_UnchangedEnvelopeSurvivesThePostAdmissionWindow(t *testing.T) {
+	up := &recordingUpstream{}
+	cfg := armCanaryLiveTier(t, up, true, 5)
+	ex := cfg.Deps.Executor
+
+	in := liveExecInput(policy.OpRead, "t1", "p1")
+	observed := false
+	in.ToolStillCurrent = func() bool { observed = true; return true }
+
+	out := ex.Execute(t.Context(), in, ex.Resolve(in))
+	if !observed {
+		t.Fatal("premise: the boundary guard never ran, so the window was not exercised")
+	}
+	if up.callCount() != 1 {
+		t.Fatalf("CONTROL: an unchanged envelope must still reach upstream exactly once, got %d (out=%+v)",
+			up.callCount(), out)
+	}
+}

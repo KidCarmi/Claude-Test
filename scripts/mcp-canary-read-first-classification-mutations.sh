@@ -36,6 +36,7 @@
 #   M19  a missing scope hash is treated as a match
 #   M20  admission compares only the generation, not scope identity
 #   M21  a principal-only recheck misses a tool/server/exclusion scope edit
+#   M22  the post-admission window is not revalidated for scope
 #
 # A COMPILE FAILURE IS NOT PROOF unless the mutation targets a structural wall whose stated purpose
 # is compile-time prevention (those declare --compile-wall). Every other mutation here is written to
@@ -457,6 +458,20 @@ run_mutation M21 \
   'TestScopeInForce_AnySelectorEditRefusesTheStaleRequest' \
   . "$ADM" \
   's/\tif !canaryScopeInForce\(resolvedScope, scopeNow\) \{/\tif cur := scopeNow; cur == nil \|\| resolvedScope == "" \|\| ident.Principal == "" \{/'
+
+GATE=mcp_live_gate.go
+
+# M22 — THE POST-ADMISSION WINDOW REOPENS. Step (5c) stays, so every direct-admission gate above
+# still passes; only the FINAL-boundary half is removed. Admission then proves the envelope was in
+# force at its own instant and nothing revalidates it across credential materialization, the
+# durable commit and connection setup — exactly the window the kill re-read exists for. A scope
+# update landing there is invisible, because a same-mode update deliberately leaves the activation
+# generation alone and the generation half of Revalidate is all that is left.
+run_mutation M22 \
+  'the authorization envelope is not revalidated in the post-admission window' \
+  'TestScopeInForce_ScopeWithdrawnAfterAdmissionRefusesBeforeUpstream' \
+  . "$GATE" \
+  's/\t\t\tif !canaryScopeInForce\(in\.ResolvedScopeHash, g\.currentScopeHash\) \{\n\t\t\t\treturn false\n\t\t\t\}\n//'
 
 printf '\n===========================================\n'
 printf 'caught: %d   survived: %d   skipped: %d\n' "$PASS" "$SURVIVED" "$SKIPPED"

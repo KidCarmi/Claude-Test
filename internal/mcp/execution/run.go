@@ -172,8 +172,9 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 		attempt = rec
 		// (2) Last-moment boundary re-checks (tool drift, then the composition-layer live-generation
 		// revalidation, then the emergency kill) run inside preCallGuard so nothing sits between them and
-		// Upstream.Call. The kill re-read stays LAST (PREREQ-MCP-KILL-1). A demoted-generation refusal is
-		// mapped to the gate-refusal classification path with a bounded rollout reason.
+		// Upstream.Call. The kill re-read stays LAST (PREREQ-MCP-KILL-1). A withdrawn-authority refusal —
+		// the reserved generation demoted, or the resolved scope replaced — is mapped to the
+		// gate-refusal classification path with a bounded rollout reason.
 		gerr, driftObserved := e.preCallGuard(in, admKillGen, revalidate)
 		if gerr != nil {
 			// The physical call never began, so this is the ONE case where
@@ -202,7 +203,7 @@ func (e *Executor) runExecute(ctx context.Context, in runtime.ExecInput, _ rollo
 				e.cfg.Safety.Breach(in.Capability.String(), attempt.generation, "tool_fingerprint_drift")
 			}
 			bf.stale, bf.killed = cls.stale, cls.killed
-			if cls.demoted {
+			if cls.withdrawn {
 				bf.gateRefused, bf.gateReason = true, mcperr.ReasonRolloutModeInvalid
 			}
 			return gerr
@@ -323,17 +324,18 @@ func (e *Executor) preCallGuard(in runtime.ExecInput, admKillGen uint64, liveRev
 	// freshness callback), so the kill generation stays the LAST authoritative state read before
 	// Upstream.Call. It NEVER engages the kill, so evaluating it here cannot reopen the F7 TOCTOU. A
 	// nil predicate (no gate, or Shadow) leaves this byte-identical to the pre-gate boundary.
-	liveDemoted := liveRevalidate != nil && !liveRevalidate()
+	authorityWithdrawn := liveRevalidate != nil && !liveRevalidate()
 	if e.cfg.State.KillGeneration() != admKillGen {
 		// Emergency stop is paramount in the REASON reported to the client, even if the tool also
-		// drifted or demoted — but the drift is still returned, so the Canary hears about it.
+		// drifted or lost its rollout authority — but the drift is still returned, so the Canary
+		// hears about it.
 		return errKilledAtBoundary, drifted
 	}
 	if drifted {
 		return errToolDriftedBeforeCall, true
 	}
-	if liveDemoted {
-		return errLiveGenerationDemotedAtBoundary, false // the reserved Canary generation was demoted mid-flight
+	if authorityWithdrawn {
+		return errLiveAuthorityWithdrawnAtBoundary, false // the generation or the scope the reservation rests on changed mid-flight
 	}
 	return nil, false
 }
@@ -534,7 +536,7 @@ func (e *Executor) materializeAndCall(ctx context.Context, in runtime.ExecInput,
 		// (Codex P2, PR #1248 for drift/kill; PR #1290 for the live gate). Return the un-metered
 		// signal and let the caller own the single classification+meter. errors.Is unwraps in case
 		// the broker wraps the callback error.
-		if errors.Is(mErr, errKilledAtBoundary) || errors.Is(mErr, errToolDriftedBeforeCall) || errors.Is(mErr, errLiveGateRefused) || errors.Is(mErr, errLiveGenerationDemotedAtBoundary) {
+		if errors.Is(mErr, errKilledAtBoundary) || errors.Is(mErr, errToolDriftedBeforeCall) || errors.Is(mErr, errLiveGateRefused) || errors.Is(mErr, errLiveAuthorityWithdrawnAtBoundary) {
 			return runtime.ExecOutput{}, true
 		}
 		return e.blocked(in, mcperr.ReasonOf(mErr), false), true
@@ -773,9 +775,9 @@ func executePreconditionFailure(e *Executor, in runtime.ExecInput) (mcperr.Reaso
 // boundaryRefusal names which final guard refused, so the caller can map it to a
 // bounded reason without repeating the errors.Is chain.
 type boundaryRefusal struct {
-	stale   bool
-	killed  bool
-	demoted bool
+	stale     bool
+	killed    bool
+	withdrawn bool
 	// gateRefused/gateReason carry a composition-layer gate denial, which reaches the
 	// same classification path as a boundary guard refusal but names its own reason.
 	gateRefused bool
@@ -787,9 +789,9 @@ type boundaryRefusal struct {
 // only fixes which named reason each refusal carries.
 func classifyBoundaryError(err error) boundaryRefusal {
 	return boundaryRefusal{
-		stale:   errors.Is(err, errToolDriftedBeforeCall),
-		killed:  errors.Is(err, errKilledAtBoundary),
-		demoted: errors.Is(err, errLiveGenerationDemotedAtBoundary),
+		stale:     errors.Is(err, errToolDriftedBeforeCall),
+		killed:    errors.Is(err, errKilledAtBoundary),
+		withdrawn: errors.Is(err, errLiveAuthorityWithdrawnAtBoundary),
 	}
 }
 

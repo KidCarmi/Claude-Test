@@ -311,6 +311,30 @@ func (g *mcpLiveSideEffectGate) AdmitSideEffect(in execution.LiveGateInput) exec
 		ReservationID:        resID,
 		ActivationGeneration: gen,
 		Revalidate: func() bool {
+			// TWO AUTHORITIES, BOTH RE-ASKED AT THE FINAL BOUNDARY.
+			//
+			// Admission is one atomic transaction under cr.mu, but the scope is published under
+			// rollout.State's OWN lock (swapMu), which this transaction does not hold and must not
+			// (taking a rollout lock inside the activation lock would invert the order every other
+			// caller uses). So admission can only ever prove the envelope was in force AT THAT
+			// INSTANT — and between that instant and Upstream.Call the request still has to get
+			// through credential materialization, the durable decision commit and connection setup.
+			// That window is exactly why the kill state is re-read here (PREREQ-MCP-KILL-1), and a
+			// withdrawn authorization envelope deserves the same treatment (Codex P1, PR #1370,
+			// round 3).
+			//
+			// Serializing scope publication with this transaction was the other remedy offered and
+			// is deliberately NOT taken: it would make an operator's scope edit block behind every
+			// in-flight admission, and it would still leave the post-admission window open, since
+			// the request continues long after the transaction returns. Re-asking at the boundary
+			// closes the window instead of narrowing it.
+			//
+			// No "unwired ⇒ allow" escape hatch is needed here, unlike the generation seam below:
+			// an admitted request has already passed step (5c), which fails closed on a nil probe
+			// and on an empty envelope, so neither degenerate input can reach this closure.
+			if !canaryScopeInForce(in.ResolvedScopeHash, g.currentScopeHash) {
+				return false
+			}
 			if g.generationCurrent == nil {
 				return true // no revalidation seam wired ⇒ preserve prior behavior (never falsely refuse)
 			}

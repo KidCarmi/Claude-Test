@@ -128,12 +128,17 @@ type LiveGateDecision struct {
 // bounded Reason in a local and classifyBoundaryRefusal surfaces it.
 var errLiveGateRefused = errors.New("mcp: live side-effect gate refused")
 
-// errLiveGenerationDemotedAtBoundary aborts callUpstream when the gate's final-boundary Revalidate
-// reports the reserved activation generation is no longer current (a concurrent demotion). Like the
-// other boundary sentinels it never escapes the package: callUpstream maps it to a bounded rollout
-// reason via classifyBoundaryRefusal so a client and block telemetry read a fail-closed refusal, never
-// a transport/durability fault or ReasonNone.
-var errLiveGenerationDemotedAtBoundary = errors.New("mcp: live activation generation demoted before upstream call")
+// errLiveAuthorityWithdrawnAtBoundary aborts callUpstream when the gate's final-boundary Revalidate
+// reports that the rollout authority this reservation rests on is no longer in force — the reserved
+// activation generation is no longer current (a concurrent demotion), or the authorization envelope
+// the request resolved under has been replaced (a concurrent scope update).
+//
+// Which of the two it was is deliberately NOT distinguished here: the gate owns that vocabulary,
+// and this package must not learn to reason about scopes or generations to decide that a physical
+// attempt is no longer authorized. Like the other boundary sentinels it never escapes the package:
+// callUpstream maps it to a bounded rollout reason via classifyBoundaryRefusal so a client and block
+// telemetry read a fail-closed refusal, never a transport/durability fault or ReasonNone.
+var errLiveAuthorityWithdrawnAtBoundary = errors.New("mcp: live rollout authority withdrawn before upstream call")
 
 // liveGateInput builds the gate input from the already-resolved ExecInput at the boundary. It
 // reads ONLY resolved decision facts (principal/tool/server/operation), never a raw request
