@@ -430,9 +430,9 @@ func applyAdminSecurity(s *AdminSettings) {
 	}
 	if s.RateLimitRPM > 0 {
 		rl.Configure(s.RateLimitRPM, time.Minute)
-		for _, ex := range s.RateLimitExemptions {
-			_ = rl.AddExemption(ex)
-		}
+		// Bulk load: one pass, one view publish (an AddExemption loop is
+		// quadratic). Invalid entries stay silently skipped, as the loop did.
+		_ = rl.AddExemptions(s.RateLimitExemptions)
 	}
 	if s.ConnLimitEnabled && s.ConnLimitMaxPerIP > 0 {
 		connLimiter.Enable(s.ConnLimitMaxPerIP)
